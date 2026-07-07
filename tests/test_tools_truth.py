@@ -325,3 +325,177 @@ def test_parse_article_convert_path_returns_none_when_missing() -> None:
     out = "md: A:\\Hermes\\Downloads\\articles\\never_existed_xyz\\ghost.md"
     # Path doesn't exist; parser returns None.
     assert _parse_article_convert_path(out) is None
+
+
+# ----------------------------------------------------------------------
+# T6: fetcher_node + researcher_node fallback paths
+# ----------------------------------------------------------------------
+
+def test_fetcher_skips_source_with_empty_url(fake_subprocess, monkeypatch):
+    """T6 fix: a source without a URL must be skipped, not crash.
+
+    Reproduces the 2026-07-08 bot failure where the planner emitted
+    pseudo-sources (search syntax or bare labels) with no `url` field.
+    Old fetcher raised KeyError, logged only, returned empty fetched.
+    New fetcher records an error and skips cleanly.
+    """
+    from argus.graph import nodes as nodes_mod
+
+    state = {
+        "sources": [
+            {"kind": "paper", "title": "X", "url": ""},
+            {"kind": "paper", "title": "Y"},  # missing 'url'
+            {"kind": "search_result", "title": "Z", "url": "site:arxiv.org foo"},
+        ],
+        "fetched": [], "findings": [], "errors": [],
+    }
+    # minimal state validator
+    out = nodes_mod.fetcher_node(state)
+    assert out["fetched"] == [], (
+        f"empty/non-http URLs must not be fetched; got {out['fetched']!r}"
+    )
+    # At least 2 errors should be recorded (one per skipped source).
+    assert len(out["errors"]) >= 2, (
+        f"each skipped source must record an error; got {out['errors']!r}"
+    )
+
+
+def test_arxiv_search_raw_returns_list_for_valid_query(monkeypatch):
+    """T6 fix: helper exists and works on real arxiv call."""
+    from argus.graph import nodes as nodes_mod
+
+    # monkeypatch httpx to a stub so the test is hermetic
+    class _R:
+        text = (
+            '<entry><title>Real paper</title>'
+            '<id>http://arxiv.org/abs/2503.16581v1</id>'
+            '<summary>An actual abstract.</summary></entry>'
+        )
+        def raise_for_status(self): pass
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, *a, **kw): return _R()
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: _C())
+
+    items = nodes_mod._arxiv_search_raw("test query")
+    assert isinstance(items, list)
+    assert len(items) == 1
+    assert items[0]["url"] == "http://arxiv.org/abs/2503.16581v1"
+    assert items[0]["title"] == "Real paper"
+
+
+def test_arxiv_search_raw_handles_empty_query():
+    """Empty / None query must NOT raise."""
+    from argus.graph import nodes as nodes_mod
+    assert nodes_mod._arxiv_search_raw("") == []
+    assert nodes_mod._arxiv_search_raw(None) == []
+
+
+def test_researcher_node_triggers_t6_fallback_when_sources_empty(monkeypatch):
+    """When primary passes yield zero sources, T6 fallback fires.
+
+    Reproduces the live-bot failure where 'metacognitive feedback' topic
+    produced 0 sources. The fallback should run arxiv_search_raw against
+    the raw user_request and surface its items.
+    """
+    from argus.graph import nodes as nodes_mod
+    from argus.graph.state import ResearchPlan, PlannedSource
+
+    # Stub _matches_plan to always reject and _arxiv_search to return
+    # empty so the only way to get sources is the T6 fallback path.
+    def _arxiv_search_stub(plan):
+        return []  # primary pass returns nothing
+    monkeypatch.setattr(nodes_mod, "_arxiv_search", _arxiv_search_stub)
+
+    # Harvest stub returns nothing.
+    def _harvest_stub(**kw):
+        from argus.tools import HarvestReport
+        return HarvestReport(folder="", items=[], raw_stdout="", duration_s=0.0)
+    monkeypatch.setattr(nodes_mod, "harvest_sources", _harvest_stub)
+
+    # Catch the fallback call.
+    fallback_calls = []
+    def _arxiv_raw_stub(q):
+        fallback_calls.append(q)
+        return [
+            {"kind": "paper", "title": "FB1", "url": "http://arxiv.org/abs/2503.99999",
+             "summary": "from fallback", "source": "arxiv-raw"},
+        ]
+    monkeypatch.setattr(nodes_mod, "_arxiv_search_raw", _arxiv_raw_stub)
+
+    state = {
+        "user_request": "esoteric test topic",
+        "plan": ResearchPlan(
+            summary="dummy", sub_questions=["dummy"],
+            planned_sources=[],  # empty so planner-url pass yields 0
+            must_have_keywords=["esoteric", "test", "topic"],
+        ).model_dump(),
+        "sources": [],
+    }
+
+    out = nodes_mod.researcher_node(state)
+    assert len(fallback_calls) == 1, (
+        f"T6 fallback must fire when sources empty; calls={fallback_calls!r}"
+    )
+    assert len(out["sources"]) == 1
+    assert out["sources"][0]["url"] == "http://arxiv.org/abs/2503.99999"
+
+
+def test_researcher_node_skips_fallback_when_already_has_sources(monkeypatch):
+    """T6 fallback must NOT overwrite existing sources."""
+    from argus.graph import nodes as nodes_mod
+    from argus.graph.state import ResearchPlan, PlannedSource
+
+    monkeypatch.setattr(nodes_mod, "_arxiv_search",
+                        lambda plan: [])  # primary returns nothing
+    monkeypatch.setattr(nodes_mod, "harvest_sources",
+                        lambda **kw: _make_empty_harvest())
+
+    fallback_called = []
+    monkeypatch.setattr(
+        nodes_mod, "_arxiv_search_raw",
+        lambda q: fallback_called.append(q) or [{
+            "kind": "paper", "title": "FB",
+            "url": "http://arxiv.org/abs/2503.11111",
+            "summary": "fb", "source": "arxiv-raw",
+        }],
+    )
+
+    state = {
+        "user_request": "any topic",
+        "plan": ResearchPlan(
+            summary="x", sub_questions=["x"],
+            planned_sources=[PlannedSource(
+                kind="repo", query="real", target_url="https://github.com/example/foo",
+                rationale="test",
+            )],
+            must_have_keywords=["any"],
+        ).model_dump(),
+        "sources": [],  # empty so we test the populated-state path
+    }
+    out = nodes_mod.researcher_node(state)
+    # planner URL pass should populate 1 source from the github URL above,
+    # so the T6 fallback must NOT be called.
+    assert fallback_called == [], (
+        f"fallback must NOT fire when planner url pass fills sources; "
+        f"calls={fallback_called!r}"
+    )
+    assert any(s.get("url") == "https://github.com/example/foo"
+               for s in out["sources"]), (
+        f"github URL should be in sources: {out['sources']!r}"
+    )
+    # The fallback URL must NOT be in sources because the fallback did
+    # not fire. This is the negative assertion that proves the gate.
+    assert not any(s.get("url") == "http://arxiv.org/abs/2503.11111"
+                   for s in out["sources"]), (
+        f"fallback URL leaked into sources despite gate: {out['sources']!r}"
+    )
+
+
+def _make_empty_harvest():
+    from argus.tools import HarvestReport
+    return HarvestReport(folder="", items=[], raw_stdout="", duration_s=0.0)

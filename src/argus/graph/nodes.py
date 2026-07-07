@@ -181,19 +181,22 @@ def researcher_node(state: ArgusState) -> dict:
         logger.warning(msg)
         errors.append(msg)
 
-    # Also try arXiv search if any planned source is a "paper".
-    if any(s.kind == "paper" for s in plan.planned_sources):
-        try:
-            arxiv_items = _arxiv_search(plan)
-            for it in arxiv_items:
-                if it["url"] in seen:
-                    continue
-                sources.append(it)
-                seen.add(it["url"])
-        except Exception as e:
-            msg = f"arxiv_search failed: {e!r}"
-            logger.warning(msg)
-            errors.append(msg)
+    # T6 fix: arXiv search is no longer gated on the planner having
+    # labelled any source as kind="paper". A weak plan (no paper
+    # labels) used to silently produce empty sources and roll forward
+    # into a vacuous "no evidence" report. We always try arXiv when
+    # we have keywords.
+    try:
+        arxiv_items = _arxiv_search(plan)
+        for it in arxiv_items:
+            if it["url"] in seen:
+                continue
+            sources.append(it)
+            seen.add(it["url"])
+    except Exception as e:
+        msg = f"arxiv_search failed: {e!r}"
+        logger.warning(msg)
+        errors.append(msg)
 
     # And any explicit target URLs from the plan.
     for s in plan.planned_sources:
@@ -208,6 +211,29 @@ def researcher_node(state: ArgusState) -> dict:
                 "source": "planner",
             })
             seen.add(s.target_url)
+
+    # T6 fallback: if we still have ZERO sources after harvest + arxiv
+    # + planner urls, the topic is too niche for those sources. Run
+    # one more arxiv pass using the raw user_request directly. This
+    # closes the "orphan topic -> 0 sources -> no evidence" gap
+    # observed in the live bot on 2026-07-08.
+    if not sources and state.get("user_request"):
+        try:
+            fallback_items = _arxiv_search_raw(state["user_request"])
+            for it in fallback_items:
+                if it["url"] in seen:
+                    continue
+                sources.append(it)
+                seen.add(it["url"])
+            if fallback_items:
+                logger.info(
+                    "researcher_node T6 fallback: arxiv raw-query "
+                    "produced %d items", len(fallback_items)
+                )
+        except Exception as e:
+            msg = f"researcher_node T6 fallback failed: {e!r}"
+            logger.warning(msg)
+            errors.append(msg)
 
     sources = sources[:18]
     out: dict[str, Any] = {
@@ -227,6 +253,46 @@ def _matches_plan(text: str, plan: ResearchPlan) -> bool:
         return True
     hits = sum(1 for k in keywords if k in text)
     return hits >= max(1, len(keywords) // 3)
+
+
+def _arxiv_search_raw(query: str) -> list[dict]:
+    """T6 fallback: arXiv search driven by a free-form query string.
+
+    Used when researcher_node ends up with zero candidate sources after
+    the standard harvest + plan-driven arxiv pass (orphan / niche
+    topic). Same Atom-XML parsing as _arxiv_search but bypasses the
+    ResearchPlan object.
+    """
+    import httpx
+    q = (query or "").strip()[:200]
+    if not q:
+        return []
+    params = {
+        "search_query": f"all:{q}",
+        "start": 0, "max_results": 8,
+        "sortBy": "relevance", "sortOrder": "descending",
+    }
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as c:
+            r = c.get("https://export.arxiv.org/api/query", params=params)
+            r.raise_for_status()
+    except Exception:
+        return []
+    entries = re.findall(r"<entry>(.*?)</entry>", r.text, re.DOTALL)
+    out: list[dict] = []
+    for ent in entries:
+        title_m = re.search(r"<title>(.*?)</title>", ent, re.DOTALL)
+        link_m = re.search(r"<id>(.*?)</id>", ent)
+        sum_m = re.search(r"<summary>(.*?)</summary>", ent, re.DOTALL)
+        title = (title_m.group(1).strip() if title_m else "")
+        link = (link_m.group(1).strip() if link_m else "")
+        summary = (sum_m.group(1).strip()[:400] if sum_m else "")
+        if title and link and link.startswith("http"):
+            out.append({
+                "kind": "paper", "title": title, "url": link,
+                "summary": summary, "source": "arxiv-raw",
+            })
+    return out[:8]
 
 
 def _arxiv_search(plan: ResearchPlan) -> list[dict]:
@@ -278,7 +344,16 @@ def fetcher_node(state: ArgusState) -> dict:
     errors: list[str] = []
     sources = state.get("sources") or []
     for src in sources:
-        url = src["url"]
+        url = src.get("url")
+        # T6 fix: a source without a URL is not fetchable. Record and
+        # skip without crashing the whole node. Old code raised
+        # KeyError on src["url"], caught by the broad except, logged
+        # only -> the user got a silent "no evidence" report.
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            msg = f"fetcher skipping source with no/empty/non-http URL: {src!r}"
+            logger.info(msg)
+            errors.append(msg)
+            continue
         kind = src.get("kind", "search_result")
         try:
             # Pick tool based on kind.
