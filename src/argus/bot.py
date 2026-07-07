@@ -97,23 +97,37 @@ async def _stream_progress(bot, chat_id: int, text: str, last_msg: dict):
 # /research
 # ---------------------------------------------------------------------------
 
+def _md_escape(s: str) -> str:
+    """Escape characters that Telegram's legacy Markdown parser treats as
+    formatting, so LLM-produced plan/report text doesn't crash the parser
+    when the message is later edited (Bug C from t_b0665cfc).
+    Only applies to DYNAMIC content; static formatting is left intact."""
+    if not s:
+        return ""
+    # Order matters: escape backslash first to avoid double-escaping.
+    out = s.replace("\\", "\\\\")
+    for ch in ("_", "*", "`", "[", "]"):
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
 def _format_plan(plan: dict) -> str:
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
     sources = plan.get("planned_sources") or []
     lines = ["📋 *Research plan*", ""]
     if summary:
-        lines += [f"_{summary}_", ""]
+        lines += [f"_{_md_escape(summary)}_", ""]
     if sub_qs:
         lines.append("*Sub-questions:*")
         for q in sub_qs:
-            lines.append(f"- {q}")
+            lines.append(f"- {_md_escape(q)}")
         lines.append("")
     if sources:
         lines.append(f"*Planned sources ({len(sources)}):*")
         for s in sources[:14]:
             target = s.get("target_url") or s.get("query") or "(search)"
-            lines.append(f"- `{s.get('kind','search')}` — {target}")
+            lines.append(f"- `{_md_escape(s.get('kind','search'))}` — {_md_escape(target)}")
     return "\n".join(lines)
 
 
@@ -150,13 +164,18 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     thread_id = f"tg:{chat_id}"
 
     progress = {"message_id": None}
-    progress = await _stream_progress(progress, chat_id,
+    progress = await _stream_progress(ctx.application.bot, chat_id,
         "🧠 *Starting research…*", progress)
     await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    # Build a per-run saver; we'll close it at the end.
+    # Build a per-run saver. We must keep it alive across the HITL pause
+    # because the in-memory graph holds a reference to it as checkpointer.
+    # The saver is closed only when the run actually terminates
+    # (Send in _resume_after_report, Cancel in on_callback, /cancel_cmd,
+    # planner-abort in the `else` branch below, or any exception).
     saver_cm = AsyncSqliteSaver.from_conn_string(str(s.checkpoint_db))
     saver = await saver_cm.__aenter__()
+    keep_saver_alive = False
     try:
         graph = build_graph(checkpointer=saver)
         cfg = {"configurable": {"thread_id": thread_id}}
@@ -210,17 +229,28 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_plan_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
             )
+            # Hand the saver to the in-flight registry so _resume_after_plan
+            # can use the same live checkpointer. Do NOT close here — that's
+            # what produced the "resume failed: no active connection" error.
+            keep_saver_alive = True
             _inflight[thread_id]["awaiting"] = "plan_approval"
             _inflight[thread_id]["cfg"] = cfg
             _inflight[thread_id]["graph"] = graph
+            _inflight[thread_id]["saver_cm"] = saver_cm
+            _inflight[thread_id]["saver"] = saver
         else:
             await ctx.application.bot.send_message(
                 chat_id=chat_id,
                 text="(planner produced no plan; aborting.)",
             )
             _inflight.pop(thread_id, None)
+    except Exception:
+        # On any error, drop the in-flight entry and let `finally` close the saver.
+        _inflight.pop(thread_id, None)
+        raise
     finally:
-        await saver_cm.__aexit__(None, None, None)
+        if not keep_saver_alive:
+            await saver_cm.__aexit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +332,13 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     thread_id = f"tg:{chat_id}"
-    _inflight.pop(thread_id, None)
+    info = _inflight.pop(thread_id, None)
+    # Close any held-over saver so we don't leak the connection.
+    if info and info.get("saver_cm"):
+        try:
+            await info["saver_cm"].__aexit__(None, None, None)
+        except Exception:
+            pass
     await update.message.reply_text("In-flight run dropped from memory.")
 
 
@@ -347,7 +383,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
     elif data == "plan:cancel":
-        _inflight.pop(thread_id, None)
+        await _drop_inflight_with_saver(thread_id)
         await q.edit_message_text("❌ Cancelled.")
     elif data == "report:send":
         await _resume_after_report(ctx, thread_id, info, q)
@@ -360,7 +396,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _resume_after_report(ctx, thread_id, info, q,
                                     revision_requested=True)
     elif data == "report:cancel":
-        _inflight.pop(thread_id, None)
+        await _drop_inflight_with_saver(thread_id)
         await q.edit_message_text("❌ Cancelled (report dropped).")
 
 
@@ -410,8 +446,8 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
             md = Path(paths["md"])
             text = (
                 f"📝 *Report preview*\n\n"
-                f"Folder: `{paths.get('folder','?')}`\n"
-                f"Markdown: `{md.name}`  "
+                f"Folder: `{_md_escape(paths.get('folder','?'))}`\n"
+                f"Markdown: `{_md_escape(md.name)}`  "
                 + (f"· PDF: `report.pdf`" if paths.get("pdf") else "· PDF: _failed_")
                 + f"\n\n_(first 1200 chars below)_"
             )
@@ -451,7 +487,7 @@ async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
                   "it will be appended to the next revision round."),
         )
         # For simplicity we stop here: the user re-runs /research.
-        _inflight.pop(thread_id, None)
+        await _drop_inflight_with_saver(thread_id)
         return
     # Send the report files.
     try:
@@ -470,7 +506,22 @@ async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
         await ctx.application.bot.send_message(chat_id=chat_id,
             text=f"⚠️ send failed: {e}")
     finally:
-        _inflight.pop(thread_id, None)
+        await _drop_inflight_with_saver(thread_id)
+
+
+async def _drop_inflight_with_saver(thread_id: str) -> None:
+    """Pop the in-flight entry and close its SqliteSaver if held.
+
+    Helper for all terminal paths (Cancel button, normal end of a run,
+    /cancel command) so the per-run saver connection is always released.
+    Without this, every research run would leak one aiosqlite connection.
+    """
+    info = _inflight.pop(thread_id, None)
+    if info and info.get("saver_cm"):
+        try:
+            await info["saver_cm"].__aexit__(None, None, None)
+        except Exception:
+            logger.exception("saver close on drop failed")
 
 
 # ---------------------------------------------------------------------------
