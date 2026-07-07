@@ -34,12 +34,12 @@
     "summary": "Cross-check three widely-used LLM evaluation suites (HELM, simple-evals, Open LLM Leaderboard) for overlap and coverage."
   },
   "report_paths": {
-    "folder": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_195348_LLM_agent_benchmarks_and_primary-source_evaluation",
-    "md": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_195348_LLM_agent_benchmarks_and_primary-source_evaluation\\report.md",
-    "pdf": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_195348_LLM_agent_benchmarks_and_primary-source_evaluation\\report.pdf"
+    "folder": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_200559_LLM_agent_benchmarks_and_primary-source_evaluation",
+    "md": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_200559_LLM_agent_benchmarks_and_primary-source_evaluation\\report.md",
+    "pdf": "A:\\Hermes\\Agents\\argus\\demo_output\\20260707_200559_LLM_agent_benchmarks_and_primary-source_evaluation\\report.pdf"
   },
-  "n_findings": 5,
-  "n_fetched": 9,
+  "n_findings": 1,
+  "n_fetched": 1,
   "revision_rounds": 0,
   "verdict": "pass",
   "model_calls": [
@@ -58,7 +58,7 @@
       "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
       "served_provider": "",
       "prompt_tokens": 252,
-      "completion_tokens": 721,
+      "completion_tokens": 714,
       "extra": {}
     },
     {
@@ -66,8 +66,8 @@
       "requested_model": "qwen/qwen3-coder:free",
       "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
       "served_provider": "",
-      "prompt_tokens": 816,
-      "completion_tokens": 927,
+      "prompt_tokens": 327,
+      "completion_tokens": 236,
       "extra": {}
     },
     {
@@ -75,10 +75,10 @@
       "requested_model": "openai/gpt-oss-120b:free",
       "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
       "served_provider": "",
-      "prompt_tokens": 1175,
+      "prompt_tokens": 501,
       "completion_tokens": 34,
       "extra": {}
     }
   ],
-  "ts": "2026-07-07T19:53:48.305577+04:00"
+  "ts": "2026-07-07T20:05:59.842834+04:00"
 }

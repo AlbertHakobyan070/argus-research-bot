@@ -1,0 +1,82 @@
+{
+  "topic": "LLM agent benchmarks and primary-source evaluation suites",
+  "thread_id": "demo",
+  "user_id": 0,
+  "revision_rounds": 3,
+  "n_findings": 5,
+  "n_sources": 9,
+  "model_calls": [
+    {
+      "tier": "cheap",
+      "requested_model": "cheap",
+      "served_model": "llama-3.1-8b-instant",
+      "served_provider": "",
+      "prompt_tokens": 136,
+      "completion_tokens": 27,
+      "extra": {}
+    },
+    {
+      "tier": "strong",
+      "requested_model": "qwen/qwen3-coder:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 252,
+      "completion_tokens": 677,
+      "extra": {}
+    },
+    {
+      "tier": "strong",
+      "requested_model": "qwen/qwen3-coder:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 857,
+      "completion_tokens": 732,
+      "extra": {}
+    },
+    {
+      "tier": "judge",
+      "requested_model": "openai/gpt-oss-120b:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 1127,
+      "completion_tokens": 263,
+      "extra": {}
+    },
+    {
+      "tier": "strong",
+      "requested_model": "qwen/qwen3-coder:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 1093,
+      "completion_tokens": 651,
+      "extra": {}
+    },
+    {
+      "tier": "judge",
+      "requested_model": "openai/gpt-oss-120b:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 1043,
+      "completion_tokens": 245,
+      "extra": {}
+    },
+    {
+      "tier": "strong",
+      "requested_model": "qwen/qwen3-coder:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 1302,
+      "completion_tokens": 626,
+      "extra": {}
+    },
+    {
+      "tier": "judge",
+      "requested_model": "openai/gpt-oss-120b:free",
+      "served_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "served_provider": "",
+      "prompt_tokens": 1013,
+      "completion_tokens": 176,
+      "extra": {}
+    }
+  ]
+}
