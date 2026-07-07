@@ -124,6 +124,69 @@ def _run_script(script: str, args: list[str], *, timeout: int = DEFAULT_TIMEOUT_
             f"timeout after {timeout}s"
         )
 
+def _parse_json_field(out: str, field: str) -> str:
+    """Extract ``field`` from the last JSON-looking line of stdout.
+
+    Several intel-stack scripts (snatch.py, crawl.py) print a single
+    JSON object on stdout like ``{"ok": true, "folder": "A:\..."}``.
+    Returns the value of ``field`` if found, else "".
+
+    Defensive: scans *all* lines (not just the last) for one that
+    starts with ``{`` and ends with ``}`` and parses; the canonical
+    contract is the LAST line is the JSON line, but tools occasionally
+    print status banners before it.
+    """
+    if not out:
+        return ""
+    candidates = []
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if ln.startswith("{") and ln.endswith("}"):
+            candidates.append(ln)
+    for ln in reversed(candidates):
+        try:
+            import json as _json
+            obj = _json.loads(ln)
+            v = obj.get(field)
+            if isinstance(v, str) and v.strip():
+                return v
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_article_convert_path(out: str, *, prefer: str = "md") -> str | None:
+    """Extract the artifact path from ``article_convert.py`` stdout.
+
+    The script prints lines like ``md: A:\path\file.md`` or
+    ``pdf: A:\path\file.pdf`` as its last data line. ``prefer``
+    chooses which kind to return (default ``md``); if absent, returns
+    the first md/pdf/html line found.
+    """
+    if not out:
+        return None
+    md_path = None
+    pdf_path = None
+    for raw in out.splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        # Strip a leading "<kind>: " prefix if present.
+        for kind in ("md", "pdf", "html"):
+            prefix = f"{kind}: "
+            if ln.lower().startswith(prefix):
+                candidate = ln[len(prefix):].strip()
+                # Defensive: confirm it looks like an absolute path
+                # on this host (A:\... or /...).
+                if (("\\" in candidate or "/" in candidate)
+                        and Path(candidate).exists()):
+                    if kind == "md" and md_path is None:
+                        md_path = candidate
+                    elif kind == "pdf" and pdf_path is None:
+                        pdf_path = candidate
+                break
+    return md_path or pdf_path
+
 
 def harvest_sources(*, hours: int = 72, top: int = 8,
                     sections: str = "papers,repos,news,blogs",
@@ -297,7 +360,17 @@ def _parse_radar_md(text: str) -> list[HarvestResult]:
 def snatch_url(url: str, *, kind: str = "auto",
                dest: str | None = None,
                timeout: int = DEFAULT_TIMEOUT_S) -> SnatchResult:
-    """Run snatch.py for a single URL. Returns the local markdown path."""
+    """Run snatch.py for a single URL. Returns the local markdown path.
+
+    Contract (T5 fix): ``snatch.py`` prints a single JSON line on stdout
+    like ``{"ok": true, "kind": "articles", "folder": "A:\\\\...\\\\dir"}``.
+    Parse the JSON; use ``payload["folder"]`` as the directory. Only
+    return ok=True when that directory actually exists and contains
+    >=1 .md. Old behavior set ok=True whenever rc==0 even if folder
+    parsing failed (e.g. grabbed the literal JSON line as folder,
+    which never resolved on disk) — that was the silent-empty-report
+    bug observed in t_7f2b625c.
+    """
     args = [url, "--kind", kind]
     if dest:
         args += ["--dest", dest]
@@ -307,22 +380,13 @@ def snatch_url(url: str, *, kind: str = "auto",
     if rc != 0:
         return SnatchResult(ok=False, url=url, error=(err or out)[-500:],
                             duration_s=duration)
-    # snatch prints the destination folder on stdout (last line)
-    folder = ""
-    for ln in reversed(out.strip().splitlines()):
-        ln = ln.strip()
-        if ln and ("\\" in ln or "/" in ln):
-            folder = ln
-            break
+    folder = _parse_json_field(out, "folder")
     md = None
     title = ""
-    if folder:
-        fpath = Path(folder)
-        # Find first .md inside.
-        mds = list(fpath.rglob("*.md"))
+    if folder and Path(folder).is_dir():
+        mds = sorted(Path(folder).rglob("*.md"))
         if mds:
             md = str(mds[0])
-            # Try to pull a title from first H1.
             try:
                 text = mds[0].read_text(encoding="utf-8", errors="replace")
                 for ln in text.splitlines():
@@ -331,13 +395,23 @@ def snatch_url(url: str, *, kind: str = "auto",
                         break
             except Exception:
                 pass
-    return SnatchResult(ok=True, folder=folder, markdown_path=md,
+    ok = bool(md) and Path(md).exists()
+    return SnatchResult(ok=ok, folder=folder or None, markdown_path=md,
                         title=title, url=url, duration_s=duration)
 
 
 def crawl_url(url: str, *, deep: bool = False, max_pages: int = 8,
               depth: int = 1,
               timeout: int = DEFAULT_TIMEOUT_S) -> CrawlResult:
+    """Crawl a documentation site / SPA via crawl.py.
+
+    Contract (T5 fix): ``crawl.py`` prints a single JSON line on stdout
+    with at least ``{"ok": true, "folder": "A:\\\\...\\\\dir", ...}``.
+    Parse the JSON; use ``payload["folder"]`` as the directory and
+    collect up to ``max_pages`` .md files under it. Only return ok=True
+    when the directory exists AND produced >=1 .md. Old behavior set
+    ok=True whenever rc==0 even if folder parsing failed.
+    """
     args = [url, "--max-pages", str(max_pages), "--depth", str(depth)]
     if deep:
         args.append("--deep")
@@ -347,27 +421,32 @@ def crawl_url(url: str, *, deep: bool = False, max_pages: int = 8,
     if rc != 0:
         return CrawlResult(ok=False, error=(err or out)[-500:],
                            duration_s=duration)
-    folder = ""
-    for ln in reversed(out.strip().splitlines()):
-        ln = ln.strip()
-        if ln and ("\\" in ln or "/" in ln):
-            folder = ln
-            break
+    folder = _parse_json_field(out, "folder")
     md = None
     pages: list[str] = []
-    if folder:
-        fpath = Path(folder)
-        mds = list(fpath.rglob("*.md"))
+    if folder and Path(folder).is_dir():
+        mds = sorted(Path(folder).rglob("*.md"))
         if mds:
             md = str(mds[0])
             pages = [str(p) for p in mds[:max_pages]]
-    return CrawlResult(ok=True, folder=folder, markdown_path=md,
+    ok = bool(md) and Path(md).exists()
+    return CrawlResult(ok=ok, folder=folder or None, markdown_path=md,
                         pages=pages, duration_s=duration)
 
 
 def normalize_to_markdown(source: str, *, md_only: bool = True,
                            timeout: int = DEFAULT_TIMEOUT_S) -> NormalizeResult:
-    """Convert URL or local file -> clean markdown via article_convert.py."""
+    """Convert URL or local file -> clean markdown via article_convert.py.
+
+    Contract (T5 fix): ``article_convert.py`` prints the destination
+    **as a single-prefixed line**, e.g. ``md: A:\\\\path\\\\file.md``
+    (with ``--md-only``, ``pdf:`` and ``html:`` are also possible). The
+    old parser treated this line as a *folder* and ran ``rglob('*.md')``
+    on it, which never matched because the line is a file path with a
+    ``md: `` prefix — that was the silent-empty-report bug. New parser
+    strips the ``<kind>: `` prefix and uses the path directly as the
+    markdown file path (and verifies it exists).
+    """
     args = [source, "--md-only"]
     t0 = time.time()
     rc, out, err = _run_script("article_convert.py", args, timeout=timeout)
@@ -375,27 +454,20 @@ def normalize_to_markdown(source: str, *, md_only: bool = True,
     if rc != 0:
         return NormalizeResult(ok=False, error=(err or out)[-500:],
                                duration_s=duration)
-    # article_convert prints the destination folder; the .md is inside.
-    folder = ""
-    for ln in reversed(out.strip().splitlines()):
-        ln = ln.strip()
-        if ln and ("\\" in ln or "/" in ln):
-            folder = ln
-            break
-    md_path = None
+    md_path = _parse_article_convert_path(out, prefer="md")
     md_text = ""
     title = ""
-    if folder:
-        fpath = Path(folder)
-        mds = list(fpath.rglob("*.md"))
-        if mds:
-            md_path = str(mds[0])
-            md_text = mds[0].read_text(encoding="utf-8", errors="replace")
+    if md_path and Path(md_path).is_file():
+        try:
+            md_text = Path(md_path).read_text(encoding="utf-8", errors="replace")
             for ln in md_text.splitlines():
                 if ln.startswith("# "):
                     title = ln[2:].strip()
                     break
-    return NormalizeResult(ok=True, markdown_path=md_path,
+        except Exception:
+            pass
+    ok = bool(md_path) and Path(md_path).exists() and bool(md_text)
+    return NormalizeResult(ok=ok, markdown_path=md_path if ok else None,
                            markdown_text=md_text[:20000],
                            title=title, duration_s=duration)
 

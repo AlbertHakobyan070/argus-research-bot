@@ -297,7 +297,11 @@ def fetcher_node(state: ArgusState) -> dict:
                 # convert abs to pdf url, then snatch as paper
                 pdf = url.replace("/abs/", "/pdf/") + ".pdf"
                 res = snatch_url(pdf, kind="papers")
-                if res.ok:
+                # T5 fix: also require markdown_path on disk, matching
+                # every other branch in this function. Otherwise a
+                # silently-empty snatch result (rc=0 but no file)
+                # would record a fake "fetched" entry with no evidence.
+                if res.ok and res.markdown_path and Path(res.markdown_path).exists():
                     fetched.append(FetchedItem(
                         url=url, title=res.title or src.get("title", ""),
                         markdown_path=res.markdown_path,
