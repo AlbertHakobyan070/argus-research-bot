@@ -96,6 +96,12 @@ def _run_script(script: str, args: list[str], *, timeout: int = DEFAULT_TIMEOUT_
                 python_bin: Path | None = None) -> tuple[int, str, str]:
     """Run an intel-stack script and capture stdout/stderr.
 
+    Default interpreter is INTEL_PYTHON_BIN because every intel-stack
+    script depends on heavy modules (feedparser, crawl4ai, scrapling,
+    markitdown, yt_dlp) that live only in the intel-stack venv. Routing
+    them through PYTHON_BIN (the argus venv) returns ModuleNotFoundError
+    instantly — see T2 of Argus Pattern E decomposition.
+
     We strip PYTHONPATH so the intel-stack subprocess doesn't accidentally
     inherit the argus venv paths or the global Hermes PYTHONPATH leak.
     """
@@ -103,7 +109,7 @@ def _run_script(script: str, args: list[str], *, timeout: int = DEFAULT_TIMEOUT_
     env.pop("PYTHONPATH", None)
     if env_extra:
         env.update(env_extra)
-    py = python_bin or PYTHON_BIN
+    py = python_bin or INTEL_PYTHON_BIN
     cmd = [str(py), str(INTEL_STACK_DIR / script), *args]
     logger.debug("exec: %s", " ".join(cmd))
     try:
@@ -137,10 +143,7 @@ def harvest_sources(*, hours: int = 72, top: int = 8,
     if date:
         args += ["--date", date]
     t0 = time.time()
-    rc, out, err = _run_script(
-        "harvest.py", args, timeout=timeout,
-        python_bin=INTEL_PYTHON_BIN,
-    )
+    rc, out, err = _run_script("harvest.py", args, timeout=timeout)
     duration = time.time() - t0
     items: list[HarvestResult] = []
     radar_md = ""

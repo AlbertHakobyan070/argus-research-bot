@@ -138,6 +138,18 @@ prints the requested vs served model for every call.
   needed, deterministic, fast). The intel-stack Chromium path is a
   last-resort fallback because headless Chromium IO is flaky on
   Windows when the pagefile is tight.
+- **Tool interpreter routing (T2)**: `tools._run_script` defaults to
+  `INTEL_PYTHON_BIN` (the intel-stack venv). Every intel-stack script
+  imports `feedparser` / `crawl4ai` / `markitdown` / `yt_dlp`, which
+  the argus venv does not have; routing them through `PYTHON_BIN`
+  returned `ModuleNotFoundError` on every call. Override with
+  `python_bin=...` if a future tool needs a different interpreter.
+- **Tool-failure visibility (T2)**: `researcher_node` and
+  `fetcher_node` append to `state["errors"]` (via the
+  `Annotated[list[str], operator.add]` reducer) instead of swallowing
+  exceptions with `logger.warning`. When every source URL fails to
+  fetch, `fetcher_node` also appends an explicit summary error so the
+  synthesizer doesn't produce a vacuous "no evidence" report.
 - **No prebuilt agent**: every node is a small function with an
   obvious shape — the contract is "explicit node/subgraph, no black box".
 

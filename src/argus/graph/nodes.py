@@ -150,10 +150,16 @@ def researcher_node(state: ArgusState) -> dict:
     Honours any pre-seeded ``state["sources"]`` (used by the demo to
     inject a static corpus) — we dedupe by URL, so re-adding them is
     a no-op.
+
+    Tool failures are appended to ``state["errors"]`` (via the
+    ``Annotated[list[str], operator.add]`` reducer on ArgusState) so the
+    report can show "0 sources because harvest/arXiv failed" instead of
+    silently producing a "no evidence" report. See Argus T2 (Pattern E).
     """
     plan = ResearchPlan.model_validate(state.get("plan") or {})
     sources: list[dict] = list(state.get("sources") or [])
     seen = {s["url"] for s in sources if s.get("url")}
+    errors: list[str] = []
     # Use harvest for primary-source radar (papers/repos/news/blogs).
     try:
         harvest = harvest_sources(hours=72, top=6,
@@ -171,7 +177,9 @@ def researcher_node(state: ArgusState) -> dict:
                 })
                 seen.add(item.url)
     except Exception as e:
-        logger.warning("harvest failed: %s", e)
+        msg = f"harvest_sources failed: {e!r}"
+        logger.warning(msg)
+        errors.append(msg)
 
     # Also try arXiv search if any planned source is a "paper".
     if any(s.kind == "paper" for s in plan.planned_sources):
@@ -183,7 +191,9 @@ def researcher_node(state: ArgusState) -> dict:
                 sources.append(it)
                 seen.add(it["url"])
         except Exception as e:
-            logger.warning("arxiv search failed: %s", e)
+            msg = f"arxiv_search failed: {e!r}"
+            logger.warning(msg)
+            errors.append(msg)
 
     # And any explicit target URLs from the plan.
     for s in plan.planned_sources:
@@ -200,11 +210,14 @@ def researcher_node(state: ArgusState) -> dict:
             seen.add(s.target_url)
 
     sources = sources[:18]
-    return {
+    out: dict[str, Any] = {
         "sources": sources,
         "messages": [{"role": "assistant",
                       "content": f"🔍 {len(sources)} candidate sources."}],
     }
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 def _matches_plan(text: str, plan: ResearchPlan) -> bool:
@@ -252,8 +265,17 @@ def _arxiv_search(plan: ResearchPlan) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def fetcher_node(state: ArgusState) -> dict:
-    """Fetch each source URL into markdown via snatch/crawl/normalize."""
+    """Fetch each source URL into markdown via snatch/crawl/normalize.
+
+    Per-URL tool failures append to ``state["errors"]`` (via the
+    ``Annotated[list[str], operator.add]`` reducer) instead of being
+    silently logged-and-forgotten. If *every* URL failed we also append
+    a summary error so the report can surface "all fetches failed" rather
+    than the synthesizer running against an empty evidence list and
+    producing a vacuous "no evidence" report. See Argus T2 (Pattern E).
+    """
     fetched: list[dict] = []
+    errors: list[str] = []
     sources = state.get("sources") or []
     for src in sources:
         url = src["url"]
@@ -302,13 +324,30 @@ def fetcher_node(state: ArgusState) -> dict:
                     section=kind,
                     excerpt=_read_excerpt(res.markdown_path),
                 ).model_dump())
+                continue
+            # All four tools returned not-ok for this URL — record it.
+            msg = f"fetch {url} failed: all tools returned not-ok"
+            errors.append(msg)
+            logger.warning(msg)
         except Exception as e:
-            logger.warning("fetch %s failed: %s", url, e)
-    return {
+            msg = f"fetch {url} failed: {e!r}"
+            logger.warning(msg)
+            errors.append(msg)
+    if sources and not fetched:
+        # Every URL failed. Surface this as a single summary error so the
+        # synthesizer's "no evidence" report can be replaced with an
+        # actionable diagnostic.
+        errors.append(
+            f"fetcher_node: all {len(sources)} source(s) failed to fetch"
+        )
+    out: dict[str, Any] = {
         "fetched": fetched,
         "messages": [{"role": "assistant",
                       "content": f"📥 {len(fetched)} items fetched."}],
     }
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 def _read_excerpt(md_path: str | None, limit: int = 600) -> str:
