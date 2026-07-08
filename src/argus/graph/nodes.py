@@ -85,13 +85,29 @@ Produce a structured research plan that maximises the chance of finding
 named engineers' blogs, GitHub repos, Hacker News threads. SEO content
 farms are banned as evidence — never include them in `planned_sources`.
 
+# URL INTEGRITY RULES (strictly enforced)
+
+1. **Do NOT invent URLs.** If you do not have a specific URL in mind, leave
+   `target_url` empty / null and use `kind: "search_result"` instead. The
+   researcher will run the query and find real primary sources.
+2. **Do NOT guess arXiv IDs.** Real arXiv IDs look like `arxiv.org/abs/2402.12345`.
+   If you do not know the exact ID, emit `kind: "search_result"` with a query
+   such as `"transformer interpretability survey 2024"`. Never invent numeric IDs.
+3. **Verify URLs by reasoning:** if you cite a github.com URL, the repo must
+   plausibly exist (e.g. `github.com/openai/gpt-4`, `github.com/NVIDIA-AI-Blueprints/aiq`).
+   If unsure, use `kind: "search_result"`.
+4. **Prefer primary-source URLs you are confident about** (official docs at
+   `docs.nvidia.com`, `python.langchain.com`, `huggingface.co/docs`; well-known
+   GitHub orgs). When unsure, fall back to `search_result` — that is the safe
+   default and the researcher will resolve it.
+
 Return JSON only, matching:
 {
   "sub_questions": ["...", "..."],
   "planned_sources": [
     {"kind": "paper|repo|news|blog|official_doc|search_result",
      "query": "search string or paper title",
-     "target_url": "https://... (only if you have a specific URL)",
+     "target_url": "https://... (only when you know the exact URL)",
      "rationale": "why this source is primary"}
   ],
   "must_have_keywords": ["...", "..."],
@@ -100,7 +116,7 @@ Return JSON only, matching:
 
 Aim for 4-7 sub_questions and 6-12 planned_sources. Mark each source's
 kind correctly. Prefer primary kinds (paper/repo/official_doc) when you
-know the right venue.
+know the right venue; otherwise emit `kind: "search_result"` with a query.
 """
 
 

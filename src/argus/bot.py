@@ -156,6 +156,24 @@ async def _stream_progress(bot, chat_id: int, text: str, last_msg: dict):
 # /research
 # ---------------------------------------------------------------------------
 
+
+def _html_escape_for_tg(s: str) -> str:
+    """Escape ``&``, ``<``, ``>`` for Telegram's HTML parse mode.
+
+    Used by the report-preview path (which was previously MARKDOWN mode and
+    crashed on excerpts containing ``_``, ``*``, ``[``, or ``&`` with
+    ``BadRequest: Can't parse entities``). Telegram's HTML mode is far more
+    permissive: ``<i>``, ``<b>``, ``<code>``, ``<pre>`` are formatting; any
+    other ``<`` would be a tag, so we escape everything.
+
+    The output is safe to embed inside a Telegram HTML message. Newlines are
+    preserved (Telegram renders ``\n`` as a real line break).
+    """
+    if not s:
+        return ""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
 def _md_escape(s: str) -> str:
     """Escape characters that Telegram's legacy Markdown parser treats as
     formatting, so LLM-produced plan/report text doesn't crash the parser
@@ -599,12 +617,49 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                 excerpt = md.read_text(encoding="utf-8", errors="replace")[:1200]
             except Exception:
                 pass
-            await ctx.application.bot.send_message(
-                chat_id=chat_id,
-                text=text + ("\n\n```\n" + excerpt + "\n```" if excerpt else ""),
-                reply_markup=_report_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
+
+            # Build two candidate bodies: an HTML-escaped preview for the
+            # primary send (ParseMode.HTML tolerates arbitrary content),
+            # and a plain-text fallback (no parse_mode) for when the
+            # excerpt is too large or Telegram chokes on the HTML.
+            # The old code used ParseMode.MARKDOWN and crashed with
+            # ``Can't parse entities`` whenever the excerpt contained
+            # ``_``, ``*``, ``[``, or ``&`` (Bug observed 2026-07-08).
+            html_body = _html_escape_for_tg(text) + (
+                ("\n\n<pre>" + _html_escape_for_tg(excerpt) + "</pre>")
+                if excerpt else ""
             )
+            plain_body = text + ("\n\n```\n" + excerpt + "\n```" if excerpt else "")
+
+            try:
+                await ctx.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=html_body,
+                    reply_markup=_report_keyboard(),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as send_err:
+                # Telegram HTML parse still failed (oversize, exotic chars,
+                # network blip). Degrade to a plain-text preview rather than
+                # crashing the resume — the user can still see the path and
+                # open the file from disk / folder link.
+                logger.warning(
+                    "report preview HTML send failed (%s); falling back to plain text",
+                    send_err,
+                )
+                try:
+                    await ctx.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=plain_body,
+                        reply_markup=_report_keyboard(),
+                    )
+                except Exception as plain_err:
+                    # Last resort: surface the error rather than crash silently.
+                    logger.exception("report preview plain-text send also failed")
+                    await ctx.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ report preview unavailable: {plain_err}",
+                    )
         else:
             await ctx.application.bot.send_message(
                 chat_id=chat_id, text="(no report_paths found)")
