@@ -228,3 +228,144 @@ def test_domain_trust_dataclass_export():
     domains = {d["domain"] for d in entries}
     assert "arxiv.org" in domains
     assert "nist.gov" in domains
+
+
+# ---------------------------------------------------------------------------
+# P2 fix — curated "low" tier + structural heuristics
+# ---------------------------------------------------------------------------
+
+def test_curated_low_hosts_are_low_tier():
+    """thetechbriefs.com and the other curated offenders must be
+    recognised as 'low' tier — not 'neutral' (which was the bug)."""
+    from argus.graph.credibility import DomainTrust
+    for url in [
+        "https://thetechbriefs.com/thudm-releases-glm-4",
+        "https://glm45.org/?",
+        "https://ai-news-briefs.com/some-post",
+        "https://buy-me-a-coffee.com/farm-content",
+    ]:
+        tier = DomainTrust.tier_for(url)
+        assert tier == "low", f"curated farm {url} should be low, got {tier}"
+
+
+def test_structural_low_hosts_get_low_tier():
+    """Hosts with 3+ hyphens or a single-char + cheap TLD get bumped
+    from 'neutral' to 'low' by the structural heuristic."""
+    from argus.graph.credibility import DomainTrust
+    cases = [
+        ("https://seo-content-farm-quick-tips-blog.click/x", "low"),
+        ("https://a.xyz/post", "low"),
+        ("https://b.gq/article", "low"),
+        ("https://x.top/x", "low"),
+    ]
+    for url, expected in cases:
+        tier = DomainTrust.tier_for(url)
+        assert tier == expected, f"structural-farm {url} should be {expected}, got {tier}"
+
+
+def test_structural_low_does_not_downgrade_curated_primary():
+    """A primary host (arxiv.org) that *also* matches a structural pattern
+    (e.g. arxiv.org) keeps its curated tier — the heuristic only nudges
+    neutral -> low, never downgrades primary/trusted."""
+    from argus.graph.credibility import DomainTrust
+    assert DomainTrust.tier_for("https://arxiv.org/abs/2402.12345") == "primary"
+    assert DomainTrust.tier_for("https://github.com/x/y") == "trusted"
+
+
+def test_domain_table_has_low_entries():
+    """The P2 fix requires actual 'low' entries in the table; previously
+    there were none, so content farms fell through to 'neutral' (0.25)."""
+    from argus.graph.credibility import DomainTrust
+    entries = DomainTrust.entries()
+    tiers = {d["tier"] for d in entries}
+    assert "low" in tiers, "_DOMAIN_TABLE must contain at least one 'low' entry"
+    # And the curated thetechbriefs.com must be the 'low' entry (regression).
+    thetechbriefs = next((d for d in entries
+                          if d["domain"] == "thetechbriefs.com"), None)
+    assert thetechbriefs is not None
+    assert thetechbriefs["tier"] == "low"
+
+
+# --- filter_node: credibility floor enforcement (P2 part 2) ---------------
+
+def test_filter_node_drops_below_floor_items():
+    """P2 fix: filter_node must drop items below CREDIBILITY_FLOOR.
+
+    GLM 5.2 reproduced here: a fetcher mix of an arxiv paper, a thetechbriefs
+    farm, and a neutral blog. After fix, the farm must be gone from the
+    report's fetched list."""
+    from argus.graph.nodes import filter_node
+    items = [
+        FetchedItem(  # arxiv — well above floor
+            url="https://arxiv.org/abs/2406.12793",
+            title="GLM-130B paper",
+            excerpt="paper on the GLM family",
+            markdown_path="/tmp/p1.md",
+            relevance_score=0.8,
+            credibility_score=0.85,
+        ),
+        FetchedItem(  # content farm — below floor
+            url="https://thetechbriefs.com/thudm-releases-glm-4",
+            title="GLM-4 release coverage",
+            excerpt="tech brief article",
+            markdown_path="/tmp/p2.md",
+            relevance_score=0.6,
+            credibility_score=0.18,  # < floor (0.4)
+        ),
+        FetchedItem(  # neutral blog — above floor
+            url="https://towardsdatascience.com/some-post",
+            title="GLM walkthrough",
+            excerpt="tds article",
+            markdown_path="/tmp/p3.md",
+            relevance_score=0.5,
+            credibility_score=0.70,
+        ),
+    ]
+    state = {
+        "user_request": "GLM 5.2",
+        "fetched": [it.model_dump() for it in items],
+        "plan": {"must_have_keywords": ["GLM"]},
+        "errors": [],
+    }
+    out = filter_node(state)
+    urls = [f["url"] for f in out["fetched"]]
+    assert "https://thetechbriefs.com/thudm-releases-glm-4" not in urls, (
+        "filter_node let through the content farm — P2 floor not enforced"
+    )
+    assert "https://arxiv.org/abs/2406.12793" in urls
+    assert "https://towardsdatascience.com/some-post" in urls
+
+
+def test_filter_node_safety_net_keeps_best_when_all_below_floor():
+    """If every fetched item scores below the floor, filter_node must NOT
+    emit an empty list — that's the Phase-1 'don't empty the report'
+    principle. The kept set should still contain the best-ranked items."""
+    from argus.graph.nodes import filter_node
+    from argus.graph.credibility import CREDIBILITY_FLOOR
+    items = [
+        FetchedItem(
+            url=f"https://thetechbriefs.com/post-{i}",
+            title="GLM release coverage",
+            excerpt="farm content",
+            markdown_path=f"/tmp/farm-{i}.md",
+            relevance_score=0.5 - (i * 0.05),  # still above 0 below floor
+            credibility_score=CREDIBILITY_FLOOR - 0.05,  # just below floor
+        )
+        for i in range(3)
+    ]
+    state = {
+        "user_request": "GLM 5.2",
+        "fetched": [it.model_dump() for it in items],
+        "plan": {"must_have_keywords": ["GLM"]},
+        "errors": [],
+    }
+    out = filter_node(state)
+    assert len(out["fetched"]) >= 1, (
+        "filter_node safety net failed: emitted empty report when all "
+        "items below floor"
+    )
+    # Items must still come from the ranked set (relevance-ordered).
+    rels = [f["relevance_score"] for f in out["fetched"]]
+    assert rels == sorted(rels, reverse=True), (
+        "safety net should preserve the (relevance, credibility) ordering"
+    )

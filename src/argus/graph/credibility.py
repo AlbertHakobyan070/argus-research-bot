@@ -79,7 +79,61 @@ _DOMAIN_TABLE: tuple[tuple[str, str], ...] = (
     ("towardsdatascience.com", "trusted"),
     ("medium.com", "trusted"),
     ("substack.com", "trusted"),
+    # ---- low (P2 fix, 2026-07-09) -----------------------------------
+    # P2 bug: previously zero entries — content farms fell through to
+    # the "neutral" default and the documented content-farm penalty
+    # never fired. Two layers:
+    #  (a) curated hostnames — known offenders observed in real runs
+    #      (the GLM 5.2 report cited thetechbriefs.com and glm45.org).
+    #      Maintain these as new farms get observed — add here, not
+    #      hard-coded elsewhere.
+    #  (b) structural heuristics — see ``_STRUCTURAL_LOW_HOST_RE`` and
+    #      ``_looks_like_seo_slug`` below; they catch patterns the
+    #      curated table misses without us shipping a 200-entry list.
+    # ---- curated low (a) ----
+    ("thetechbriefs.com", "low"),
+    ("techbriefs.com", "low"),
+    ("ai-news-briefs.com", "low"),
+    ("research-briefs.com", "low"),
+    ("ml-briefs.com", "low"),
+    ("seo-content.ai", "low"),
+    ("buymeacoffee.com", "low"),  # personal blog host, spam-prone
+    ("carvinghall.com", "low"),
+    ("parked-domain.cn", "low"),
+    ("glm45.org", "low"),
+    # ---- end curated low ----
 )
+
+
+# ---- structural (b) — pen-and-skip heuristics for SEO farms ----
+#
+# Match hosts that look like content farms even when the exact
+# hostname is not in the curated table. Cheap patterns:
+#   * 3+ hyphens in the host       (seo-slug-content-farm-x.example)
+#   * host contains "briefs" / "news" / "blog" AND ends in non-profit TLDs
+#   * 1-char-or-tiny second-level  (a.com, b.io — classic SEO farms)
+_STRUCTURAL_LOW_HOST_RE = re.compile(
+    r"(?:"
+    r"^[a-z0-9]+(?:[-][a-z0-9]+){3,}\."  # 3+ hyphen-separated labels
+    r"|[-](?:briefs|news|seo-content|content-ai|tips[-]?|tricks)[-]?\."
+    r"|^[a-z]\.(?:xyz|click|top|gq|tk|ml|cf|ga)$"  # 1-char + cheap TLD
+    r")"
+)
+
+
+def _looks_like_low_host(url: str) -> bool:
+    """Return True if the URL's host matches the structural low-credibility
+    patterns.
+
+    Kept separate from :meth:`DomainTrust.tier_for` so the curated
+    table can be tested independently. Both signals compose in
+    :func:`credibility_score`.
+    """
+    host = _host(url)
+    if not host:
+        return False
+    return bool(_STRUCTURAL_LOW_HOST_RE.search(host))
+
 
 _TIER_SCORE: dict[str, float] = {
     "primary": 1.0,
@@ -103,7 +157,12 @@ class DomainTrust:
 
     @classmethod
     def tier_for(cls, url: str) -> str:
-        """Return the trust tier for a URL (or ``"neutral"`` if unknown)."""
+        """Return the trust tier for a URL (or ``"neutral"`` if unknown).
+
+        Order matters: the curated table wins first, then the
+        structural low-credibility heuristic bumps ``"neutral"``
+        down to ``"low"`` so content farms get the documented penalty.
+        """
         host = (urlparse(url).netloc or "").lower()
         if not host:
             return "neutral"
@@ -111,6 +170,11 @@ class DomainTrust:
         for pattern, t in _DOMAIN_TABLE:
             if pattern in host:
                 tier = t
+        # P2 fix — structural pen for SEO farms that aren't in the
+        # curated table. Only ever nudge neutral -> low (never upgrade
+        # a curated tier downward).
+        if tier == "neutral" and _looks_like_low_host(url):
+            tier = "low"
         return tier
 
     @classmethod

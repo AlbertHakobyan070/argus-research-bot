@@ -712,19 +712,19 @@ def _keyword_words(keywords: list[str]) -> list[str]:
 
 
 def filter_node(state: ArgusState) -> dict:
-    """Rank fetched items by relevance + credibility; keep the top 14.
+    """Rank fetched sources and keep the top-N, with a credibility floor.
 
-    Design note (2026-07-09): this used to *hard-drop* any item whose
-    whole-phrase keyword score fell below 0.05, which discarded even the
-    correct source when the planner's keywords were multi-word phrases —
-    a primary cause of empty reports. The sources now arrive from
-    topic-targeted searches (ddgs / GitHub / arXiv via the researcher
-    subgraph), so relevance is best used to *rank* rather than to gate.
-    We keep every item that has an on-disk evidence body, rank by
-    (relevance, credibility), and cap at 14. We only surface an error if
-    filtering removed everything (which should now only happen when no
-    item has a markdown body at all).
+    P2 fix (2026-07-09): previously ``filter_node`` ranked by
+    ``(relevance, credibility)`` and capped at 14 but **never** dropped
+    items below :data:`credibility.CREDIBILITY_FLOOR`. A neutral-scored
+    content farm with high keyword overlap survived and got cited as
+    evidence (thetechbriefs in the GLM 5.2 report). Now we enforce the
+    floor: drop items below the floor. If that empties the set, fall
+    back to the pre-floor top-N so the report is never empty (matches
+    the Phase-1 "don't empty the report" principle).
     """
+    from .credibility import CREDIBILITY_FLOOR
+
     fetched = [FetchedItem.model_validate(f) for f in state.get("fetched") or []]
     plan = ResearchPlan.model_validate(state.get("plan") or {})
     kw_words = _keyword_words(plan.must_have_keywords) or \
@@ -741,7 +741,23 @@ def filter_node(state: ArgusState) -> dict:
         kept.append(f)
     kept.sort(key=lambda x: (x.relevance_score, x.credibility_score or 0.0),
               reverse=True)
-    kept = kept[:14]
+    full_ranked = kept[:14]
+
+    # P2 — enforce credibility floor with safety net. If dropping
+    # below-floor items empties the report, fall back to full_ranked
+    # (sorted list) so we never deliver a 0-sourced report for a
+    # difficult query.
+    above_floor = [
+        f for f in full_ranked
+        if (f.credibility_score or 0.0) >= CREDIBILITY_FLOOR
+    ]
+    if above_floor:
+        kept = above_floor
+    else:
+        # Safety net. Same shape as the Phase-1 "don't empty the
+        # report" guard.
+        kept = full_ranked
+
     out: dict[str, Any] = {"fetched": [f.model_dump() for f in kept]}
     if fetched and not kept:
         out["errors"] = [
