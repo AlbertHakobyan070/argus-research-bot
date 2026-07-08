@@ -1391,6 +1391,37 @@ def report_builder_node(state: ArgusState) -> dict:
     n_findings = len(state.get("findings") or [])
     n_sources = len(state.get("fetched") or [])
     revision_rounds = int(state.get("revision_rounds") or 0)
+
+    # P4 — quarantine reviewer-flagged fabrication claims BEFORE we
+    # compose the body so the title-block flags report honest numbers.
+    # We only consider claims from a "real" reviewer run (verdict
+    # present). Empty review_verdict means the run never went through
+    # the reflexion loop (e.g. short/tldr).
+    review_verdict = state.get("review_verdict") or {}
+    body = state.get("draft_md") or "# (empty draft)"
+    if review_verdict:
+        try:
+            from ..quarantine import quarantine_flagged_claims as \
+                _quarantine_flagged_claims
+            _qres = _quarantine_flagged_claims(
+                body,
+                review_verdict.get("unsupported_claims") or [],
+                review_verdict.get("fabrication_flags") or [],
+                mode="move",
+            )
+            n_quarantined = len(_qres.quarantined)
+            n_still_unmatched = len(_qres.still_unmatched)
+            body = _qres.cleaned_text
+            if n_quarantined:
+                logger.info(
+                    "quarantine: moved %d flagged sentence(s) to "
+                    "appendix (%d unmatched)",
+                    n_quarantined, n_still_unmatched,
+                )
+        except Exception as _e:
+            # Quarantine failure is non-fatal — degrade to the raw body.
+            logger.warning("quarantine pass skipped (%s); body unchanged", _e)
+
     title_block = render_title_block(
         topic=state["user_request"],
         length=length,
@@ -1401,7 +1432,6 @@ def report_builder_node(state: ArgusState) -> dict:
         revision_rounds=revision_rounds,
         validated_assessment=validated,
     )
-    body = state.get("draft_md") or "# (empty draft)"
     appendix = ""
     if mode.include_appendix:
         appendix = render_lecture_appendix(
