@@ -25,8 +25,9 @@ from ..tools import (
 )
 from .state import (
     ArgusState, Finding, FetchedItem, PlannedSource,
-    ResearchPlan, ReviewVerdict,
+    ResearchPlan, ReviewVerdict, ValidatedAssessment,
 )
+from .synthesis_modes import get_mode, is_valid as is_valid_length
 
 logger = logging.getLogger("argus.nodes")
 
@@ -488,6 +489,16 @@ def filter_node(state: ArgusState) -> dict:
 # synthesizer
 # ---------------------------------------------------------------------------
 
+# T7 — per-mode synthesizer prompts. Each template has a target
+# length + structure the LLM is asked to match, plus a JSON-return
+# contract (with an optional validated_assessment block for long /
+# lecture modes).
+#
+# We keep the original SYNTH_SYSTEM for the short / flat path so the
+# behaviour change vs T6 is zero for users on default "short"; the
+# other modes get bespoke prompts that explicitly ask for the
+# extended structure.
+
 SYNTH_SYSTEM = """You are Argus's senior research synthesizer.
 
 You will be given a topic, the user's question, and a set of fetched
@@ -516,14 +527,269 @@ Make sure every URL in citation_urls appears in the Sources section.
 """
 
 
+SYNTH_SYSTEM_MEDIUM = """You are Argus's senior research synthesizer producing a
+MEDIUM-length report (target 3000-6500 chars, ~8 cited findings,
+sub-headings for organization).
+
+You will be given a topic, the user's question, and a set of fetched
+evidence items. Produce a grounded report:
+
+1. Every factual claim MUST cite at least one evidence URL using
+   the literal format [n] where n is the index in the evidence list.
+2. Only use information that appears in the evidence. If the evidence
+   is insufficient for a claim, omit it (do NOT fabricate).
+3. Structure: # Title, ## TL;DR (1 short paragraph), then ## Key Findings
+   (each finding = claim + citations + inline confidence), then
+   ## Background (1-2 short paragraphs of context, cited), then
+   ## Current state (2-3 short paragraphs / bullet groups, cited),
+   then ## Open questions (1-2 bullets), then ## Sources (numbered).
+4. Aim for ~8 findings. Each finding 1-2 sentences.
+5. Sub-headings (### level) welcome inside ## Current state.
+
+Return JSON only:
+{
+  "findings": [
+    {"claim": "...", "citation_urls": ["https://...", "..."],
+     "confidence": "high|medium|low"},
+    ...
+  ],
+  "draft_md": "the full markdown report, ready to render"
+}
+"""
+
+
+SYNTH_SYSTEM_LONG = """You are Argus's senior research synthesizer producing a
+LONG report (target 10000-16000 chars, ~12 cited findings, sub-headings,
+validated assessment).
+
+You will be given a topic, the user's question, and a set of fetched
+evidence items. Produce a deeply-grounded, well-structured report:
+
+1. Every factual claim MUST cite at least one evidence URL using
+   the literal format [n] where n is the index in the evidence list.
+2. Only use information that appears in the evidence. If the evidence
+   is insufficient for a claim, omit it (do NOT fabricate).
+3. Structure: # Title, ## TL;DR (1 paragraph), ## Background (1-2
+   paragraphs of context, cited), ## Current state of the field
+   (3-5 sub-sections, deeply cited, mix of paragraphs and bulleted
+   findings), ## Open problems (1-2 paragraphs, more speculative
+   but still cited where evidence exists), ## Sources (numbered),
+   ## Quality assessment (per-section confidence + open challenges,
+   see schema below).
+4. Aim for ~12 findings. Findings are NOT a flat list — each finding
+   belongs to a sub-section of ## Current state and references back
+   to that sub-section in its "section" field.
+5. Validated assessment: rate your confidence per ## section
+   (high/medium/low), and surface "open challenges" for sections
+   where evidence is thin or conflicting.
+
+Return JSON only:
+{
+  "findings": [
+    {"claim": "...", "citation_urls": ["https://...", "..."],
+     "confidence": "high|medium|low",
+     "section": "Current state > <sub-section name>"},
+    ...
+  ],
+  "draft_md": "the full markdown report, ready to render",
+  "validated_assessment": {
+    "sections": [
+      {"name": "Background",
+       "confidence": "high|medium|low",
+       "open_challenges": ["...","..."],
+       "claim_count": 0},
+      ...
+    ],
+    "overall_relevancy": "high|medium|low",
+    "knowledge_density": {
+      "claims_per_section": {"Background": 0, ...},
+      "citations_per_claim": 0.0,
+      "conflict_markers": 0
+    }
+  }
+}
+"""
+
+
+SYNTH_SYSTEM_LECTURE = """You are Argus's senior research synthesizer producing a
+LECTURE-style deep-dive (target 14000-24000 chars, ~15 cited findings,
+Parts I-IV + References + Appendix).
+
+You will be given a topic, the user's question, and a set of fetched
+evidence items. Produce a richly-structured, lecture-format report:
+
+1. Every factual claim MUST cite at least one evidence URL using
+   the literal format [n] where n is the index in the evidence list.
+2. Only use information that appears in the evidence. If the evidence
+   is insufficient for a claim, omit it (do NOT fabricate).
+3. STRUCTURE (mandatory, in this exact order):
+   - # <Topic>: A Research Report  (title page heading)
+   - ## Executive TL;DR (1 paragraph)
+   - ## Part I — Background (1-2 sub-sections, deeply cited)
+   - ## Part II — Current state of the field (3-5 sub-sections,
+     each a mini-essay with cited findings + inline code/diagram
+     references where helpful)
+   - ## Part III — Open problems (1-2 sub-sections, more speculative
+     but still cited where evidence exists; surface strongest
+     opposing claims)
+   - ## Part IV — Practice and exercises (where applicable: 2-4
+     concrete actions a practitioner can take this week)
+   - ## References (numbered, with author/year/venue when extractable
+     from the URL or evidence excerpt; otherwise URL only)
+   - ## Quality assessment + Appendix (per-section confidence +
+     tool calls log + density metrics)
+4. Aim for ~15 findings spread across Parts I-III. Each finding
+   1-3 sentences. Use sub-headings (###) freely.
+5. Validated assessment: rate your confidence per ## section /
+   Part (high/medium/low), surface open challenges, and compute
+   knowledge density (claims_per_section, citations_per_claim,
+   conflict_markers).
+
+Return JSON only:
+{
+  "findings": [
+    {"claim": "...", "citation_urls": ["https://...", "..."],
+     "confidence": "high|medium|low",
+     "section": "Part II > <sub-section name>"},
+    ...
+  ],
+  "draft_md": "the full lecture-format markdown, ready to render",
+  "validated_assessment": {
+    "sections": [
+      {"name": "Part I — Background",
+       "confidence": "high|medium|low",
+       "open_challenges": ["...","..."],
+       "claim_count": 0},
+      ...
+    ],
+    "overall_relevancy": "high|medium|low",
+    "knowledge_density": {
+      "claims_per_section": {"Part I — Background": 0, ...},
+      "citations_per_claim": 0.0,
+      "conflict_markers": 0
+    }
+  },
+  "lecture_appendix": {
+    "methodology": "1-2 sentence note on what was searched and how.",
+    "tool_calls": ["arxiv: query '...'", "harvest: ...", ...],
+    "density_metrics": {
+      "total_chars": 0,
+      "total_findings": 0,
+      "total_citations": 0,
+      "unique_sources": 0,
+      "avg_citations_per_finding": 0.0
+    }
+  }
+}
+"""
+
+
+SYNTH_SYSTEM_TLDR = """You are Argus. Produce a single short paragraph
+(80-400 chars) that answers the user's question using the evidence
+provided. Every factual claim must cite one of the evidence URLs
+inline using [n]. If the evidence is too thin to answer, say so.
+
+Return JSON only:
+{
+  "findings": [],
+  "draft_md": "<one short paragraph, possibly with [1] inline citations>"
+}
+"""
+
+
+def _synth_prompt_for(length: str) -> str:
+    """Return the right system prompt for the requested length mode.
+
+    The branch order matters: lecture > long > medium > tldr > short.
+    short keeps the legacy SYNTH_SYSTEM so a default-mode user gets the
+    same report shape they got pre-T7.
+    """
+    if length == "lecture":
+        return SYNTH_SYSTEM_LECTURE
+    if length == "long":
+        return SYNTH_SYSTEM_LONG
+    if length == "medium":
+        return SYNTH_SYSTEM_MEDIUM
+    if length == "tldr":
+        return SYNTH_SYSTEM_TLDR
+    return SYNTH_SYSTEM
+
+
+def _parse_validated_assessment(data: dict) -> dict:
+    """Best-effort parse of an LLM-returned validated_assessment block.
+
+    Returns an empty dict if the LLM did not include one. The schema is
+    loose by design (free-form per-section structure), so we don't try
+    to enforce the full ValidatedAssessment model here — we just want
+    to ensure ``sections`` is a list and the density dict exists.
+    """
+    va = data.get("validated_assessment") or {}
+    if not isinstance(va, dict):
+        return {}
+    sections = va.get("sections") or []
+    if not isinstance(sections, list):
+        sections = []
+    density = va.get("knowledge_density") or {}
+    if not isinstance(density, dict):
+        density = {}
+    return {
+        "sections": sections,
+        "overall_relevancy": va.get("overall_relevancy", "medium"),
+        "knowledge_density": density,
+        "reviewer_unsupported": va.get("reviewer_unsupported", []) or [],
+        "reviewer_fabrication_flags": va.get("reviewer_fabrication_flags", []) or [],
+    }
+
+
+def _parse_lecture_appendix(data: dict) -> dict:
+    """Parse an LLM-returned lecture_appendix block (methodology + density)."""
+    ap = data.get("lecture_appendix") or {}
+    if not isinstance(ap, dict):
+        return {}
+    return {
+        "methodology": ap.get("methodology", ""),
+        "tool_calls": ap.get("tool_calls", []) or [],
+        "density_metrics": ap.get("density_metrics", {}) or {},
+    }
+
+
 def synthesizer_node(state: ArgusState) -> dict:
-    chat = llm.chat_for_tier("strong", temperature=0.3, max_tokens=2500)
+    """T7 — mode-aware synthesizer.
+
+    Behaviour by ``state["length"]`` (default = "short"):
+
+    - ``tldr``     — single short paragraph, no findings list.
+    - ``short``    — legacy T6 behaviour: TL;DR + numbered findings +
+                     Sources.
+    - ``medium``   — TL;DR + Background + Current state + Open
+                     questions + Sources; ~8 findings.
+    - ``long``     — sectioned report with ## Background / ##
+                     Current state (3-5 sub-sections) / ## Open
+                     problems / ## Sources / ## Quality
+                     assessment; ~12 findings; validated_assessment
+                     block on state.
+    - ``lecture``  — Parts I-IV + References + Appendix; ~15
+                     findings; validated_assessment +
+                     lecture_appendix on state.
+
+    The LLM call's ``max_tokens`` and ``temperature`` are read from
+    ``synthesis_modes.SYNTHESIS_MODES`` so this node does not own
+    those knobs.
+    """
+    length = state.get("length") or "short"
+    if not is_valid_length(length):
+        length = "short"
+    mode = get_mode(length)
+
+    chat = llm.chat_for_tier(
+        "strong", temperature=mode.temperature, max_tokens=mode.max_tokens,
+    )
     fetched = [FetchedItem.model_validate(f) for f in state.get("fetched") or []]
     # Build evidence corpus (cap length).
     ev_lines: list[str] = []
     for i, f in enumerate(fetched, start=1):
         ev_lines.append(
-            f"[{i}] {f.title or '(no title)'} — {f.url}\n"
+            f"[{i}] {f.title or '(no title)'} -- {f.url}\n"
             f"    excerpt: {(f.excerpt or '')[:400]}"
         )
     evidence = "\n".join(ev_lines) or "(no evidence fetched)"
@@ -535,19 +801,29 @@ def synthesizer_node(state: ArgusState) -> dict:
             + "\n".join(f"- {n}" for n in revision_notes)
         )
 
+    target_phrase = (
+        f"Target length: {mode.label} ({mode.target_chars_min}-"
+        f"{mode.target_chars_max} chars, ~{mode.target_findings} findings, "
+        f"template={mode.template})."
+    )
+
     user = (
-        f"Topic: {state['user_request']}\n\n"
+        f"Topic: {state['user_request']}\n"
+        f"Mode: {length}\n"
+        f"{target_phrase}\n\n"
         f"Evidence ({len(fetched)} items):\n{evidence}\n"
         f"{revision_block}\n\n"
         "Write the JSON response now."
     )
     resp = chat.invoke([
-        SystemMessage(content=SYNTH_SYSTEM),
+        SystemMessage(content=_synth_prompt_for(length)),
         HumanMessage(content=user[:14000]),
     ])
     rec = llm.record_from_response("strong", llm.resolve_tier("strong"), resp)
     findings: list[Finding] = []
     draft_md = ""
+    validated: dict = {}
+    lecture_appendix: dict = {}
     try:
         data = _parse_json_obj(resp.content)
         for fd in data.get("findings", []):
@@ -556,24 +832,96 @@ def synthesizer_node(state: ArgusState) -> dict:
             except Exception as e:
                 logger.warning("bad finding: %s", e)
         draft_md = data.get("draft_md") or _draft_md_from_findings(
-            state["user_request"], findings)
+            state["user_request"], findings, length=length)
+        if mode.include_validated_assessment:
+            validated = _parse_validated_assessment(data)
+        if mode.include_appendix:
+            lecture_appendix = _parse_lecture_appendix(data)
     except Exception as e:
         logger.warning("Synthesizer returned non-JSON: %s", e)
         draft_md = (
             f"# {state['user_request']}\n\n"
-            "_Synthesis incomplete — model did not return structured JSON._\n\n"
+            "_Synthesis incomplete -- model did not return structured JSON._\n\n"
             f"Raw model output:\n\n```\n{resp.content[:3000]}\n```\n"
         )
-    return {
+
+    out: dict[str, Any] = {
         "findings": [f.model_dump() for f in findings],
         "draft_md": draft_md,
         "model_calls": [rec.model_dump()],
         "messages": [{"role": "assistant",
-                      "content": f"🧠 Synthesized {len(findings)} findings."}],
+                      "content": f"🧠 Synthesized {len(findings)} findings "
+                                 f"({mode.label})."}],
     }
+    if validated:
+        out["validated_assessment"] = validated
+    if lecture_appendix:
+        out["lecture_appendix"] = lecture_appendix
+    return out
+def _draft_md_from_findings(topic: str, findings: list[Finding],
+                            *, length: str = "short") -> str:
+    """Fallback markdown builder when the LLM failed to return one.
 
-
-def _draft_md_from_findings(topic: str, findings: list[Finding]) -> str:
+    Honors the length mode so a fallback document still respects the
+    user's HITL choice (lecture fallback has Parts I-IV; tldr fallback
+    is a single paragraph). The synthesizer normally returns its own
+    draft_md; this only runs when JSON parsing failed.
+    """
+    from .synthesis_modes import get_mode
+    mode = get_mode(length)
+    urls: list[str] = []
+    for f in findings:
+        urls.extend(f.citation_urls)
+    unique_urls = list(dict.fromkeys(urls))
+    if length == "tldr":
+        # Single paragraph: just join the findings as one bullet run.
+        body = " ".join(f.claim for f in findings) or "(no findings)"
+        return f"# {topic}\n\n{body}\n"
+    if mode.template == "lecture":
+        parts = [f"# {topic}: A Research Report", "",
+                 f"_Mode: lecture • findings: {len(findings)} • "
+                 f"sources: {len(unique_urls)}_", "", "## Executive TL;DR", "",
+                 "Lecture-format fallback. The synthesizer did not return a "
+                 "structured draft; the findings below are presented as a "
+                 "Parts I-III walkthrough.", "", "## Part I -- Background", ""]
+        for f in findings[: max(1, len(findings) // 4)]:
+            cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
+            parts.append(f"- **{f.claim}** {cites} _(confidence: {f.confidence})_")
+        parts += ["", "## Part II -- Current state of the field", ""]
+        mid_lo = max(1, len(findings) // 4)
+        mid_hi = max(mid_lo + 1, 3 * len(findings) // 4)
+        for f in findings[mid_lo:mid_hi]:
+            cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
+            parts.append(f"- **{f.claim}** {cites} _(confidence: {f.confidence})_")
+        parts += ["", "## Part III -- Open problems", ""]
+        for f in findings[mid_hi:]:
+            cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
+            parts.append(f"- **{f.claim}** {cites} _(confidence: {f.confidence})_")
+        parts += ["", "## References", ""]
+        for i, u in enumerate(unique_urls, 1):
+            parts.append(f"{i}. {u}")
+        parts += ["", "## Quality assessment", "",
+                  "_Fallback document -- validated assessment unavailable._"]
+        return "\n".join(parts)
+    if mode.template == "sectioned":
+        parts = [f"# {topic}", "", "## TL;DR", "",
+                 f"Sectioned report ({mode.label}). {len(findings)} findings.",
+                 "", "## Background", ""]
+        bg_count = max(1, len(findings) // 4)
+        for f in findings[:bg_count]:
+            cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
+            parts.append(f"- **{f.claim}** {cites} _(confidence: {f.confidence})_")
+        parts += ["", "## Current state of the field", ""]
+        for f in findings[bg_count:]:
+            cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
+            parts.append(f"- **{f.claim}** {cites} _(confidence: {f.confidence})_")
+        parts += ["", "## Open problems", "",
+                  "_Fallback document -- open problems not enumerated._",
+                  "", "## Sources", ""]
+        for i, u in enumerate(unique_urls, 1):
+            parts.append(f"{i}. {u}")
+        return "\n".join(parts)
+    # default / flat
     parts = [f"# {topic}", "", "## TL;DR", "",
              "Report generated from the synthesized findings below.", "",
              "## Key Findings", ""]
@@ -581,10 +929,7 @@ def _draft_md_from_findings(topic: str, findings: list[Finding]) -> str:
         cites = " ".join(f"[{_url_index(c, findings)}]" for c in f.citation_urls)
         parts.append(f"{i}. **{f.claim}** {cites} _(confidence: {f.confidence})_")
     parts += ["", "## Sources", ""]
-    urls = []
-    for f in findings:
-        urls.extend(f.citation_urls)
-    for i, u in enumerate(dict.fromkeys(urls), 1):
+    for i, u in enumerate(unique_urls, 1):
         parts.append(f"{i}. {u}")
     return "\n".join(parts)
 
@@ -696,21 +1041,82 @@ def route_after_review(state: ArgusState) -> str:
 # ---------------------------------------------------------------------------
 
 def report_builder_node(state: ArgusState) -> dict:
-    """Render markdown -> PDF; create per-run folder; trigger HITL preview."""
+    """T7 — mode-aware report builder.
+
+    Responsibilities:
+    1. Pick the markdown template based on ``state["length"]``
+       (delegated to ``_draft_md_from_findings`` if the synthesizer
+       failed and returned no draft_md).
+    2. Prepend a T7 title-page block (mode, date, quality summary,
+       per-section confidence) so the user can see what they're getting
+       before scrolling.
+    3. Append a lecture appendix (methodology + tool calls + density)
+       when ``state["length"] == "lecture"``.
+    4. Merge reviewer-flagged unsupported_claims / fabrication_flags
+       into the validated_assessment so the title page reflects the
+       adversarial pass.
+    5. Write ``metadata.json`` sidecar with the same fields + the full
+       validated_assessment + lecture_appendix blobs.
+    6. Render markdown -> PDF via ReportLab (fast, no browser) with
+       fallback to intel-stack Chromium for the styled HTML route.
+    7. Trigger the report-preview HITL gate.
+    """
     from ..config import get_settings
+    from .synthesis_modes import get_mode
+    from .report_builder_helpers import (
+        build_sidecar_metadata, merge_reviewer_into_assessment,
+        now_iso, render_lecture_appendix, render_title_block,
+        sidecar_to_json,
+    )
     s = get_settings()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    length = state.get("length") or "short"
+    mode = get_mode(length)
     topic = re.sub(r"[^A-Za-z0-9_-]+", "_", state["user_request"])[:50] or "report"
-    folder = s.reports_root / f"{stamp}_{topic}"
+    folder = s.reports_root / f"{stamp}_{topic}_{length}"
     folder.mkdir(parents=True, exist_ok=True)
     md_path = folder / "report.md"
     pdf_path = folder / "report.pdf"
-    md_text = state.get("draft_md") or "# (empty draft)"
-    md_text += (
-        "\n\n---\n\n_Generated by Argus • "
-        f"{datetime.now().astimezone().isoformat()}_\n"
+
+    # Merge reviewer verdict into the validated_assessment so the
+    # title-page summary is honest about adversarial findings.
+    validated = state.get("validated_assessment") or {}
+    validated = merge_reviewer_into_assessment(
+        validated, state.get("review_verdict"),
+    )
+
+    # Compose the final markdown: title block + body + (optional) appendix.
+    n_findings = len(state.get("findings") or [])
+    n_sources = len(state.get("fetched") or [])
+    revision_rounds = int(state.get("revision_rounds") or 0)
+    title_block = render_title_block(
+        topic=state["user_request"],
+        length=length,
+        length_label=mode.label,
+        stamp=now_iso(),
+        n_findings=n_findings,
+        n_sources=n_sources,
+        revision_rounds=revision_rounds,
+        validated_assessment=validated,
+    )
+    body = state.get("draft_md") or "# (empty draft)"
+    appendix = ""
+    if mode.include_appendix:
+        appendix = render_lecture_appendix(
+            state.get("lecture_appendix") or {},
+            density_metrics={},
+            total_chars=len(body),
+        )
+    md_text = (
+        title_block
+        + body
+        + "\n\n---\n\n_Generated by Argus • "
+        + now_iso()
+        + f" • mode: {mode.label}_\n"
+        + appendix
     )
     md_path.write_text(md_text, encoding="utf-8")
+
     pdf_ok = False
     try:
         # markdown_to_pdf uses playwright via the intel-stack helper. That
@@ -753,18 +1159,23 @@ def report_builder_node(state: ArgusState) -> dict:
             pdf_ok = pdf_path.exists()
     except Exception as e:
         logger.warning("PDF render failed: %s", e)
-    meta = {
-        "topic": state["user_request"],
-        "thread_id": state.get("thread_id"),
-        "user_id": state.get("user_id"),
-        "revision_rounds": state.get("revision_rounds", 0),
-        "n_findings": len(state.get("findings") or []),
-        "n_sources": len(state.get("fetched") or []),
-        "model_calls": state.get("model_calls") or [],
-    }
+
+    meta = build_sidecar_metadata(
+        topic=state["user_request"],
+        thread_id=state.get("thread_id"),
+        user_id=state.get("user_id"),
+        length=length,
+        length_label=mode.label,
+        stamp=stamp,
+        n_findings=n_findings,
+        n_sources=n_sources,
+        revision_rounds=revision_rounds,
+        validated_assessment=validated,
+        lecture_appendix=state.get("lecture_appendix"),
+        model_calls=state.get("model_calls") or [],
+    )
     (folder / "metadata.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        sidecar_to_json(meta), encoding="utf-8",
     )
     return {
         "report_paths": {
@@ -779,7 +1190,8 @@ def report_builder_node(state: ArgusState) -> dict:
                      "pdf": str(pdf_path) if pdf_ok else None,
                  }}},
         "messages": [{"role": "assistant",
-                      "content": "📝 Report ready. Awaiting your sign-off."}],
+                      "content": f"📝 Report ready ({mode.label}). "
+                                 "Awaiting your sign-off."}],
     }
 
 

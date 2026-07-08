@@ -496,58 +496,203 @@ def markdown_to_pdf(md_text: str, pdf_path: str, *, title: str = "") -> None:
 
 
 def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
-    """Simple, deterministic ReportLab PDF — no browser, no fonts to fetch.
+    """T7 — designed PDF via ReportLab (Chromium-free fallback path).
 
     We render headings, paragraphs, bullet lists, code blocks, blockquotes,
-    and links as plain text. The focus is on a deliverable, citation-rich
-    PDF (not pixel-perfect typography).
+    and tables with a real stylesheet (sans headings + serif body + monospace
+    code + tinted dividers + coloured confidence markers). ReportLab is the
+    fallback when the intel-stack Chromium renderer is unavailable; the
+    primary Chromium route in ``_common.markdown_to_pdf`` produces the
+    same visual identity via CSS.
+
+    Why still maintain a ReportLab path
+    -----------------------------------
+    Some Windows machines (Albert's is one) have flaky pagefile behaviour
+    when Chromium spins up. The ReportLab path is ~50ms and produces a
+    deterministic, font-safe PDF even on a constrained host. The Chromium
+    path is preferred because CSS gives us callouts/tables/dividers, but
+    if it fails, the ReportLab fallback must not look like 1995.
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.lib.enums import TA_LEFT
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                     Preformatted)
+                                     Preformatted, Table, TableStyle,
+                                     KeepTogether, HRFlowable)
     from reportlab.lib import colors
 
-    styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("H1", parent=styles["Heading1"],
-                        fontSize=18, spaceAfter=10, textColor=colors.HexColor("#1a1a1a"))
-    h2 = ParagraphStyle("H2", parent=styles["Heading2"],
-                        fontSize=14, spaceBefore=8, spaceAfter=6,
-                        textColor=colors.HexColor("#222"))
-    h3 = ParagraphStyle("H3", parent=styles["Heading3"], fontSize=12,
-                        spaceBefore=6, spaceAfter=4)
-    body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10,
-                          leading=14, spaceAfter=4, alignment=TA_LEFT)
-    bullet = ParagraphStyle("Bullet", parent=body, leftIndent=14,
-                            bulletIndent=4, spaceAfter=2)
-    quote = ParagraphStyle("Quote", parent=body, leftIndent=18,
-                           textColor=colors.HexColor("#444"),
-                           fontName="Helvetica-Oblique")
-    code = ParagraphStyle("Code", parent=body, fontName="Courier",
-                          fontSize=9, leftIndent=8, textColor=colors.HexColor("#333"),
-                          backColor=colors.HexColor("#f5f5f5"))
-    link = ParagraphStyle("Link", parent=body, textColor=colors.HexColor("#0645ad"))
+    # Colour palette mirrors the Chromium CSS so the two paths look the same.
+    INK = colors.HexColor("#0f172a")        # heading ink
+    BODY = colors.HexColor("#1a1a1a")       # body ink
+    MUTED = colors.HexColor("#475569")      # meta / captions
+    RULE = colors.HexColor("#1e40af")       # primary accent
+    TINT = colors.HexColor("#f1f5f9")       # h2 background tint
+    CODE_BG = colors.HexColor("#f8fafc")    # inline-code background
+    CODE_INK = colors.HexColor("#0f172a")
+    DIVIDER = colors.HexColor("#94a3b8")    # dashed hr
+    QUALITY_BG = colors.HexColor("#eff6ff")
+    QUALITY_BORDER = colors.HexColor("#2563eb")
+    CONF_HIGH = colors.HexColor("#047857")
+    CONF_MED = colors.HexColor("#b45309")
+    CONF_LOW = colors.HexColor("#b91c1c")
 
-    # html-style escape: keep simple text safe for Paragraph.
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle(
+        "ArgusH1", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=22, leading=26,
+        textColor=INK, spaceAfter=8, spaceBefore=0,
+    )
+    h2 = ParagraphStyle(
+        "ArgusH2", parent=styles["Heading2"],
+        fontName="Helvetica-Bold", fontSize=14, leading=18,
+        textColor=INK, spaceBefore=14, spaceAfter=6,
+        backColor=TINT, borderPadding=(4, 6, 4, 6),
+        leftIndent=0,
+    )
+    h3 = ParagraphStyle(
+        "ArgusH3", parent=styles["Heading3"],
+        fontName="Helvetica-Bold", fontSize=12, leading=15,
+        textColor=INK, spaceBefore=10, spaceAfter=4,
+    )
+    h4 = ParagraphStyle(
+        "ArgusH4", parent=styles["Heading4"],
+        fontName="Helvetica-Oblique", fontSize=10.5, leading=13,
+        textColor=colors.HexColor("#334155"),
+        spaceBefore=8, spaceAfter=2,
+    )
+    body = ParagraphStyle(
+        "ArgusBody", parent=styles["BodyText"],
+        fontName="Times-Roman", fontSize=10.5, leading=14.5,
+        textColor=BODY, spaceAfter=4, alignment=TA_LEFT,
+    )
+    bullet = ParagraphStyle(
+        "ArgusBullet", parent=body, leftIndent=14, bulletIndent=4,
+        spaceAfter=2,
+    )
+    quote = ParagraphStyle(
+        "ArgusQuote", parent=body, leftIndent=18, rightIndent=8,
+        textColor=MUTED, fontName="Times-Italic",
+        borderPadding=(4, 6, 4, 8),
+    )
+    code = ParagraphStyle(
+        "ArgusCode", parent=body, fontName="Courier",
+        fontSize=9, leading=11, leftIndent=8,
+        textColor=CODE_INK, backColor=CODE_BG,
+    )
+    codeblock = ParagraphStyle(
+        "ArgusCodeBlock", parent=code,
+        backColor=colors.HexColor("#0f172a"),
+        textColor=colors.HexColor("#e2e8f0"),
+        fontSize=8.5, leading=11,
+        borderPadding=(6, 8, 6, 8),
+    )
+    meta = ParagraphStyle(
+        "ArgusMeta", parent=body, fontName="Helvetica",
+        fontSize=8.5, textColor=MUTED, leading=11,
+    )
+    quality = ParagraphStyle(
+        "ArgusQuality", parent=body,
+        backColor=QUALITY_BG, borderColor=QUALITY_BORDER,
+        borderWidth=0, leftBorderColor=QUALITY_BORDER,
+        leftBorderWidth=3,
+        borderPadding=(8, 10, 8, 10),
+        fontSize=10, leading=13,
+        fontName="Helvetica",
+    )
+    conf_high = ParagraphStyle("ConfHigh", parent=body, fontName="Helvetica-Bold",
+                                textColor=CONF_HIGH, fontSize=10)
+    conf_med = ParagraphStyle("ConfMed", parent=body, fontName="Helvetica-Bold",
+                               textColor=CONF_MED, fontSize=10)
+    conf_low = ParagraphStyle("ConfLow", parent=body, fontName="Helvetica-Bold",
+                               textColor=CONF_LOW, fontSize=10)
+    divider = HRFlowable(
+        width="100%", thickness=3,
+        color=RULE, spaceBefore=14, spaceAfter=10,
+        hAlign="CENTER",
+    )
+
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;")
                  .replace("<", "&lt;")
                  .replace(">", "&gt;"))
 
+    def conf_style(level: str) -> ParagraphStyle:
+        return {"high": conf_high, "medium": conf_med,
+                "low": conf_low}.get(level.lower(), conf_med)
+
+    def md_inline_to_rl(text: str) -> str:
+        """Light inline-MD -> ReportLab miniHTML: **bold**, *em*, `code`, [n].
+
+        We deliberately do NOT try to be a full markdown renderer here;
+        we just upgrade the bold/em/inline-code/inline-link spans so the
+        body has the same visual rhythm as the Chromium route.
+        """
+        import re as _re
+        # Escape first so user content can't inject miniHTML.
+        s = esc(text)
+        # Inline code: `...`
+        s = _re.sub(r"`([^`]+)`",
+                    r'<font name="Courier" color="#0f172a" '
+                    r'backColor="#f8fafc">\1</font>', s)
+        # Bold: **...**
+        s = _re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+        # Italic: *...*  (single-asterisk, non-greedy)
+        s = _re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", s)
+        # [n] -> superscript number badge
+        s = _re.sub(r"\[(\d+)\]", r'<font color="#1d4ed8"><b>[\1]</b></font>', s)
+        return s
+
     flow = []
     if title:
         flow.append(Paragraph(esc(title), h1))
-        flow.append(Spacer(1, 4))
+        flow.append(divider)
 
     in_code = False
     code_buf: list[str] = []
+    # Table support: collects lines between | markers, then flushes.
+    table_buf: list[str] = []
+    in_table = False
+    last_was_quality = False
+
+    def flush_table() -> list:
+        if not table_buf:
+            return []
+        rows = []
+        for row in table_buf:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            rows.append([Paragraph(md_inline_to_rl(c), body) for c in cells])
+        if len(rows) >= 2 and all(set(c.replace("|","").replace(":","").replace("-","").strip()) == set()
+                                   for c in table_buf[1]):
+            # second row is the markdown alignment marker (---|---|) — drop it
+            rows.pop(1)
+        tbl = Table(rows, hAlign="LEFT")
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), RULE),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#f8fafc")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ("TOPPADDING", (0,0), (-1,-1), 5),
+            ("LEFTPADDING", (0,0), (-1,-1), 6),
+            ("RIGHTPADDING", (0,0), (-1,-1), 6),
+            ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#cbd5e1")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1),
+             [colors.white, colors.HexColor("#f8fafc")]),
+        ]))
+        return [tbl, Spacer(1, 8)]
+
     for raw in (md_text or "").splitlines():
         line = raw.rstrip()
+        # Flush table if we hit a non-table line.
+        if in_table and not line.lstrip().startswith("|"):
+            flow.extend(flush_table())
+            table_buf = []
+            in_table = False
+        # Code fences
         if line.strip().startswith("```"):
             if in_code:
-                flow.append(Preformatted("\n".join(code_buf), code))
+                flow.append(Preformatted("\n".join(code_buf), codeblock))
                 code_buf = []
                 in_code = False
             else:
@@ -556,35 +701,69 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
         if in_code:
             code_buf.append(line)
             continue
+        # Tables
+        if line.lstrip().startswith("|"):
+            in_table = True
+            table_buf.append(line)
+            continue
         if not line.strip():
             flow.append(Spacer(1, 4))
             continue
         if line.startswith("# "):
+            # If the previous flow item was a quality block, separate visually.
+            if last_was_quality:
+                flow.append(divider)
             flow.append(Paragraph(esc(line[2:].strip()), h1))
+            flow.append(divider)
+            last_was_quality = False
         elif line.startswith("## "):
+            flow.append(Spacer(1, 4))
             flow.append(Paragraph(esc(line[3:].strip()), h2))
+            last_was_quality = False
         elif line.startswith("### "):
             flow.append(Paragraph(esc(line[4:].strip()), h3))
+        elif line.startswith("#### "):
+            flow.append(Paragraph(esc(line[5:].strip()), h4))
         elif line.lstrip().startswith("> "):
-            flow.append(Paragraph(esc(line.lstrip("> ").strip()), quote))
+            text = md_inline_to_rl(line.lstrip("> ").strip())
+            if text.startswith("**Quality"):
+                # Promote Argus quality blockquote to the tinted callout.
+                flow.append(Paragraph(text, quality))
+                last_was_quality = True
+            else:
+                flow.append(Paragraph(text, quote))
+                last_was_quality = False
         elif line.lstrip().startswith("- "):
-            flow.append(Paragraph(esc(line.lstrip("- ").strip()), bullet,
-                                  bulletText="•"))
+            text = md_inline_to_rl(line.lstrip("- ").strip())
+            flow.append(Paragraph(text, bullet, bulletText="•"))
         elif line.lstrip()[:2].isdigit() and line.lstrip()[2:4] == ". ":
             # numbered list
-            flow.append(Paragraph(esc(line.strip()), bullet,
-                                  bulletText="•"))
+            text = md_inline_to_rl(line.strip())
+            flow.append(Paragraph(text, bullet, bulletText="•"))
+        elif line.strip() == "---":
+            flow.append(HRFlowable(width="60%", thickness=0.6,
+                                    color=DIVIDER, spaceBefore=8, spaceAfter=8,
+                                    hAlign="CENTER"))
+        elif line.startswith("_") and line.endswith("_"):
+            flow.append(Paragraph(md_inline_to_rl(line), meta))
         else:
-            flow.append(Paragraph(esc(line.strip()), body))
+            flow.append(Paragraph(md_inline_to_rl(line), body))
 
+    # Tail-flushes.
+    if in_table:
+        flow.extend(flush_table())
     if in_code and code_buf:
-        flow.append(Preformatted("\n".join(code_buf), code))
+        flow.append(Preformatted("\n".join(code_buf), codeblock))
 
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=A4,
         leftMargin=18 * mm, rightMargin=18 * mm,
         topMargin=18 * mm, bottomMargin=18 * mm,
         title=title or "Argus report",
+        # Show the report topic in the PDF metadata so Acrobat / Preview
+        # show "Argus - <topic>" in the title bar.
+        author="Argus (coding-app)",
+        subject=f"Length mode: {title or 'report'}",
     )
     doc.build(flow)
 

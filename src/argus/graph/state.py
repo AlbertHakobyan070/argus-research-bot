@@ -15,6 +15,13 @@ from typing_extensions import NotRequired
 Mode = Literal["quick", "deep"]
 Verdict = Literal["pass", "revise"]
 
+# T7 length selector. Chosen at plan-approval time (HITL). Drives
+# synthesizer prompt/template depth + report_builder decisions.
+Length = Literal["tldr", "short", "medium", "long", "lecture"]
+DEFAULT_LENGTH: Length = "short"
+VALID_LENGTHS: tuple[Length, ...] = (
+    "tldr", "short", "medium", "long", "lecture")
+
 
 class PlannedSource(BaseModel):
     """One source the planner intends to consult."""
@@ -56,6 +63,23 @@ class ReviewVerdict(BaseModel):
     fabrication_flags: list[str] = Field(default_factory=list)
 
 
+class ValidatedAssessment(BaseModel):
+    """T7.6 — per-section self-assessment of the synthesized report.
+
+    The synthesizer LLM produces one entry per major section it wrote,
+    rating confidence and flagging open challenges. The reviewer verifier
+    annotates unsupported claims. Surfaced to the reader in the document
+    so they can calibrate trust per section rather than trust the whole
+    report as a monolith.
+    """
+
+    sections: list[dict] = Field(default_factory=list)  # each: {name, confidence, open_challenges, claim_count}
+    overall_relevancy: Literal["high", "medium", "low"] = "medium"
+    knowledge_density: dict = Field(default_factory=dict)  # {claims_per_section, citations_per_claim, conflict_markers}
+    reviewer_unsupported: list[str] = Field(default_factory=list)
+    reviewer_fabrication_flags: list[str] = Field(default_factory=list)
+
+
 # Sentinel prefix the report_builder writes to mark the end of the
 # deliverable block.
 REPORT_MARKER = "<!-- ARGUS_REPORT_END -->"
@@ -70,6 +94,7 @@ class ArgusState(TypedDict, total=False):
 
     # Working memory
     messages: Annotated[list[dict], "appended-only chat history"]  # type: ignore
+    length: Length                  # T7: chosen at plan-approval HITL
     plan: dict | None               # ResearchPlan.model_dump()
     plan_approved: bool             # set by HITL resume
 
@@ -85,6 +110,8 @@ class ArgusState(TypedDict, total=False):
     # Delivery
     report_paths: dict              # {"md": str, "pdf": str, "folder": str}
     quick_answer: str               # for /ask path
+    validated_assessment: dict      # T7: ValidatedAssessment.model_dump()
+    lecture_appendix: dict          # T7: methodology + tool calls log + density metrics
 
     # HITL control
     hitl: dict                      # {"pending": bool, "kind": str, "ctx": dict}

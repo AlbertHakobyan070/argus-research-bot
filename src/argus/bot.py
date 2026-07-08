@@ -1,16 +1,27 @@
 """Argus Telegram bot layer.
 
 python-telegram-bot v22 async, long-polling. Commands:
-  /research <topic>   — full deep loop with both HITL gates
-  /ask <question>     — quick grounded answer
-  /status             — show in-flight run for this chat
-  /cancel             — drop in-flight run
-  /help               — usage
+  /research <topic>              — full deep loop with both HITL gates
+  /research /length <m> <topic>  — pre-set output length mode (T7)
+  /ask <question>                — quick grounded answer
+  /status                        — show in-flight run for this chat
+  /cancel                        — drop in-flight run
+  /help                          — usage
 
 The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety. It manages
 the SqliteSaver lifecycle inside the running event loop and exposes
 resume() so inline-keyboard callbacks can continue a paused LangGraph
 run via Command(resume=...).
+
+T7 additions
+------------
+- 5-button length selector at plan approval (TLDR / Short / Medium /
+  Long / Lecture). The chosen mode is pushed back into the graph
+  checkpoint via ``graph.aupdate_state`` before ``Command(resume=)``,
+  so the synthesizer + report_builder see the user's HITL choice.
+- /length flag in /research for users who want to skip the keyboard.
+- Validation summary on title page + per-section confidence in the
+  markdown + redesigned PDF.
 """
 from __future__ import annotations
 
@@ -34,6 +45,7 @@ from telegram.ext import (
 
 from .config import Settings, get_settings
 from .graph import build_graph, quick_answer_graph
+from .graph.state import DEFAULT_LENGTH, VALID_LENGTHS, Length
 
 logger = logging.getLogger("argus.bot")
 
@@ -41,11 +53,21 @@ HELP_TEXT = """\
 *Argus — multi-agent Telegram research bot* (brain: FreeLLMAPI proxy)
 
 Commands:
-  /research <topic>   — full deep loop with plan-approval + report-preview HITL gates
-  /ask <question>     — quick grounded single-shot answer
-  /status             — show the latest report paths for this chat
-  /cancel             — drop in-flight runs for this chat
-  /help               — this message
+  /research <topic>                 — full deep loop with plan-approval + report-preview HITL gates
+  /research /length <m> <topic>     — pre-pin output length mode (see below)
+  /ask <question>                   — quick grounded single-shot answer
+  /status                           — show the latest report paths for this chat
+  /cancel                           — drop in-flight runs for this chat
+  /help                             — this message
+
+*Length modes* (selectable at plan approval):
+  • `tldr`     — single short paragraph
+  • `short`    — current report (~300-700 chars)
+  • `medium`   — 2-3 page MD (~3-6k chars, sub-headings)
+  • `long`     — 5-8 page MD (~10-15k chars, 10-15 findings)
+  • `lecture`  — 8-10 page MD, lecture format with Part I-IV + References + Appendix
+
+Without `/length`, the default is `short`.
 
 Inline-keyboard buttons appear after the plan is drafted and after the
 report is built. Click *Approve* / *Send* to advance, *Cancel* to drop.
@@ -53,6 +75,43 @@ report is built. Click *Approve* / *Send* to advance, *Cancel* to drop.
 Per-chat memory is checkpointed in SQLite; reports are persisted to
 `A:\\Hermes\\Downloads\\reports\\`.
 """
+
+# ---------------------------------------------------------------------------
+# Length selector (T7.1) — HITL keyboard button + /length CLI flag.
+# ---------------------------------------------------------------------------
+
+# Human-readable labels for the 5 modes, ordered shortest → longest.
+_LENGTH_LABELS: dict[Length, str] = {
+    "tldr":    "TL;DR",
+    "short":   "Short",
+    "medium":  "Medium",
+    "long":    "Long",
+    "lecture": "Lecture",
+}
+
+
+def _parse_length(args: list[str]) -> tuple[str, list[str]]:
+    """Recognise ``/length <mode>`` at the head of an args list.
+
+    Returns ``(mode, remaining_args)``. If no flag is present (or the
+    flag is unrecognised) ``mode`` is ``""`` and the original ``args``
+    list is returned untouched as the remaining-args. Recognised flag
+    spellings: ``/length`` (Telegram-flavoured), ``--length``,
+    ``-l``.
+    """
+    if not args:
+        return "", []
+    head = args[0].lower()
+    if head not in ("/length", "--length", "-l"):
+        return "", list(args)
+    if len(args) < 2:
+        return "", []  # malformed: /length with no mode at all
+    mode = args[1].lower().strip()
+    if mode not in _LENGTH_LABELS:
+        # unrecognised mode — keep original args so caller can complain
+        return "", list(args)
+    return mode, list(args[2:])
+
 
 # In-memory bookkeeping: which thread_id currently has an in-flight run.
 # Persisted checkpoint state is the source of truth; this is just for
@@ -111,11 +170,12 @@ def _md_escape(s: str) -> str:
     return out
 
 
-def _format_plan(plan: dict) -> str:
+def _format_plan(plan: dict, length: str = DEFAULT_LENGTH) -> str:
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
     sources = plan.get("planned_sources") or []
-    lines = ["📋 *Research plan*", ""]
+    mode_label = _LENGTH_LABELS.get(length, length)
+    lines = [f"📋 *Research plan*  ·  mode: {mode_label}", ""]
     if summary:
         lines += [f"_{_md_escape(summary)}_", ""]
     if sub_qs:
@@ -131,8 +191,27 @@ def _format_plan(plan: dict) -> str:
     return "\n".join(lines)
 
 
-def _plan_keyboard() -> InlineKeyboardMarkup:
+def _plan_keyboard(default_length: str = DEFAULT_LENGTH) -> InlineKeyboardMarkup:
+    """T7.1 — five-button length selector at plan approval.
+
+    Button order is tldr→lecture (cheapest→deepest). The button matching
+    ``default_length`` gets a check-mark in its label so the user can
+    see what they'll get if they tap nothing besides Approve.
+    """
+    def label(mode: str) -> str:
+        return (_LENGTH_LABELS[mode]
+                + (" ✅" if mode == default_length else ""))
+
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(label("tldr"), callback_data="len:tldr"),
+            InlineKeyboardButton(label("short"), callback_data="len:short"),
+            InlineKeyboardButton(label("medium"), callback_data="len:medium"),
+        ],
+        [
+            InlineKeyboardButton(label("long"), callback_data="len:long"),
+            InlineKeyboardButton(label("lecture"), callback_data="len:lecture"),
+        ],
         [
             InlineKeyboardButton("✅ Approve", callback_data="plan:approve"),
             InlineKeyboardButton("✏️ Edit", callback_data="plan:edit"),
@@ -157,9 +236,24 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized.")
         return
     if not ctx.args:
-        await update.message.reply_text("Usage: /research <topic>")
+        await update.message.reply_text(
+            "Usage: /research [/length <m>] <topic>\n"
+            "Lengths: " + " / ".join(VALID_LENGTHS)
+        )
         return
-    topic = " ".join(ctx.args)
+    # T7.1: allow ``/research /length <m> <topic>`` so the user can
+    # pre-pin a length without waiting for the keyboard. Empty /length
+    # is silently ignored (caller falls back to DEFAULT_LENGTH).
+    length, topic_args = _parse_length(list(ctx.args))
+    if not length:
+        length = DEFAULT_LENGTH
+        topic_args = list(ctx.args)
+    topic = " ".join(topic_args).strip()
+    if not topic:
+        await update.message.reply_text(
+            "Usage: /research [/length <m>] <topic>"
+        )
+        return
     chat_id = update.effective_chat.id
     thread_id = f"tg:{chat_id}"
 
@@ -179,16 +273,19 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         graph = build_graph(checkpointer=saver)
         cfg = {"configurable": {"thread_id": thread_id}}
-        state_in = {
+        state_in: dict[str, Any] = {
             "thread_id": thread_id,
             "user_id": update.effective_user.id,
             "user_request": topic,
+            "length": length,           # T7 — Length selector carry
             "messages": [], "plan": None,
             "sources": [], "fetched": [], "findings": [],
             "draft_md": "", "revision_notes": [], "revision_rounds": 0,
             "model_calls": [], "hitl": {"pending": False},
         }
-        _inflight[thread_id] = {"state": state_in, "stage": "intake"}
+        _inflight[thread_id] = {
+            "state": state_in, "stage": "intake", "length": length,
+        }
 
         # Stream until first interrupt.
         async for ev in graph.astream(state_in, config=cfg,
@@ -210,7 +307,8 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"📥 Fetched {n} items.", progress)
                 elif node_name == "synthesizer":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        "🧠 Synthesizing findings…", progress)
+                        f"🧠 Synthesizing ({_LENGTH_LABELS.get(length,'?')})…",
+                        progress)
                 elif node_name == "reviewer":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"🔬 Reviewer: {delta.get('review_verdict',{}).get('verdict','?')}",
@@ -223,10 +321,10 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # First HITL = plan approval.
         plan = cur.get("plan") or {}
         if plan:
-            text = _format_plan(plan)
+            text = _format_plan(plan, length=length)
             await ctx.application.bot.send_message(
                 chat_id=chat_id, text=text,
-                reply_markup=_plan_keyboard(),
+                reply_markup=_plan_keyboard(default_length=length),
                 parse_mode=ParseMode.MARKDOWN,
             )
             # Hand the saver to the in-flight registry so _resume_after_plan
@@ -275,10 +373,11 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         graph = quick_answer_graph(checkpointer=saver)
         cfg = {"configurable": {"thread_id": thread_id}}
-        state_in = {
+        state_in: dict[str, Any] = {
             "thread_id": thread_id,
             "user_id": update.effective_user.id,
             "user_request": question,
+            "length": DEFAULT_LENGTH,
             "messages": [], "plan": None,
             "sources": [], "fetched": [], "findings": [],
             "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -320,6 +419,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     snap_lines = [
         f"Stage: `{info.get('stage','?')}`",
         f"Awaiting: `{info.get('awaiting','-')}`",
+        f"Length: `{info.get('length','?')}`",
     ]
     await update.message.reply_text("\n".join(snap_lines),
                                     parse_mode=ParseMode.MARKDOWN)
@@ -368,6 +468,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("(no in-flight run)")
         return
     data = q.data or ""
+    # T7.1 — length selector clicks act as "approve with this length".
+    if data.startswith("len:"):
+        chosen = data.split(":", 1)[1]
+        if chosen not in _LENGTH_LABELS:
+            await q.edit_message_text("Unknown length mode.")
+            return
+        info["length"] = chosen
+        info["plan_approved"] = True
+        await q.edit_message_text(
+            (q.message.text or "")
+            + f"\n\n_📏 Length set to *{_LENGTH_LABELS.get(chosen, chosen)}* "
+              "— continuing._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _resume_after_plan(ctx, thread_id, info)
+        return
     if data == "plan:approve":
         info["plan_approved"] = True
         await q.edit_message_text(
@@ -407,6 +523,30 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
     cfg = info["cfg"]
     chat_id = int(thread_id.split(":", 1)[1])
     progress = {"message_id": None}
+
+    # T7.1 — push the chosen length back into the graph state BEFORE
+    # resuming, so the synthesizer + report_builder see the user's
+    # HITL choice rather than the default. ``aupdate_state`` is the
+    # canonical way to fork a thread checkpoint from outside.
+    chosen_length = (info.get("length")
+                     or info.get("state", {}).get("length")
+                     or DEFAULT_LENGTH)
+    try:
+        await graph.aupdate_state(cfg, {"length": chosen_length})
+    except AttributeError:
+        # Compiled graph without async API — fall back to sync.
+        try:
+            graph.update_state(cfg, {"length": chosen_length})
+        except Exception:
+            logger.exception(
+                "could not push length=%s into state; defaulting",
+                chosen_length,
+            )
+    except Exception:
+        logger.exception(
+            "aupdate_state failed; defaulting length=%s", chosen_length,
+        )
+
     progress = await _stream_progress(ctx.application.bot, chat_id,
         "🔍 Researching primary sources…", progress)
 
@@ -425,7 +565,8 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                         f"📥 {n} fetched + normalized.", progress)
                 elif node_name == "synthesizer":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        "🧠 Synthesizing…", progress)
+                        f"🧠 Synthesizing ({_LENGTH_LABELS.get(chosen_length,'?')})…",
+                        progress)
                 elif node_name == "reviewer":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"🔬 Reviewer verdict: "
@@ -436,16 +577,18 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"📝 Report ready: {paths.get('folder','?')}", progress)
                     info["report_paths"] = paths
+                    info["length"] = chosen_length
 
         snap = await graph.aget_state(cfg)
         cur = snap.values if snap else {}
         paths = cur.get("report_paths") or info.get("report_paths") or {}
         info["awaiting"] = "report_preview"
         info["paths"] = paths
+        info["length"] = chosen_length
         if paths.get("md"):
             md = Path(paths["md"])
             text = (
-                f"📝 *Report preview*\n\n"
+                f"📝 *Report preview*  ·  {_LENGTH_LABELS.get(chosen_length,'?')}\n\n"
                 f"Folder: `{_md_escape(paths.get('folder','?'))}`\n"
                 f"Markdown: `{_md_escape(md.name)}`  "
                 + (f"· PDF: `report.pdf`" if paths.get("pdf") else "· PDF: _failed_")
