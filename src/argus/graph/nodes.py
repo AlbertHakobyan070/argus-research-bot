@@ -575,8 +575,21 @@ def fetcher_node(state: ArgusState) -> dict:
                     excerpt=_read_excerpt(res.markdown_path),
                 ).model_dump())
                 continue
-            # All four tools returned not-ok for this URL — record it.
-            msg = f"fetch {url} failed: all tools returned not-ok"
+            # Phase 2 last resort: bot-walled / Cloudflare sites (the plain
+            # requests GET inside snatch/crawl returns 403 or a JS challenge).
+            # Retry once with Scrapling's stealth fetcher (camoufox). Kept
+            # last because it spins up a headless browser and is slow.
+            res = snatch_url(url, kind="auto", stealth=True)
+            if res.ok and res.markdown_path:
+                fetched.append(FetchedItem(
+                    url=url, title=res.title or src.get("title", ""),
+                    markdown_path=res.markdown_path,
+                    section=kind,
+                    excerpt=_read_excerpt(res.markdown_path),
+                ).model_dump())
+                continue
+            # All fetch strategies (normalize/snatch/crawl/stealth) failed.
+            msg = f"fetch {url} failed: all tools returned not-ok (incl. stealth)"
             errors.append(msg)
             logger.warning(msg)
         except Exception as e:
@@ -1477,17 +1490,80 @@ def report_builder_node(state: ArgusState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# deliver
+# deliver + Phase 2 HITL "extend research" loop
 # ---------------------------------------------------------------------------
 
+MAX_EXTEND_ROUNDS = 2
+
+
+def _will_extend(state: ArgusState) -> bool:
+    """True when the user asked to extend and we're under the round cap."""
+    return bool(state.get("extend_requested")) and \
+        int(state.get("extend_rounds") or 0) < MAX_EXTEND_ROUNDS
+
+
 def deliver_node(state: ArgusState) -> dict:
-    """Just records the paths; the Telegram bot layer does the actual send."""
+    """Records the paths; the Telegram bot layer does the actual send.
+
+    If the user asked to extend research at the preview gate (and we're under
+    the round cap), this is a no-op pass-through — ``route_after_deliver``
+    sends the run back through ``extend_prep`` instead of finalising.
+    """
+    if _will_extend(state):
+        return {"messages": [{"role": "assistant",
+                              "content": "↪️ Extending research…"}]}
     paths = state.get("report_paths") or {}
     return {
         "hitl": {"pending": False},
         "messages": [{"role": "assistant", "content": (
             f"✅ Delivered. Folder: {paths.get('folder')}")}],
     }
+
+
+def route_after_deliver(state: ArgusState) -> str:
+    """Loop back to deepen research, or end the run."""
+    return "extend" if _will_extend(state) else "end"
+
+
+def extend_prep_node(state: ArgusState) -> dict:
+    """Phase 2 — broaden the plan and gather MORE sources for another pass.
+
+    Runs the researcher subgraph itself (rather than routing back to the
+    ``researcher`` node, which is gated by ``interrupt_before`` and would
+    re-trigger the plan-approval pause). New sources are merged with the
+    existing ones by the subgraph's pre-seed step; the run then flows on to
+    ``fetcher`` → … → ``report_builder`` for a fresh preview.
+
+    To surface genuinely new material (not the same URLs), we fold salient
+    words from the plan's sub_questions into ``must_have_keywords`` so the
+    subgraph's web/GitHub searches broaden their coverage.
+    """
+    plan = ResearchPlan.model_validate(state.get("plan") or {})
+    extra: list[str] = []
+    for sq in plan.sub_questions:
+        extra += [w for w in re.split(r"[^A-Za-z0-9]+", sq) if len(w) > 4]
+    plan.must_have_keywords = list(
+        dict.fromkeys(list(plan.must_have_keywords) + extra))[:8]
+
+    seeded = dict(state)
+    seeded["plan"] = plan.model_dump()
+    research = run_researcher_subgraph(seeded)
+
+    rnd = int(state.get("extend_rounds") or 0) + 1
+    out: dict[str, Any] = {
+        "plan": plan.model_dump(),
+        "sources": research.get("sources", []),
+        "extend_requested": False,
+        "extend_rounds": rnd,
+        # Fresh review budget for the re-synthesis of the widened evidence.
+        "revision_rounds": 0,
+        "messages": [{"role": "assistant",
+                      "content": f"🔎 Extending research (round {rnd}) — "
+                                 f"{len(research.get('sources') or [])} sources now."}],
+    }
+    if research.get("errors"):
+        out["errors"] = research["errors"]
+    return out
 
 
 # ---------------------------------------------------------------------------

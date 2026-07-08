@@ -118,6 +118,8 @@ class ArgusState(TypedDict, total=False):
 
     # HITL control
     hitl: dict                      # {"pending": bool, "kind": str, "ctx": dict}
+    extend_requested: bool          # Phase 2: user asked to deepen research at preview
+    extend_rounds: int              # Phase 2: how many extend loops have run (capped)
 
     # Telemetry — append-only so each node can return just the new record.
     model_calls: Annotated[list[dict], operator.add]

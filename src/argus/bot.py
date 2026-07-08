@@ -56,6 +56,7 @@ Commands:
   /research <topic>                 — full deep loop with plan-approval + report-preview HITL gates
   /research /length <m> <topic>     — pre-pin output length mode (see below)
   /ask <question>                   — quick grounded single-shot answer
+  /video [shorts] <query>           — search YouTube (videos or shorts)
   /status                           — show the latest report paths for this chat
   /cancel                           — drop in-flight runs for this chat
   /help                             — this message
@@ -242,6 +243,9 @@ def _report_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📤 Send", callback_data="report:send"),
+            InlineKeyboardButton("🔎 Extend", callback_data="report:extend"),
+        ],
+        [
             InlineKeyboardButton("🔁 Revise", callback_data="report:revise"),
             InlineKeyboardButton("❌ Cancel", callback_data="report:cancel"),
         ],
@@ -420,6 +424,81 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /video — YouTube search (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _fmt_duration(seconds: Any) -> str:
+    """Seconds -> H:MM:SS or M:SS. Empty string for missing/invalid."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if s <= 0:
+        return ""
+    m, sec = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/video [shorts] <query> — search YouTube and list ranked videos.
+
+    ``/video shorts <query>`` biases toward Shorts. Metadata-only (title,
+    channel, duration, link); no download, so it works without yt-dlp
+    impersonation.
+    """
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    args = list(ctx.args or [])
+    shorts = False
+    if args and args[0].lower().lstrip("-/") == "shorts":
+        shorts = True
+        args = args[1:]
+    if not args:
+        await update.message.reply_text("Usage: /video [shorts] <query>")
+        return
+    query = " ".join(args)
+    chat_id = update.effective_chat.id
+    await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    from .tools import youtube_search
+    # youtube_search shells out to yt-dlp (blocking); run off the event loop.
+    try:
+        results = await asyncio.to_thread(
+            youtube_search, query, max_results=6, shorts=shorts)
+    except Exception as e:
+        logger.exception("video_cmd search failed")
+        await update.message.reply_text(f"⚠️ YouTube search failed: {e}")
+        return
+    if not results:
+        await update.message.reply_text(
+            f"🎬 No videos found for “{query}”. Try different terms.")
+        return
+
+    header = f"🎬 *YouTube {'Shorts ' if shorts else ''}results* for _{_md_escape(query)}_:\n"
+    lines = [header]
+    for i, v in enumerate(results, 1):
+        dur = _fmt_duration(v.get("duration"))
+        title = _md_escape((v.get("title") or "")[:100])
+        chan = _md_escape(v.get("channel") or "")
+        meta = " · ".join(x for x in (chan, dur) if x)
+        lines.append(f"{i}. [{title}]({v['url']})" + (f"\n   _{meta}_" if meta else ""))
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Legacy-markdown parse choked on an exotic title — send plain text
+        # (URLs still clickable in Telegram) rather than crash.
+        plain = "\n".join(
+            [f"YouTube{' Shorts' if shorts else ''} results for {query}:"]
+            + [f"{i}. {v.get('title','')} — {v['url']}"
+               for i, v in enumerate(results, 1)])
+        await update.message.reply_text(plain)
+
+
+# ---------------------------------------------------------------------------
 # /status, /cancel, /help
 # ---------------------------------------------------------------------------
 
@@ -521,6 +600,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Cancelled.")
     elif data == "report:send":
         await _resume_after_report(ctx, thread_id, info, q)
+    elif data == "report:extend":
+        # Phase 2 HITL: deepen the research. Set the graph flag, then reuse
+        # the plan-resume streamer — it drives deliver → extend_prep →
+        # fetcher → … → report_builder and shows the next preview.
+        graph = info["graph"]
+        cfg = info["cfg"]
+        try:
+            await graph.aupdate_state(cfg, {"extend_requested": True})
+        except Exception:
+            logger.exception("could not set extend_requested; aborting extend")
+            await q.edit_message_text(
+                (q.message.text or "") + "\n\n_⚠️ Extend failed to start._",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+        await q.edit_message_text(
+            (q.message.text or "") + "\n\n_🔎 Extending research — gathering more…_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _resume_after_plan(ctx, thread_id, info)
     elif data == "report:revise":
         info["report_revise"] = True
         await q.edit_message_text(
@@ -733,6 +831,7 @@ def build_application() -> Application:
     app = Application.builder().token(s.telegram_bot_token).build()
     app.add_handler(CommandHandler("research", research_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("video", video_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))

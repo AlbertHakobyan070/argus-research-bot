@@ -27,10 +27,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from .nodes import (
-    credibility_node, deliver_node, fetcher_node, filter_node,
-    intake_node, normalizer_node, planner_node, planner_reflect_node,
-    quick_answer_node, report_builder_node, researcher_node, reviewer_node,
-    route_after_review, synthesizer_node,
+    credibility_node, deliver_node, extend_prep_node, fetcher_node,
+    filter_node, intake_node, normalizer_node, planner_node,
+    planner_reflect_node, quick_answer_node, report_builder_node,
+    researcher_node, reviewer_node, route_after_deliver, route_after_review,
+    synthesizer_node,
 )
 from .state import ArgusState
 
@@ -57,6 +58,7 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     g.add_node("reviewer", reviewer_node)
     g.add_node("report_builder", report_builder_node)
     g.add_node("deliver", deliver_node)
+    g.add_node("extend_prep", extend_prep_node)
 
     g.add_edge(START, "intake")
 
@@ -83,7 +85,16 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     )
 
     g.add_edge("report_builder", "deliver")
-    g.add_edge("deliver", END)
+    # Phase 2 HITL "extend": after the report-preview gate, either finish or
+    # loop back to gather more (extend_prep runs the researcher itself, then
+    # rejoins at fetcher — it must NOT route through the interrupt-gated
+    # `researcher` node or it would re-trigger the plan-approval pause).
+    g.add_conditional_edges(
+        "deliver",
+        route_after_deliver,
+        {"extend": "extend_prep", "end": END},
+    )
+    g.add_edge("extend_prep", "fetcher")
 
     if checkpointer is None:
         checkpointer = MemorySaver()

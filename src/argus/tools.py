@@ -379,6 +379,8 @@ def _parse_radar_md(text: str) -> list[HarvestResult]:
 
 def snatch_url(url: str, *, kind: str = "auto",
                dest: str | None = None,
+               stealth: bool = False,
+               transcript: bool = False,
                timeout: int = DEFAULT_TIMEOUT_S) -> SnatchResult:
     """Run snatch.py for a single URL. Returns the local markdown path.
 
@@ -390,10 +392,20 @@ def snatch_url(url: str, *, kind: str = "auto",
     parsing failed (e.g. grabbed the literal JSON line as folder,
     which never resolved on disk) — that was the silent-empty-report
     bug observed in t_7f2b625c.
+
+    ``stealth=True`` passes ``--stealth`` so snatch.py escalates to
+    Scrapling's ``StealthyFetcher`` (camoufox) for bot-walled / Cloudflare
+    article sites. Argus uses this as a last-resort fetch retry (Phase 2).
+    ``transcript=True`` passes ``--transcript`` so video URLs yield their
+    caption track as markdown evidence.
     """
     args = [url, "--kind", kind]
     if dest:
         args += ["--dest", dest]
+    if stealth:
+        args.append("--stealth")
+    if transcript:
+        args.append("--transcript")
     t0 = time.time()
     rc, out, err = _run_script("snatch.py", args, timeout=timeout)
     duration = time.time() - t0
@@ -987,6 +999,93 @@ def search_web(
         return perplexity_search(query, max_results=max_results)
     logger.warning("search_web: unknown engine %r; returning []", engine)
     return []
+
+
+# ---------------------------------------------------------------------------
+# YouTube search (Phase 2) — yt-dlp lives in the intel-stack venv, so we shell
+# out to it the same way the fetch wrappers do. Metadata-only (flat playlist)
+# keeps it fast: no per-video extraction, no download.
+# ---------------------------------------------------------------------------
+
+def _run_yt_dlp(args: list[str], *, timeout: int = 60) -> tuple[int, str, str]:
+    """Run ``python -m yt_dlp`` in the intel-stack venv (which has yt-dlp).
+
+    PYTHONPATH is cleared so the intel-stack interpreter doesn't inherit the
+    argus venv / Hermes path leak (same rule as ``_run_script``).
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    cmd = [str(INTEL_PYTHON_BIN), "-m", "yt_dlp", *args]
+    logger.debug("exec: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            env=env, encoding="utf-8", errors="replace",
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.stdout or "") if isinstance(e.stdout, str) else "", (
+            f"timeout after {timeout}s"
+        )
+
+
+def youtube_search(query: str, *, max_results: int = 6, shorts: bool = False,
+                   timeout: int = 60) -> list[dict[str, Any]]:
+    """Search YouTube via yt-dlp's ``ytsearch`` and return video metadata.
+
+    Returns a list of ``{url, title, channel, duration, views, snippet,
+    source}`` dicts (``source="youtube"``). Fail-soft: any error (yt-dlp
+    missing, network, parse) returns ``[]`` so callers never crash.
+
+    ``shorts=True`` biases the query toward Shorts (appends ``#shorts``);
+    YouTube Shorts are just short videos, so results are still normal watch
+    URLs. ``--flat-playlist`` keeps it fast (metadata only, no download).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    if shorts:
+        q = f"{q} #shorts"
+    n = max(1, int(max_results))
+    args = [
+        f"ytsearch{n}:{q}",
+        "--flat-playlist", "--dump-json",
+        "--no-warnings", "--quiet", "--ignore-errors",
+    ]
+    t0 = time.time()
+    rc, out, err = _run_yt_dlp(args, timeout=timeout)
+    if rc != 0 and not out.strip():
+        logger.warning("youtube_search: yt-dlp rc=%s err=%s", rc,
+                       (err or "")[-200:])
+        return []
+    results: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        vid = d.get("id") or ""
+        url = (d.get("url") or d.get("webpage_url")
+               or (f"https://www.youtube.com/watch?v={vid}" if vid else ""))
+        if not url:
+            continue
+        results.append({
+            "url": url,
+            "title": d.get("title") or "",
+            "channel": d.get("channel") or d.get("uploader") or "",
+            "duration": d.get("duration"),
+            "views": d.get("view_count"),
+            "snippet": (d.get("description") or "")[:400],
+            "source": "youtube",
+        })
+        if len(results) >= n:
+            break
+    logger.info("youtube_search: %d result(s) in %.1fs", len(results),
+                time.time() - t0)
+    return results
 
 
 # LangChain tool wrappers (so the graph can call these as @tool).

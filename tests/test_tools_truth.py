@@ -488,3 +488,68 @@ def test_researcher_node_does_not_inject_planner_urls(monkeypatch):
 def _make_empty_harvest():
     from argus.tools import HarvestReport
     return HarvestReport(folder="", items=[], raw_stdout="", duration_s=0.0)
+
+
+# ----------------------------------------------------------------------
+# Phase 2: scrapling stealth fetch fallback
+# ----------------------------------------------------------------------
+
+def test_snatch_url_passes_stealth_and_transcript_flags(monkeypatch):
+    """snatch_url(stealth=True, transcript=True) must forward --stealth and
+    --transcript to snatch.py; the defaults must not include them."""
+    from argus import tools
+    captured: dict = {}
+
+    def fake_run_script(script, args, **kw):
+        captured["script"] = script
+        captured["args"] = list(args)
+        return (0, '{"ok": true, "folder": "A:\\\\nope"}', "")
+
+    monkeypatch.setattr(tools, "_run_script", fake_run_script)
+
+    tools.snatch_url("https://x.example", kind="auto",
+                     stealth=True, transcript=True)
+    assert captured["script"] == "snatch.py"
+    assert "--stealth" in captured["args"]
+    assert "--transcript" in captured["args"]
+
+    tools.snatch_url("https://x.example", kind="auto")
+    assert "--stealth" not in captured["args"]
+    assert "--transcript" not in captured["args"]
+
+
+def test_fetcher_retries_with_stealth_when_normal_fetch_fails(monkeypatch):
+    """When snatch (plain) + crawl both fail, fetcher_node retries once with
+    Scrapling stealth. A success there must land in fetched (bot-walled site
+    recovery)."""
+    from argus.graph import nodes as nodes_mod
+    from argus.tools import SnatchResult, CrawlResult
+
+    stealth_flags: list[bool] = []
+
+    def fake_snatch(url, *a, **kw):
+        stealth_flags.append(bool(kw.get("stealth")))
+        if kw.get("stealth"):
+            return SnatchResult(ok=True, folder="A:\\f",
+                                markdown_path="A:\\f\\ok.md",
+                                title="Stealth OK", url=url)
+        return SnatchResult(ok=False, url=url, error="403 bot wall")
+
+    def fake_crawl(url, *a, **kw):
+        return CrawlResult(ok=False, error="403", duration_s=0.0)
+
+    monkeypatch.setattr(nodes_mod, "snatch_url", fake_snatch)
+    monkeypatch.setattr(nodes_mod, "crawl_url", fake_crawl)
+
+    state = {
+        "sources": [{"url": "https://walled.example", "kind": "blog",
+                     "title": "W", "summary": ""}],
+        "fetched": [], "errors": [],
+    }
+    out = nodes_mod.fetcher_node(state)
+    assert True in stealth_flags, (
+        f"stealth retry must fire after snatch+crawl fail; calls={stealth_flags!r}"
+    )
+    assert len(out["fetched"]) == 1
+    assert out["fetched"][0]["url"] == "https://walled.example"
+    assert "errors" not in out or not out["errors"], out.get("errors")
