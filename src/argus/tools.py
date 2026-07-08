@@ -33,14 +33,20 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("argus.tools")
 
-# Optional dependency: duckduckgo_search provides DDGS, a free, no-key web
-# search backend. We import it lazily inside ddgs_search() so that the module
-# remains importable on hosts where the package is not installed. Tests
-# inject a fake DDGS via ``monkeypatch.setattr(tools, "DDGS", ...)``.
+# Optional dependency: DDGS is a free, no-key web search backend. The package
+# was renamed from ``duckduckgo_search`` to ``ddgs`` in 2025; the old name
+# still installs but its DuckDuckGo endpoint is dead and returns zero hits
+# (observed 2026-07-08). We import the maintained ``ddgs`` package first and
+# only fall back to the legacy name if it isn't present. Both expose the same
+# ``DDGS().text(query, ...)`` API returning ``{title, href, body}`` dicts.
+# Tests inject a fake DDGS via ``monkeypatch.setattr(tools, "DDGS", ...)``.
 try:  # pragma: no cover - exercised only at runtime when the package is present
-    from duckduckgo_search import DDGS as _DDGS  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - we want graceful degradation
-    _DDGS = None  # type: ignore[assignment]
+    from ddgs import DDGS as _DDGS  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    try:
+        from duckduckgo_search import DDGS as _DDGS  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover - we want graceful degradation
+        _DDGS = None  # type: ignore[assignment]
 
 # Re-export under a stable name so tests can ``monkeypatch.setattr(tools, "DDGS", ...)``.
 DDGS = _DDGS

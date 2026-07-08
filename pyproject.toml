@@ -16,6 +16,7 @@ dependencies = [
     "markdown>=3.6",
     "tenacity>=8.2",
     "reportlab>=4.0",
+    "ddgs>=9.0",
 ]
 
 [project.optional-dependencies]
