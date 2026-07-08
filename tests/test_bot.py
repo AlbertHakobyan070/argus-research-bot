@@ -1,11 +1,38 @@
 """Telegram bot smoke test — only verifies imports/wiring without connecting."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+from telegram.constants import ParseMode
 
 from argus.bot import (
     HELP_TEXT, build_application, _format_plan, _plan_keyboard,
+    _safe_send, _safe_edit_cb, _stream_progress, video_cmd,
 )
+
+
+class _FakeBot:
+    """Bot double that mimics Telegram rejecting markdown with unbalanced
+    entities (underscores in paths) but accepting plain text."""
+
+    def __init__(self):
+        self.sent: list[tuple[str, object]] = []
+        self._mid = 100
+
+    async def send_message(self, chat_id=None, text="", reply_markup=None,
+                           parse_mode=None, **kw):
+        if parse_mode == ParseMode.MARKDOWN and "_" in text:
+            raise RuntimeError("Can't parse entities: byte offset 113")
+        self._mid += 1
+        self.sent.append((text, parse_mode))
+        return SimpleNamespace(message_id=self._mid)
+
+    async def edit_message_text(self, chat_id=None, message_id=None, text="",
+                                parse_mode=None, **kw):
+        if parse_mode == ParseMode.MARKDOWN and "_" in text:
+            raise RuntimeError("Can't parse entities: byte offset 113")
+        return SimpleNamespace(message_id=message_id)
 
 
 def test_help_text_nonempty():
@@ -51,3 +78,47 @@ def test_build_application_requires_token(monkeypatch):
         build_application()
     # restore
     config_mod._cached = None
+
+
+# --- markdown-parse resilience (the "Can't parse entities" / "resume failed"
+#     bug hit live on 2026-07-09: report folder paths with underscores broke
+#     legacy-markdown sends and crashed the resume) ------------------------------
+
+async def test_safe_send_falls_back_to_plain_on_markdown_error():
+    bot = _FakeBot()
+    msg = await _safe_send(bot, 1, "A:/reports/2026_metacognitive_rl_transformers")
+    assert msg is not None, "message must still be sent"
+    assert bot.sent[-1][1] is None, "should have retried as plain text"
+
+
+async def test_stream_progress_survives_underscore_path():
+    """The exact crash: '📝 Report ready: <folder with underscores>'."""
+    bot = _FakeBot()
+    last = await _stream_progress(
+        bot, 1, "📝 Report ready: A:/r/20260709_topic_long", {"message_id": None})
+    assert last["message_id"] is not None
+    assert bot.sent[-1][1] is None  # plain fallback used
+
+
+async def test_safe_edit_cb_falls_back_to_plain():
+    calls: list[object] = []
+
+    class _Q:
+        async def edit_message_text(self, text, reply_markup=None, parse_mode=None):
+            if parse_mode == ParseMode.MARKDOWN and "_" in text:
+                raise RuntimeError("Can't parse entities")
+            calls.append(parse_mode)
+
+    await _safe_edit_cb(_Q(), "plan with _underscores_ and *stars*")
+    assert calls and calls[-1] is None  # plain fallback used
+
+
+def test_help_mentions_video_command():
+    assert "/video" in HELP_TEXT
+
+
+def test_report_keyboard_has_extend_button():
+    from argus.bot import _report_keyboard
+    labels = [b.text for row in _report_keyboard().inline_keyboard for b in row]
+    assert any("Extend" in l for l in labels)
+    assert any("Send" in l for l in labels)

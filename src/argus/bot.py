@@ -134,22 +134,72 @@ async def _send_md_doc(bot, chat_id: int, path: Path, caption: str = ""):
                                 filename=path.name, caption=caption[:1024])
 
 
-async def _stream_progress(bot, chat_id: int, text: str, last_msg: dict):
-    """Edit the previous progress message in place, or send a new one."""
+async def _safe_send(bot, chat_id: int, text: str, *, reply_markup=None,
+                     parse_mode=ParseMode.MARKDOWN):
+    """send_message that never dies on a Telegram markdown parse error.
+
+    Legacy-markdown mode chokes on raw dynamic content (file paths with ``_``,
+    topics with ``*``/``[``, etc.) with "Can't parse entities". We try the
+    requested parse_mode first, then retry as plain text so the message always
+    goes out. Returns the sent Message (or None if even the plain send failed).
+    """
     try:
-        if last_msg.get("message_id"):
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=last_msg["message_id"],
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        return await bot.send_message(chat_id=chat_id, text=text,
+                                      reply_markup=reply_markup,
+                                      parse_mode=parse_mode)
+    except Exception as e:
+        logger.warning("send (%s) failed (%s); retrying plain text",
+                       parse_mode, e)
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text,
+                                          reply_markup=reply_markup)
+        except Exception:
+            logger.exception("plain-text send also failed")
+            return None
+
+
+async def _safe_edit_cb(q, text: str, *, reply_markup=None,
+                        parse_mode=ParseMode.MARKDOWN):
+    """callback_query.edit_message_text with the same markdown->plain fallback."""
+    try:
+        return await q.edit_message_text(text, reply_markup=reply_markup,
+                                         parse_mode=parse_mode)
+    except Exception as e:
+        logger.warning("edit (%s) failed (%s); retrying plain text",
+                       parse_mode, e)
+        try:
+            return await q.edit_message_text(text, reply_markup=reply_markup)
+        except Exception:
+            logger.exception("plain-text edit also failed")
+            return None
+
+
+async def _stream_progress(bot, chat_id: int, text: str, last_msg: dict):
+    """Edit the previous progress message in place, or send a new one.
+
+    Bulletproof against markdown parse errors: progress strings often embed
+    report folder paths whose ``_`` underscores break legacy-markdown
+    ("Can't parse entities" -> the old "resume failed" crash). We try
+    markdown then plain for both the edit and the send.
+    """
+    mid = last_msg.get("message_id")
+    if mid:
+        for pm in (ParseMode.MARKDOWN, None):
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=mid,
+                                            text=text, parse_mode=pm)
+                return last_msg
+            except Exception:
+                continue  # try plain, then fall through to a fresh send
+    for pm in (ParseMode.MARKDOWN, None):
+        try:
+            msg = await bot.send_message(chat_id=chat_id, text=text,
+                                         parse_mode=pm)
+            last_msg["message_id"] = msg.message_id
             return last_msg
-    except Exception:
-        pass
-    msg = await bot.send_message(chat_id=chat_id, text=text,
-                                 parse_mode=ParseMode.MARKDOWN)
-    last_msg["message_id"] = msg.message_id
+        except Exception:
+            continue
+    logger.warning("progress update failed entirely for: %r", text[:80])
     return last_msg
 
 
@@ -344,8 +394,11 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         plan = cur.get("plan") or {}
         if plan:
             text = _format_plan(plan, length=length)
-            await ctx.application.bot.send_message(
-                chat_id=chat_id, text=text,
+            # _safe_send falls back to plain text if the plan body (topic /
+            # sub-questions / URLs) contains markdown-special chars — so the
+            # plan proposal ALWAYS renders instead of silently failing to send.
+            await _safe_send(
+                ctx.application.bot, chat_id, text,
                 reply_markup=_plan_keyboard(default_length=length),
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -415,10 +468,12 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     answer_text = delta.get("quick_answer") or answer_text
                 elif node == "deliver":
                     pass
-        await update.message.reply_text(
-            answer_text or "(no answer)",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        # LLM answers can contain unbalanced markdown; fall back to plain.
+        try:
+            await update.message.reply_text(
+                answer_text or "(no answer)", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(answer_text or "(no answer)")
     finally:
         await saver_cm.__aexit__(None, None, None)
 
@@ -518,8 +573,11 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Awaiting: `{info.get('awaiting','-')}`",
         f"Length: `{info.get('length','?')}`",
     ]
-    await update.message.reply_text("\n".join(snap_lines),
-                                    parse_mode=ParseMode.MARKDOWN)
+    try:
+        await update.message.reply_text("\n".join(snap_lines),
+                                        parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text("\n".join(snap_lines))
 
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -573,28 +631,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         info["length"] = chosen
         info["plan_approved"] = True
-        await q.edit_message_text(
+        await _safe_edit_cb(
+            q,
             (q.message.text or "")
             + f"\n\n_📏 Length set to *{_LENGTH_LABELS.get(chosen, chosen)}* "
               "— continuing._",
-            parse_mode=ParseMode.MARKDOWN,
         )
         await _resume_after_plan(ctx, thread_id, info)
         return
     if data == "plan:approve":
         info["plan_approved"] = True
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n_✅ Approved — continuing._",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _safe_edit_cb(
+            q, (q.message.text or "") + "\n\n_✅ Approved — continuing._")
         await _resume_after_plan(ctx, thread_id, info)
     elif data == "plan:edit":
         info["plan_approved"] = "edit"
         info["plan_edit"] = True
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n_✏️ Edit mode — reply with your changes._",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _safe_edit_cb(
+            q,
+            (q.message.text or "") + "\n\n_✏️ Edit mode — reply with your changes._")
     elif data == "plan:cancel":
         await _drop_inflight_with_saver(thread_id)
         await q.edit_message_text("❌ Cancelled.")
@@ -610,21 +665,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await graph.aupdate_state(cfg, {"extend_requested": True})
         except Exception:
             logger.exception("could not set extend_requested; aborting extend")
-            await q.edit_message_text(
-                (q.message.text or "") + "\n\n_⚠️ Extend failed to start._",
-                parse_mode=ParseMode.MARKDOWN)
+            await _safe_edit_cb(
+                q, (q.message.text or "") + "\n\n_⚠️ Extend failed to start._")
             return
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n_🔎 Extending research — gathering more…_",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _safe_edit_cb(
+            q,
+            (q.message.text or "") + "\n\n_🔎 Extending research — gathering more…_")
         await _resume_after_plan(ctx, thread_id, info)
     elif data == "report:revise":
         info["report_revise"] = True
-        await q.edit_message_text(
-            (q.message.text or "") + "\n\n_🔁 Revision requested._",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _safe_edit_cb(
+            q, (q.message.text or "") + "\n\n_🔁 Revision requested._")
         await _resume_after_report(ctx, thread_id, info, q,
                                     revision_requested=True)
     elif data == "report:cancel":
@@ -824,6 +875,23 @@ async def _drop_inflight_with_saver(thread_id: str) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler.
+
+    Without one, python-telegram-bot logs 'No error handlers are registered'
+    for every polling hiccup (e.g. a 409 Conflict when a second bot instance
+    is running). We log concisely; transient polling conflicts (409) are
+    demoted to a warning since they resolve once the duplicate poller exits.
+    """
+    err = getattr(ctx, "error", None)
+    from telegram.error import Conflict
+    if isinstance(err, Conflict):
+        logger.warning("Telegram 409 Conflict — another bot instance is "
+                       "polling this token. Stop the duplicate (see run.sh).")
+        return
+    logger.error("Unhandled bot error: %r", err, exc_info=err)
+
+
 def build_application() -> Application:
     s = get_settings()
     if not s.telegram_bot_token:
@@ -836,6 +904,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(_on_error)
     return app
 
 
