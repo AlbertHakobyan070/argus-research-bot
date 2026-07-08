@@ -905,6 +905,19 @@ Return JSON only:
     }
   }
 }
+
+
+CRITICAL (added 2026-07-09 - empty-Long-mode bug fix): if the evidence
+does not support even ONE grounded finding, do NOT return an empty
+`findings[]` field silently. Instead, return exactly:
+
+  {"findings": [], "no_evidence": true,
+   "no_evidence_reason": "<one short sentence naming what is missing>"}
+
+The report builder uses the `no_evidence=true` flag to surface a
+classified "synthesis_no_evidence" marker instead of a misleading
+1.4 KB skeleton. An empty `findings[]` without `no_evidence=true` is
+treated as a synthesis bug and produces a loud failure block.
 """
 
 
@@ -983,6 +996,19 @@ Return JSON only:
     }
   }
 }
+
+
+CRITICAL (added 2026-07-09 - empty-Long-mode bug fix): if the evidence
+does not support even ONE grounded finding, do NOT return an empty
+`findings[]` field silently. Instead, return exactly:
+
+  {"findings": [], "no_evidence": true,
+   "no_evidence_reason": "<one short sentence naming what is missing>"}
+
+The report builder uses the `no_evidence=true` flag to surface a
+classified "synthesis_no_evidence" marker instead of a misleading
+1.4 KB skeleton. An empty `findings[]` without `no_evidence=true` is
+treated as a synthesis bug and produces a loud failure block.
 """
 
 
@@ -1139,40 +1165,139 @@ def synthesizer_node(state: ArgusState) -> dict:
     draft_md = ""
     validated: dict = {}
     lecture_appendix: dict = {}
+    # T7-emptyLong-fix (2026-07-09): severity classification for the
+    # synthesis outcome. "ok" = normal success. "no_evidence" = LLM
+    # was honest, evidence base too thin to ground any finding
+    # (acceptable - narrow scope on retry is the user's move).
+    # "empty_fallback" = LLM violated the no_evidence contract by
+    # returning empty findings[] WITHOUT the no_evidence flag (bug,
+    # loud failure block). "synthesis_error" = parse / LLM call
+    # failed (degraded gracefully - bot stays alive, user sees a
+    # retryable error block).
+    synthesis_outcome: str = "ok"
+    synthesis_error: str = ""
+    synthesis_no_evidence_reason: str = ""
     try:
         data = _parse_json_obj(resp.content)
-        for fd in data.get("findings", []):
-            try:
-                findings.append(Finding.model_validate(fd))
-            except Exception as e:
-                logger.warning("bad finding: %s", e)
-        draft_md = data.get("draft_md") or _draft_md_from_findings(
-            state["user_request"], findings, length=length)
-        if mode.include_validated_assessment:
-            validated = _parse_validated_assessment(data)
-        if mode.include_appendix:
-            lecture_appendix = _parse_lecture_appendix(data)
+        if data.get("no_evidence") is True:
+            synthesis_outcome = "no_evidence"
+            synthesis_no_evidence_reason = (
+                data.get("no_evidence_reason")
+                or "Evidence base too thin to support any grounded finding."
+            )
+            draft_md = _no_evidence_failure_md(
+                state["user_request"], length=length,
+                fetched_count=len(fetched),
+                reason=synthesis_no_evidence_reason,
+            )
+            logger.info(
+                "synthesizer: no_evidence (length=%s, fetched=%d, reason=%s)",
+                length, len(fetched), synthesis_no_evidence_reason,
+            )
+        else:
+            for fd in (data.get("findings") or []):
+                try:
+                    findings.append(Finding.model_validate(fd))
+                except Exception as e:
+                    logger.warning("bad finding: %s", e)
+            if (not findings) and (not (data.get("draft_md") or "").strip()):
+                synthesis_outcome = "empty_fallback"
+                synthesis_no_evidence_reason = (
+                    "Synthesizer returned empty findings[] and empty draft_md "
+                    "without the required no_evidence=true flag."
+                )
+                draft_md = _no_evidence_failure_md(
+                    state["user_request"], length=length,
+                    fetched_count=len(fetched),
+                    reason=synthesis_no_evidence_reason,
+                )
+                logger.warning(
+                    "synthesizer: empty findings[] with no no_evidence flag "
+                    "(length=%s, fetched=%d) - emitting loud failure block",
+                    length, len(fetched),
+                )
+            else:
+                draft_md = data.get("draft_md") or _draft_md_from_findings(
+                    state["user_request"], findings, length=length)
+            if mode.include_validated_assessment:
+                validated = _parse_validated_assessment(data)
+            if mode.include_appendix:
+                lecture_appendix = _parse_lecture_appendix(data)
     except Exception as e:
-        logger.warning("Synthesizer returned non-JSON: %s", e)
+        synthesis_outcome = "synthesis_error"
+        synthesis_error = str(e)
+        logger.warning("Synthesizer returned non-JSON / failed parse: %s", e)
         draft_md = (
             f"# {state['user_request']}\n\n"
-            "_Synthesis incomplete -- model did not return structured JSON._\n\n"
-            f"Raw model output:\n\n```\n{resp.content[:3000]}\n```\n"
+            "⚠️ **Synthesis failed.**\n\n"
+            "- **Class:** `synthesis_error`\n"
+            f"- **Reason:** {synthesis_error[:500]}\n\n"
+            "The Argus pipeline could not produce a structured JSON response "
+            "on this attempt. Try `/research <topic>` again; if the failure "
+            "persists, narrow the scope.\n"
         )
 
     out: dict[str, Any] = {
         "findings": [f.model_dump() for f in findings],
         "draft_md": draft_md,
+        "synthesis_outcome": synthesis_outcome,
         "model_calls": [rec.model_dump()],
         "messages": [{"role": "assistant",
-                      "content": f"🧠 Synthesized {len(findings)} findings "
-                                 f"({mode.label})."}],
+                      "content": (
+                          f"🧠 Synthesized {len(findings)} findings ({mode.label})."
+                          if synthesis_outcome == "ok" else
+                          f"⚠️ Synthesis outcome: {synthesis_outcome} ({mode.label})."
+                      )}],
     }
+    if synthesis_error:
+        out["synthesis_error"] = synthesis_error
+    if synthesis_no_evidence_reason:
+        out["synthesis_no_evidence_reason"] = synthesis_no_evidence_reason
     if validated:
         out["validated_assessment"] = validated
     if lecture_appendix:
         out["lecture_appendix"] = lecture_appendix
     return out
+
+
+def _no_evidence_failure_md(topic: str, *, length: str,
+                            fetched_count: int, reason: str) -> str:
+    """Loud, classified failure block (T7-emptyLong-fix, 2026-07-09).
+
+    Replaces the previous quiet 1.4 KB skeleton that carried the
+    literal sentinels `Sectioned report (Long). 0 findings.` and
+    `Fallback document -- open problems not enumerated.`. Used when
+    the synthesizer was honest about a thin evidence base
+    (`no_evidence=true`) or when it silently violated the contract
+    (empty_fallback).
+
+    The class, mode, fetched count, and reason are surfaced in the
+    block so a kanban reviewer or the user can immediately diagnose
+    why the report is short - instead of getting a markdown that
+    looks like a successful run with empty sections.
+    """
+    from .synthesis_modes import get_mode
+    mode = get_mode(length)
+    return (
+        f"# {topic}\n\n"
+        "⚠️ **Synthesis could not produce findings.**\n\n"
+        "- **Class:** `synthesis_no_evidence`\n"
+        f"- **Mode:** {mode.label}\n"
+        f"- **Fetched evidence:** {fetched_count} item(s)\n"
+        f"- **Reason:** {reason or '(no reason given)'}\n\n"
+        "This is a classified synthesis failure (not a successful report). "
+        "The pipeline could not derive at least one grounded, cited "
+        "finding from the fetched evidence.\n\n"
+        "**Try:**\n"
+        "1. `/research <narrower scope>` - fewer sub-topics, more concrete entity.\n"
+        "2. Wait a minute and retry - transient OpenRouter 5xx and malformed\n"
+        "   JSON are auto-recovered on the next run.\n"
+        "3. If this keeps happening for the same topic, the entity may\n"
+        "   genuinely have thin public coverage; consult a human-curated\n"
+        "   source instead.\n"
+    )
+
+
 def _draft_md_from_findings(topic: str, findings: list[Finding],
                             *, length: str = "short") -> str:
     """Fallback markdown builder when the LLM failed to return one.
