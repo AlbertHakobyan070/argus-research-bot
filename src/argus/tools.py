@@ -887,16 +887,38 @@ def perplexity_search(query: str, *, max_results: int = 8) -> list[dict[str, str
     return out
 
 
-def ddgs_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
+def _validate_timelimit(timelimit: str | None) -> str | None:
+    """Validate the timelimit arg. Empty string is treated as None so callers
+    don't have to special-case missing env vars. Anything outside the
+    whitelist raises ValueError so callers don't silently send garbage to
+    DDGS (which would either ignore it or raise a confusing TypeError).
+    Returns the normalized value (None or one of d/w/m/y).
+    """
+    effective = timelimit if timelimit else None
+    if effective is not None and effective not in ("d", "w", "m", "y"):
+        raise ValueError(
+            f"timelimit must be one of ['d', 'w', 'm', 'y'] or None, got {timelimit!r}"
+        )
+    return effective
+
+
+def ddgs_search(query: str, *, max_results: int = 8,
+                timelimit: str | None = None) -> list[dict[str, str]]:
     """Search DuckDuckGo via the ``duckduckgo_search`` library (DDGS).
 
     Returns ``[]`` (with a logged warning) if the library is not installed
     or DDGS raises. The mapping from DDGS's ``{href,title,body}`` to our
     unified ``{url,title,snippet}`` schema lives here so callers never have
     to know the source library's field names.
+
+    ``timelimit`` (lifted from NVIDIA AI-Q Blueprint's
+    sources/duckduckgo_news_search/src/register.py) scopes results to a
+    recency window: ``"d"``=day, ``"w"``=week, ``"m"``=month, ``"y"``=year,
+    or ``None`` for no limit. Empty string is treated as None.
     """
     if not (query or "").strip():
         return []
+    effective_timelimit = _validate_timelimit(timelimit)
     if DDGS is None:  # pragma: no cover - package not installed on this host
         logger.warning("ddgs_search: duckduckgo_search not installed; returning []")
         return []
@@ -906,11 +928,17 @@ def ddgs_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
         # (matches duckduckgo_search >= 6.x) and fall back to context
         # form on AttributeError for robustness.
         client = DDGS()
+        # Build kwargs. Always include timelimit (with None when unset) so
+        # callers/tests can observe the decision.
+        text_kwargs: dict = {
+            "max_results": max(1, int(max_results)),
+            "timelimit": effective_timelimit,
+        }
         try:
-            hits = client.text(query, max_results=max(1, int(max_results)))
+            hits = client.text(query, **text_kwargs)
         except AttributeError:
             with DDGS() as ctx:
-                hits = ctx.text(query, max_results=max(1, int(max_results)))
+                hits = ctx.text(query, **text_kwargs)
     except Exception as e:
         logger.warning("ddgs_search: failure (%s); returning []", e)
         return []
@@ -929,7 +957,8 @@ def ddgs_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
 
 
 def search_web(
-    query: str, *, max_results: int = 8, engine: str = "ddgs"
+    query: str, *, max_results: int = 8, engine: str = "ddgs",
+    timelimit: str | None = None,
 ) -> list[dict[str, str]]:
     """Unified web-search API for the Argus graph.
 
@@ -947,7 +976,7 @@ def search_web(
         return []
     engine = (engine or "ddgs").strip().lower()
     if engine == "ddgs":
-        return ddgs_search(query, max_results=max_results)
+        return ddgs_search(query, max_results=max_results, timelimit=timelimit)
     if engine == "perplexity":
         return perplexity_search(query, max_results=max_results)
     logger.warning("search_web: unknown engine %r; returning []", engine)

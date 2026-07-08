@@ -53,10 +53,25 @@ class _FakeDDGS:
                 "body": "Snippet B",
             },
         ]
+        self.last_text_kwargs: dict[str, Any] = {}  # captured for inspection
 
     def text(self, query: str, max_results: int | None = None,
              **_kwargs: Any) -> list[dict[str, str]]:
+        # Capture all kwargs so tests can assert on timelimit/etc.
+        self.last_text_kwargs = {"max_results": max_results, **_kwargs}
         return list(self.results)[: max_results] if max_results else list(self.results)
+
+
+class _CapturingDDGS(_FakeDDGS):
+    """Records every text() call (query + kwargs) so tests can assert."""
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.calls: list[dict[str, Any]] = []
+
+    def text(self, query: str, max_results: int | None = None,
+             **_kwargs: Any) -> list[dict[str, str]]:
+        self.calls.append({"query": query, "max_results": max_results, **_kwargs})
+        return super().text(query, max_results=max_results, **_kwargs)
 
 
 class _FakeResponse:
@@ -290,3 +305,73 @@ def test_langchain_tool_wrapper_exposed() -> None:
     lc_tools = tools.make_langchain_tools()
     names = {t.name for t in lc_tools if isinstance(t, BaseTool)}
     assert "search_web" in names
+
+
+# ---------------------------------------------------------------------------
+# 5. ddgs_search timelimit (lifted from NVIDIA AI-Q Blueprint
+#    sources/duckduckgo_news_search/src/register.py)
+# ---------------------------------------------------------------------------
+# AI-Q's news-search wrapper forwards ``timelimit='d' | 'w' | 'm' | 'y' | None``
+# to duckduckgo_search so news queries can scope to recent results. Argus
+# currently has ddgs_search but doesn't expose the timelimit parameter.
+# Adding it is a 3-line change with real value: news queries become time-scoped.
+
+
+@pytest.mark.parametrize("timelimit,expected", [
+    ("d", "d"),
+    ("w", "w"),
+    ("m", "m"),
+    ("y", "y"),
+    (None, None),
+    ("", None),  # empty string means "no timelimit" (per duckduckgo_search)
+])
+def test_ddgs_search_forwards_timelimit(monkeypatch, timelimit, expected):
+    """ddgs_search must forward the ``timelimit`` kwarg to DDGS().text()."""
+    captured_kwargs: dict[str, Any] = {}
+
+    class _SpyDDGS:
+        def text(self, query: str, max_results: int | None = None,
+                 **kwargs: Any) -> list[dict[str, str]]:
+            captured_kwargs.update(kwargs)
+            return [{"href": "https://x", "title": "t", "body": "b"}]
+
+    monkeypatch.setattr(tools, "DDGS", lambda: _SpyDDGS())
+
+    tools.ddgs_search("ai breakthrough", max_results=5, timelimit=timelimit)
+
+    assert "timelimit" in captured_kwargs, (
+        "ddgs_search must forward the timelimit kwarg to DDGS().text() — "
+        "lifted from AI-Q's duckduckgo_news_search."
+    )
+    assert captured_kwargs["timelimit"] == expected, (
+        f"timelimit not passed through correctly: "
+        f"input={timelimit!r} got={captured_kwargs['timelimit']!r}"
+    )
+
+
+def test_ddgs_search_timelimit_rejects_invalid_value():
+    """Invalid timelimit values (anything other than d/w/m/y/None) must
+    raise ValueError so callers don't silently send garbage to DDGS."""
+    for bad in ["z", "week", "7", "hour", 5, True]:
+        with pytest.raises(ValueError):
+            tools.ddgs_search("anything", timelimit=bad)
+
+
+def test_search_web_forwards_timelimit(monkeypatch):
+    """The unified ``search_web(engine='ddgs', timelimit=...)`` API must also
+    accept and forward timelimit, so callers don't need to know about
+    engine-specific kwargs."""
+    captured_kwargs: dict[str, Any] = {}
+
+    class _SpyDDGS:
+        def text(self, query: str, max_results: int | None = None,
+                 **kwargs: Any) -> list[dict[str, str]]:
+            captured_kwargs.update(kwargs)
+            return [{"href": "https://x", "title": "t", "body": "b"}]
+
+    monkeypatch.setattr(tools, "DDGS", lambda: _SpyDDGS())
+
+    tools.search_web("news", engine="ddgs", timelimit="w")
+    assert captured_kwargs.get("timelimit") == "w", (
+        "search_web(engine='ddgs', timelimit=...) must forward the kwarg."
+    )
