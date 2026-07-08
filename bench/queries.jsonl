@@ -1,0 +1,10 @@
+{"id": "q001", "query": "What are the main architectural layers of NVIDIA AI-Q Blueprint?", "expected_domains": ["github.com", "nvidia.com"], "difficulty": "medium"}
+{"id": "q002", "query": "How does event-sourced job infrastructure work in agent systems?", "expected_domains": ["arxiv.org", "github.com"], "difficulty": "medium"}
+{"id": "q003", "query": "Recent advances in transformer interpretability 2025", "expected_domains": ["arxiv.org"], "difficulty": "hard"}
+{"id": "q004", "query": "What is the Golden Record pattern for RAG knowledge layers?", "expected_domains": ["github.com"], "difficulty": "easy"}
+{"id": "q005", "query": "Compare LangChain Deep Agents and LangGraph for long-horizon research", "expected_domains": ["python.langchain.com", "langchain-ai.github.io"], "difficulty": "hard"}
+{"id": "q006", "query": "How does DuckDuckGo's timelimit parameter affect news search results?", "expected_domains": ["duckduckgo.com"], "difficulty": "easy"}
+{"id": "q007", "query": "What are the main types of citation hallucinations in LLM research reports?", "expected_domains": ["arxiv.org", "acm.org"], "difficulty": "hard"}
+{"id": "q008", "query": "How does PostgreSQL LISTEN/NOTIFY work for real-time event streaming?", "expected_domains": ["postgresql.org"], "difficulty": "easy"}
+{"id": "q009", "query": "Best practices for testing citation-grounded LLM outputs", "expected_domains": ["arxiv.org"], "difficulty": "hard"}
+{"id": "q010", "query": "What is the LangGraph interrupt mechanism and how do agents resume?", "expected_domains": ["langchain-ai.github.io"], "difficulty": "medium"}
