@@ -23,6 +23,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,18 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("argus.tools")
+
+# Optional dependency: duckduckgo_search provides DDGS, a free, no-key web
+# search backend. We import it lazily inside ddgs_search() so that the module
+# remains importable on hosts where the package is not installed. Tests
+# inject a fake DDGS via ``monkeypatch.setattr(tools, "DDGS", ...)``.
+try:  # pragma: no cover - exercised only at runtime when the package is present
+    from duckduckgo_search import DDGS as _DDGS  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - we want graceful degradation
+    _DDGS = None  # type: ignore[assignment]
+
+# Re-export under a stable name so tests can ``monkeypatch.setattr(tools, "DDGS", ...)``.
+DDGS = _DDGS
 
 INTEL_STACK_DIR = Path(r"A:\Hermes\Agents\intel-stack\scripts")
 PYTHON_BIN = Path(sys.executable)  # the argus venv's python
@@ -768,11 +782,183 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
     doc.build(flow)
 
 
+# ---------------------------------------------------------------------------
+# Web search (handoff action #4 — see HANDOFF-RESEARCH-2026-07-08.md §6)
+# ---------------------------------------------------------------------------
+#
+# Background: Argus's planner is bad at producing real URLs. The fix is to
+# give it a tool to find them. ``search_web`` is a thin unified wrapper
+# that returns ``list[{url, title, snippet, source}]`` so the graph nodes
+# can substitute planner URLs with real ones.
+#
+# Two backends:
+#   * ``perplexity`` — https://api.perplexity.ai (requires PERPLEXITY_API_KEY).
+#     Free tier is fine; we use the Search endpoint with model='sonar'.
+#     If the key is missing we return [] with a logged warning (don't crash).
+#   * ``ddgs`` — duckduckgo-search library, free, no key, hits duckduckgo.com.
+#
+# Both fail soft: any exception (network, parse, library bug) degrades to
+# [] + a warning. The graph never crashes because a search backend is down.
+
+PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search"
+PERPLEXITY_MODEL = "sonar"
+DEFAULT_WEB_TIMEOUT_S = 20
+
+
+def _normalize_web_hit(
+    *, url: str, title: str, snippet: str, source: str
+) -> dict[str, str]:
+    """Build a single hit dict; never raise on missing keys."""
+    return {
+        "url": (url or "").strip(),
+        "title": (title or "").strip(),
+        "snippet": (snippet or "").strip(),
+        "source": source,
+    }
+
+
+def perplexity_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
+    """Call Perplexity's Search endpoint and return hits in our unified schema.
+
+    Returns ``[]`` (with a logged warning) when ``PERPLEXITY_API_KEY`` is
+    not set in the environment, so the graph never crashes for a missing
+    optional key.
+    """
+    api_key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        logger.warning(
+            "perplexity_search: PERPLEXITY_API_KEY is not set; returning []"
+        )
+        return []
+    if not (query or "").strip():
+        return []
+
+    payload = json.dumps({
+        "query": query,
+        "max_results": max(1, int(max_results)),
+        "model": PERPLEXITY_MODEL,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        PERPLEXITY_SEARCH_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DEFAULT_WEB_TIMEOUT_S) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        obj = json.loads(body)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError, OSError) as e:
+        logger.warning("perplexity_search: HTTP/parse failure (%s); returning []", e)
+        return []
+
+    # The Search endpoint returns {"results": [{title, url, snippet, ...}, ...]}.
+    # Some Perplexity responses wrap a single "result" string; we tolerate
+    # both shapes because the contract has drifted over time.
+    raw = obj.get("results")
+    if isinstance(raw, list):
+        hits_iter = raw
+    elif isinstance(obj.get("result"), str):
+        # No structured list — synthesise a single hit pointing at the API
+        # answer text so the planner still gets *something* useful.
+        return [_normalize_web_hit(
+            url="", title="Perplexity answer",
+            snippet=obj["result"][:600], source="perplexity",
+        )]
+    else:
+        logger.warning("perplexity_search: unexpected payload shape; returning []")
+        return []
+
+    out: list[dict[str, str]] = []
+    for h in hits_iter[: max(1, int(max_results))]:
+        if not isinstance(h, dict):
+            continue
+        out.append(_normalize_web_hit(
+            url=h.get("url", ""),
+            title=h.get("title", ""),
+            snippet=h.get("snippet", ""),
+            source="perplexity",
+        ))
+    return out
+
+
+def ddgs_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
+    """Search DuckDuckGo via the ``duckduckgo_search`` library (DDGS).
+
+    Returns ``[]`` (with a logged warning) if the library is not installed
+    or DDGS raises. The mapping from DDGS's ``{href,title,body}`` to our
+    unified ``{url,title,snippet}`` schema lives here so callers never have
+    to know the source library's field names.
+    """
+    if not (query or "").strip():
+        return []
+    if DDGS is None:  # pragma: no cover - package not installed on this host
+        logger.warning("ddgs_search: duckduckgo_search not installed; returning []")
+        return []
+    try:
+        # The library's ``text`` is a context-manager-required method on
+        # some versions, and a plain method on others. Use the plain form
+        # (matches duckduckgo_search >= 6.x) and fall back to context
+        # form on AttributeError for robustness.
+        client = DDGS()
+        try:
+            hits = client.text(query, max_results=max(1, int(max_results)))
+        except AttributeError:
+            with DDGS() as ctx:
+                hits = ctx.text(query, max_results=max(1, int(max_results)))
+    except Exception as e:
+        logger.warning("ddgs_search: failure (%s); returning []", e)
+        return []
+
+    out: list[dict[str, str]] = []
+    for h in (hits or [])[: max(1, int(max_results))]:
+        if not isinstance(h, dict):
+            continue
+        out.append(_normalize_web_hit(
+            url=h.get("href") or h.get("url") or "",
+            title=h.get("title") or "",
+            snippet=h.get("body") or h.get("snippet") or "",
+            source="ddgs",
+        ))
+    return out
+
+
+def search_web(
+    query: str, *, max_results: int = 8, engine: str = "ddgs"
+) -> list[dict[str, str]]:
+    """Unified web-search API for the Argus graph.
+
+    Returns a list of ``{url, title, snippet, source}`` dicts. Fail-soft:
+    any backend error (missing key, network, parse) returns ``[]`` so the
+    graph never crashes because a search backend is unavailable.
+
+    Args:
+        query: The search query string. Empty/whitespace -> ``[]``.
+        max_results: Hint forwarded to the backend. Defaults to 8.
+        engine: ``'ddgs'`` (default, free) or ``'perplexity'`` (needs key).
+            Unknown engines log a warning and return ``[]``.
+    """
+    if not (query or "").strip():
+        return []
+    engine = (engine or "ddgs").strip().lower()
+    if engine == "ddgs":
+        return ddgs_search(query, max_results=max_results)
+    if engine == "perplexity":
+        return perplexity_search(query, max_results=max_results)
+    logger.warning("search_web: unknown engine %r; returning []", engine)
+    return []
+
+
 # LangChain tool wrappers (so the graph can call these as @tool).
 def make_langchain_tools():
     from langchain_core.tools import tool
 
-    @tool("harvest_sources", parse_docstring=True)
+    @tool("harvest_sources", parse_docstring=False)
     def t_harvest(hours: int = 72, top: int = 8,
                   sections: str = "papers,repos,news,blogs") -> dict:
         """Pull primary-source items (papers, repos, news, blogs) from the
@@ -780,19 +966,38 @@ def make_langchain_tools():
         r = harvest_sources(hours=hours, top=top, sections=sections)
         return r.model_dump()
 
-    @tool("snatch_url", parse_docstring=True)
+    @tool("snatch_url", parse_docstring=False)
     def t_snatch(url: str, kind: str = "auto") -> dict:
         """Download a single URL (paper/article/media) and convert to markdown."""
         return snatch_url(url, kind=kind).model_dump()
 
-    @tool("crawl_url", parse_docstring=True)
+    @tool("crawl_url", parse_docstring=False)
     def t_crawl(url: str, deep: bool = False, max_pages: int = 8) -> dict:
         """Crawl a documentation site or SPA with crawl4ai and return markdown."""
         return crawl_url(url, deep=deep, max_pages=max_pages).model_dump()
 
-    @tool("normalize_markdown", parse_docstring=True)
+    @tool("normalize_markdown", parse_docstring=False)
     def t_normalize(source: str) -> dict:
         """Convert a URL or local file into clean markdown via article_convert."""
         return normalize_to_markdown(source).model_dump()
 
-    return [t_harvest, t_snatch, t_crawl, t_normalize]
+    @tool("search_web", parse_docstring=False)
+    def t_search_web(
+        query: str, max_results: int = 8, engine: str = "ddgs"
+    ) -> list[dict]:
+        """Web search returning a list of result dicts.
+
+        Use this when the planner's planned URLs look made-up or when you
+        need fresh sources. ``engine='ddgs'`` (default) is free and needs
+        no API key; ``engine='perplexity'`` uses the Perplexity API when
+        ``PERPLEXITY_API_KEY`` is set. Returns an empty list on failure
+        (never raises), so the graph degrades gracefully.
+
+        Args:
+            query: The search query string.
+            max_results: Maximum number of results to return (default 8).
+            engine: 'ddgs' (default, free) or 'perplexity' (needs key).
+        """
+        return search_web(query, max_results=max_results, engine=engine)
+
+    return [t_harvest, t_snatch, t_crawl, t_normalize, t_search_web]
