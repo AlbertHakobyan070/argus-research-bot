@@ -5,6 +5,8 @@ __pycache__/
 reports/
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
 *.db
 .langgraph_checkpoints/
 .env
