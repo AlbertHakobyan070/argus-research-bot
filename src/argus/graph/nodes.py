@@ -1390,6 +1390,34 @@ def report_builder_node(state: ArgusState) -> dict:
         + f" • mode: {mode.label}_\n"
         + appendix
     )
+
+    # Citation integrity pass (lifted from NVIDIA AI-Q Blueprint).
+    # Every URL in the final report must resolve to a URL that was
+    # actually fetched by a researcher tool. Anything else is stripped,
+    # along with its inline citation, and recorded in the audit trail.
+    # This is the structural fix for the 2026-07-08 hallucinated-URL bug.
+    try:
+        from ..citations import (
+            SourceRegistry as _CitationRegistry,
+            verify_citations as _verify_citations,
+            sanitize_report as _sanitize_report,
+        )
+        _reg = _CitationRegistry()
+        _reg.add_from_fetched(state.get("fetched") or [])
+        _verified = _verify_citations(md_text, _reg)
+        _sanitized = _sanitize_report(_verified.verified_report)
+        md_text = _sanitized.cleaned_text
+        if _verified.removed_citations or _sanitized.removed:
+            logger.info(
+                "citation integrity: stripped %d unregistered URL(s), %d sanitized URL(s)",
+                len(_verified.removed_citations),
+                len(_sanitized.removed),
+            )
+    except Exception as _e:
+        # Citation module failure must NOT block report delivery; degrade
+        # gracefully and log. The user's bot should always produce a report.
+        logger.warning("citation integrity pass skipped (%s); report unchanged", _e)
+
     md_path.write_text(md_text, encoding="utf-8")
 
     pdf_ok = False
