@@ -199,6 +199,28 @@ def test_reflexion_revise_then_pass(monkeypatch, tmp_path):
     monkeypatch.setattr(nm2, "intake_node", _fake_intake)
     graph_mod2.intake_node = _fake_intake
 
+    # researcher_node now runs the real 3-way subgraph (live network). Mock it
+    # to return the single seeded source so this reflexion test stays hermetic
+    # AND the now-active citation-integrity pass can resolve the cited URL
+    # (it builds the registry from state["fetched"], so the cited example.com/a
+    # must genuinely be fetched, not just named in the synthesizer's draft).
+    def _fake_research(state, **kw):
+        return {"sources": [{"kind": "paper", "title": "Source A",
+                             "url": "https://example.com/a",
+                             "summary": "primary", "source": "test"}],
+                "messages": [], "errors": []}
+    monkeypatch.setattr(nm2, "run_researcher_subgraph", _fake_research)
+
+    # Mock the fetch so fetcher_node yields example.com/a backed by the tmp
+    # markdown file created above (kept by filter_node, registered for the
+    # citation check).
+    from argus.tools import SnatchResult
+    def _fake_snatch(url, *a, **kw):
+        return SnatchResult(ok=True, folder=str(tmp_path),
+                            markdown_path=str(tmp_path / "x.md"),
+                            title="Source A", url=url)
+    monkeypatch.setattr(nm2, "snatch_url", _fake_snatch)
+
     monkeypatch.setenv("ARGUS_REPORTS_ROOT", str(tmp_path))
     # Invalidate cached settings so the report_builder picks it up.
     from argus import config as cfg_mod

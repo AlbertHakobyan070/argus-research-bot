@@ -29,6 +29,7 @@ from .state import (
 )
 from .synthesis_modes import get_mode, is_valid as is_valid_length
 from .credibility import score_fetched, CREDIBILITY_FLOOR
+from .researcher_subgraph import run_researcher_subgraph
 
 logger = logging.getLogger("argus.nodes")
 
@@ -388,105 +389,32 @@ def planner_reflect_node(state: ArgusState) -> dict:
 # ---------------------------------------------------------------------------
 
 def researcher_node(state: ArgusState) -> dict:
-    """Gather candidate URLs from intel-radar + arXiv + web search.
+    """Gather candidate sources via the 3-way researcher subgraph.
 
-    Honours any pre-seeded ``state["sources"]`` (used by the demo to
-    inject a static corpus) — we dedupe by URL, so re-adding them is
-    a no-op.
+    Delegates to :func:`run_researcher_subgraph`, which fans out to three
+    sub-researchers in parallel — arXiv (papers), GitHub (repos), and web
+    search (blogs / news / official docs via DDGS) — and merges their
+    results by URL. This replaces the legacy single-node
+    harvest + arXiv + planner-URL path.
 
-    Tool failures are appended to ``state["errors"]`` (via the
-    ``Annotated[list[str], operator.add]`` reducer on ArgusState) so the
-    report can show "0 sources because harvest/arXiv failed" instead of
-    silently producing a "no evidence" report. See Argus T2 (Pattern E).
+    Two properties matter for the bugs this fixes (2026-07-09):
+
+    * **No hallucinated URLs.** The subgraph searches fresh for each source
+      kind instead of trusting the planner's ``target_url`` values, so the
+      planner's invented URLs never enter the candidate set. (The old node
+      copied ``planned_source.target_url`` straight into ``sources`` — that
+      is how fabricated links like ``https://nvidia.com/ai-blueprint``
+      reached the fetcher.)
+    * **Failure isolation + observability.** A failure in any one sub is
+      captured as an error string and surfaced in ``state["errors"]`` (via
+      the ``operator.add`` reducer) without poisoning the other subs.
+
+    The arXiv T6 orphan-topic fallback (raw ``user_request`` query when the
+    structured plan yields nothing) is preserved inside ``arxiv_sub``.
+    Pre-seeded ``state["sources"]`` (demo/static corpus) are honoured — the
+    subgraph's merge step lists them first. See ``researcher_subgraph.py``.
     """
-    plan = ResearchPlan.model_validate(state.get("plan") or {})
-    sources: list[dict] = list(state.get("sources") or [])
-    seen = {s["url"] for s in sources if s.get("url")}
-    errors: list[str] = []
-    # Use harvest for primary-source radar (papers/repos/news/blogs).
-    try:
-        harvest = harvest_sources(hours=72, top=6,
-                                  sections="papers,repos,news,blogs")
-        for item in harvest.items[:25]:
-            if item.url in seen:
-                continue
-            if _matches_plan(item.title + " " + item.summary, plan):
-                sources.append({
-                    "kind": item.section or "search_result",
-                    "title": item.title,
-                    "url": item.url,
-                    "summary": item.summary,
-                    "source": "intel-radar",
-                })
-                seen.add(item.url)
-    except Exception as e:
-        msg = f"harvest_sources failed: {e!r}"
-        logger.warning(msg)
-        errors.append(msg)
-
-    # T6 fix: arXiv search is no longer gated on the planner having
-    # labelled any source as kind="paper". A weak plan (no paper
-    # labels) used to silently produce empty sources and roll forward
-    # into a vacuous "no evidence" report. We always try arXiv when
-    # we have keywords.
-    try:
-        arxiv_items = _arxiv_search(plan)
-        for it in arxiv_items:
-            if it["url"] in seen:
-                continue
-            sources.append(it)
-            seen.add(it["url"])
-    except Exception as e:
-        msg = f"arxiv_search failed: {e!r}"
-        logger.warning(msg)
-        errors.append(msg)
-
-    # And any explicit target URLs from the plan.
-    for s in plan.planned_sources:
-        if s.target_url and s.target_url.startswith("http"):
-            if s.target_url in seen:
-                continue
-            sources.append({
-                "kind": s.kind,
-                "title": s.query or s.target_url,
-                "url": s.target_url,
-                "summary": s.rationale,
-                "source": "planner",
-            })
-            seen.add(s.target_url)
-
-    # T6 fallback: if we still have ZERO sources after harvest + arxiv
-    # + planner urls, the topic is too niche for those sources. Run
-    # one more arxiv pass using the raw user_request directly. This
-    # closes the "orphan topic -> 0 sources -> no evidence" gap
-    # observed in the live bot on 2026-07-08.
-    if not sources and state.get("user_request"):
-        try:
-            fallback_items = _arxiv_search_raw(state["user_request"])
-            for it in fallback_items:
-                if it["url"] in seen:
-                    continue
-                sources.append(it)
-                seen.add(it["url"])
-            if fallback_items:
-                logger.info(
-                    "researcher_node T6 fallback: arxiv raw-query "
-                    "produced %d items", len(fallback_items)
-                )
-        except Exception as e:
-            msg = f"researcher_node T6 fallback failed: {e!r}"
-            logger.warning(msg)
-            errors.append(msg)
-
-    sources = sources[:18]
-    out: dict[str, Any] = {
-        "sources": sources,
-        "messages": [{"role": "assistant",
-                      "content": f"🔍 {len(sources)} candidate sources."}],
-    }
-    if errors:
-        out["errors"] = errors
-    return out
+    return run_researcher_subgraph(state)
 
 
 def _matches_plan(text: str, plan: ResearchPlan) -> bool:
@@ -743,21 +671,71 @@ def credibility_node(state: ArgusState) -> dict:
 # filter / rank
 # ---------------------------------------------------------------------------
 
+_FILTER_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "that", "this", "what",
+    "how", "why", "are", "was", "were", "has", "have", "its", "their",
+})
+
+
+def _keyword_words(keywords: list[str]) -> list[str]:
+    """Tokenise the plan's must_have_keywords into distinct signal words.
+
+    The old filter matched each *whole* keyword phrase (e.g.
+    ``"nvidia ai-q blueprint"``) as a literal substring, so a source whose
+    text said "AI-Q NVIDIA Blueprint" (different word order) scored zero and
+    got dropped — the empty-report bug on the AI-Q query (2026-07-08). We
+    split phrases into words so partial, out-of-order overlap still counts.
+    Words shorter than 3 chars are dropped (they match too much as
+    substrings, e.g. "ai" in "domain").
+    """
+    words: list[str] = []
+    seen: set[str] = set()
+    for k in keywords:
+        for w in re.split(r"[^a-z0-9]+", (k or "").lower()):
+            if len(w) >= 3 and w not in _FILTER_STOPWORDS and w not in seen:
+                seen.add(w)
+                words.append(w)
+    return words
+
+
 def filter_node(state: ArgusState) -> dict:
-    """Drop low-signal items; keep provenance."""
+    """Rank fetched items by relevance + credibility; keep the top 14.
+
+    Design note (2026-07-09): this used to *hard-drop* any item whose
+    whole-phrase keyword score fell below 0.05, which discarded even the
+    correct source when the planner's keywords were multi-word phrases —
+    a primary cause of empty reports. The sources now arrive from
+    topic-targeted searches (ddgs / GitHub / arXiv via the researcher
+    subgraph), so relevance is best used to *rank* rather than to gate.
+    We keep every item that has an on-disk evidence body, rank by
+    (relevance, credibility), and cap at 14. We only surface an error if
+    filtering removed everything (which should now only happen when no
+    item has a markdown body at all).
+    """
     fetched = [FetchedItem.model_validate(f) for f in state.get("fetched") or []]
     plan = ResearchPlan.model_validate(state.get("plan") or {})
-    keywords = [k.lower() for k in plan.must_have_keywords] or \
-        [state["user_request"][:30].lower()]
-    scored: list[FetchedItem] = []
+    kw_words = _keyword_words(plan.must_have_keywords) or \
+        _keyword_words([state.get("user_request", "")])
+    kept: list[FetchedItem] = []
     for f in fetched:
+        if not f.markdown_path:
+            continue  # no evidence body on disk → nothing to synthesize from
         haystack = (f.title + " " + f.excerpt).lower()
-        score = sum(1.0 for k in keywords if k in haystack) / max(1, len(keywords))
-        f.relevance_score = score
-        if score >= 0.05 and f.markdown_path:
-            scored.append(f)
-    scored.sort(key=lambda x: x.relevance_score, reverse=True)
-    return {"fetched": [f.model_dump() for f in scored[:14]]}
+        if kw_words:
+            hits = sum(1 for w in kw_words if w in haystack)
+            f.relevance_score = hits / len(kw_words)
+        # else: leave relevance_score as-is (e.g. pre-seeded test corpus)
+        kept.append(f)
+    kept.sort(key=lambda x: (x.relevance_score, x.credibility_score or 0.0),
+              reverse=True)
+    kept = kept[:14]
+    out: dict[str, Any] = {"fetched": [f.model_dump() for f in kept]}
+    if fetched and not kept:
+        out["errors"] = [
+            f"filter_node: dropped all {len(fetched)} fetched item(s) — "
+            "none had a markdown body on disk"
+        ]
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -395,99 +395,88 @@ def test_arxiv_search_raw_handles_empty_query():
     assert nodes_mod._arxiv_search_raw(None) == []
 
 
-def test_researcher_node_triggers_t6_fallback_when_sources_empty(monkeypatch):
-    """When primary passes yield zero sources, T6 fallback fires.
+def test_researcher_node_delegates_to_subgraph(monkeypatch):
+    """researcher_node now delegates to the 3-way subgraph and returns its
+    merged sources verbatim.
 
-    Reproduces the live-bot failure where 'metacognitive feedback' topic
-    produced 0 sources. The fallback should run arxiv_search_raw against
-    the raw user_request and surface its items.
+    The T6 orphan-topic arXiv fallback that used to live in researcher_node
+    now lives in ``arxiv_sub`` (covered by
+    test_researcher_subgraph.py::test_arxiv_sub_handles_empty_keywords_with_fallback),
+    and ``_arxiv_search_raw`` itself is still unit-tested above. Here we only
+    assert the delegation contract at the node boundary.
     """
     from argus.graph import nodes as nodes_mod
-    from argus.graph.state import ResearchPlan, PlannedSource
+    from argus.graph.state import ResearchPlan
 
-    # Stub _matches_plan to always reject and _arxiv_search to return
-    # empty so the only way to get sources is the T6 fallback path.
-    def _arxiv_search_stub(plan):
-        return []  # primary pass returns nothing
-    monkeypatch.setattr(nodes_mod, "_arxiv_search", _arxiv_search_stub)
-
-    # Harvest stub returns nothing.
-    def _harvest_stub(**kw):
-        from argus.tools import HarvestReport
-        return HarvestReport(folder="", items=[], raw_stdout="", duration_s=0.0)
-    monkeypatch.setattr(nodes_mod, "harvest_sources", _harvest_stub)
-
-    # Catch the fallback call.
-    fallback_calls = []
-    def _arxiv_raw_stub(q):
-        fallback_calls.append(q)
-        return [
-            {"kind": "paper", "title": "FB1", "url": "http://arxiv.org/abs/2503.99999",
-             "summary": "from fallback", "source": "arxiv-raw"},
-        ]
-    monkeypatch.setattr(nodes_mod, "_arxiv_search_raw", _arxiv_raw_stub)
+    def fake_run(state, **kw):
+        return {
+            "sources": [
+                {"kind": "paper", "title": "FB1",
+                 "url": "http://arxiv.org/abs/2503.99999",
+                 "summary": "from subgraph", "source": "arxiv-raw"},
+            ],
+            "messages": [{"role": "assistant", "content": "1 source"}],
+            "errors": [],
+        }
+    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
 
     state = {
         "user_request": "esoteric test topic",
         "plan": ResearchPlan(
-            summary="dummy", sub_questions=["dummy"],
-            planned_sources=[],  # empty so planner-url pass yields 0
+            summary="dummy", sub_questions=["dummy"], planned_sources=[],
             must_have_keywords=["esoteric", "test", "topic"],
         ).model_dump(),
         "sources": [],
     }
-
     out = nodes_mod.researcher_node(state)
-    assert len(fallback_calls) == 1, (
-        f"T6 fallback must fire when sources empty; calls={fallback_calls!r}"
-    )
     assert len(out["sources"]) == 1
     assert out["sources"][0]["url"] == "http://arxiv.org/abs/2503.99999"
 
 
-def test_researcher_node_skips_fallback_when_already_has_sources(monkeypatch):
-    """T6 fallback must NOT overwrite existing sources."""
+def test_researcher_node_does_not_inject_planner_urls(monkeypatch):
+    """Anti-hallucination regression guard.
+
+    The old node copied ``planned_source.target_url`` straight into
+    ``sources`` — that is how fabricated links (e.g.
+    ``https://nvidia.com/ai-blueprint``) reached the fetcher. The subgraph
+    searches fresh instead, so a planner-supplied URL must NOT appear in the
+    candidate set unless a sub-researcher independently found it. We assert
+    researcher_node adds nothing of its own beyond the subgraph's output.
+    """
     from argus.graph import nodes as nodes_mod
     from argus.graph.state import ResearchPlan, PlannedSource
 
-    monkeypatch.setattr(nodes_mod, "_arxiv_search",
-                        lambda plan: [])  # primary returns nothing
-    monkeypatch.setattr(nodes_mod, "harvest_sources",
-                        lambda **kw: _make_empty_harvest())
+    def fake_run(state, **kw):
+        # Subgraph did NOT surface the planner's fabricated URL.
+        return {
+            "sources": [
+                {"kind": "repo", "title": "real repo",
+                 "url": "https://github.com/found/by-search",
+                 "summary": "", "source": "github-search"},
+            ],
+            "messages": [], "errors": [],
+        }
+    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
 
-    fallback_called = []
-    monkeypatch.setattr(
-        nodes_mod, "_arxiv_search_raw",
-        lambda q: fallback_called.append(q) or [{
-            "kind": "paper", "title": "FB",
-            "url": "http://arxiv.org/abs/2503.11111",
-            "summary": "fb", "source": "arxiv-raw",
-        }],
-    )
-
+    bogus = "https://nvidia.com/ai-blueprint"  # a plausible-looking fake
     state = {
         "user_request": "any topic",
         "plan": ResearchPlan(
             summary="x", sub_questions=["x"],
             planned_sources=[PlannedSource(
-                kind="repo", query="real", target_url="https://github.com/example/foo",
+                kind="official_doc", query="real", target_url=bogus,
                 rationale="test",
             )],
             must_have_keywords=["any"],
         ).model_dump(),
-        "sources": [],  # empty so we test the populated-state path
+        "sources": [],
     }
     out = nodes_mod.researcher_node(state)
-    # planner URL pass should populate 1 source from the github URL above,
-    # so the T6 fallback must NOT be called.
-    assert fallback_called == [], (
-        f"fallback must NOT fire when planner url pass fills sources; "
-        f"calls={fallback_called!r}"
+    urls = [s.get("url") for s in out["sources"]]
+    assert bogus not in urls, (
+        f"planner target_url must not be injected by researcher_node; {urls!r}"
     )
-    assert any(s.get("url") == "https://github.com/example/foo"
-               for s in out["sources"]), (
-        f"github URL should be in sources: {out['sources']!r}"
-    )
+    assert "https://github.com/found/by-search" in urls
     # The fallback URL must NOT be in sources because the fallback did
     # not fire. This is the negative assertion that proves the gate.
     assert not any(s.get("url") == "http://arxiv.org/abs/2503.11111"

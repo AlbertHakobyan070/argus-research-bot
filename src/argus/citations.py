@@ -105,14 +105,28 @@ class SourceRegistry:
             entry=entry,
         )
 
-    def add_from_fetched(self, items: Iterable[FetchedItem]) -> None:
-        """Bulk-load from ArgusState['fetched'] (the natural integration)."""
+    def add_from_fetched(self, items: Iterable[FetchedItem | dict]) -> None:
+        """Bulk-load from ArgusState['fetched'] (the natural integration).
+
+        ``state["fetched"]`` holds ``FetchedItem.model_dump()`` *dicts*, not
+        ``FetchedItem`` objects, so we accept both. The dict path is the one
+        report_builder_node actually uses; before 2026-07-09 this method only
+        handled objects and did ``it.url`` on a dict, raising
+        ``'dict' object has no attribute 'url'`` — which the try/except in
+        report_builder_node swallowed, silently disabling the entire
+        citation-integrity pass in production. Handle both shapes explicitly.
+        """
         for it in items:
-            self.add(SourceEntry(
-                url=it.url,
-                title=it.title or "",
-                tool_name=it.section or "",  # section doubles as tool-bucket label
-            ))
+            if isinstance(it, dict):
+                url = it.get("url") or ""
+                title = it.get("title") or ""
+                tool_name = it.get("section") or ""
+            else:
+                url = getattr(it, "url", "") or ""
+                title = getattr(it, "title", "") or ""
+                tool_name = getattr(it, "section", "") or ""
+            if url:
+                self.add(SourceEntry(url=url, title=title, tool_name=tool_name))
 
     def clear(self) -> None:
         self._urls.clear()
@@ -281,14 +295,15 @@ def verify_citations(report_text: str, registry: SourceRegistry) -> Verification
 
     The reported ``verified_report`` preserves all non-URL markdown intact.
     """
-    if registry.size() == 0:
-        # No sources fetched — every URL is suspect. Treat the whole
-        # report as unverifiable and emit an empty body.
-        return VerificationResult(
-            verified_report="(no sources fetched; report suppressed)",
-            removed_citations=[{"url": u, "reason": "empty_registry"}
-                               for u in set(_URL_RE.findall(report_text))],
-        )
+    # NOTE: an empty registry (nothing was successfully fetched) is NOT a
+    # reason to destroy the report. Earlier code replaced the whole body with
+    # "(no sources fetched; report suppressed)", which turned a thin run into a
+    # 39-char non-report — the "empty output" bug observed on the AI-Q query
+    # (2026-07-08). We instead fall through to the normal path: every URL fails
+    # to resolve and is stripped (links → their display text, bare URLs
+    # dropped), but the synthesizer's prose is preserved so the reader still
+    # gets the analysis, clearly unlinked. The report_builder title block
+    # (n_sources=0) already signals low confidence.
 
     removed: list[dict] = []
 

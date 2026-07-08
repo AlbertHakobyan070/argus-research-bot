@@ -277,49 +277,53 @@ def test_fetcher_node_partial_failure_mixes_fetched_and_errors(monkeypatch):
                    for e in out["errors"]), out["errors"]
 
 
-def test_researcher_node_propagates_harvest_and_arxiv_errors(monkeypatch):
-    """Both harvest_sources and arxiv failures must land in state["errors"]."""
-    def boom_harvest(*a, **kw):
-        raise RuntimeError("harvest exploded")
-    def boom_arxiv(plan):
-        raise RuntimeError("arxiv exploded")
+def test_researcher_node_propagates_subgraph_errors(monkeypatch):
+    """A sub-researcher failure captured by the subgraph must surface in
+    researcher_node's state["errors"] — never silently swallowed.
 
-    monkeypatch.setattr(nodes_mod, "harvest_sources", boom_harvest)
-    monkeypatch.setattr(nodes_mod, "_arxiv_search", boom_arxiv)
+    researcher_node now delegates to the 3-way subgraph (arxiv|github|web);
+    the deep per-sub behaviour is covered in test_researcher_subgraph.py, so
+    here we only assert the delegation contract at the node boundary.
+    """
+    def fake_run(state, **kw):
+        return {
+            "sources": [],
+            "messages": [{"role": "assistant", "content": "0 sources"}],
+            "errors": ["arxiv_sub failed: RuntimeError('arxiv exploded')",
+                       "web_sub failed: RuntimeError('ddg down')"],
+        }
+
+    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
 
     state = _make_state(_plan_with_paper())
     out = researcher_node(state)
     errs = out["errors"]
     assert isinstance(errs, list)
-    assert any("harvest_sources failed" in e for e in errs), errs
-    assert any("arxiv_search failed" in e for e in errs), errs
+    assert any("arxiv_sub failed" in e for e in errs), errs
+    assert any("web_sub failed" in e for e in errs), errs
 
 
-def test_researcher_node_no_errors_on_clean_run(monkeypatch):
-    """Happy path: when both harvest and arxiv succeed, no errors field
-    is returned (clean run, no failure surface)."""
-    from argus.tools import HarvestReport, HarvestResult
+def test_researcher_node_returns_merged_sources(monkeypatch):
+    """Happy path: researcher_node passes through the subgraph's merged
+    sources and carries no failures on a clean run."""
+    def fake_run(state, **kw):
+        return {
+            "sources": [
+                {"kind": "paper", "title": "T",
+                 "url": "https://arxiv.org/abs/1", "summary": "S",
+                 "source": "arxiv"},
+            ],
+            "messages": [{"role": "assistant", "content": "1 source"}],
+            "errors": [],
+        }
 
-    monkeypatch.setattr(
-        nodes_mod, "harvest_sources",
-        lambda *a, **kw: HarvestReport(
-            folder="A:\\fake", radar_md="", items=[],
-            raw_stdout="", duration_s=0.0,
-        ),
-    )
-    monkeypatch.setattr(
-        nodes_mod, "_arxiv_search",
-        lambda plan: [
-            {"kind": "paper", "title": "T", "url": "https://arxiv.org/abs/1",
-             "summary": "S", "source": "arxiv"},
-        ],
-    )
+    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
 
     state = _make_state(_plan_with_paper())
     out = researcher_node(state)
-    assert "errors" not in out, (
-        f"clean run should not emit errors, got {out.get('errors')!r}"
-    )
+    # A clean run carries no error strings (an empty list is fine — the
+    # operator.add reducer treats it as a no-op).
+    assert not out.get("errors"), out.get("errors")
     # Sources must include the arxiv item.
     assert any(s["url"] == "https://arxiv.org/abs/1"
                 for s in out["sources"]), out["sources"]

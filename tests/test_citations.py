@@ -74,6 +74,24 @@ def test_registry_add_from_fetched_items():
     assert not reg.has_url("https://c.com/z")
 
 
+def test_registry_add_from_fetched_dicts():
+    """Regression: report_builder_node passes FetchedItem.model_dump() DICTS,
+    not FetchedItem objects. add_from_fetched must handle both. Before the
+    2026-07-09 fix, the dict path raised 'dict object has no attribute url',
+    which the report_builder try/except swallowed — silently disabling the
+    citation-integrity pass in production."""
+    reg = SourceRegistry()
+    fetched_dicts = [
+        make_fetched("https://a.com/x", title="A").model_dump(),
+        make_fetched("https://b.com/y", title="B").model_dump(),
+        {"url": "", "title": "no url — must be skipped"},  # empty url tolerated
+    ]
+    reg.add_from_fetched(fetched_dicts)
+    assert reg.has_url("https://a.com/x")
+    assert reg.has_url("https://b.com/y")
+    assert reg.size() == 2
+
+
 # --- 5-strategy resolve_url cascade (lifted from AI-Q) -----------------------
 
 def test_resolve_exact_match():

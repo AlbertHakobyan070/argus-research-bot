@@ -77,6 +77,19 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(nodes_mod, "crawl_url", fake_crawl)
     monkeypatch.setattr(nodes_mod, "normalize_to_markdown", fake_normalize)
 
+    # researcher_node now delegates to the 3-way subgraph, whose subs make
+    # real GitHub/arXiv/DDG calls. Stub the delegation so this graph-level
+    # test stays off the network (per-sub behaviour is covered hermetically
+    # in test_researcher_subgraph.py).
+    def fake_research(state, **kw):
+        return {
+            "sources": [{"kind": "repo", "title": "stub",
+                         "url": "https://github.com/stub/repo",
+                         "summary": "", "source": "github-search"}],
+            "messages": [], "errors": [],
+        }
+    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_research)
+
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "test:deep"}}
     out = g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),

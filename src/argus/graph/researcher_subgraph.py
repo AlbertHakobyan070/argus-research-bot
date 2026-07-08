@@ -380,16 +380,24 @@ def run_researcher_subgraph(
                                          state.get("thread_id", "default")}}
     # Use ainvoke so LangGraph schedules the async sub-researchers in
     # parallel; the sync invoke path refuses async nodes.
+    #
+    # This function is called from the sync ``researcher_node``. Under the
+    # bot's async ``graph.astream``, LangGraph runs sync nodes on a worker
+    # thread with no running loop, so ``asyncio.run`` works directly. If we
+    # are ever called ON a thread that already has a running loop,
+    # ``asyncio.run`` raises RuntimeError — we then run the subgraph in a
+    # fresh loop on a dedicated worker thread. (The old fallback scheduled
+    # onto ``get_event_loop()`` and blocked on ``.result()``, which
+    # deadlocks when that loop is the caller's own.)
+    def _run_fresh_loop() -> dict:
+        return asyncio.run(sg.ainvoke(sub_state, config=cfg))
+
     try:
-        out = asyncio.run(sg.ainvoke(sub_state, config=cfg))
+        out = _run_fresh_loop()
     except RuntimeError:
-        # Already inside an event loop (bot driver path) — fall back to
-        # the async convenience helper, which runs the subgraph via
-        # to_thread so we don't deadlock.
-        out = asyncio.run_coroutine_threadsafe(
-            arun_researcher_subgraph(state, subgraph=sg, config=cfg),
-            asyncio.get_event_loop(),
-        ).result()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            out = ex.submit(_run_fresh_loop).result()
     final_sources = out.get("final_sources", []) or []
     errs = out.get("errors", []) or []
     msgs = [{"role": "assistant",
