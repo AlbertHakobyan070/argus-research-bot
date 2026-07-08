@@ -775,6 +775,11 @@ grounded report:
    the literal format [n] where n is the index in the evidence list.
 2. Only use information that appears in the evidence. If the evidence
    is insufficient for a claim, omit it (do NOT fabricate).
+3. You may ONLY cite [n] slots where n is a real index in the numbered
+   evidence list you are given. Never invent an [n] ref or [n] entry
+   in the Sources block — empty/dangling citation slots are dropped
+   before the report ships, and any claim that depends on a missing
+   ref is removed with it.
 3. Structure: ## TL;DR, ## Key Findings (each finding = claim + citations),
    ## Sources (numbered), ## Open Questions.
 4. Keep prose tight; prefer numbered findings over paragraphs.
@@ -804,6 +809,11 @@ evidence items. Produce a grounded report:
    the literal format [n] where n is the index in the evidence list.
 2. Only use information that appears in the evidence. If the evidence
    is insufficient for a claim, omit it (do NOT fabricate).
+3. You may ONLY cite [n] slots where n is a real index in the numbered
+   evidence list you are given. Never invent an [n] ref or [n] entry
+   in the Sources block — empty/dangling citation slots are dropped
+   before the report ships, and any claim that depends on a missing
+   ref is removed with it.
 3. Structure: # Title, ## TL;DR (1 short paragraph), then ## Key Findings
    (each finding = claim + citations + inline confidence), then
    ## Background (1-2 short paragraphs of context, cited), then
@@ -835,6 +845,11 @@ evidence items. Produce a deeply-grounded, well-structured report:
    the literal format [n] where n is the index in the evidence list.
 2. Only use information that appears in the evidence. If the evidence
    is insufficient for a claim, omit it (do NOT fabricate).
+3. You may ONLY cite [n] slots where n is a real index in the numbered
+   evidence list you are given. Never invent an [n] ref or [n] entry
+   in the Sources block — empty/dangling citation slots are dropped
+   before the report ships, and any claim that depends on a missing
+   ref is removed with it.
 3. Structure: # Title, ## TL;DR (1 paragraph), ## Background (1-2
    paragraphs of context, cited), ## Current state of the field
    (3-5 sub-sections, deeply cited, mix of paragraphs and bulleted
@@ -888,6 +903,11 @@ evidence items. Produce a richly-structured, lecture-format report:
    the literal format [n] where n is the index in the evidence list.
 2. Only use information that appears in the evidence. If the evidence
    is insufficient for a claim, omit it (do NOT fabricate).
+3. You may ONLY cite [n] slots where n is a real index in the numbered
+   evidence list you are given. Never invent an [n] ref or [n] entry
+   in the Sources block — empty/dangling citation slots are dropped
+   before the report ships, and any claim that depends on a missing
+   ref is removed with it.
 3. STRUCTURE (mandatory, in this exact order):
    - # <Topic>: A Research Report  (title page heading)
    - ## Executive TL;DR (1 paragraph)
@@ -1393,11 +1413,32 @@ def report_builder_node(state: ArgusState) -> dict:
             verify_citations as _verify_citations,
             sanitize_report as _sanitize_report,
         )
+        from ..sources_block import (
+            sanitize_sources_block as _sanitize_sources_block,
+        )
         _reg = _CitationRegistry()
         _reg.add_from_fetched(state.get("fetched") or [])
         _verified = _verify_citations(md_text, _reg)
         _sanitized = _sanitize_report(_verified.verified_report)
         md_text = _sanitized.cleaned_text
+        # P3 — drop dangling [N] source slots left behind by
+        # verify_citations (which only strips the URL, not the label).
+        # Also renumbers body refs so nothing points at an empty slot.
+        try:
+            _src_block = _sanitize_sources_block(md_text)
+            if _src_block.dropped_count:
+                md_text = _src_block.cleaned_text
+                logger.info(
+                    "sources block: dropped %d dangling slot(s), "
+                    "renumbered %d ref(s)",
+                    _src_block.dropped_count,
+                    len(_src_block.renumbered),
+                )
+        except Exception as _e:
+            logger.warning(
+                "sources-block post-pass skipped (%s); report unchanged",
+                _e,
+            )
         if _verified.removed_citations or _sanitized.removed:
             logger.info(
                 "citation integrity: stripped %d unregistered URL(s), %d sanitized URL(s)",
