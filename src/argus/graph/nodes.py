@@ -28,6 +28,7 @@ from .state import (
     ResearchPlan, ReviewVerdict, ValidatedAssessment,
 )
 from .synthesis_modes import get_mode, is_valid as is_valid_length
+from .credibility import score_fetched, CREDIBILITY_FLOOR
 
 logger = logging.getLogger("argus.nodes")
 
@@ -129,16 +130,241 @@ def planner_node(state: ArgusState) -> dict:
             summary=resp.content[:300],
         )
     return {
-        "plan": plan.model_dump(),
-        "model_calls": [rec.model_dump()],
-        "messages": [{"role": "assistant", "content": (
-            f"📋 Drafted plan with {len(plan.planned_sources)} sources. "
-            "Awaiting your approval.")}, {"ts": _ts()}],
-        # Set HITL pending; the bot layer will surface this and the
-        # LangGraph interrupt will pause the run.
-        "hitl": {"pending": True, "kind": "plan_approval",
-                 "ctx": {"plan": plan.model_dump()}},
-    }
+            "plan": plan.model_dump(),
+            "model_calls": [rec.model_dump()],
+            "messages": [{"role": "assistant", "content": (
+                f"📋 Drafted plan with {len(plan.planned_sources)} sources. "
+                "Awaiting your approval.")}, {"ts": _ts()}],
+            # Set HITL pending; the bot layer will surface this and the
+            # LangGraph interrupt will pause the run.
+            "hitl": {"pending": True, "kind": "plan_approval",
+                     "ctx": {"plan": plan.model_dump()}},
+        }
+
+
+# ---------------------------------------------------------------------------
+# planner_reflect (handoff action #7 — HANDOFF-RESEARCH-2026-07-08.md §6)
+# ---------------------------------------------------------------------------
+#
+# Sits between planner_node and researcher_node. Inspects the freshly
+# drafted plan against five quality signals and re-invokes planner_node
+# ONCE if any signal fails. Bounded at MAX_ATTEMPTS = 2 so a chronically
+# bad planner cannot loop indefinitely; on the second weak plan we
+# proceed with a warning so the rest of the pipeline can still run.
+#
+# Rationale: T6-class orphan-topic bugs (planner produces an empty /
+# single-source / lazy plan, researcher ends up with zero candidates,
+# report says "no evidence") were being papered over by the researcher's
+# fallback path. Catching them at planning time means the fallback only
+# fires for genuinely niche topics that no reasonable plan can cover.
+#
+# Quality signals:
+#   (a) planned_sources count  >= 3 ideal; < 2 triggers re-plan
+#   (b) source_type diversity   >= 2 distinct kinds
+#   (c) sub_questions count     >= 3
+#   (d) no sub_question is too similar to user_request verbatim
+#   (e) at least 1 planned_source mentions a word from user_request
+# ---------------------------------------------------------------------------
+
+MAX_PLAN_ATTEMPTS = 2
+REFLECT_MIN_SOURCES = 3           # >= ideal (a)
+REFLECT_MIN_SOURCE_KINDS = 2      # diversity (b)
+REFLECT_MIN_SUB_QUESTIONS = 3     # (c)
+REFLECT_VERBATIM_OVERLAP = 0.9    # >= of sub_question chars that must
+                                  # match user_request before we treat
+                                  # the sub_question as a verbatim
+                                  # echo of the request (lazy plan)
+
+
+def _normalise(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _verbatim_overlap_ratio(text: str, reference: str) -> float:
+    """Return the fraction of words in ``text`` that also appear in
+    ``reference`` (set intersection). Used to detect sub_questions that
+    are just the user_request echoed back, which is a lazy-plan signal.
+    """
+    t = _normalise(text)
+    r = _normalise(reference)
+    if not t or not r:
+        return 0.0
+    t_words = {w for w in re.findall(r"\w+", t) if len(w) > 2}
+    r_words = {w for w in re.findall(r"\w+", r) if len(w) > 2}
+    if not t_words:
+        return 0.0
+    return len(t_words & r_words) / len(t_words)
+
+
+def _reflect_plan_quality(plan: dict | None,
+                          user_request: str) -> list[tuple[str, bool, str]]:
+    """Run the five plan-quality checks.
+
+    Returns a list of ``(check_name, passed, detail)`` tuples so callers
+    can both log the failing reasons and decide what to do.
+    """
+    plan = plan or {}
+    sources = plan.get("planned_sources") or []
+    sub_qs = plan.get("sub_questions") or []
+    kinds = {s.get("kind", "") for s in sources if s.get("kind")}
+
+    req_norm = _normalise(user_request)
+    req_words = {w for w in re.findall(r"\w+", req_norm) if len(w) > 2}
+
+    # (a) planned_sources count
+    src_ok = len(sources) >= REFLECT_MIN_SOURCES
+    src_detail = f"{len(sources)} planned_sources (need >= {REFLECT_MIN_SOURCES})"
+
+    # (b) source_type diversity
+    div_ok = len(kinds) >= REFLECT_MIN_SOURCE_KINDS
+    div_detail = f"{len(kinds)} distinct kinds {sorted(kinds)} (need >= {REFLECT_MIN_SOURCE_KINDS})"
+
+    # (c) sub_questions count
+    sq_ok = len(sub_qs) >= REFLECT_MIN_SUB_QUESTIONS
+    sq_detail = f"{len(sub_qs)} sub_questions (need >= {REFLECT_MIN_SUB_QUESTIONS})"
+
+    # (d) any sub_question is too similar to user_request verbatim
+    dupe_idx = -1
+    dupe_ratio = 0.0
+    for i, sq in enumerate(sub_qs):
+        r = _verbatim_overlap_ratio(sq, user_request)
+        if r > dupe_ratio:
+            dupe_ratio = r
+            dupe_idx = i
+    dup_ok = dupe_ratio < REFLECT_VERBATIM_OVERLAP
+    dup_detail = (f"max verbatim overlap {dupe_ratio:.2f} "
+                  f"(threshold {REFLECT_VERBATIM_OVERLAP}) "
+                  f"on sub_question #{dupe_idx}")
+
+    # (e) at least one planned_source mentions a word from user_request
+    hit_idx = -1
+    if req_words:
+        for i, s in enumerate(sources):
+            haystack = _normalise(
+                (s.get("query") or "") + " " + (s.get("rationale") or "")
+            )
+            if any(w in haystack for w in req_words):
+                hit_idx = i
+                break
+    kw_ok = hit_idx >= 0
+    kw_detail = (f"keyword hit on planned_source #{hit_idx}"
+                 if kw_ok else
+                 f"no planned_source mentions a word from user_request "
+                 f"({sorted(req_words)[:5]})")
+
+    return [
+        ("sources_count",       src_ok, src_detail),
+        ("source_diversity",    div_ok, div_detail),
+        ("sub_questions_count", sq_ok,  sq_detail),
+        ("sub_question_duplicate", dup_ok, dup_detail),
+        ("keyword_coverage",    kw_ok,  kw_detail),
+    ]
+
+
+def planner_reflect_node(state: ArgusState) -> dict:
+    """Reflect on the freshly-drafted plan; re-plan ONCE if weak.
+
+    Reads ``state["plan"]`` and ``state["user_request"]``, runs
+    :func:`_reflect_plan_quality`, and:
+      • if every check passes: returns ``plan_attempts=1`` (or whatever
+        it was) with no re-plan. The pipeline proceeds to researcher.
+      • if any check fails AND ``plan_attempts < MAX_PLAN_ATTEMPTS``:
+        appends reflection notes to ``state["plan"]["reflection_notes"]``,
+        calls ``planner_node(state)`` to draft a replacement, merges the
+        returned ``plan`` / ``model_calls`` / ``messages`` into state,
+        and increments ``plan_attempts``.
+      • if any check fails AND we have already hit
+        ``MAX_PLAN_ATTEMPTS``: returns the (still-weak) plan with a
+        warning appended to ``messages`` so downstream nodes know the
+        plan was weak but the user isn't stuck.
+
+    The reflect node never raises on a malformed plan — an empty dict
+    simply fails every check, which is the correct diagnostic.
+    """
+    user_request = state.get("user_request") or ""
+    plan = state.get("plan")
+    plan_attempts = int(state.get("plan_attempts") or 0)
+
+    # Bump the counter for *this* planner invocation. The reflect node
+    # runs once per planner call, so a freshly-set state arrives with
+    # plan_attempts == 1 (the initial planner_node ran). If we're being
+    # called as a re-plan (state already has reflection_notes from a
+    # previous reflect pass), increment further.
+    if plan_attempts < 1:
+        plan_attempts = 1
+    checks = _reflect_plan_quality(plan, user_request)
+    failed = [(name, detail) for (name, ok, detail) in checks if not ok]
+
+    if not failed:
+            return {
+                "plan": plan,
+                "plan_attempts": plan_attempts,
+                "messages": [{"role": "assistant",
+                              "content": (f"✅ plan passed reflect "
+                                          f"({len(checks)} checks ok)."),
+                              "ts": _ts()}],
+            }
+
+    # Plan is weak. Decide: re-plan or warn-and-proceed.
+    if plan_attempts >= MAX_PLAN_ATTEMPTS:
+        # Bounded: we've already tried twice. Proceed with warning so
+        # the user can still get a (likely-thin) report rather than
+        # hanging at the HITL plan-approval gate forever.
+        return {
+            "plan_attempts": plan_attempts,
+            "messages": [{"role": "assistant",
+                          "content": (f"⚠️ plan still weak after "
+                                      f"{plan_attempts} attempts — "
+                                      f"proceeding. failed checks: "
+                                      f"{[n for n, _ in failed]}"),
+                          "ts": _ts()}],
+            "errors": [f"planner_reflect: plan weak after "
+                       f"{plan_attempts} attempts: "
+                       f"{[n for n, _ in failed]}"],
+        }
+
+    # Re-plan: append reflection notes to the current plan dict and
+    # call planner_node again so the LLM can produce a fresh plan with
+    # the weakness diagnoses in hand.
+    plan_dict = dict(plan or {})
+    existing_notes = list(plan_dict.get("reflection_notes") or [])
+    existing_notes.append({
+        "attempt": plan_attempts,
+        "failed_checks": [name for name, _ in failed],
+        "details": {name: detail for name, detail in failed},
+    })
+    plan_dict["reflection_notes"] = existing_notes
+    # Build a state for the planner that includes the reflection notes
+    # in the user_request context — the planner's prompt reads
+    # ``state["user_request"]`` and we don't want to overwrite the
+    # original request, so we stash the notes on a side-channel key.
+    planner_state = dict(state)
+    planner_state["plan"] = plan_dict
+    # Reflection guidance for the planner LLM: tell it why the last
+    # plan was rejected so it can target the gaps.
+    reflection_brief = (
+        "Your previous plan was rejected by planner_reflect. "
+        "Re-plan addressing these gaps:\n"
+        + "\n".join(f"- {name}: {detail}" for name, detail in failed)
+        + "\n\nUser request: " + user_request
+    )
+    planner_state["user_request"] = reflection_brief
+
+    replanned = planner_node(planner_state)
+
+    # Merge: keep the original user_request on the returned state so
+    # downstream nodes (researcher, etc.) see the right thing, not the
+    # reflection-brief.
+    replanned["user_request"] = user_request
+    replanned["plan_attempts"] = plan_attempts + 1
+    replanned.setdefault("messages", []).append({
+        "role": "assistant",
+        "content": (f"🔁 re-planning (attempt {plan_attempts + 1}/"
+                    f"{MAX_PLAN_ATTEMPTS}) — failed checks: "
+                    f"{[n for n, _ in failed]}"),
+        "ts": _ts(),
+    })
+    return replanned
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +688,39 @@ def normalizer_node(state: ArgusState) -> dict:
                 item.title = item.title or res.title
         patched.append(item.model_dump())
     return {"fetched": patched}
+
+
+# ---------------------------------------------------------------------------
+# credibility — tag fetched items with a 0..1 trust score.
+# Items below the 0.4 floor get `credibility_flag = "low_credibility"` but
+# are NOT dropped; the downstream filter_node still does its own keep_topN.
+# ---------------------------------------------------------------------------
+
+def credibility_node(state: ArgusState) -> dict:
+    """Score every fetched item on (domain trust + URL pattern + title
+    relevance). Pure local compute — no LLM call.
+
+    Returns the updated ``fetched`` list with ``credibility_score`` and
+    ``credibility_flag`` fields populated. If ``fetched`` is empty we
+    pass through cleanly (no errors, no model_calls).
+    """
+    user_request = state.get("user_request") or ""
+    fetched = [FetchedItem.model_validate(f) for f in state.get("fetched") or []]
+    if not fetched:
+        return {
+            "fetched": [],
+            "messages": [{"role": "assistant",
+                          "content": "🛡️ 0 items to score (nothing fetched)."}],
+        }
+    scored = score_fetched(fetched, user_request=user_request)
+    flagged = sum(1 for s in scored if (s.credibility_score or 0.0) < CREDIBILITY_FLOOR)
+    return {
+        "fetched": [s.model_dump() for s in scored],
+        "messages": [{"role": "assistant",
+                      "content": (f"🛡️ {len(scored)} items scored, "
+                                  f"{flagged} flagged as low-credibility "
+                                  f"(below {CREDIBILITY_FLOOR:.1f}).")}],
+    }
 
 
 # ---------------------------------------------------------------------------

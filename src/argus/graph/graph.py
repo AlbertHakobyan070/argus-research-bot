@@ -3,9 +3,9 @@
 Architecture (deep path):
 
   intake ──► planner ──HITL plan_approval──► researcher ──► fetcher ──►
-  normalizer ──► filter ──► synthesizer ──► reviewer ──► (pass|revise)
-                          ▲                                │
-                          └──────── revision loop ─────────┘
+  normalizer ──► credibility ──► filter ──► synthesizer ──► reviewer
+  ──► (pass|revise) ▲                                │
+                     └──────────── revision loop ────┘
                                                           ▼
                                                     report_builder
                                                           │
@@ -27,9 +27,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from .nodes import (
-    deliver_node, fetcher_node, filter_node, intake_node,
-    normalizer_node, planner_node, quick_answer_node,
-    report_builder_node, researcher_node, reviewer_node,
+    credibility_node, deliver_node, fetcher_node, filter_node,
+    intake_node, normalizer_node, planner_node, planner_reflect_node,
+    quick_answer_node, report_builder_node, researcher_node, reviewer_node,
     route_after_review, synthesizer_node,
 )
 from .state import ArgusState
@@ -47,9 +47,11 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
 
     g.add_node("intake", intake_node)
     g.add_node("planner", planner_node)
+    g.add_node("planner_reflect", planner_reflect_node)
     g.add_node("researcher", researcher_node)
     g.add_node("fetcher", fetcher_node)
     g.add_node("normalizer", normalizer_node)
+    g.add_node("credibility", credibility_node)
     g.add_node("filter", filter_node)
     g.add_node("synthesizer", synthesizer_node)
     g.add_node("reviewer", reviewer_node)
@@ -65,10 +67,12 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     # We use LangGraph's interrupt mechanism via dynamic_break on the
     # `hitl.pending` flag — the actual wait + resume is driven by the
     # Telegram bot via Command(resume=...).
-    g.add_edge("planner", "researcher")
+    g.add_edge("planner", "planner_reflect")
+    g.add_edge("planner_reflect", "researcher")
     g.add_edge("researcher", "fetcher")
     g.add_edge("fetcher", "normalizer")
-    g.add_edge("normalizer", "filter")
+    g.add_edge("normalizer", "credibility")
+    g.add_edge("credibility", "filter")
     g.add_edge("filter", "synthesizer")
     g.add_edge("synthesizer", "reviewer")
 

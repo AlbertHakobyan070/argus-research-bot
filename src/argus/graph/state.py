@@ -47,6 +47,8 @@ class FetchedItem(BaseModel):
     section: str = ""  # which planned-source bucket it came from
     excerpt: str = ""   # first 600 chars of the markdown
     relevance_score: float = 0.0
+    credibility_score: float | None = None  # set by credibility_node
+    credibility_flag: str | None = None    # e.g. "low_credibility"
 
 
 class Finding(BaseModel):
@@ -97,6 +99,7 @@ class ArgusState(TypedDict, total=False):
     length: Length                  # T7: chosen at plan-approval HITL
     plan: dict | None               # ResearchPlan.model_dump()
     plan_approved: bool             # set by HITL resume
+    plan_attempts: int              # T8: counter for planner_reflect_node re-plans
 
     # Research pipeline
     sources: list[dict]             # candidate sources from researcher
