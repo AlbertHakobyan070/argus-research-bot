@@ -50,6 +50,9 @@ def test_format_plan_basic():
              "rationale": "primary source"},
             {"kind": "official_doc", "query": "", "target_url":
              "https://example.com/x", "rationale": "docs"},
+            {"kind": "blog", "query": "metacognitive RL transformers",
+             "target_url": "https://blog.ought.com/fabricated-x",
+             "rationale": "adjacent commentary"},
         ],
     }
     text = _format_plan(plan)
@@ -57,7 +60,63 @@ def test_format_plan_basic():
     assert "Investigate X" in text
     assert "What is X?" in text
     assert "paper" in text
+    # query takes precedence — the fabricated blog URL must NOT be shown
+    # raw, even when it's the only hint we have:
+    assert "metacognitive RL transformers" in text
+    assert "blog.ought.com/fabricated-x" not in text
+
+
+def test_format_plan_prefers_query_over_target_url():
+    """P1 — planner target_urls are now ignored by the researcher subgraph
+    (Phase-1 fix), so showing them in the plan preview is misleading. The
+    plan must show the search intent (query) instead and label any
+    fallback URL as a candidate that will be verified at fetch time."""
+    plan = {
+        "summary": "Investigate X",
+        "sub_questions": [],
+        "planned_sources": [
+            {"kind": "blog", "query": "metacognitive RL transformers",
+             "target_url": "https://blog.ought.com/fabricated-x",
+             "rationale": "adjacent"},
+        ],
+    }
+    text = _format_plan(plan)
+    # The fabricated URL the researcher will never use must not appear
+    # bare in the plan preview.
+    assert "blog.ought.com/fabricated-x" not in text
+    # The query it WOULD search for must.
+    assert "metacognitive RL transformers" in text
+    # And the provenance caveat ("candidate", "verified at fetch") must
+    # be visible enough that the reader knows URLs aren't claimed URLs.
+    assert "verified at fetch" in text
+
+
+def test_format_plan_fallback_url_labelled_candidate():
+    """When a planner source has ONLY a target_url (no query), show it
+    but label it as a candidate so the user knows it'll be re-checked."""
+    plan = {
+        "summary": "",
+        "sub_questions": [],
+        "planned_sources": [
+            {"kind": "official_doc", "query": "", "target_url":
+             "https://example.com/x", "rationale": "docs"},
+        ],
+    }
+    text = _format_plan(plan)
     assert "example.com/x" in text
+    assert "candidate" in text.lower()
+
+
+def test_format_plan_no_query_no_url_says_live_search():
+    plan = {
+        "summary": "",
+        "sub_questions": [],
+        "planned_sources": [
+            {"kind": "search", "rationale": "broad"},
+        ],
+    }
+    text = _format_plan(plan)
+    assert "live search" in text.lower()
 
 
 def test_plan_keyboard_has_buttons():

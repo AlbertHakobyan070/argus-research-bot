@@ -253,10 +253,21 @@ def _format_plan(plan: dict, length: str = DEFAULT_LENGTH) -> str:
             lines.append(f"- {_md_escape(q)}")
         lines.append("")
     if sources:
-        lines.append(f"*Planned sources ({len(sources)}):*")
+        lines.append(
+            "*Planned sources "
+            f"({len(sources)}, queries only — URLs are verified at fetch time):*"
+        )
         for s in sources[:14]:
-            target = s.get("target_url") or s.get("query") or "(search)"
-            lines.append(f"- `{_md_escape(s.get('kind','search'))}` — {_md_escape(target)}")
+            kind = s.get("kind", "search")
+            q = s.get("query")
+            url = s.get("target_url")
+            if q:
+                intent = f"_search intent:_ {_md_escape(q)}"
+            elif url:
+                intent = f"_candidate (verified at fetch):_ {_md_escape(url)}"
+            else:
+                intent = "_live search_"
+            lines.append(f"- `{_md_escape(kind)}` — {intent}")
     return "\n".join(lines)
 
 
