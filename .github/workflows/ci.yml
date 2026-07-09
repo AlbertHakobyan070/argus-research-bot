@@ -32,13 +32,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install ".[dev]"
 
-      - name: Run tests (skip LLM/manual end-to-end)
+      - name: Run hermetic tests
         env:
           PYTHONNOUSERSITE: '1'
-          ARGUS_OPENAI_BASE_URL: 'http://127.0.0.1:3001/v1'
-          ARGUS_TELEGRAM_BOT_TOKEN: 'ci-stub-token'
         run: |
+          # Integration tests that need a live FreeLLMAPI proxy or a
+          # Windows-only file path are excluded here — they're
+          # exercised locally on the dev box where those are available.
+          # Manual end-to-end and the full e2e_research harness are
+          # excluded for the same reason.
           python -m pytest tests/ \
             --ignore=tests/manual_e2e.py \
             --ignore=tests/test_e2e_research.py \
+            --ignore=tests/test_llm.py \
+            --ignore=tests/test_graph.py \
+            --ignore=tests/test_reflexion.py \
+            --ignore=tests/test_post_synthesis.py \
+            --ignore=tests/test_config_tools.py \
             -v --tb=short
