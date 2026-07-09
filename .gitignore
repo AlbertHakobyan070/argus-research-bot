@@ -16,3 +16,11 @@ htmlcov/
 *.egg-info/
 build/
 dist/
+
+# Session-scoped working notes (handoffs, wake-up readmes). Handoffs
+# already in git history stay tracked; new ones should NOT leak into
+# the repo. See multi-agent-project-bootstrap + handoff-doc-implementation.
+tonight/HANDOFF-*.md
+HANDOFF-*.md
+WAKEUP-README.md
+WAKEUP-*.md
