@@ -1186,11 +1186,19 @@ class YouTubeTranscriptResult(BaseModel):
 
 def youtube_video_transcript(
     url: str, *, langs: str = "en.*", timeout: int = 90,
+    format: str = "txt",
 ) -> YouTubeTranscriptResult:
     """Fetch ONLY the transcript of one YouTube video.
 
     No media download (``--skip-download``); yt-dlp writes ``.vtt``
     auto-subtitles to a tmp dir, we strip timings, return plain text.
+
+    ``format`` controls the output:
+      - "txt" (default): timings stripped, plain prose (legacy behaviour)
+      - "srt":           raw .vtt body with timestamps preserved; the
+                         ``transcript_bytes`` payload and the file the
+                         bot ships as ``.srt`` are both the verbatim .vtt
+    Any other value raises ``ValueError`` before yt-dlp is invoked.
 
     ``langs`` is forwarded to ``--sub-langs`` (default ``"en.*"`` covers
     all English variants — en-US, en-GB, etc.). The smoke-test video
@@ -1200,6 +1208,12 @@ def youtube_video_transcript(
     readable via transcript_text). Caller can attach the ``.txt`` to a
     Telegram chat directly — ~10-20 kB for a 10-min video.
     """
+    fmt = (format or "txt").lower()
+    if fmt not in ("txt", "srt"):
+        raise ValueError(
+            f"format must be 'txt' or 'srt' (got {format!r})"
+        )
+
     t0 = time.time()
     url = (url or "").strip()
     if not url:
@@ -1248,11 +1262,28 @@ def youtube_video_transcript(
                 break
         if chosen is None:
             chosen = vtt_files[0]
-        transcript = _vtt_to_text(chosen)
-        if not transcript:
-            return YouTubeTranscriptResult(
-                ok=False, url=url, duration_s=time.time() - t0,
-                error=f"vtt parse empty ({chosen.name})")
+        # Format='srt' -> ship the raw .vtt bytes with timestamps intact.
+        # Format='txt' (default) -> run _vtt_to_text to get plain prose.
+        if fmt == "srt":
+            try:
+                raw_vtt = chosen.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return YouTubeTranscriptResult(
+                    ok=False, url=url, duration_s=time.time() - t0,
+                    error=f"vtt read failed ({chosen.name})")
+            if not raw_vtt:
+                return YouTubeTranscriptResult(
+                    ok=False, url=url, duration_s=time.time() - t0,
+                    error=f"vtt parse empty ({chosen.name})")
+            transcript = raw_vtt
+            ext = "srt"
+        else:
+            transcript = _vtt_to_text(chosen)
+            if not transcript:
+                return YouTubeTranscriptResult(
+                    ok=False, url=url, duration_s=time.time() - t0,
+                    error=f"vtt parse empty ({chosen.name})")
+            ext = "txt"
         # Parse info.json for metadata if present
         title = ""
         channel = ""
@@ -1274,16 +1305,16 @@ def youtube_video_transcript(
                      chosen.name)
         if m:
             language = m.group(1)
-        # Derive a stable filename for the .txt download from the video id
-        # in the chosen filename (the vtt stub wraps it). Fall back to the
-        # info.json id; fall back to a hash of the URL.
+        # Derive a stable filename for the .txt/.srt download from the
+        # video id in the chosen filename (the vtt stub wraps it). Fall
+        # back to the info.json id; fall back to a hash of the URL.
         vid = (chosen.stem.split(".", 1)[0]
                or (info.get("id") if info_files else "")
                or re.sub(r"\W+", "_", url))
-        fname = f"{vid}.txt"
-        # Persist the plain text alongside so callers can ship it as a file.
-        # We store it via a sibling path OUTSIDE the tempdir so cleanup of
-        # the tempdir doesn't take our deliverable with it.
+        fname = f"{vid}.{ext}"
+        # Persist the deliverable alongside so callers can ship it as a
+        # file. We store it via a sibling path OUTSIDE the tempdir so
+        # cleanup of the tempdir doesn't take our deliverable with it.
         out_path = None
         try:
             stable_dir = Path(tempfile.gettempdir()) / "argus_ytt_out"
