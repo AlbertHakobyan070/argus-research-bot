@@ -20,8 +20,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -1086,6 +1088,219 @@ def youtube_search(query: str, *, max_results: int = 6, shorts: bool = False,
     logger.info("youtube_search: %d result(s) in %.1fs", len(results),
                 time.time() - t0)
     return results
+
+
+def _vtt_to_text(vtt_path: Path) -> str:
+    """Strip VTT/WebVTT cues to plain readable text.
+
+    WebVTT format (per the smoke test):
+        WEBVTT
+        Kind: captions
+        Language: en
+
+        00:00:01.200 --> 00:00:03.360
+        Some text line one
+        line two
+
+        00:00:05.318 --> 00:00:07.974
+        ...
+
+    We drop the WEBVTT header, the cue timings, any NOTE / STYLE / Kind:
+    blocks, and any <...> positioning tags. Cue bodies are kept verbatim,
+    joining multi-line cues with a single space.
+
+    Empty input -> ``""`` (never raises).
+    """
+    try:
+        raw = vtt_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    # WebVTT often starts with "WEBVTT" or "WEBVTT\nKind: captions".
+    # Strip the header section until the first blank line.
+    if raw.startswith("WEBVTT"):
+        # Skip until first double newline (cue blocks follow)
+        head, _, rest = raw.partition("\n\n")
+        # If 'rest' still contains the Kind/Language metadata, drop the
+        # metadata block too (single trailing line preceding an empty line).
+        # Pragmatic: just strip any line matching metadata-ish patterns.
+        lines = rest.splitlines()
+    else:
+        lines = raw.splitlines()
+
+    out_blocks: list[str] = []
+    block: list[str] = []
+    timing_re = re.compile(
+        r"^\d{1,2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{1,2}:\d{2}:\d{2}\.\d{3}"
+    )
+    for line in lines:
+        line = line.replace("CARRIAGERETURN", "")
+        stripped = line.strip()
+        if not stripped:
+            if block:
+                text = " ".join(b.strip() for b in block if b.strip())
+                if text:
+                    out_blocks.append(text)
+                block = []
+            continue
+        if timing_re.match(stripped):
+            # new cue — flush previous block first
+            if block:
+                text = " ".join(b.strip() for b in block if b.strip())
+                if text:
+                    out_blocks.append(text)
+                block = []
+            continue
+        if stripped.startswith(("NOTE", "STYLE", "Kind:", "Language:")):
+            continue
+        # drop positioning tags like <c.color>...</c>, <00:00:01.200>
+        s = re.sub(r"<[^>]+>", "", stripped).strip()
+        if s:
+            block.append(s)
+    if block:
+        text = " ".join(b.strip() for b in block if b.strip())
+        if text:
+            out_blocks.append(text)
+    return "\n".join(out_blocks)
+
+
+class YouTubeTranscriptResult(BaseModel):
+    """Result of a single-video transcript fetch. Fail-soft: ``ok=False``
+    on any backend/parse error; the caller decides what to surface."""
+    ok: bool
+    url: str = ""
+    title: str = ""
+    channel: str = ""
+    duration: int | None = None
+    language: str = ""
+    transcript_text: str = ""
+    # Bytes already in memory (utf-8 encoded transcript). The caller can
+    # ship them straight to Telegram via BytesIO without a tempdir hop.
+    transcript_bytes: bytes = b""
+    # Suggested filename for the .txt download. Usually
+    # ``<video_id>.txt`` so the user gets a recognisable attachment.
+    suggested_filename: str = "transcript.txt"
+    error: str | None = None
+    duration_s: float = 0.0
+
+
+def youtube_video_transcript(
+    url: str, *, langs: str = "en.*", timeout: int = 90,
+) -> YouTubeTranscriptResult:
+    """Fetch ONLY the transcript of one YouTube video.
+
+    No media download (``--skip-download``); yt-dlp writes ``.vtt``
+    auto-subtitles to a tmp dir, we strip timings, return plain text.
+
+    ``langs`` is forwarded to ``--sub-langs`` (default ``"en.*"`` covers
+    all English variants — en-US, en-GB, etc.). The smoke-test video
+    produced ``jNQXAC9IVRw.en-en.vtt``; we accept any ``*.vtt``.
+
+    The result's ``transcript_path`` points at the on-disk ``.txt`` (also
+    readable via transcript_text). Caller can attach the ``.txt`` to a
+    Telegram chat directly — ~10-20 kB for a 10-min video.
+    """
+    t0 = time.time()
+    url = (url or "").strip()
+    if not url:
+        return YouTubeTranscriptResult(ok=False, error="empty url")
+    if not url.startswith(("http://", "https://")):
+        return YouTubeTranscriptResult(
+            ok=False, url=url, error="not a http(s) url")
+
+    # yt-dlp writes `<outtmpl>.<lang>.<ext>`; use a per-call tmpdir so
+    # concurrent fetches don't clobber each other. tempfile is imported
+    # at module top so tests can monkeypatch ``tools.tempfile.TemporaryDirectory``.
+    with tempfile.TemporaryDirectory(prefix="argus_ytt_") as tmpd:
+        tmpdir = Path(tmpd)
+        out_tmpl = str(tmpdir / "%(id)s.%(ext)s")
+        args = [
+            "--skip-download",
+            "--write-auto-subs",
+            "--write-info-json",
+            f"--sub-langs={langs}",
+            "--no-warnings",
+            "-o", out_tmpl,
+            url,
+        ]
+        # ``--write-info-json`` lets us recover title/channel/duration even
+        # though we ran with --skip-download (info-json is metadata-only).
+        rc, _out, err = _run_yt_dlp(args, timeout=timeout)
+        if rc != 0 and rc != 1:
+            # rc=1 sometimes fires when one sub-lang fetches a 429 — the
+            # .vtt may still be on disk. Warn and continue.
+            logger.warning(
+                "youtube_video_transcript: yt-dlp rc=%s err=%s", rc,
+                (err or "")[-200:])
+        # Find the .vtt and .info.json
+        vtt_files = sorted(tmpdir.glob("*.vtt"))
+        info_files = sorted(tmpdir.glob("*.info.json"))
+        if not vtt_files:
+            return YouTubeTranscriptResult(
+                ok=False, url=url, duration_s=time.time() - t0,
+                error=("no .vtt produced; yt-dlp said: "
+                       + ((err or "").strip() or "no stderr")[-300:]))
+        # Prefer the first English-flavoured track; else fall back to any vtt.
+        chosen: Path | None = None
+        for f in vtt_files:
+            if ".en" in f.stem or f.stem.endswith("-en"):
+                chosen = f
+                break
+        if chosen is None:
+            chosen = vtt_files[0]
+        transcript = _vtt_to_text(chosen)
+        if not transcript:
+            return YouTubeTranscriptResult(
+                ok=False, url=url, duration_s=time.time() - t0,
+                error=f"vtt parse empty ({chosen.name})")
+        # Parse info.json for metadata if present
+        title = ""
+        channel = ""
+        duration = None
+        language = ""
+        if info_files:
+            try:
+                info = json.loads(info_files[0].read_text(
+                    encoding="utf-8", errors="replace"))
+                title = info.get("title") or ""
+                channel = info.get("channel") or info.get("uploader") or ""
+                duration = info.get("duration")
+                # info dict can carry 'subtitles' or 'automatic_captions'.
+            except Exception:
+                pass
+        # Detect language from the chosen filename suffix
+        # 'jNQXAC9IVRw.en-en.vtt' -> 'en-en'
+        m = re.match(r".+\.([a-z]{2}(?:[-_][a-zA-Z]{2,4})?)\.vtt$",
+                     chosen.name)
+        if m:
+            language = m.group(1)
+        # Derive a stable filename for the .txt download from the video id
+        # in the chosen filename (the vtt stub wraps it). Fall back to the
+        # info.json id; fall back to a hash of the URL.
+        vid = (chosen.stem.split(".", 1)[0]
+               or (info.get("id") if info_files else "")
+               or re.sub(r"\W+", "_", url))
+        fname = f"{vid}.txt"
+        # Persist the plain text alongside so callers can ship it as a file.
+        # We store it via a sibling path OUTSIDE the tempdir so cleanup of
+        # the tempdir doesn't take our deliverable with it.
+        out_path = None
+        try:
+            stable_dir = Path(tempfile.gettempdir()) / "argus_ytt_out"
+            stable_dir.mkdir(parents=True, exist_ok=True)
+            out_path = stable_dir / fname
+            out_path.write_text(transcript, encoding="utf-8")
+        except Exception:
+            out_path = None  # not fatal — caller still has bytes
+        return YouTubeTranscriptResult(
+            ok=True, url=url, title=title, channel=channel,
+            duration=duration, language=language,
+            transcript_text=transcript,
+            transcript_bytes=transcript.encode("utf-8"),
+            suggested_filename=fname,
+            transcript_path=str(out_path) if out_path else None,
+            duration_s=time.time() - t0,
+        )
 
 
 # LangChain tool wrappers (so the graph can call these as @tool).

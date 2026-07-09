@@ -29,13 +29,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 from telegram import (
+    InputFile,
     InlineKeyboardButton, InlineKeyboardMarkup, Update,
 )
 from telegram.constants import ChatAction, ParseMode
@@ -57,6 +60,9 @@ Commands:
   /research /length <m> <topic>     — pre-pin output length mode (see below)
   /ask <question>                   — quick grounded single-shot answer
   /video [shorts] <query>           — search YouTube (videos or shorts)
+  /transcript <indices>             — fetch captions for picked videos
+                                       from the last /video results
+                                       (e.g. 2,4 or `all` or 1-3)
   /status                           — show the latest report paths for this chat
   /cancel                           — drop in-flight runs for this chat
   /help                             — this message
@@ -118,6 +124,76 @@ def _parse_length(args: list[str]) -> tuple[str, list[str]]:
 # Persisted checkpoint state is the source of truth; this is just for
 # progress messages and "is there a paused run?" checks.
 _inflight: dict[str, dict[str, Any]] = {}
+
+# Per-chat last /video result pool. Keyed by thread_id; entries hold
+# (results list, timestamp). Capped to a TTL so we never leak if the
+# user walks away mid-session. ``/transcript <indices>`` reads from here.
+_VIDEO_POOL_TTL_S = 1800   # 30 minutes — long enough for a follow-up,
+                            # short enough that a stale pool doesn't
+                            # silently outlive its relevance.
+_video_pool: dict[str, dict[str, Any]] = {}
+
+
+def _pool_get(thread_id: str) -> list[dict[str, Any]] | None:
+    """Return the cached /video result list for ``thread_id``, or None
+    if it's missing/expired. Touches nothing on miss."""
+    entry = _video_pool.get(thread_id)
+    if not entry:
+        return None
+    if (time.time() - entry["ts"]) > _VIDEO_POOL_TTL_S:
+        _video_pool.pop(thread_id, None)
+        return None
+    return entry["results"]
+
+
+def _pool_put(thread_id: str, results: list[dict[str, Any]]) -> None:
+    _video_pool[thread_id] = {"results": list(results), "ts": time.time()}
+
+
+def _parse_indices(text: str) -> list[int]:
+    """Parse a free-form user reply into 1-based list indices.
+
+    Accepts: ``"2,4"``, ``"2 4"``, ``"2, 4"``, ``"all"``, ``"1-3"``.
+    - Whitespace, trailing commas, and a leading ``/transcript`` are
+      stripped upstream before this function is called.
+    - Returns indices in the order they appear; ``all`` returns every
+      index currently in the pool. Bad tokens are silently skipped.
+
+    Returns an empty list for empty / unparseable input — callers
+    decide whether to error."""
+    s = (text or "").strip().lower()
+    if not s:
+        return []
+    # Drop leading command if the user did ``/transcript 2,4`` mistakenly
+    if s.startswith("/transcript"):
+        s = s[len("/transcript"):].strip()
+    if s in ("all", "*"):
+        return []  # "" means caller should expand to "every index"
+    out: list[int] = []
+    for tok in re.split(r"[,\s]+", s):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            # Range like "1-3". Same number twice = single.
+            try:
+                a, b = tok.split("-", 1)
+                a_i, b_i = int(a), int(b)
+            except Exception:
+                continue
+            if a_i <= 0 or b_i <= 0:
+                continue
+            if a_i > b_i:
+                a_i, b_i = b_i, a_i
+            out.extend(range(a_i, b_i + 1))
+            continue
+        try:
+            n = int(tok)
+        except Exception:
+            continue
+        if n > 0:
+            out.append(n)
+    return out
 
 
 def _allowed(settings: Settings, user_id: int | None) -> bool:
@@ -551,6 +627,14 @@ async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chan = _md_escape(v.get("channel") or "")
         meta = " · ".join(x for x in (chan, dur) if x)
         lines.append(f"{i}. [{title}]({v['url']})" + (f"\n   _{meta}_" if meta else ""))
+    # CTA — tell the user how to pick videos by index. Plain text is
+    # simplest on mobile; the /transcript command also accepts "all".
+    lines.append("")
+    lines.append(
+        f"_↪ Reply with `/transcript <indices>` to fetch captions — "
+        f"e.g._ `/transcript 2,4` _or_ `/transcript all`. _Pool expires "
+        f"in 30 min; results replace any previous pool for this chat._"
+    )
     text = "\n".join(lines)
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -560,8 +644,166 @@ async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         plain = "\n".join(
             [f"YouTube{' Shorts' if shorts else ''} results for {query}:"]
             + [f"{i}. {v.get('title','')} — {v['url']}"
-               for i, v in enumerate(results, 1)])
+               for i, v in enumerate(results, 1)]
+            + ["",
+               "Reply: /transcript <indices>  (e.g. /transcript 2,4 or /transcript all)"])
         await update.message.reply_text(plain)
+    # Stash the result list for /transcript follow-ups (keyed by thread_id).
+    thread_id = f"tg:{update.effective_chat.id}"
+    _pool_put(thread_id, results)
+    logger.info("/video pooled %d result(s) for %s (query=%r)",
+                len(results), thread_id, query)
+
+
+# ---------------------------------------------------------------------------
+# /transcript — fetch captions for videos from the last /video pool.
+# ---------------------------------------------------------------------------
+
+
+async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/transcript <indices|all> — fetch YouTube auto-captions for the
+    picked videos from the last /video result pool.
+
+    Index syntax: ``2``, ``2,4``, ``2 4``, ``1-3``, ``all``, ``*``.
+    Each fetched transcript is delivered as:
+      - a short Telegram message with the title + a preview snippet, then
+      - a ``.txt`` file attachment carrying the FULL plain text.
+    """
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    chat_id = update.effective_chat.id
+    thread_id = f"tg:{chat_id}"
+    pool = _pool_get(thread_id)
+    if not pool:
+        await update.message.reply_text(
+            "No recent /video results for this chat. "
+            "Run `/video <query>` first, then pick indices."
+        )
+        return
+    raw = " ".join(ctx.args or []).strip()
+    if not raw:
+        await update.message.reply_text(
+            "Usage: /transcript <indices>  (e.g. /transcript 2,4 or /transcript all)"
+        )
+        return
+
+    indices = _parse_indices(raw)
+    n_total = len(pool)
+    # Special-case ``all`` / empty-list-means-all: caller passed "" sentinel.
+    if not indices:
+        if raw.strip().lower() in ("all", "*"):
+            indices = list(range(1, n_total + 1))
+        else:
+            await update.message.reply_text(
+                f"No valid indices in _{_md_escape(raw)}_. "
+                f"Pool has {n_total} video(s); try "
+                f"`/transcript 1` or `/transcript all`."
+            )
+            return
+    # Clamp / dedupe / preserve order
+    seen: set[int] = set()
+    picked: list[tuple[int, dict[str, Any]]] = []
+    for i in indices:
+        if i in seen:
+            continue
+        seen.add(i)
+        if 1 <= i <= n_total:
+            picked.append((i, pool[i - 1]))
+
+    invalid = [i for i in indices if i < 1 or i > n_total]
+    if not picked:
+        await update.message.reply_text(
+            f"None of {indices} are in the pool "
+            f"(valid range: 1–{n_total})."
+        )
+        return
+    if invalid:
+        await update.message.reply_text(
+            f"⚠️ Ignoring out-of-range indices: {invalid} (valid range 1–{n_total})."
+        )
+
+    await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    from .tools import youtube_video_transcript
+
+    delivered = 0
+    for idx, v in picked:
+        url = v.get("url") or ""
+        title = v.get("title") or "(untitled)"
+        channel = v.get("channel") or ""
+        dur = _fmt_duration(v.get("duration"))
+        meta = " · ".join(x for x in (channel, dur) if x)
+        # Sequential (one fetch per video) — yt-dlp is rate-limited and
+        # parallel fetches can hammer YouTube. For 6 videos this is fine
+        # (~60 s total); batch parallelism is future work.
+        try:
+            r = await asyncio.to_thread(
+                youtube_video_transcript, url, timeout=90)
+        except Exception as e:
+            logger.exception("youtube_video_transcript crashed")
+            await update.message.reply_text(
+                f"⚠️ {idx}. {_md_escape(title)} — fetch crashed: {e}"
+            )
+            continue
+        if not r.ok:
+            await update.message.reply_text(
+                f"⚠️ {idx}. {_md_escape(title)}\n"
+                f"   `{_md_escape(url)}`\n"
+                f"   transcript unavailable: {_md_escape(r.error or 'unknown error')}"
+            )
+            continue
+        # Prefer the richer metadata from the tool result; fall back to the
+        # /video pool values if the info-json didn't include them.
+        t_title = r.title or title
+        t_channel = r.channel or channel
+        t_dur = _fmt_duration(r.duration) or dur
+        header = (
+            f"📝 *Transcript {idx}/{n_total}* — "
+            f"_{_md_escape(t_title)}_\n"
+            f"   `{_md_escape(url)}`\n"
+            f"   _{_md_escape(' · '.join(x for x in (t_channel, t_dur) if x))}_"
+            f"   ·  lang: `{_md_escape(r.language or '?')}`"
+        )
+        text = r.transcript_text or ""
+        # Telegram message limit ~4096 — keep the preview tight.
+        # 3500 chars leaves headroom for the header.
+        PREVIEW = 3500 - len(header)
+        if PREVIEW < 800:
+            PREVIEW = 800
+        if len(text) > PREVIEW:
+            snippet = text[:PREVIEW].rstrip() + "\n… _(see attached .txt)_"
+        else:
+            snippet = text
+        await _safe_send(
+            ctx.application.bot, chat_id,
+            header + "\n\n<pre>" + _html_escape_for_tg(snippet) + "</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+        # Attach the full text as a .txt file. Prefer the in-memory bytes
+        # (always present, no disk race with the tempdir cleanup). The
+        # legacy transcript_path is kept as a fallback if bytes are
+        # somehow empty.
+        fname = r.suggested_filename or "transcript.txt"
+        import io
+        payload: io.BytesIO | None = None
+        if r.transcript_bytes:
+            payload = io.BytesIO(r.transcript_bytes)
+        elif r.transcript_path and Path(r.transcript_path).exists():
+            payload = Path(r.transcript_path).open("rb")
+        if payload is not None:
+            cap = f"{t_title} — captions"
+            await ctx.application.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(payload, filename=fname),
+                caption=cap[:1024],
+            )
+        delivered += 1
+
+    await update.message.reply_text(
+        f"✅ Delivered {delivered}/{len(picked)} transcript(s)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +1153,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("research", research_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("video", video_cmd))
+    app.add_handler(CommandHandler("transcript", transcript_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
