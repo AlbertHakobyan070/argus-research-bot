@@ -17,6 +17,7 @@ handlers — if the tool + parser hold, the handler is wired by inspection.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -182,6 +183,111 @@ def test_youtube_video_transcript_success(monkeypatch, tmp_path: Path):
     assert "--write-auto-subs" in args
     assert any(a.startswith("--sub-langs=") for a in args)
     assert args[-1].startswith("https://")
+
+
+# ---------------------------------------------------------------------------
+# format=txt|srt mode (Phase 2.5, 2026-07-10)
+# ---------------------------------------------------------------------------
+
+_SRT_VTT_FIXTURE = (
+    "WEBVTT\n"
+    "Kind: captions\n"
+    "Language: en\n"
+    "\n"
+    "00:00:01.200 --> 00:00:03.360\n"
+    "All right, so here we are, in front of the\n"
+    "elephants\n"
+    "\n"
+    "00:00:05.318 --> 00:00:07.974\n"
+    "Welcome to the zoo.\n"
+)
+
+_SRT_TIMESTAMP_RE = re.compile(
+    r"\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}"
+)
+
+
+def test_youtube_video_transcript_format_srt_preserves_timestamps(
+    monkeypatch, tmp_path: Path,
+):
+    """format='srt' returns the raw .vtt body with timestamps intact.
+
+    text_mode='txt' must NOT call _vtt_to_text when format='srt' is
+    requested; the raw .vtt bytes are shipped verbatim so the user can
+    see when each line was spoken.
+    """
+    _fake_ytdlp = _fake_ytdlp_success(
+        monkeypatch, tmp_path, vtt_text=_SRT_VTT_FIXTURE)
+    monkeypatch.setattr(tools.tempfile, "TemporaryDirectory", _fake_ytdlp)
+
+    def fake_run(args, **kw):
+        return (0, "", "")
+    monkeypatch.setattr(tools, "_run_yt_dlp", fake_run)
+    monkeypatch.setattr(tools, "_vtt_to_text", lambda _p: (
+        pytest.fail("_vtt_to_text should NOT run under format='srt'")))
+
+    r = tools.youtube_video_transcript(
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        format="srt", timeout=10)
+
+    assert r.ok, r.error
+    # Timestamps kept in both the in-memory text and the bytes.
+    assert _SRT_TIMESTAMP_RE.search(r.transcript_text), (
+        f"expected SRT-style timestamp in transcript_text, got: "
+        f"{r.transcript_text!r}"
+    )
+    assert _SRT_TIMESTAMP_RE.search(r.transcript_bytes.decode("utf-8"))
+    # The WEBVTT header line is preserved.
+    assert "WEBVTT" in r.transcript_text
+    # Suggested filename drops '.txt' for '.srt'.
+    assert r.suggested_filename.endswith(".srt")
+
+
+def test_youtube_video_transcript_default_format_is_txt(
+    monkeypatch, tmp_path: Path,
+):
+    """No format= kwarg -> legacy 'txt' behaviour (timestamps stripped)."""
+    _fake_ytdlp = _fake_ytdlp_success(
+        monkeypatch, tmp_path, vtt_text=_SRT_VTT_FIXTURE)
+    monkeypatch.setattr(tools.tempfile, "TemporaryDirectory", _fake_ytdlp)
+
+    def fake_run(args, **kw):
+        return (0, "", "")
+    monkeypatch.setattr(tools, "_run_yt_dlp", fake_run)
+
+    r = tools.youtube_video_transcript(
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw", timeout=10)
+    assert r.ok, r.error
+    # Timings stripped -> no SRT-style stamp survives in transcript_text.
+    assert not _SRT_TIMESTAMP_RE.search(r.transcript_text), (
+        f"timestamps leaked through txt-mode: {r.transcript_text!r}"
+    )
+    assert r.suggested_filename.endswith(".txt")
+
+
+def test_youtube_video_transcript_format_invalid_raises():
+    """Bad format -> ValueError, fail-fast before yt-dlp is invoked."""
+    with pytest.raises(ValueError, match="format"):
+        tools.youtube_video_transcript(
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw", format="json")
+
+
+def test_parse_indices_ignores_format_flag():
+    """`/transcript 2 format=srt` -> indices=[2], the flag is dropped."""
+    indices = bot._parse_indices("2 format=srt")
+    assert indices == [2]
+
+
+def test_parse_indices_with_format_flag_and_range():
+    """`/transcript 1-3 format=txt` -> indices=[1,2,3]."""
+    indices = bot._parse_indices("1-3 format=txt")
+    assert indices == [1, 2, 3]
+
+
+def test_parse_indices_format_only_no_indices():
+    """`/transcript format=srt` -> empty list (caller surfaces usage hint)."""
+    indices = bot._parse_indices("format=srt")
+    assert indices == []
 
 
 def test_youtube_video_transcript_empty_url():

@@ -687,15 +687,35 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(ctx.args or []).strip()
     if not raw:
         await update.message.reply_text(
-            "Usage: /transcript <indices>  (e.g. /transcript 2,4 or /transcript all)"
+            "Usage: /transcript <indices> [format=txt|srt]\n"
+            "  /transcript 2,4            (plain text, default)\n"
+            "  /transcript 2 format=srt   (timestamps preserved)"
         )
         return
 
-    indices = _parse_indices(raw)
+    # Strip `format=txt|srt` tokens from `raw` so _parse_indices sees
+    # only index tokens. Default format is 'txt' (legacy behaviour).
+    fmt = "txt"
+    tokens = raw.split()
+    kept: list[str] = []
+    for tok in tokens:
+        if tok.lower().startswith("format="):
+            value = tok.split("=", 1)[1].lower()
+            if value not in ("txt", "srt"):
+                await update.message.reply_text(
+                    f"Unknown format {value!r}; use 'txt' or 'srt'."
+                )
+                return
+            fmt = value
+        else:
+            kept.append(tok)
+    raw_indices = " ".join(kept).strip()
+    indices = _parse_indices(raw_indices) if raw_indices else []
     n_total = len(pool)
-    # Special-case ``all`` / empty-list-means-all: caller passed "" sentinel.
+    # Special-case ``all`` / empty-list-means-all: caller passed "all" /
+    # ``*`` sentinel.
     if not indices:
-        if raw.strip().lower() in ("all", "*"):
+        if raw_indices.lower() in ("all", "*"):
             indices = list(range(1, n_total + 1))
         else:
             await update.message.reply_text(
@@ -742,7 +762,14 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # (~60 s total); batch parallelism is future work.
         try:
             r = await asyncio.to_thread(
-                youtube_video_transcript, url, timeout=90)
+                youtube_video_transcript, url, timeout=90, format=fmt)
+        except ValueError as ve:
+            await update.message.reply_text(
+                f"⚠️ {idx}. {_md_escape(title)}\n"
+                f"   `{_md_escape(url)}`\n"
+                f"   bad format: {_md_escape(str(ve))}"
+            )
+            continue
         except Exception as e:
             logger.exception("youtube_video_transcript crashed")
             await update.message.reply_text(
@@ -767,6 +794,8 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   `{_md_escape(url)}`\n"
             f"   _{_md_escape(' · '.join(x for x in (t_channel, t_dur) if x))}_"
             f"   ·  lang: `{_md_escape(r.language or '?')}`"
+            f"   ·  format: `{fmt}`"
+            + (" _(timestamps preserved)_" if fmt == "srt" else "")
         )
         text = r.transcript_text or ""
         # Telegram message limit ~4096 — keep the preview tight.
