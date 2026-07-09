@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch on a new push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install project + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Run tests (skip LLM/manual end-to-end)
+        env:
+          PYTHONNOUSERSITE: '1'
+          ARGUS_OPENAI_BASE_URL: 'http://127.0.0.1:3001/v1'
+          ARGUS_TELEGRAM_BOT_TOKEN: 'ci-stub-token'
+        run: |
+          python -m pytest tests/ \
+            --ignore=tests/manual_e2e.py \
+            --ignore=tests/test_e2e_research.py \
+            -v --tb=short
