@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+
 import re
 import shutil
 import time
@@ -47,6 +48,7 @@ from telegram.ext import (
 )
 
 from .config import Settings, get_settings
+from .cache_cleanup import cleanup_argus_ytt_cache
 from .graph import build_graph, quick_answer_graph
 from .graph.state import DEFAULT_LENGTH, VALID_LENGTHS, Length
 
@@ -1169,6 +1171,12 @@ def main():
     )
     app = build_application()
     logger.info("Argus bot starting; long-polling…")
+    # Trim persistent /transcript cache. Best-effort, exception-tolerant.
+    _removed = cleanup_argus_ytt_cache()
+    if _removed:
+        logger.info(
+            "argus_ytt cache cleanup: removed %d stale deliverable(s)", _removed,
+        )
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
