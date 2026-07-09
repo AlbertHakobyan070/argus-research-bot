@@ -15,8 +15,10 @@ the downstream filter_node still does its own keep_topN.
 from __future__ import annotations
 
 from argus.graph.credibility import (
+    CREDIBILITY_FLOOR,
     DomainTrust,
     credibility_score,
+    is_arxiv_year_suspicious,
     score_fetched,
 )
 from argus.graph.nodes import credibility_node
@@ -369,3 +371,127 @@ def test_filter_node_safety_net_keeps_best_when_all_below_floor():
     assert rels == sorted(rels, reverse=True), (
         "safety net should preserve the (relevance, credibility) ordering"
     )
+
+
+# ---------------------------------------------------------------------------
+# (d) arxiv year-fabrication heuristic (P2.5, 2026-07-10)
+# ---------------------------------------------------------------------------
+
+def test_arxiv_year_suspicious_flags_fabricated_future_year():
+    """`2606.32032` in July 2026 is current-year, but the 5-digit
+    sequence at month-6 hasn't been reached yet — fabricate flag."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/2606.32032", current_year=2026,
+    )
+    assert susp is True
+    assert year == 2026
+
+
+def test_arxiv_year_suspicious_flags_future_year():
+    """YY > current_yy is plain-fabricated."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/3301.12345", current_year=2026,
+    )
+    assert susp is True
+    assert year == 2033
+
+
+def test_arxiv_year_suspicious_allows_legitimate_past_papers():
+    """A valid 2024 paper with 5-digit ID and MM >= 7 must NOT flag."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/2407.01234", current_year=2026,
+    )
+    assert susp is False
+    assert year == 2024
+
+
+def test_arxiv_year_suspicious_allows_current_year_with_four_digit_seq():
+    """A current-year URL with a 4-digit sequence is fine even at month <=6."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/2603.1234", current_year=2026,
+    )
+    assert susp is False
+    assert year == 2026
+
+
+def test_arxiv_year_suspicious_skips_non_arxiv_hosts():
+    """`/abs/YYMM.NNNNN` on google.com is not an arxiv absolute."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://google.com/abs/9999.99999", current_year=2026,
+    )
+    assert susp is False
+    assert year is None
+
+
+def test_arxiv_year_suspicious_skips_arxiv_browse_pages():
+    """`/list/cs.LG/recent` doesn't match the /abs/ pattern."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/list/cs.LG/recent", current_year=2026,
+    )
+    assert susp is False
+    assert year is None
+
+
+def test_arxiv_year_suspicious_flags_pre_2015_format_attempts():
+    """arxiv new-format YY.NNNNN started 2015; YY<15 is fabricated."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/9101.00001", current_year=2026,
+    )
+    assert susp is True
+    assert year == 2091  # parsed as 2091, which is also future
+
+
+def test_arxiv_year_suspicious_flags_invalid_month():
+    """MM=13 doesn't exist."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/2613.12345", current_year=2026,
+    )
+    assert susp is True
+    assert year == 2026
+
+
+def test_arxiv_year_suspicious_allows_version_suffix():
+    """`v7` suffix is preserved but not blocking."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/1706.03762v7", current_year=2026,
+    )
+    assert susp is False
+    assert year == 2017
+
+
+def test_arxiv_year_suspicious_handles_empty_path():
+    """Empty / no path returns (False, None), no exception."""
+    susp, year = is_arxiv_year_suspicious(
+        "https://arxiv.org/abs/", current_year=2026,
+    )
+    assert susp is False
+    assert year is None
+
+
+# End-to-end: a fabricated arxiv URL must surface in score_fetched
+# with credibility_flag="fabricated_path" AND score below floor.
+
+def test_score_fetched_marks_fabricated_arxiv_with_flag_and_below_floor():
+    """Fabricated arxiv URL -> flagged AND dropped below the floor so
+    filter_node's P2 enforcement handles it uniformly."""
+    item = FetchedItem(
+        url="https://arxiv.org/abs/2606.32032",
+        title="Some metacognitive RL paper",
+        excerpt="non-credible abstract",
+    )
+    out = score_fetched([item], user_request="metacognitive RL")
+    assert len(out) == 1
+    scored = out[0]
+    assert scored.credibility_flag == "fabricated_path"
+    assert scored.credibility_score < CREDIBILITY_FLOOR
+
+
+def test_score_fetched_does_not_flag_legitimate_arxiv():
+    """A legitimate 2024 arxiv URL stays un-flagged."""
+    item = FetchedItem(
+        url="https://arxiv.org/abs/2401.01234",
+        title="Deep Research Agents: A Systematic Examination And Roadmap",
+        excerpt="arxiv preprint on agent architectures",
+    )
+    out = score_fetched([item], user_request="deep research agents")
+    assert out[0].credibility_flag != "fabricated_path"

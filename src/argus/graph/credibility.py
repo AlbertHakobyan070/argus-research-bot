@@ -4,7 +4,8 @@ Sits between fetcher_node and filter_node. Assigns every FetchedItem a
 ``credibility_score`` in [0, 1] based on three signals:
 
   (a) Domain trust      — curated DomainTrust list + TLD analysis
-  (b) URL pattern       — arxiv / .edu / .gov boost, content-farm penalty
+  (b) URL pattern       — arxiv / .edu / .gov boost, content-farm penalty,
+                          arxiv year-fabrication flag (P2.5, 2026-07-10)
   (c) Title relevance   — token overlap with the user_request
 
 Items below the 0.4 floor are tagged (``credibility_flag = "low_credibility"``)
@@ -16,6 +17,7 @@ Reference: HANDOFF-RESEARCH-2026-07-08.md §4 (lines 110-135) and §6 row #2.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import ClassVar, Iterable
 from urllib.parse import urlparse
 
@@ -23,6 +25,64 @@ from .state import FetchedItem
 
 
 CREDIBILITY_FLOOR = 0.4
+
+
+# ---------------------------------------------------------------------------
+# Arxiv year-fabrication heuristic (P2.5, 2026-07-10)
+# ---------------------------------------------------------------------------
+#
+# In live runs (notably the 2026-07-09 03:30 metacognitive-RL report),
+# the LLM hallucinates arxiv absolute IDs whose YYMM segment encodes a
+# year that's either in the future (e.g. ``2606.32032`` in July 2026 —
+# MM=06 may look fine but the 5-digit sequence at month-6 isn't reached
+# yet) or earlier than the format itself (any /abs/YYMM.NNNNN with
+# year < 2015 is impossible, the format was introduced 2015-01).
+#
+# We surface those URLs with ``credibility_flag = "fabricated_path"``
+# AND drag the score below CREDIBILITY_FLOOR so the existing
+# filter_node P2 enforcement drops them. Real arxiv URLs aren't
+# affected: 2015 ≤ year ≤ current_year with MM ≤ 6 and a 5-digit
+# sequence will trip the heuristic in the early year, but those are
+# vanishingly rare in real submissions anyway.
+#
+# Old-format IDs (``/abs/1706037``) are intentionally NOT handled here.
+# They're rare in 2026 LLM output and would need a different parser.
+# If we see them in production we can extend ``is_arxiv_year_suspicious``.
+_ARXIV_NEW_RE = re.compile(r"^/abs/(\d{4})\.(\d{4,5})(?:v\d+)?$")
+_ARXIV_NEW_FORMAT_START_YEAR = 2015   # YY=1501 (Jan 2015) is the earliest
+
+
+def is_arxiv_year_suspicious(url: str, *, current_year: int | None = None
+                              ) -> tuple[bool, int | None]:
+    """Return ``(is_suspicious, detected_year)`` for an arxiv /abs/ URL.
+
+    Non-arxiv hosts and non-``/abs/`` paths return ``(False, None)``.
+    """
+    if current_year is None:
+        current_year = datetime.now().year
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if not host or "arxiv.org" not in host:
+        return (False, None)
+    m = _ARXIV_NEW_RE.match(parsed.path or "")
+    if not m:
+        return (False, None)
+    yymm, seq = m.group(1), m.group(2)
+    try:
+        yy = int(yymm[:2])
+        mm = int(yymm[2:4])
+    except ValueError:
+        return (False, None)
+    if not (1 <= mm <= 12):
+        return (True, 2000 + yy)
+    year = 2000 + yy
+    if year < _ARXIV_NEW_FORMAT_START_YEAR:
+        return (True, year)
+    if year > current_year:
+        return (True, year)
+    if year == current_year and len(seq) == 5 and mm <= 6:
+        return (True, year)
+    return (False, year)
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +365,31 @@ def score_fetched(items: Iterable[FetchedItem], *,
                   user_request: str,
                   floor: float = CREDIBILITY_FLOOR) -> list[FetchedItem]:
     """Return a new list of FetchedItem with ``credibility_score`` (and
-    ``credibility_flag``) populated. Does not drop items."""
+    ``credibility_flag``) populated. Does not drop items.
+
+    Adds a ``fabricated_path`` flag (with the score dragged below
+    ``floor``) for arxiv /abs/ URLs whose YYMM encodes a year outside
+    the legitimate new-format window ``[2015, current_year]``. This is
+    the P2.5 layer added 2026-07-10 in response to the 2026-07-09
+    metacognitive-RL run (cites ``arxiv 2606.32032`` as legitimate).
+    """
+    now_year = datetime.now().year
     out: list[FetchedItem] = []
     for it in items:
         s = credibility_score(it, user_request=user_request)
+        flag: str | None = None
+        if s < floor:
+            flag = "low_credibility"
+        # P2.5: arxiv year-fabrication wins over a generic low flag so
+        # downstream consumers can grep for the specific cause.
+        susp, _year = is_arxiv_year_suspicious(it.url or "", current_year=now_year)
+        if susp:
+            flag = "fabricated_path"
+            s = min(s, floor - 0.05)
         # mutating a copy keeps the caller's list untouched
         updated = it.model_copy(update={
             "credibility_score": s,
-            "credibility_flag": "low_credibility" if s < floor else None,
+            "credibility_flag": flag,
         })
         out.append(updated)
     return out
