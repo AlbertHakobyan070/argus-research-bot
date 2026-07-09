@@ -1195,11 +1195,20 @@ def synthesizer_node(state: ArgusState) -> dict:
                 length, len(fetched), synthesis_no_evidence_reason,
             )
         else:
-            for fd in (data.get("findings") or []):
+            for i, fd in enumerate(data.get("findings") or []):
                 try:
-                    findings.append(Finding.model_validate(fd))
+                    f = Finding.model_validate(fd)
                 except Exception as e:
                     logger.warning("bad finding: %s", e)
+                    continue
+                # Assign a stable per-run id so post-synthesis passes
+                # (quarantine, fabrication detector, grounding verifier)
+                # can route findings by id instead of substring-matching
+                # prose. The synthesizer is not required to produce an
+                # id — we assign one here in source order.
+                if not f.id:
+                    f.id = f"f{i}"
+                findings.append(f)
             if (not findings) and (not (data.get("draft_md") or "").strip()):
                 synthesis_outcome = "empty_fallback"
                 synthesis_no_evidence_reason = (
@@ -1413,8 +1422,17 @@ Return JSON only:
   "verdict": "pass" | "revise",
   "notes": ["...", "..."],
   "unsupported_claims": ["the exact claim text...", "..."],
-  "fabrication_flags": ["the exact suspicious text...", "..."]
+  "fabrication_flags": ["the exact suspicious text...", "..."],
+  "flagged_finding_ids": ["f0", "f3", "..."]
 }
+
+CRITICAL: each finding in the input has an `id` field (e.g. "f0",
+"f3"). When you flag a claim as unsupported or fabricated, list
+the corresponding `id` in `flagged_finding_ids`. This is the
+routing key the report builder uses to move the finding to the
+## flagged-claims appendix - matching by id is exact, matching
+by claim text fragments the prose when the same claim recurs
+across sections.
 """
 
 
@@ -1436,6 +1454,7 @@ def reviewer_node(state: ArgusState) -> dict:
         HumanMessage(content=user[:14000]),
     ])
     rec = llm.record_from_response("judge", llm.resolve_tier("judge"), resp)
+    flagged_ids: list[str] = []
     try:
         data = _parse_json_obj(resp.content)
         verdict = ReviewVerdict.model_validate({
@@ -1444,6 +1463,7 @@ def reviewer_node(state: ArgusState) -> dict:
             "unsupported_claims": data.get("unsupported_claims", []),
             "fabrication_flags": data.get("fabrication_flags", []),
         })
+        flagged_ids = list(data.get("flagged_finding_ids") or [])
     except Exception as e:
         logger.warning("Reviewer non-JSON, defaulting to revise: %s", e)
         verdict = ReviewVerdict(
@@ -1458,7 +1478,7 @@ def reviewer_node(state: ArgusState) -> dict:
         1 if verdict.verdict == "revise" else 0
     )
     return {
-        "review_verdict": verdict.model_dump(),
+        "review_verdict": {**verdict.model_dump(), "flagged_finding_ids": flagged_ids},
         "revision_notes": notes,
         "revision_rounds": rounds,
         "model_calls": [rec.model_dump()],
@@ -1530,35 +1550,88 @@ def report_builder_node(state: ArgusState) -> dict:
     n_sources = len(state.get("fetched") or [])
     revision_rounds = int(state.get("revision_rounds") or 0)
 
-    # P4 — quarantine reviewer-flagged fabrication claims BEFORE we
+    # P4 - quarantine reviewer-flagged fabrication claims BEFORE we
     # compose the body so the title-block flags report honest numbers.
-    # We only consider claims from a "real" reviewer run (verdict
-    # present). Empty review_verdict means the run never went through
-    # the reflexion loop (e.g. short/tldr).
+    #
+    # Two paths:
+    #   (a) Structured (default, 2026-07-09): route findings by
+    #       ``finding_id`` through ``post_synthesis.quarantine_by_id``.
+    #       This is the structural fix for the §4.1 fragmentation
+    #       bug - when the same flagged claim appears in multiple
+    #       sections, the structured path routes it exactly once
+    #       instead of partially matching substrings and producing
+    #       orphaned prose fragments.
+    #   (b) Legacy string-quarantine fallback: when findings lack
+    #       ids (legacy checkpoint replay) or the structured path
+    #       raises, fall back to the substring-matching legacy
+    #       ``quarantine_flagged_claims``. Removed when the legacy
+    #       module is retired (post 5.4 of the argus-async handoff).
     review_verdict = state.get("review_verdict") or {}
     body = state.get("draft_md") or "# (empty draft)"
+    used_structured_quarantine = False
     if review_verdict:
+        # The reviewer may flag findings by id (new structured
+        # contract) OR by claim text (legacy substring contract). We
+        # support both - preferring id-based when available.
+        flagged_ids = review_verdict.get("flagged_finding_ids") or []
+        flagged_claim_text = (
+            list(review_verdict.get("unsupported_claims") or [])
+            + list(review_verdict.get("fabrication_flags") or [])
+        )
         try:
-            from ..quarantine import quarantine_flagged_claims as \
-                _quarantine_flagged_claims
-            _qres = _quarantine_flagged_claims(
-                body,
-                review_verdict.get("unsupported_claims") or [],
-                review_verdict.get("fabrication_flags") or [],
-                mode="move",
+            from ..post_synthesis import (
+                assign_finding_ids,
+                quarantine_by_id as _quarantine_by_id,
+                render_quarantine_appendix as _render_quarantine_appendix,
             )
-            n_quarantined = len(_qres.quarantined)
-            n_still_unmatched = len(_qres.still_unmatched)
-            body = _qres.cleaned_text
-            if n_quarantined:
+            findings_records = assign_finding_ids(state.get("findings") or [])
+            if findings_records and flagged_ids:
+                kept, q, d, unmatched = _quarantine_by_id(
+                    findings_records, flagged_ids, mode="move",
+                )
+                n_quarantined = len(q)
+                n_still_unmatched = len(unmatched)
+                # Append the structured appendix. The body itself is
+                # left intact (the synthesizer already wrote it from
+                # the surviving findings); the appendix is the only
+                # place where flagged claims appear.
+                if q:
+                    body = body + _render_quarantine_appendix(q)
+                used_structured_quarantine = True
                 logger.info(
-                    "quarantine: moved %d flagged sentence(s) to "
-                    "appendix (%d unmatched)",
-                    n_quarantined, n_still_unmatched,
+                    "quarantine(structured): moved %d finding(s) to "
+                    "appendix (%d unmatched); kept %d",
+                    n_quarantined, n_still_unmatched, len(kept),
                 )
         except Exception as _e:
-            # Quarantine failure is non-fatal — degrade to the raw body.
-            logger.warning("quarantine pass skipped (%s); body unchanged", _e)
+            logger.warning(
+                "structured quarantine skipped (%s); falling back to "
+                "legacy string-quarantine", _e,
+            )
+
+        if not used_structured_quarantine and flagged_claim_text:
+            try:
+                from ..quarantine import quarantine_flagged_claims as                     _quarantine_flagged_claims
+                _qres = _quarantine_flagged_claims(
+                    body,
+                    review_verdict.get("unsupported_claims") or [],
+                    review_verdict.get("fabrication_flags") or [],
+                    mode="move",
+                )
+                n_quarantined = len(_qres.quarantined)
+                n_still_unmatched = len(_qres.still_unmatched)
+                body = _qres.cleaned_text
+                if n_quarantined:
+                    logger.info(
+                        "quarantine(legacy): moved %d flagged "
+                        "sentence(s) to appendix (%d unmatched)",
+                        n_quarantined, n_still_unmatched,
+                    )
+            except Exception as _e:
+                logger.warning(
+                    "quarantine pass skipped (%s); body unchanged", _e,
+                )
+
 
     title_block = render_title_block(
         topic=state["user_request"],
