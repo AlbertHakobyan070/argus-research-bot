@@ -52,10 +52,25 @@ class FetchedItem(BaseModel):
 
 
 class Finding(BaseModel):
-    """One cited claim in the synthesized report."""
+    """One cited claim in the synthesized report.
+
+    ``id`` is a stable per-run identifier assigned by the synthesizer
+    (e.g. ``"f3"``). It is the join key for post-synthesis passes
+    (quarantine, fabrication detector, grounding verifier) — those
+    passes operate on ``finding_id`` rather than substring-matching the
+    prose, so a sentence that recurs in multiple sections is matched
+    exactly once instead of partially. See
+    ``src/argus/post_synthesis.py`` for the consumers.
+    """
+    id: str = ""  # set by synthesizer; empty only for legacy findings
     claim: str
     citation_urls: list[str]  # at least one FetchedItem URL
     confidence: Literal["high", "medium", "low"] = "medium"
+    # Optional section anchor for finding-id routing. Set by the
+    # synthesizer when the LLM places the claim under a specific
+    # heading (e.g. "## Current state"). Used by report_builder to
+    # group findings under sections.
+    section: str = ""
 
 
 class ReviewVerdict(BaseModel):
