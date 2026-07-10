@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -525,6 +526,50 @@ def fetcher_node(state: ArgusState) -> dict:
     sources = state.get("sources") or []
     for src in sources:
         url = src.get("url")
+        # v2 Phase 4: appended LOCAL sources (vault transcripts, saved
+        # reports) carry ``local_path`` instead of a fetchable URL. They
+        # become FetchedItems with file:/// urls so the citation
+        # registry can reference them like any web source.
+        local_path = src.get("local_path")
+        if local_path:
+            try:
+                p = Path(local_path)
+                if not p.exists():
+                    msg = f"fetcher: appended local file missing: {local_path}"
+                    logger.warning(msg)
+                    errors.append(msg)
+                    continue
+                if p.suffix.lower() == ".md":
+                    md_path = p
+                elif p.suffix.lower() == ".txt":
+                    # Plain text (transcripts) → copy to a .md work file
+                    # OUTSIDE the vault so we don't litter it.
+                    work = Path(tempfile.gettempdir()) / "argus_local_md"
+                    work.mkdir(parents=True, exist_ok=True)
+                    md_path = work / (p.stem + ".md")
+                    md_path.write_text(
+                        p.read_text(encoding="utf-8", errors="replace"),
+                        encoding="utf-8")
+                else:
+                    res = normalize_to_markdown(str(p))
+                    if not (res.ok and res.markdown_path):
+                        msg = (f"fetcher: could not normalize local file "
+                               f"{p.name}: {res.error or 'not ok'}")
+                        errors.append(msg)
+                        continue
+                    md_path = Path(res.markdown_path)
+                fetched.append(FetchedItem(
+                    url="file:///" + str(p).replace("\\", "/"),
+                    title=src.get("title") or p.stem,
+                    markdown_path=str(md_path),
+                    section=src.get("kind", "local"),
+                    excerpt=_read_excerpt(str(md_path)),
+                ).model_dump())
+            except Exception as e:
+                msg = f"fetcher: local file {local_path} failed: {e!r}"
+                logger.warning(msg)
+                errors.append(msg)
+            continue
         # T6 fix: a source without a URL is not fetchable. Record and
         # skip without crashing the whole node. Old code raised
         # KeyError on src["url"], caught by the broad except, logged
@@ -646,6 +691,12 @@ def normalizer_node(state: ArgusState) -> dict:
     for f in state.get("fetched") or []:
         item = FetchedItem.model_validate(f)
         if not item.markdown_path or not Path(item.markdown_path).exists():
+            if item.url.startswith("file:///"):
+                # Local appended source — there is nothing to re-fetch
+                # over the network; keep it as-is (the citation still
+                # stands, the excerpt was captured at fetch time).
+                patched.append(item.model_dump())
+                continue
             # try once more via normalize
             res = normalize_to_markdown(item.url)
             if res.ok and res.markdown_path:
@@ -748,9 +799,16 @@ def filter_node(state: ArgusState) -> dict:
             f.relevance_score = hits / len(kw_words)
         # else: leave relevance_score as-is (e.g. pre-seeded test corpus)
         kept.append(f)
-    kept.sort(key=lambda x: (x.relevance_score, x.credibility_score or 0.0),
-              reverse=True)
-    full_ranked = kept[:14]
+    # v2 Phase 4: user-appended local sources (file:/// — vault
+    # transcripts etc.) are PINNED: an explicit /append must never be
+    # silently out-ranked by web results (live E2E caught exactly that).
+    pinned = [f for f in kept if f.url.startswith("file:///")]
+    ranked_pool = [f for f in kept if not f.url.startswith("file:///")]
+    ranked_pool.sort(
+        key=lambda x: (x.relevance_score, x.credibility_score or 0.0),
+        reverse=True)
+    cap = max(1, 14 - len(pinned))
+    full_ranked = ranked_pool[:cap]
 
     # P2 — enforce credibility floor with safety net. If dropping
     # below-floor items empties the report, fall back to full_ranked
@@ -761,11 +819,11 @@ def filter_node(state: ArgusState) -> dict:
         if (f.credibility_score or 0.0) >= CREDIBILITY_FLOOR
     ]
     if above_floor:
-        kept = above_floor
+        kept = pinned + above_floor
     else:
         # Safety net. Same shape as the Phase-1 "don't empty the
         # report" guard.
-        kept = full_ranked
+        kept = pinned + full_ranked
 
     out: dict[str, Any] = {"fetched": [f.model_dump() for f in kept]}
     if fetched and not kept:
@@ -1859,7 +1917,26 @@ def extend_prep_node(state: ArgusState) -> dict:
     To surface genuinely new material (not the same URLs), we fold salient
     words from the plan's sub_questions into ``must_have_keywords`` so the
     subgraph's web/GitHub searches broaden their coverage.
+
+    v2 Phase 4 — ``append_only``: /continue after /append ingests
+    EXACTLY the user's appended sources (already merged into
+    ``state["sources"]`` by the bot before the resume) without running
+    fresh searches. Plain /continue keeps the search-widening behaviour.
     """
+    if state.get("append_only"):
+        rnd = int(state.get("extend_rounds") or 0) + 1
+        srcs = state.get("sources") or []
+        return {
+            "sources": srcs,
+            "extend_requested": False,
+            "append_only": False,
+            "extend_rounds": rnd,
+            "revision_rounds": 0,
+            "messages": [{"role": "assistant",
+                          "content": (f"➕ Continuing with appended sources "
+                                      f"only (round {rnd}) — "
+                                      f"{len(srcs)} total.")}],
+        }
     plan = ResearchPlan.model_validate(state.get("plan") or {})
     extra: list[str] = []
     for sq in plan.sub_questions:
