@@ -89,6 +89,8 @@ Without `/length`, the default is `short`.
 
 Inline-keyboard buttons appear after the plan is drafted and after the
 report is built. Click *Approve* / *Send* to advance, *Cancel* to drop.
+The plan preview lists sources found by LIVE search (run before the
+gate) — planner URL guesses are never shown.
 
 Runs are checkpointed in SQLite (each run gets its own thread, so runs
 survive bot restarts); reports are persisted to the DS-vault
@@ -367,10 +369,18 @@ def _md_escape(s: str) -> str:
     return out
 
 
-def _format_plan(plan: dict, length: str = DEFAULT_LENGTH) -> str:
+def _format_plan(plan: dict, length: str = DEFAULT_LENGTH,
+                 sources: list[dict] | None = None) -> str:
+    """Render the plan-approval preview.
+
+    v2 grounded gate: ``sources`` are the REAL results the researcher
+    found via live search (ddgs/arxiv/github) before this gate. Planner
+    ``target_url`` values are NEVER rendered — they are LLM guesses
+    (knowledge-cutoff fantasy links) and the researcher ignores them.
+    """
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
-    sources = plan.get("planned_sources") or []
+    intents = plan.get("planned_sources") or []
     mode_label = _LENGTH_LABELS.get(length, length)
     lines = [f"📋 *Research plan*  ·  mode: {mode_label}", ""]
     if summary:
@@ -380,22 +390,30 @@ def _format_plan(plan: dict, length: str = DEFAULT_LENGTH) -> str:
         for q in sub_qs:
             lines.append(f"- {_md_escape(q)}")
         lines.append("")
-    if sources:
-        lines.append(
-            "*Planned sources "
-            f"({len(sources)}, queries only — URLs are verified at fetch time):*"
-        )
-        for s in sources[:14]:
+    if intents:
+        lines.append(f"*Search intents ({len(intents)}):*")
+        for s in intents[:14]:
             kind = s.get("kind", "search")
             q = s.get("query")
-            url = s.get("target_url")
-            if q:
-                intent = f"_search intent:_ {_md_escape(q)}"
-            elif url:
-                intent = f"_candidate (verified at fetch):_ {_md_escape(url)}"
-            else:
-                intent = "_live search_"
+            intent = f"_{_md_escape(q)}_" if q else "_live search_"
             lines.append(f"- `{_md_escape(kind)}` — {intent}")
+        lines.append("")
+    if sources is not None:
+        if sources:
+            shown = sources[:12]
+            lines.append(f"*Found sources ({len(sources)}, live search):*")
+            for s in shown:
+                title = (s.get("title") or "").strip()
+                url = s.get("url") or ""
+                if not title:
+                    title = url.split("//", 1)[-1][:60] or "(untitled)"
+                lines.append(f"- [{_md_escape(title[:70])}]({url})")
+            if len(sources) > len(shown):
+                lines.append(f"  _…and {len(sources) - len(shown)} more_")
+        else:
+            lines.append(
+                "⚠️ *Live search found no sources.* Approving will fetch "
+                "nothing — Edit the plan or Cancel.")
     return "\n".join(lines)
 
 
@@ -524,10 +542,12 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"🎯 Mode detected: _{delta.get('mode','?')}_", progress)
                 elif node_name == "planner":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        "📋 Plan drafted — awaiting your approval.", progress)
+                        "📋 Plan drafted — searching live sources…", progress)
                 elif node_name == "researcher":
+                    n = len(delta.get("sources") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        "🔍 Researching primary sources…", progress)
+                        f"🔍 Live search found {n} candidate source(s) — "
+                        "awaiting your approval.", progress)
                 elif node_name == "fetcher":
                     n = len(delta.get("fetched") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
@@ -545,10 +565,12 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         snap = await graph.aget_state(cfg)
         cur = snap.values if snap else {}
 
-        # First HITL = plan approval.
+        # First HITL = plan approval — grounded: the researcher already
+        # ran, so the preview lists REAL sources from live search.
         plan = cur.get("plan") or {}
         if plan:
-            text = _format_plan(plan, length=length)
+            text = _format_plan(plan, length=length,
+                                sources=cur.get("sources") or [])
             # Remember the base plan text so length taps can re-render it
             # without stacking status suffixes on top of each other.
             info["plan_text"] = text
@@ -1155,17 +1177,17 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
         )
 
     progress = await _stream_progress(ctx.application.bot, chat_id,
-        "🔍 Researching primary sources…", progress)
+        "📥 Fetching approved sources…", progress)
 
     try:
         async for ev in graph.astream(Command(resume=True), config=cfg,
                                       stream_mode="updates"):
             for node_name, delta in ev.items():
                 info["stage"] = node_name
-                if node_name == "researcher":
+                if node_name == "extend_prep":
                     n = len(delta.get("sources") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🔍 {n} candidate sources.", progress)
+                        f"🔎 Extend: source pool now {n}.", progress)
                 elif node_name == "fetcher":
                     n = len(delta.get("fetched") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,

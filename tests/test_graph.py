@@ -43,7 +43,8 @@ def test_quick_graph_runs():
 
 
 def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
-    """First interrupt must fire after planner (before researcher)."""
+    """First interrupt fires AFTER researcher (grounded plan gate): the
+    plan AND real search results must both be in state at the pause."""
     # Force reports into a tmp folder via env var the report_builder reads.
     monkeypatch.setenv("ARGUS_REPORTS_ROOT", str(tmp_path))
     # Invalidate the cached settings so the report_builder picks it up.
@@ -94,12 +95,15 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
     cfg = {"configurable": {"thread_id": "test:deep"}}
     out = g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),
                    config=cfg)
-    # After first invoke, we expect an interrupt (paused before researcher).
+    # After first invoke, we expect the grounded plan gate: paused AFTER
+    # researcher, before fetcher.
     snap = g.get_state(cfg)
-    assert snap.next, "expected graph to pause on first interrupt"
-    # The plan must be set.
+    assert snap.next == ("fetcher",), (
+        f"expected the grounded plan gate (next=fetcher), got {snap.next!r}")
     cur = snap.values
     assert cur.get("plan"), "planner should have set the plan"
+    assert cur.get("sources"), (
+        "live search results must be available at the plan gate")
     # Approve -> resume
     g.invoke(Command(resume=True), config=cfg)
     snap = g.get_state(cfg)

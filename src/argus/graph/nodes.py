@@ -132,11 +132,16 @@ def planner_node(state: ArgusState) -> dict:
         )),
     ])
     rec = llm.record_from_response("strong", llm.resolve_tier("strong"), resp)
+    planner_errors: list[str] = []
     try:
         data = _parse_json_obj(resp.content)
         plan = ResearchPlan.model_validate(data)
     except Exception as e:
         logger.warning("Planner returned non-JSON (%s); falling back.", e)
+        logger.debug("raw planner output: %r", resp.content[:1000])
+        # NEVER put the raw LLM output in the summary — _format_plan
+        # renders it in the Telegram preview (raw ```json blob observed
+        # live, 2026-07-10). Neutral notice + loud errors entry instead.
         plan = ResearchPlan(
             sub_questions=[state["user_request"]],
             planned_sources=[PlannedSource(
@@ -144,10 +149,14 @@ def planner_node(state: ArgusState) -> dict:
                 query=state["user_request"],
                 rationale="Fallback: a single web search.",
             )],
-            summary=resp.content[:300],
+            summary=("⚠️ Planner output was unparseable — falling back to "
+                     "a single-search plan. Live search still runs; Edit "
+                     "or Cancel if the topic needs a richer plan."),
         )
+        planner_errors.append(f"planner: unparseable output ({e})")
     return {
             "plan": plan.model_dump(),
+            "errors": planner_errors,
             "model_calls": [rec.model_dump()],
             "messages": [{"role": "assistant", "content": (
                 f"📋 Drafted plan with {len(plan.planned_sources)} sources. "

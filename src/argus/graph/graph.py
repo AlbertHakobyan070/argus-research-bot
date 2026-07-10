@@ -2,7 +2,8 @@
 
 Architecture (deep path):
 
-  intake ──► planner ──HITL plan_approval──► researcher ──► fetcher ──►
+  intake ──► planner ──► planner_reflect ──► researcher (LIVE search)
+  ──HITL plan_approval (real found sources shown)──► fetcher ──►
   normalizer ──► credibility ──► filter ──► synthesizer ──► reviewer
   ──► (pass|revise) ▲                                │
                      └──────────── revision loop ────┘
@@ -100,9 +101,13 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
         checkpointer = MemorySaver()
     return g.compile(
         checkpointer=checkpointer,
-        interrupt_before=["researcher", "deliver"],
-        # planner runs, then we pause before researcher (plan approval)
-        # report_builder runs, then we pause before deliver (preview)
+        # Grounded plan gate (v2): pause AFTER researcher, so the plan
+        # preview can show REAL sources found by live search instead of
+        # the planner LLM's invented URLs. The extend loop rejoins at
+        # fetcher and thus never re-triggers this gate.
+        interrupt_after=["researcher"],
+        # report_builder runs, then we pause before deliver (preview).
+        interrupt_before=["deliver"],
     )
 
 
