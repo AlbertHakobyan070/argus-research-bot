@@ -267,3 +267,17 @@ def test_mirror_run_md_writes_into_report_dir(tmp_path):
 def test_mirror_run_md_without_report_dir_returns_none(tmp_path):
     run = {"run_id": "x", "topic": "t", "report_dir": None}
     assert mirror_run_md(run) is None
+
+
+# ---------------------------------------------------------------------------
+# settings kv (backs /quality and future global toggles)
+# ---------------------------------------------------------------------------
+
+
+async def test_settings_roundtrip_and_default(lib: Library):
+    assert await lib.get_setting("media_quality") is None
+    assert await lib.get_setting("media_quality", "auto") == "auto"
+    await lib.set_setting("media_quality", "720")
+    assert await lib.get_setting("media_quality") == "720"
+    await lib.set_setting("media_quality", "max")   # overwrite
+    assert await lib.get_setting("media_quality") == "max"

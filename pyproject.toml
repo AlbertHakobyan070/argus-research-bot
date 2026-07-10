@@ -18,6 +18,8 @@ dependencies = [
     "tenacity>=8.2",
     "reportlab>=4.0",
     "ddgs>=9.0",
+    "yt-dlp>=2026.6",
+    "imageio-ffmpeg>=0.6",
 ]
 
 [project.optional-dependencies]
