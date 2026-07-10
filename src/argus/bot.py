@@ -907,21 +907,28 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("(no in-flight run)")
         return
     data = q.data or ""
-    # T7.1 — length selector clicks act as "approve with this length".
+    # T7.1 + 2026-07-10 fix: length taps update the chosen length and
+    # re-render the plan message, but MUST NOT resume the graph.
+    # Resuming belongs to the Approve button. The previous behaviour
+    # (Length-tap auto-resumed and Approve-tap auto-resumed again)
+    # created two concurrent ``Command(resume=True)`` astream sessions
+    # on the same thread, which made the Approve button appear
+    # 'unpressable' and let the user skip past the plan review window
+    # — observed in the live 2026-07-10 logs. The Approve-tap path
+    # reads ``info["length"]`` so the chosen length carries through.
     if data.startswith("len:"):
         chosen = data.split(":", 1)[1]
         if chosen not in _LENGTH_LABELS:
             await q.edit_message_text("Unknown length mode.")
             return
         info["length"] = chosen
-        info["plan_approved"] = True
+        # NOTE: do NOT set plan_approved here — keep the gate single-step.
         await _safe_edit_cb(
             q,
             (q.message.text or "")
             + f"\n\n_📏 Length set to *{_LENGTH_LABELS.get(chosen, chosen)}* "
-              "— continuing._",
+              "— tap ✅ Approve to continue._",
         )
-        await _resume_after_plan(ctx, thread_id, info)
         return
     if data == "plan:approve":
         info["plan_approved"] = True
