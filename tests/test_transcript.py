@@ -385,3 +385,89 @@ def test_pool_isolates_threads():
     bot._pool_put("tg:b", [{"url": "B", "title": "B"}])
     assert bot._pool_get("tg:a")[0]["url"] == "A"
     assert bot._pool_get("tg:b")[0]["url"] == "B"
+
+
+# ---------------------------------------------------------------------------
+# rolling-caption duplication (v2 Phase 3 — Albert's 2026-07-10 screenshot)
+# ---------------------------------------------------------------------------
+
+_ROLLING_VTT = (
+    "WEBVTT\n"
+    "Kind: captions\n"
+    "Language: en\n"
+    "\n"
+    "00:00:00.000 --> 00:00:02.000\n"
+    "when you really need to, looking at\n"
+    "\n"
+    "00:00:02.000 --> 00:00:04.000\n"
+    "when you really need to, looking at changes,\n"
+    "\n"
+    "00:00:04.000 --> 00:00:06.000\n"
+    "changes, clicking around, going to\n"
+    "\n"
+    "00:00:06.000 --> 00:00:08.000\n"
+    "changes, clicking around, going to definition.\n"
+    "\n"
+    "00:00:08.000 --> 00:00:10.000\n"
+    "Probably the most exciting\n"
+    "\n"
+    "00:00:10.000 --> 00:00:12.000\n"
+    "Probably the most exciting\n"
+)
+
+
+def test_vtt_to_text_collapses_rolling_caption_overlap(tmp_path: Path):
+    """YouTube auto-captions repeat each cue's tail at the start of the
+    next cue (rolling window). The txt transcript must collapse the
+    overlap so prose reads once, not twice (live report 2026-07-10)."""
+    f = tmp_path / "roll.vtt"
+    f.write_text(_ROLLING_VTT, encoding="utf-8")
+    out = tools._vtt_to_text(f)
+
+    assert out.count("when you really need to, looking at") == 1, out
+    assert out.count("changes, clicking around, going to") == 1, out
+    assert out.count("Probably the most exciting") == 1, out
+    # No word content may be lost either.
+    assert "definition." in out
+
+
+def test_vtt_to_text_keeps_distinct_consecutive_lines(tmp_path: Path):
+    """Dedup must not eat genuinely distinct cues."""
+    f = tmp_path / "ok.vtt"
+    f.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\nfirst thought here\n\n"
+        "00:00:02.000 --> 00:00:03.000\nsecond idea entirely\n",
+        encoding="utf-8")
+    out = tools._vtt_to_text(f)
+    assert "first thought here" in out
+    assert "second idea entirely" in out
+
+
+# ---------------------------------------------------------------------------
+# out_dir vault persistence (v2 Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_youtube_video_transcript_persists_into_out_dir(monkeypatch,
+                                                        tmp_path: Path):
+    info = dict(_INFO_JSON)
+    info["upload_date"] = "20050424"
+    fake_src = tmp_path / "src"
+    fake_src.mkdir()
+    _FakeTD = _fake_ytdlp_success(monkeypatch, fake_src, info_json=info)
+    monkeypatch.setattr(tools.tempfile, "TemporaryDirectory", _FakeTD)
+    monkeypatch.setattr(tools, "_run_yt_dlp", lambda a, **k: (0, "", ""))
+
+    vault = tmp_path / "vault" / "transcripts" / "youtube"
+    r = tools.youtube_video_transcript(
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw", timeout=10,
+        out_dir=vault)
+    assert r.ok, r.error
+    p = Path(r.transcript_path)
+    assert p.parent == vault, "deliverable must persist into out_dir"
+    assert p.exists()
+    assert p.name.startswith("20050424_jNQXAC9IVRw_"), (
+        f"vault filename must be <date>_<id>_<title>: {p.name}")
+    assert p.name.endswith(".txt")
+    assert "Me_at_the_zoo" in p.name
