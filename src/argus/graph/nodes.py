@@ -151,7 +151,7 @@ def planner_node(state: ArgusState) -> dict:
             "model_calls": [rec.model_dump()],
             "messages": [{"role": "assistant", "content": (
                 f"📋 Drafted plan with {len(plan.planned_sources)} sources. "
-                "Awaiting your approval.")}, {"ts": _ts()}],
+                "Awaiting your approval."), "ts": _ts()}],
             # Set HITL pending; the bot layer will surface this and the
             # LangGraph interrupt will pause the run.
             "hitl": {"pending": True, "kind": "plan_approval",

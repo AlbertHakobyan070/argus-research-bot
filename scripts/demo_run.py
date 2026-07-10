@@ -167,10 +167,8 @@ def main():
     from argus.graph import build_graph
     from argus.config import get_settings
 
-    # Point reports at demo_output (inside argus/, not A:\Hermes\).
+    # Point reports at demo_output (inside argus/, not the vault).
     os.environ["ARGUS_REPORTS_ROOT"] = str(DEMO_OUT)
-    os.environ["ARGUS_LANGGRAPH_DIR"] = str(DEMO_OUT / "_langgraph")
-    Path(DEMO_OUT / "_langgraph").mkdir(parents=True, exist_ok=True)
     from argus import config as cfg_mod
     cfg_mod._cached = None
     s = get_settings()

@@ -24,8 +24,10 @@ uv venv --python 3.12 venv
 ```
 
 Then in Telegram: `/research <topic>` (deep) or `/ask <question>` (quick).
-Per-chat memory is checkpointed in SQLite; reports are persisted to
-`A:\Hermes\Downloads\reports\<stamp>_<topic>\`.
+Every run gets its own SQLite checkpoint thread (`tg:<chat>:<run8>`), is
+registered in the Argus library DB (`argus_library.sqlite`), and reports
+are persisted to the DS-vault research-history folder (override with
+`ARGUS_REPORTS_ROOT` / `ARGUS_VAULT_ROOT`).
 
 ## ⚠ PYTHONPATH gotcha (read this or nothing will start)
 
@@ -52,7 +54,8 @@ do `set PYTHONPATH=` (cmd) or `unset PYTHONPATH` (bash) first.
                                   ▼
                 ┌─────────────────────────────────────┐
                 │       LangGraph supervisor          │
-                │  SqliteSaver (thread_id = chat_id)  │
+                │ AsyncSqliteSaver (one per process;  │
+                │  thread_id = tg:<chat>:<run8>)      │
                 └─┬─────┬─────┬─────┬─────┬─────┬────┬─┘
                   ▼     ▼     ▼     ▼     ▼     ▼    ▼
                intake planner res  fetch norm  rank synth rev─► report ─► deliver
@@ -125,8 +128,11 @@ prints the requested vs served model for every call.
 
 ## Architecture decisions
 
-- **State checkpointer**: `SqliteSaver` keyed on `thread_id = tg:<chat_id>`.
-  Each user's in-flight run survives a bot restart.
+- **State checkpointer**: one long-lived `AsyncSqliteSaver` opened in PTB
+  `post_init`, shared by every run. Threads are per-run
+  (`thread_id = tg:<chat>:<run8>`), so runs are individually resumable
+  and survive bot restarts; the run registry lives in
+  `argus_library.sqlite` (`src/argus/library.py`).
 - **HITL via LangGraph `interrupt_before`**: graph pauses before
   `researcher` (plan approval) and before `deliver` (report preview).
   The Telegram layer drives the resume with `Command(resume=...)`.
@@ -181,7 +187,8 @@ argus/
 │   ├── test_bot.py         (formatting + keyboard wiring)
 │   └── test_reflexion.py   (reviewer→revise→synth→pass loop, scripted)
 ├── demo_output/            (created at runtime; reports + transcript)
-└── .langgraph_checkpoints/ (SqliteSaver directory)
+├── argus_checkpoints.sqlite (LangGraph checkpoints, one thread per run)
+└── argus_library.sqlite     (run + asset registry; see src/argus/library.py)
 ```
 
 ## Tests

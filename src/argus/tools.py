@@ -1180,6 +1180,11 @@ class YouTubeTranscriptResult(BaseModel):
     # Suggested filename for the .txt download. Usually
     # ``<video_id>.txt`` so the user gets a recognisable attachment.
     suggested_filename: str = "transcript.txt"
+    # On-disk deliverable path (persistent cache / vault). The constructor
+    # was already passing this, but the field was missing — Pydantic v2
+    # silently dropped it and reading ``r.transcript_path`` raised
+    # AttributeError on the (rare) empty-bytes fallback path.
+    transcript_path: str | None = None
     error: str | None = None
     duration_s: float = 0.0
 

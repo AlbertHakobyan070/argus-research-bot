@@ -24,7 +24,12 @@ class Settings:
     # Optional knobs (with sane defaults).
     reports_root: Path
     checkpoint_db: Path
-    langgraph_dir: Path
+    library_db: Path
+    vault_root: Path
+    media_root: Path
+    transcripts_root: Path
+    history_root: Path
+    ffmpeg_path: str | None
     request_timeout_seconds: float
     max_revision_rounds: int
 
@@ -46,16 +51,31 @@ class Settings:
                 "(expected '<id>:<secret>' from @BotFather)."
             )
 
+        # DS vault — the single home for everything Argus produces.
+        # Directories are created lazily by the writers (media downloader,
+        # report builder, mirror), NOT here: Settings.load() must stay
+        # filesystem-neutral so hermetic tests / CI (no A:\ drive) work.
+        vault_root = Path(
+            os.environ.get(
+                "ARGUS_VAULT_ROOT",
+                r"A:\DS_Vault\DS Main Vault\DS_AUA_Toolkit\Assets\Argus",
+            )
+        )
+        media_root = vault_root / "media"
+        transcripts_root = vault_root / "transcripts"
+        history_root = vault_root / "research history"
+
+        # Reports live in the vault research-history folder by default
+        # (v2 decision). ARGUS_REPORTS_ROOT still overrides for tests.
         reports_root = Path(
-            os.environ.get("ARGUS_REPORTS_ROOT", r"A:\Hermes\Downloads\reports")
+            os.environ.get("ARGUS_REPORTS_ROOT", str(history_root))
         )
         checkpoint_db = Path(
             os.environ.get("ARGUS_CHECKPOINT_DB", str(_PROJECT_ROOT / "argus_checkpoints.sqlite"))
         )
-        langgraph_dir = Path(
-            os.environ.get("ARGUS_LANGGRAPH_DIR", str(_PROJECT_ROOT / ".langgraph_checkpoints"))
+        library_db = Path(
+            os.environ.get("ARGUS_LIBRARY_DB", str(_PROJECT_ROOT / "argus_library.sqlite"))
         )
-        langgraph_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(
             freellmapi_base_url=base.rstrip("/"),
@@ -64,7 +84,12 @@ class Settings:
             telegram_allowed_user_id=allowed,
             reports_root=reports_root,
             checkpoint_db=checkpoint_db,
-            langgraph_dir=langgraph_dir,
+            library_db=library_db,
+            vault_root=vault_root,
+            media_root=media_root,
+            transcripts_root=transcripts_root,
+            history_root=history_root,
+            ffmpeg_path=os.environ.get("ARGUS_FFMPEG") or None,
             request_timeout_seconds=float(os.environ.get("ARGUS_TIMEOUT", "60")),
             max_revision_rounds=int(os.environ.get("ARGUS_MAX_REVISIONS", "3")),
         )
