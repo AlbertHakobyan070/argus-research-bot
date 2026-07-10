@@ -376,6 +376,16 @@ def score_fetched(items: Iterable[FetchedItem], *,
     now_year = datetime.now().year
     out: list[FetchedItem] = []
     for it in items:
+        # v2 Phase 4: file:/// items are the user's OWN vault materials
+        # (appended transcripts, saved reports). Scoring them like an
+        # unknown web domain landed them below the floor and the filter
+        # cut them — defeating an explicit /append. Trust them.
+        if (it.url or "").startswith("file:///"):
+            out.append(it.model_copy(update={
+                "credibility_score": 0.9,
+                "credibility_flag": "user_provided",
+            }))
+            continue
         s = credibility_score(it, user_request=user_request)
         flag: str | None = None
         if s < floor:

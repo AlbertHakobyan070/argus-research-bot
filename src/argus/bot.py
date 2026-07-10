@@ -88,6 +88,13 @@ Commands:
                                        (e.g. 2,4 or `all` or 1-3)
   /transcripts                      — browse saved vault transcripts
                                        (📤 buttons re-send any of them)
+  /runs                             — run history (ids for /continue & /append)
+  /append <run-id> <url|asset:N>    — queue sources for a run (vault
+                                       transcripts via their asset ids)
+  /continue <run-id>                — re-attach a paused run, or extend a
+                                       finished one (appended sources are
+                                       ingested; otherwise a fresh search
+                                       pass deepens it)
   /status                           — in-flight runs + recent run history for this chat
   /cancel [run-id|all]              — cancel an in-flight run (id optional when only one)
   /help                             — this message
@@ -1068,7 +1075,8 @@ async def transcripts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         title = (a.get("title") or Path(a["path"]).name)[:60]
         backend = (a.get("meta") or {}).get("backend", "")
         lines.append(f"{i}. [{a.get('platform','?')}] {title}"
-                     f" · {kb:.0f} KB" + (f" · {backend}" if backend else ""))
+                     f" · {kb:.0f} KB" + (f" · {backend}" if backend else "")
+                     + f" · asset:{a['asset_id']}")
         row.append(InlineKeyboardButton(
             f"📤 {i}", callback_data=f"t:send:{a['asset_id']}"))
         if len(row) == 5:
@@ -1076,6 +1084,8 @@ async def transcripts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             row = []
     if row:
         buttons.append(row)
+    lines.append("")
+    lines.append("↪ feed one into research: /append <run-id> asset:<N>")
     await update.message.reply_text(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1390,6 +1400,222 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"❌ Cancelled {len(picked)} run(s): " + ", ".join(picked))
 
 
+# ---------------------------------------------------------------------------
+# Research history: /runs, /append, /continue (v2 Phase 4)
+# ---------------------------------------------------------------------------
+
+
+async def runs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/runs — the run registry for this chat (newest first)."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    runs = await lib.list_runs(chat_id=update.effective_chat.id, limit=10)
+    if not runs:
+        await update.message.reply_text("No runs recorded yet — /research!")
+        return
+    lines = ["🗂 Runs (newest first):"]
+    for r in runs:
+        glyph = _STATUS_GLYPHS.get(r["status"], "·")
+        lines.append(f"{glyph} {r['run_id']} · {r['status']} · {r['length']}"
+                     f" · {(r['topic'] or '')[:44]}")
+    lines.append("")
+    lines.append("↪ /continue <id> resumes or extends a run; "
+                 "/append <id> <url|asset:N> queues sources for it.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _sources_from_refs(lib: Library,
+                             pending: list[dict]) -> list[dict]:
+    """Map pending run_sources rows onto researcher-style source dicts.
+
+    URLs become search_result sources the fetcher downloads; asset refs
+    (``asset:<id>``, e.g. vault transcripts) become local_path sources
+    the fetcher ingests from disk (file:/// citations).
+    """
+    out: list[dict] = []
+    for row in pending:
+        ref = row.get("ref") or ""
+        if ref.startswith("asset:"):
+            try:
+                rows = await lib.get_assets([int(ref.split(":", 1)[1])])
+            except Exception:
+                logger.exception("asset ref lookup failed for %s", ref)
+                rows = []
+            if not rows:
+                logger.warning("appended %s no longer exists; skipping", ref)
+                continue
+            a = rows[0]
+            out.append({
+                "kind": "local",
+                "title": a.get("title") or Path(a["path"]).name,
+                "url": "file:///" + str(a["path"]).replace("\\", "/"),
+                "local_path": a["path"],
+                "summary": "", "source": "appended-asset",
+            })
+        else:
+            out.append({
+                "kind": "search_result", "title": ref, "url": ref,
+                "summary": "", "source": "appended-url",
+            })
+    return out
+
+
+async def append_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/append <run-id> <url…|asset:N…> — queue sources for a run.
+
+    They are ingested on the next /continue <run-id> (append-only pass:
+    no fresh searches, exactly your sources)."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    args = list(ctx.args or [])
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /append <run-id> <url…|asset:N…>\n"
+            "Find run ids with /runs, asset ids with /transcripts.")
+        return
+    run = await lib.resolve_run(update.effective_chat.id, args[0])
+    if run is None:
+        await update.message.reply_text(
+            f"No unique run matches '{args[0]}' — see /runs.")
+        return
+    rest = " ".join(args[1:])
+    refs = [t for t in rest.split() if t.startswith("asset:")]
+    refs += extract_urls(rest)
+    if not refs:
+        await update.message.reply_text(
+            "Nothing to append — give me URLs or asset:N refs.")
+        return
+    for ref in refs:
+        await lib.add_run_source(run["run_id"], ref,
+                                 kind="asset" if ref.startswith("asset:")
+                                 else "url")
+    pending = await lib.pending_sources(run["run_id"])
+    await update.message.reply_text(
+        f"➕ Appended {len(refs)} source(s) to run {run['run_id']} "
+        f"({len(pending)} pending total).\n"
+        f"Run /continue {run['run_id']} to ingest them.")
+
+
+async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/continue <run-id> — re-attach a paused run, or extend a finished
+    one (with appended sources if any, else a fresh search pass)."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    graph = _bot_data_get(ctx, "graph")
+    if lib is None or graph is None:
+        await update.message.reply_text("⚠️ Bot not fully initialized.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /continue <run-id> — see /runs.")
+        return
+    chat_id = update.effective_chat.id
+    run = await lib.resolve_run(chat_id, ctx.args[0])
+    if run is None:
+        await update.message.reply_text(
+            f"No unique run matches '{ctx.args[0]}' — see /runs.")
+        return
+    run_id = run["run_id"]
+    if run_id in _inflight and _inflight[run_id].get("resuming"):
+        await update.message.reply_text(
+            f"Run {run_id} is already resuming — hang on.")
+        return
+    cfg = {"configurable": {"thread_id": run["thread_id"]}}
+    try:
+        snap = await graph.aget_state(cfg)
+    except Exception:
+        logger.exception("aget_state failed for %s", run["thread_id"])
+        snap = None
+    if snap is None or not (snap.values or {}):
+        await update.message.reply_text(
+            f"No checkpoint found for run {run_id} — it may predate the "
+            "v2 upgrade or its checkpoint DB was deleted.")
+        return
+    cur = snap.values
+    info: dict[str, Any] = {
+        "run_id": run_id, "chat_id": chat_id,
+        "thread_id": run["thread_id"],
+        "state": {"user_request": run.get("topic", "")},
+        "stage": "continue", "length": cur.get("length") or run.get("length")
+                                        or DEFAULT_LENGTH,
+        "cfg": cfg, "graph": graph,
+    }
+
+    nxt = tuple(snap.next or ())
+    if nxt == ("fetcher",):
+        # Paused at the plan gate (possibly before a restart) — re-render.
+        _inflight[run_id] = info
+        info["awaiting"] = "plan_approval"
+        plan = cur.get("plan") or {}
+        text = _format_plan(plan, length=info["length"],
+                            sources=cur.get("sources") or [])
+        info["plan_text"] = text
+        await _safe_send(ctx.application.bot, chat_id, text,
+                         reply_markup=_plan_keyboard(
+                             default_length=info["length"], run_id=run_id),
+                         parse_mode=ParseMode.MARKDOWN)
+        await _set_run_status(ctx, run_id, "awaiting_plan")
+        return
+    if nxt == ("deliver",):
+        # Paused at the report preview — re-render preview + keyboard.
+        _inflight[run_id] = info
+        info["awaiting"] = "report_preview"
+        info["paths"] = cur.get("report_paths") or {}
+        await _send_report_preview(ctx, info)
+        await _set_run_status(ctx, run_id, "awaiting_report")
+        return
+    if nxt:
+        await update.message.reply_text(
+            f"Run {run_id} is mid-pipeline (next: {', '.join(nxt)}) — "
+            "wait for it to pause or finish.")
+        return
+
+    # Finished run → extend fork. Merge pending appended sources into the
+    # FULL sources list (last-value channel: never send a delta).
+    pending = await lib.pending_sources(run_id)
+    appended = await _sources_from_refs(lib, pending)
+    merged = list(cur.get("sources") or []) + appended
+    append_only = bool(appended)
+    try:
+        await graph.aupdate_state(
+            cfg,
+            {"sources": merged, "extend_requested": True,
+             "extend_rounds": 0, "revision_rounds": 0,
+             "append_only": append_only},
+            as_node="deliver")
+    except Exception as e:
+        logger.exception("extend fork failed for %s", run_id)
+        await update.message.reply_text(f"⚠️ Could not fork the run: {e}")
+        return
+    _inflight[run_id] = info
+    await _set_run_status(ctx, run_id, "running")
+    mode_note = (f"with {len(appended)} appended source(s), no new searches"
+                 if append_only else "with a fresh search pass")
+    await update.message.reply_text(
+        f"▶️ Continuing run {run_id} {mode_note}…")
+    await _resume_after_plan(ctx, info, resume_input=None)
+    if pending and info.get("awaiting") == "report_preview":
+        try:
+            await lib.mark_sources(run_id, [p["ref"] for p in pending],
+                                   "ingested")
+        except Exception:
+            logger.exception("mark_sources failed for %s", run_id)
+
+
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
@@ -1570,11 +1796,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
-    """Resume the graph from the 'researcher' interrupt (or re-drive the
+async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
+                             resume_input: Any = ...):
+    """Resume the graph from the plan-gate interrupt (or re-drive the
     deliver→extend loop). Re-entrancy-guarded: only one astream session
     per run may be live — a second resume on the same thread races the
-    first and produced the 'Approve unpressable' bug class."""
+    first and produced the 'Approve unpressable' bug class.
+
+    ``resume_input`` defaults to ``Command(resume=True)`` (continuing
+    from a static interrupt). /continue on a FINISHED run forks the
+    checkpoint via ``aupdate_state(as_node="deliver")`` first and passes
+    ``None`` — there is no pending interrupt to resume, the graph just
+    proceeds from the fork.
+    """
     if info.get("resuming"):
         logger.warning("resume already in flight for run %s; ignoring",
                        info.get("run_id"))
@@ -1585,6 +1819,8 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
     run_id = info["run_id"]
     chat_id = info["chat_id"]
     progress = {"message_id": None}
+    if resume_input is ...:
+        resume_input = Command(resume=True)
 
     # T7.1 — push the chosen length back into the graph state BEFORE
     # resuming, so the synthesizer + report_builder see the user's
@@ -1604,7 +1840,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
         "📥 Fetching approved sources…", progress)
 
     try:
-        async for ev in graph.astream(Command(resume=True), config=cfg,
+        async for ev in graph.astream(resume_input, config=cfg,
                                       stream_mode="updates"):
             for node_name, delta in ev.items():
                 info["stage"] = node_name
@@ -1640,66 +1876,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
         info["length"] = chosen_length
         await _set_run_status(ctx, run_id, "awaiting_report",
                               report_dir=paths.get("folder"))
-        if paths.get("md"):
-            md = Path(paths["md"])
-            text = (
-                f"📝 *Report preview*  ·  {_LENGTH_LABELS.get(chosen_length,'?')}\n\n"
-                f"Folder: `{_md_escape(paths.get('folder','?'))}`\n"
-                f"Markdown: `{_md_escape(md.name)}`  "
-                + (f"· PDF: `report.pdf`" if paths.get("pdf") else "· PDF: _failed_")
-                + f"\n\n_(first 1200 chars below)_"
-            )
-            excerpt = ""
-            try:
-                excerpt = md.read_text(encoding="utf-8", errors="replace")[:1200]
-            except Exception:
-                pass
-
-            # Build two candidate bodies: an HTML-escaped preview for the
-            # primary send (ParseMode.HTML tolerates arbitrary content),
-            # and a plain-text fallback (no parse_mode) for when the
-            # excerpt is too large or Telegram chokes on the HTML.
-            # The old code used ParseMode.MARKDOWN and crashed with
-            # ``Can't parse entities`` whenever the excerpt contained
-            # ``_``, ``*``, ``[``, or ``&`` (Bug observed 2026-07-08).
-            html_body = _html_escape_for_tg(text) + (
-                ("\n\n<pre>" + _html_escape_for_tg(excerpt) + "</pre>")
-                if excerpt else ""
-            )
-            plain_body = text + ("\n\n```\n" + excerpt + "\n```" if excerpt else "")
-
-            try:
-                await ctx.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=html_body,
-                    reply_markup=_report_keyboard(run_id),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as send_err:
-                # Telegram HTML parse still failed (oversize, exotic chars,
-                # network blip). Degrade to a plain-text preview rather than
-                # crashing the resume — the user can still see the path and
-                # open the file from disk / folder link.
-                logger.warning(
-                    "report preview HTML send failed (%s); falling back to plain text",
-                    send_err,
-                )
-                try:
-                    await ctx.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=plain_body,
-                        reply_markup=_report_keyboard(run_id),
-                    )
-                except Exception as plain_err:
-                    # Last resort: surface the error rather than crash silently.
-                    logger.exception("report preview plain-text send also failed")
-                    await ctx.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⚠️ report preview unavailable: {plain_err}",
-                    )
-        else:
-            await ctx.application.bot.send_message(
-                chat_id=chat_id, text="(no report_paths found)")
+        await _send_report_preview(ctx, info)
     except Exception as e:
         logger.exception("resume failed")
         await _set_run_status(ctx, run_id, "error")
@@ -1707,6 +1884,67 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
             text=f"⚠️ resume failed: {e}")
     finally:
         info["resuming"] = False
+
+
+async def _send_report_preview(ctx: ContextTypes.DEFAULT_TYPE,
+                               info: dict) -> None:
+    """Send the report-preview message + keyboard for a run whose
+    report_builder has produced ``info["paths"]``. Shared by the normal
+    resume flow and /continue's re-attach."""
+    chat_id = info["chat_id"]
+    run_id = info["run_id"]
+    paths = info.get("paths") or {}
+    chosen_length = info.get("length") or DEFAULT_LENGTH
+    if not paths.get("md"):
+        await ctx.application.bot.send_message(
+            chat_id=chat_id, text="(no report_paths found)")
+        return
+    md = Path(paths["md"])
+    text = (
+        f"📝 *Report preview*  ·  {_LENGTH_LABELS.get(chosen_length,'?')}\n\n"
+        f"Folder: `{_md_escape(paths.get('folder','?'))}`\n"
+        f"Markdown: `{_md_escape(md.name)}`  "
+        + (f"· PDF: `report.pdf`" if paths.get("pdf") else "· PDF: _failed_")
+        + f"\n\n_(first 1200 chars below)_"
+    )
+    excerpt = ""
+    try:
+        excerpt = md.read_text(encoding="utf-8", errors="replace")[:1200]
+    except Exception:
+        pass
+
+    # HTML primary (tolerates arbitrary content), plain-text fallback —
+    # legacy-markdown crashed on ``_ * [ &`` in excerpts (2026-07-08 bug).
+    html_body = _html_escape_for_tg(text) + (
+        ("\n\n<pre>" + _html_escape_for_tg(excerpt) + "</pre>")
+        if excerpt else ""
+    )
+    plain_body = text + ("\n\n```\n" + excerpt + "\n```" if excerpt else "")
+
+    try:
+        await ctx.application.bot.send_message(
+            chat_id=chat_id,
+            text=html_body,
+            reply_markup=_report_keyboard(run_id),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as send_err:
+        logger.warning(
+            "report preview HTML send failed (%s); falling back to plain text",
+            send_err,
+        )
+        try:
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text=plain_body,
+                reply_markup=_report_keyboard(run_id),
+            )
+        except Exception as plain_err:
+            logger.exception("report preview plain-text send also failed")
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ report preview unavailable: {plain_err}",
+            )
 
 
 async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
@@ -1866,6 +2104,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("quality", quality_cmd))
     app.add_handler(CommandHandler("transcript", transcript_cmd))
     app.add_handler(CommandHandler("transcripts", transcripts_cmd))
+    app.add_handler(CommandHandler("runs", runs_cmd))
+    app.add_handler(CommandHandler("append", append_cmd))
+    app.add_handler(CommandHandler("continue", continue_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
