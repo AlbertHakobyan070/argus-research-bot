@@ -53,6 +53,7 @@ from telegram import (
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
 )
 
 from .config import Settings, get_settings
@@ -60,6 +61,10 @@ from .cache_cleanup import cleanup_argus_ytt_cache
 from .graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from .graph.state import DEFAULT_LENGTH, VALID_LENGTHS, Length
 from .library import Library, mirror_run_md, new_run_id
+from .media import (
+    detect_platform, download_media, extract_urls, quality_format,
+    reddit_search, resolve_ffmpeg,
+)
 
 logger = logging.getLogger("argus.bot")
 
@@ -70,9 +75,15 @@ Commands:
   /research <topic>                 — full deep loop with plan-approval + report-preview HITL gates
   /research /length <m> <topic>     — pre-pin output length mode (see below)
   /ask <question>                   — quick grounded single-shot answer
+  /find [yt|shorts|reddit] <query>  — search for videos, then tap ⬇ / 📝
+                                       buttons to download / transcribe
+  /fetch <url> [url…]               — download media links straight into
+                                       the DS vault (YouTube / X / Reddit
+                                       / Instagram; or just PASTE links)
+  /quality [auto|min|max|<height>]  — global download quality setting
   /video [shorts] <query>           — search YouTube (videos or shorts)
   /transcript <indices>             — fetch captions for picked videos
-                                       from the last /video results
+                                       from the last /video or /find pool
                                        (e.g. 2,4 or `all` or 1-3)
   /status                           — in-flight runs + recent run history for this chat
   /cancel [run-id|all]              — cancel an in-flight run (id optional when only one)
@@ -748,10 +759,298 @@ async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                "Reply: /transcript <indices>  (e.g. /transcript 2,4 or /transcript all)"])
         await update.message.reply_text(plain)
     # Stash the result list for /transcript follow-ups (keyed by thread_id).
+    for v in results:
+        v.setdefault("platform", "youtube")
     thread_id = f"tg:{update.effective_chat.id}"
     _pool_put(thread_id, results)
     logger.info("/video pooled %d result(s) for %s (query=%r)",
                 len(results), thread_id, query)
+
+
+# ---------------------------------------------------------------------------
+# Media engine commands (Phase 2): /fetch, /find, /quality + URL paste
+# ---------------------------------------------------------------------------
+
+# Telegram bots can upload at most 50 MB; leave headroom.
+_TG_UPLOAD_CAP_BYTES = 49 * 1024 * 1024
+_MEDIA_PROGRESS_INTERVAL_S = 3.0
+
+
+def _media_keyboard(n: int) -> InlineKeyboardMarkup:
+    """One row per result: download / transcript / both, index-scoped.
+
+    Media buttons act on the per-chat result pool (30-min TTL), not on a
+    run — so the callback carries the 1-based pool index.
+    """
+    rows = []
+    for i in range(1, n + 1):
+        rows.append([
+            InlineKeyboardButton(f"⬇ {i}", callback_data=f"m:dl:{i}"),
+            InlineKeyboardButton(f"📝 {i}", callback_data=f"m:tr:{i}"),
+            InlineKeyboardButton(f"⬇+📝 {i}", callback_data=f"m:both:{i}"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _get_media_quality(app) -> str:
+    lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
+    if lib is None:
+        return "auto"
+    try:
+        return (await lib.get_setting("media_quality", "auto")) or "auto"
+    except Exception:
+        logger.exception("could not read media_quality; using auto")
+        return "auto"
+
+
+async def _fetch_one_media(app, chat_id: int, url: str) -> None:
+    """Background task: download one URL into the vault, register it,
+    stream throttled progress edits, deliver the file when small enough."""
+    bot = app.bot
+    s = get_settings()
+    quality = await _get_media_quality(app)
+
+    prog = {"message_id": None, "last": 0.0}
+    await _stream_progress(bot, chat_id, f"⬇️ Downloading…\n{url}", prog)
+
+    def on_progress(pct: float, eta: str) -> None:
+        now = time.monotonic()
+        if pct < 100.0 and (now - prog["last"]) < _MEDIA_PROGRESS_INTERVAL_S:
+            return
+        prog["last"] = now
+        asyncio.ensure_future(_stream_progress(
+            bot, chat_id, f"⬇️ {pct:.0f}%  ·  ETA {eta}\n{url}", prog))
+
+    try:
+        r = await download_media(url, dest_root=s.media_root,
+                                 quality=quality, on_progress=on_progress)
+    except Exception as e:
+        logger.exception("download_media crashed for %s", url)
+        await _stream_progress(bot, chat_id, f"⚠️ Download crashed: {e}", prog)
+        return
+
+    if not r.ok:
+        await _stream_progress(
+            bot, chat_id, f"⚠️ Download failed ({r.platform or '?'}):\n"
+                          f"{(r.error or 'unknown error')[:800]}", prog)
+        return
+
+    lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
+    if lib is not None:
+        try:
+            await lib.add_asset(
+                kind="media", platform=r.platform, source_url=url,
+                media_id=r.media_id, title=r.title or url, path=r.path,
+                size_bytes=r.size_bytes, duration_s=r.duration_s,
+                meta={"quality": quality,
+                      "info_json": r.info_json_path})
+        except Exception:
+            logger.exception("asset registration failed for %s", r.path)
+
+    size_mb = r.size_bytes / (1024 * 1024)
+    dur = _fmt_duration(r.duration_s)
+    summary = (f"✅ Saved ({r.platform}, {size_mb:.1f} MB"
+               + (f", {dur}" if dur else "") + f")\n{r.path}")
+    await _stream_progress(bot, chat_id, summary, prog)
+
+    if r.size_bytes <= _TG_UPLOAD_CAP_BYTES:
+        try:
+            with Path(r.path).open("rb") as f:
+                await bot.send_video(
+                    chat_id=chat_id, video=f,
+                    caption=(r.title or Path(r.path).name)[:1024],
+                    supports_streaming=True)
+        except Exception:
+            logger.warning("send_video failed; retrying as document")
+            try:
+                with Path(r.path).open("rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id, document=f,
+                        filename=Path(r.path).name,
+                        caption=(r.title or "")[:1024])
+            except Exception:
+                logger.exception("document send failed too; path was "
+                                 "already delivered in the summary")
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(f"📁 File is {size_mb:.0f} MB (over Telegram's bot upload "
+                  "cap) — it stays in the vault at the path above."))
+
+
+async def _transcript_for_item(app, chat_id: int, item: dict) -> None:
+    """Background task: caption-based transcript for one pool item.
+
+    YouTube-only until the ASR phase lands; other platforms get an
+    honest notice instead of a fake attempt."""
+    bot = app.bot
+    url = item.get("url") or ""
+    platform = item.get("platform") or detect_platform(url) or ""
+    if platform != "youtube":
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(f"📝 {platform or 'this platform'} has no caption tracks — "
+                  "speech-to-text transcription arrives with the ASR phase."))
+        return
+    from .tools import youtube_video_transcript
+    try:
+        r = await asyncio.to_thread(youtube_video_transcript, url, timeout=90)
+    except Exception as e:
+        logger.exception("transcript fetch crashed")
+        await bot.send_message(chat_id=chat_id,
+                               text=f"⚠️ Transcript crashed: {e}")
+        return
+    if not r.ok:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Transcript unavailable: {(r.error or '?')[:400]}")
+        return
+    import io
+    title = r.title or item.get("title") or "(untitled)"
+    await bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(io.BytesIO(r.transcript_bytes),
+                           filename=r.suggested_filename or "transcript.txt"),
+        caption=f"{title} — captions"[:1024])
+
+
+async def fetch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/fetch <url> [url…] — download media links into the vault."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    urls = extract_urls(" ".join(ctx.args or []))
+    if not urls:
+        await update.message.reply_text(
+            "Usage: /fetch <url> [url…]\n"
+            "Supported: YouTube (incl. shorts), X/Twitter, Reddit, "
+            "Instagram reels/posts.")
+        return
+    chat_id = update.effective_chat.id
+    good = [u for u in urls if detect_platform(u)]
+    bad = [u for u in urls if not detect_platform(u)]
+    if bad:
+        await update.message.reply_text(
+            "⚠️ Skipping unsupported link(s):\n" + "\n".join(bad[:5]))
+    if not good:
+        return
+    for u in good:
+        ctx.application.create_task(
+            _fetch_one_media(ctx.application, chat_id, u))
+    await update.message.reply_text(
+        f"⏬ Queued {len(good)} download(s) — progress follows.")
+
+
+async def find_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/find [yt|shorts|reddit] <query> — search, then act via buttons."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    args = list(ctx.args or [])
+    where = "yt"
+    if args and args[0].lower().lstrip("-/") in ("yt", "youtube", "shorts",
+                                                 "reddit"):
+        where = args.pop(0).lower().lstrip("-/")
+    if not args:
+        await update.message.reply_text(
+            "Usage: /find [yt|shorts|reddit] <query>")
+        return
+    query = " ".join(args)
+    chat_id = update.effective_chat.id
+    await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    if where == "reddit":
+        results = await reddit_search(query, limit=6)
+    else:
+        from .tools import youtube_search
+        try:
+            results = await asyncio.to_thread(
+                youtube_search, query, max_results=6,
+                shorts=(where == "shorts"))
+        except Exception as e:
+            logger.exception("find: youtube search failed")
+            await update.message.reply_text(f"⚠️ Search failed: {e}")
+            return
+        for r in results:
+            r.setdefault("platform", "youtube")
+    if not results:
+        await update.message.reply_text(
+            f"🔍 No {where} videos found for “{query}”.")
+        return
+
+    lines = [f"🔍 *{where} results* for _{_md_escape(query)}_:", ""]
+    for i, v in enumerate(results, 1):
+        dur = _fmt_duration(v.get("duration"))
+        title = _md_escape((v.get("title") or "")[:90])
+        chan = _md_escape(v.get("channel") or "")
+        meta = " · ".join(x for x in (chan, dur) if x)
+        lines.append(f"{i}. [{title}]({v['url']})"
+                     + (f"\n   _{meta}_" if meta else ""))
+    lines.append("")
+    lines.append("_⬇ download to vault · 📝 transcript · ⬇+📝 both. "
+                 "Pool lives 30 min; /transcript <indices> also works._")
+    await _safe_send(ctx.application.bot, chat_id, "\n".join(lines),
+                     reply_markup=_media_keyboard(len(results)),
+                     parse_mode=ParseMode.MARKDOWN)
+    _pool_put(f"tg:{chat_id}", results)
+
+
+async def quality_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/quality [auto|min|max|<height>] — global download quality."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    ffmpeg = resolve_ffmpeg()
+    if not ctx.args:
+        cur = "auto"
+        if lib is not None:
+            cur = (await lib.get_setting("media_quality", "auto")) or "auto"
+        ff_note = ("available" if ffmpeg
+                   else "MISSING (single-file formats only — no merged hi-res)")
+        await update.message.reply_text(
+            f"🎚 Download quality: {cur}\n"
+            f"ffmpeg: {ff_note}\n\n"
+            "Set with /quality auto | min | max | <pixel height>\n"
+            "e.g. /quality 720")
+        return
+    v = ctx.args[0].lower().strip()
+    try:
+        quality_format(v, ffmpeg_available=bool(ffmpeg))
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    if lib is None:
+        await update.message.reply_text(
+            "⚠️ Library unavailable — setting not persisted.")
+        return
+    await lib.set_setting("media_quality", v)
+    await update.message.reply_text(f"🎚 Download quality set to: {v}")
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Free-text router. Phase 2: pasted media links get an action
+    keyboard. (Plan-edit / revise replies join here in the HITL phase.)"""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        return  # silently ignore strangers
+    text = (update.message.text or "") if update.message else ""
+    urls = [u for u in extract_urls(text) if detect_platform(u)]
+    if not urls:
+        return
+    chat_id = update.effective_chat.id
+    results = [{"title": u, "url": u, "platform": detect_platform(u)}
+               for u in urls]
+    _pool_put(f"tg:{chat_id}", results)
+    lines = [f"🔗 Detected {len(urls)} media link(s):"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. [{r['platform']}] {r['url']}")
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=_media_keyboard(len(results)),
+        disable_web_page_preview=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +1352,39 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("(stale button — start a new /research)")
         return
     ns, action, run_id = parts
+
+    # Media buttons (m:dl:<i> / m:tr:<i> / m:both:<i>) act on the
+    # per-chat result pool, not on a run — handle before run lookup.
+    if ns == "m":
+        chat_id = q.message.chat.id if q.message else update.effective_chat.id
+        pool = _pool_get(f"tg:{chat_id}")
+        try:
+            idx = int(run_id)
+        except ValueError:
+            idx = 0
+        if not pool or idx < 1 or idx > len(pool):
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text="(result pool expired — run /find or paste the "
+                     "link again)")
+            return
+        item = pool[idx - 1]
+        queued: list[str] = []
+        if action in ("dl", "both"):
+            ctx.application.create_task(
+                _fetch_one_media(ctx.application, chat_id, item["url"]))
+            queued.append("download")
+        if action in ("tr", "both"):
+            ctx.application.create_task(
+                _transcript_for_item(ctx.application, chat_id, item))
+            queued.append("transcript")
+        if queued:
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏬ Queued {' + '.join(queued)} for #{idx}: "
+                     f"{(item.get('title') or item['url'])[:80]}")
+        return
+
     info = _inflight.get(run_id)
     if not info:
         await q.edit_message_text(
@@ -1390,6 +1722,13 @@ async def _post_init(app: Application) -> None:
     app.bot_data["graph"] = build_graph(checkpointer=saver)
     app.bot_data["quick_graph"] = quick_answer_graph(checkpointer=saver)
     app.bot_data["library"] = lib
+    ffmpeg = resolve_ffmpeg()
+    if ffmpeg:
+        logger.info("ffmpeg: %s", ffmpeg)
+    else:
+        logger.warning("ffmpeg NOT found — media downloads fall back to "
+                       "single-file formats (set ARGUS_FFMPEG or install "
+                       "imageio-ffmpeg)")
     loop_name = type(asyncio.get_running_loop()).__name__
     if "Proactor" not in loop_name and os.name == "nt":
         # asyncio subprocesses (Phase 2 media engine) need the Proactor
@@ -1430,11 +1769,15 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("research", research_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("video", video_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("fetch", fetch_cmd))
+    app.add_handler(CommandHandler("quality", quality_cmd))
     app.add_handler(CommandHandler("transcript", transcript_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(_on_error)
     return app
 

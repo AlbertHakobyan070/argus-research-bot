@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS assets (
 );
 CREATE INDEX IF NOT EXISTS idx_assets_kind ON assets(kind, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_sources (
   run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   ref         TEXT NOT NULL,
@@ -304,6 +309,23 @@ class Library:
             [int(i) for i in asset_ids])
         await db.commit()
         return cur.rowcount
+
+    # -- settings kv (global toggles like /quality) ----------------------------
+
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
+        db = self._conn()
+        async with db.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        db = self._conn()
+        await db.execute(
+            "INSERT INTO settings (key, value) VALUES (?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value))
+        await db.commit()
 
     # -- run_sources (append/continue) ----------------------------------------
 
