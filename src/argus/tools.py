@@ -1161,7 +1161,50 @@ def _vtt_to_text(vtt_path: Path) -> str:
         text = " ".join(b.strip() for b in block if b.strip())
         if text:
             out_blocks.append(text)
-    return "\n".join(out_blocks)
+    return "\n".join(_dedup_rolling_captions(out_blocks))
+
+
+def _dedup_rolling_captions(blocks: list[str]) -> list[str]:
+    """Collapse YouTube's rolling-caption overlap between cue blocks.
+
+    Auto-generated captions repeat each cue's tail at the head of the
+    next cue ("A B C" → "A B C D" → "C D E F"), so a naive join reads
+    every phrase twice (live report, 2026-07-10). For each block we find
+    the longest word-level overlap between the emitted tail and the new
+    block's head, and keep only the extension. Fully-repeated cues are
+    dropped; blocks that extend the previous one are merged into it so
+    the prose flows.
+    """
+    def norm(w: str) -> str:
+        # Case/punctuation-insensitive comparison: whisper and YouTube
+        # both re-case/re-punctuate the repeated words across segments
+        # ("…so happy right now." → "Happy right now…").
+        return re.sub(r"[^\w']+", "", w).lower()
+
+    out_words: list[str] = []
+    out_norm: list[str] = []
+    merged: list[str] = []
+    for b in blocks:
+        words = b.split()
+        if not words:
+            continue
+        words_norm = [norm(w) for w in words]
+        tail_norm = out_norm[-40:]
+        overlap = 0
+        for k in range(min(len(words), len(tail_norm)), 0, -1):
+            if tail_norm[-k:] == words_norm[:k]:
+                overlap = k
+                break
+        new = words[overlap:]
+        if not new:
+            continue  # cue was a full repeat of what we already emitted
+        out_words.extend(new)
+        out_norm.extend(words_norm[overlap:])
+        if overlap and merged:
+            merged[-1] = merged[-1] + " " + " ".join(new)
+        else:
+            merged.append(" ".join(new))
+    return merged
 
 
 class YouTubeTranscriptResult(BaseModel):
@@ -1191,7 +1234,7 @@ class YouTubeTranscriptResult(BaseModel):
 
 def youtube_video_transcript(
     url: str, *, langs: str = "en.*", timeout: int = 90,
-    format: str = "txt",
+    format: str = "txt", out_dir: Path | str | None = None,
 ) -> YouTubeTranscriptResult:
     """Fetch ONLY the transcript of one YouTube video.
 
@@ -1316,13 +1359,27 @@ def youtube_video_transcript(
         vid = (chosen.stem.split(".", 1)[0]
                or (info.get("id") if info_files else "")
                or re.sub(r"\W+", "_", url))
-        fname = f"{vid}.{ext}"
-        # Persist the deliverable alongside so callers can ship it as a
-        # file. We store it via a sibling path OUTSIDE the tempdir so
-        # cleanup of the tempdir doesn't take our deliverable with it.
+        # v2 Phase 3: with ``out_dir`` (the DS-vault transcripts folder)
+        # the deliverable gets the vault naming scheme
+        # <upload_date>_<id>_<title60>.<ext>; the legacy default stays
+        # the tempdir cache with the bare-id name (aged out at startup).
+        if out_dir is not None:
+            upload_date = ""
+            if info_files:
+                try:
+                    upload_date = str(info.get("upload_date") or "")
+                except Exception:
+                    upload_date = ""
+            safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_")
+            fname = f"{upload_date or 'na'}_{vid}_{safe_title[:60]}.{ext}"
+        else:
+            fname = f"{vid}.{ext}"
+        # Persist the deliverable OUTSIDE the tempdir so its cleanup
+        # doesn't take the file with it.
         out_path = None
         try:
-            stable_dir = Path(tempfile.gettempdir()) / "argus_ytt_out"
+            stable_dir = (Path(out_dir) if out_dir is not None
+                          else Path(tempfile.gettempdir()) / "argus_ytt_out")
             stable_dir.mkdir(parents=True, exist_ok=True)
             out_path = stable_dir / fname
             out_path.write_text(transcript, encoding="utf-8")

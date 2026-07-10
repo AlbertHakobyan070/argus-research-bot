@@ -65,6 +65,7 @@ from .media import (
     detect_platform, download_media, extract_urls, quality_format,
     reddit_search, resolve_ffmpeg,
 )
+from .transcribe import transcribe_url
 
 logger = logging.getLogger("argus.bot")
 
@@ -85,6 +86,8 @@ Commands:
   /transcript <indices>             — fetch captions for picked videos
                                        from the last /video or /find pool
                                        (e.g. 2,4 or `all` or 1-3)
+  /transcripts                      — browse saved vault transcripts
+                                       (📤 buttons re-send any of them)
   /status                           — in-flight runs + recent run history for this chat
   /cancel [run-id|all]              — cancel an in-flight run (id optional when only one)
   /help                             — this message
@@ -879,39 +882,49 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
 
 
 async def _transcript_for_item(app, chat_id: int, item: dict) -> None:
-    """Background task: caption-based transcript for one pool item.
-
-    YouTube-only until the ASR phase lands; other platforms get an
-    honest notice instead of a fake attempt."""
+    """Background task: transcript for one pool item, persisted into the
+    DS vault. YouTube goes via captions; X/Reddit/Instagram go via local
+    whisper ASR (download → speech-to-text)."""
     bot = app.bot
+    s = get_settings()
     url = item.get("url") or ""
-    platform = item.get("platform") or detect_platform(url) or ""
-    if platform != "youtube":
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(f"📝 {platform or 'this platform'} has no caption tracks — "
-                  "speech-to-text transcription arrives with the ASR phase."))
-        return
-    from .tools import youtube_video_transcript
+    platform = item.get("platform") or detect_platform(url) or "?"
+    lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
+
+    note = ("🎙 Transcribing captions…" if platform == "youtube" else
+            "🎙 Transcribing via whisper (download + speech-to-text — this "
+            "can take a few minutes; the first ever run also downloads "
+            "the model)…")
+    await bot.send_message(chat_id=chat_id, text=note)
+
+    quality = await _get_media_quality(app)
     try:
-        r = await asyncio.to_thread(youtube_video_transcript, url, timeout=90)
+        r = await transcribe_url(
+            url, transcripts_root=s.transcripts_root,
+            media_root=s.media_root, quality=quality, library=lib)
     except Exception as e:
-        logger.exception("transcript fetch crashed")
+        logger.exception("transcribe_url crashed")
         await bot.send_message(chat_id=chat_id,
                                text=f"⚠️ Transcript crashed: {e}")
         return
     if not r.ok:
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ Transcript unavailable: {(r.error or '?')[:400]}")
+            text=f"⚠️ Transcript unavailable: {(r.error or '?')[:500]}")
         return
-    import io
     title = r.title or item.get("title") or "(untitled)"
-    await bot.send_document(
-        chat_id=chat_id,
-        document=InputFile(io.BytesIO(r.transcript_bytes),
-                           filename=r.suggested_filename or "transcript.txt"),
-        caption=f"{title} — captions"[:1024])
+    p = Path(r.path)
+    try:
+        with p.open("rb") as f:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(f, filename=p.name),
+                caption=(f"{title} — {r.backend}"
+                         + (f" ({r.language})" if r.language else ""))[:1024])
+    except Exception:
+        logger.exception("transcript document send failed")
+        await bot.send_message(
+            chat_id=chat_id, text=f"📝 Transcript saved:\n{r.path}")
 
 
 async def fetch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1029,6 +1042,42 @@ async def quality_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await lib.set_setting("media_quality", v)
     await update.message.reply_text(f"🎚 Download quality set to: {v}")
+
+
+async def transcripts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/transcripts — list the latest vault transcripts with Send buttons."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    rows = await lib.list_assets(kind="transcript", limit=10)
+    if not rows:
+        await update.message.reply_text(
+            "No transcripts in the vault yet — use /find + 📝, paste a "
+            "link, or /transcript after /video.")
+        return
+    lines = ["📚 Latest transcripts:"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, a in enumerate(rows, 1):
+        kb = (a.get("bytes") or 0) / 1024
+        title = (a.get("title") or Path(a["path"]).name)[:60]
+        backend = (a.get("meta") or {}).get("backend", "")
+        lines.append(f"{i}. [{a.get('platform','?')}] {title}"
+                     f" · {kb:.0f} KB" + (f" · {backend}" if backend else ""))
+        row.append(InlineKeyboardButton(
+            f"📤 {i}", callback_data=f"t:send:{a['asset_id']}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1156,9 +1205,12 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Sequential (one fetch per video) — yt-dlp is rate-limited and
         # parallel fetches can hammer YouTube. For 6 videos this is fine
         # (~60 s total); batch parallelism is future work.
+        # v2 Phase 3: deliverables persist into the DS-vault transcripts
+        # folder (per-platform subdir) instead of the temp cache.
         try:
             r = await asyncio.to_thread(
-                youtube_video_transcript, url, timeout=90, format=fmt)
+                youtube_video_transcript, url, timeout=90, format=fmt,
+                out_dir=s.transcripts_root / "youtube")
         except ValueError as ve:
             await update.message.reply_text(
                 f"⚠️ {idx}. {_md_escape(title)}\n"
@@ -1226,6 +1278,20 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 document=InputFile(payload, filename=fname),
                 caption=cap[:1024],
             )
+        # Register the vault copy in the library.
+        lib = _get_library(ctx)
+        if lib is not None and r.transcript_path:
+            try:
+                tp = Path(r.transcript_path)
+                await lib.add_asset(
+                    kind="transcript", platform="youtube", source_url=url,
+                    title=t_title, path=r.transcript_path,
+                    size_bytes=tp.stat().st_size if tp.exists() else 0,
+                    duration_s=float(r.duration) if r.duration else None,
+                    meta={"backend": "captions", "language": r.language,
+                          "format": fmt})
+            except Exception:
+                logger.exception("transcript asset registration failed")
         delivered += 1
 
     await update.message.reply_text(
@@ -1383,6 +1449,32 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=f"⏬ Queued {' + '.join(queued)} for #{idx}: "
                      f"{(item.get('title') or item['url'])[:80]}")
+        return
+
+    # Transcript library buttons (t:send:<asset_id>).
+    if ns == "t" and action == "send":
+        chat_id = q.message.chat.id if q.message else update.effective_chat.id
+        lib = _get_library(ctx)
+        if lib is None:
+            await ctx.application.bot.send_message(
+                chat_id=chat_id, text="⚠️ Library unavailable.")
+            return
+        try:
+            rows = await lib.get_assets([int(run_id)])
+        except Exception:
+            logger.exception("t:send lookup failed")
+            rows = []
+        if not rows or not Path(rows[0]["path"]).exists():
+            await ctx.application.bot.send_message(
+                chat_id=chat_id,
+                text="(transcript missing on disk — was it deleted?)")
+            return
+        a = rows[0]
+        p = Path(a["path"])
+        with p.open("rb") as f:
+            await ctx.application.bot.send_document(
+                chat_id=chat_id, document=InputFile(f, filename=p.name),
+                caption=(a.get("title") or p.name)[:1024])
         return
 
     info = _inflight.get(run_id)
@@ -1773,6 +1865,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("fetch", fetch_cmd))
     app.add_handler(CommandHandler("quality", quality_cmd))
     app.add_handler(CommandHandler("transcript", transcript_cmd))
+    app.add_handler(CommandHandler("transcripts", transcripts_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))

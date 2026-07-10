@@ -282,6 +282,19 @@ class Library:
             rows = await cur.fetchall()
         return [_row_to_asset(r) for r in rows]
 
+    async def get_asset_by_source(self, source_url: str,
+                                  kind: str) -> dict[str, Any] | None:
+        """Newest asset of ``kind`` registered for a source URL (lets the
+        transcriber reuse an already-downloaded media file)."""
+        if kind not in ASSET_KINDS:
+            raise ValueError(f"unknown asset kind {kind!r}")
+        db = self._conn()
+        async with db.execute(
+                "SELECT * FROM assets WHERE source_url = ? AND kind = ?"
+                " ORDER BY asset_id DESC LIMIT 1", (source_url, kind)) as cur:
+            row = await cur.fetchone()
+        return _row_to_asset(row) if row else None
+
     async def list_assets(self, *, kind: str | None = None, limit: int = 20,
                           offset: int = 0) -> list[dict[str, Any]]:
         if kind is not None and kind not in ASSET_KINDS:
