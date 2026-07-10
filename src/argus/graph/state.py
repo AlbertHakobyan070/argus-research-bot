@@ -110,7 +110,11 @@ class ArgusState(TypedDict, total=False):
     mode: Mode                      # "quick" or "deep"
 
     # Working memory
-    messages: Annotated[list[dict], "appended-only chat history"]  # type: ignore
+    # NB: this MUST be a real reducer. The previous annotation was the
+    # STRING "appended-only chat history", which LangGraph ignores —
+    # the channel silently became last-write-wins and every node's
+    # message overwrote the history it claimed to append to.
+    messages: Annotated[list[dict], operator.add]
     length: Length                  # T7: chosen at plan-approval HITL
     plan: dict | None               # ResearchPlan.model_dump()
     plan_approved: bool             # set by HITL resume
@@ -135,6 +139,11 @@ class ArgusState(TypedDict, total=False):
     hitl: dict                      # {"pending": bool, "kind": str, "ctx": dict}
     extend_requested: bool          # Phase 2: user asked to deepen research at preview
     extend_rounds: int              # Phase 2: how many extend loops have run (capped)
+    plan_feedback: str              # v2: user's plan-edit reply, consumed by planner
+    revision_requested: bool        # v2: user asked to revise at report preview
+    revise_rounds: int              # v2: user-driven revise loops (capped)
+    append_only: bool               # v2: /continue ingests only appended sources
+                                    #     (extend_prep skips the researcher subgraph)
 
     # Telemetry — append-only so each node can return just the new record.
     model_calls: Annotated[list[dict], operator.add]

@@ -8,10 +8,19 @@ python-telegram-bot v22 async, long-polling. Commands:
   /cancel                        — drop in-flight run
   /help                          — usage
 
-The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety. It manages
-the SqliteSaver lifecycle inside the running event loop and exposes
-resume() so inline-keyboard callbacks can continue a paused LangGraph
-run via Command(resume=...).
+The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety.
+
+v2 architecture (Phase 1)
+-------------------------
+- ONE long-lived AsyncSqliteSaver + ONE compiled graph per flavour
+  (deep/quick), opened in PTB ``post_init`` and stored on
+  ``application.bot_data``. Runs are isolated by per-run thread ids
+  ``tg:<chat>:<run8>`` — multiple concurrent runs per chat are legal,
+  and any run can be re-attached after a bot restart.
+- Every run is registered in the Library (SQLite) so /status lists
+  history and later phases can /append + /continue + /delete.
+- Callback data is run-scoped (``plan:approve:<run8>``) so buttons on
+  old messages can never act on the wrong run.
 
 T7 additions
 ------------
@@ -36,7 +45,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 from telegram import (
     InputFile,
@@ -49,8 +57,9 @@ from telegram.ext import (
 
 from .config import Settings, get_settings
 from .cache_cleanup import cleanup_argus_ytt_cache
-from .graph import build_graph, quick_answer_graph
+from .graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from .graph.state import DEFAULT_LENGTH, VALID_LENGTHS, Length
+from .library import Library, mirror_run_md, new_run_id
 
 logger = logging.getLogger("argus.bot")
 
@@ -65,8 +74,8 @@ Commands:
   /transcript <indices>             — fetch captions for picked videos
                                        from the last /video results
                                        (e.g. 2,4 or `all` or 1-3)
-  /status                           — show the latest report paths for this chat
-  /cancel                           — drop in-flight runs for this chat
+  /status                           — in-flight runs + recent run history for this chat
+  /cancel [run-id|all]              — cancel an in-flight run (id optional when only one)
   /help                             — this message
 
 *Length modes* (selectable at plan approval):
@@ -81,8 +90,9 @@ Without `/length`, the default is `short`.
 Inline-keyboard buttons appear after the plan is drafted and after the
 report is built. Click *Approve* / *Send* to advance, *Cancel* to drop.
 
-Per-chat memory is checkpointed in SQLite; reports are persisted to
-`A:\\Hermes\\Downloads\\reports\\`.
+Runs are checkpointed in SQLite (each run gets its own thread, so runs
+survive bot restarts); reports are persisted to the DS-vault
+research-history folder and registered in the Argus library.
 """
 
 # ---------------------------------------------------------------------------
@@ -122,10 +132,50 @@ def _parse_length(args: list[str]) -> tuple[str, list[str]]:
     return mode, list(args[2:])
 
 
-# In-memory bookkeeping: which thread_id currently has an in-flight run.
-# Persisted checkpoint state is the source of truth; this is just for
-# progress messages and "is there a paused run?" checks.
+# In-memory bookkeeping of in-flight runs, keyed by run_id (8-hex).
+# Persisted checkpoint state + the Library registry are the sources of
+# truth; this holds live objects (graph cfg, progress message ids,
+# chosen length, resuming flag) for runs the current process started.
 _inflight: dict[str, dict[str, Any]] = {}
+
+
+def _chat_entries(chat_id: int) -> dict[str, dict[str, Any]]:
+    """All in-flight entries belonging to one chat, keyed by run_id."""
+    return {rid: i for rid, i in _inflight.items()
+            if i.get("chat_id") == chat_id}
+
+
+def _bot_data_get(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> Any:
+    """Fetch a shared object placed on ``application.bot_data`` by
+    ``_post_init``. Returns None when the app isn't fully wired (unit
+    tests with bare mocks; a production hit means post_init didn't run)."""
+    bd = getattr(ctx.application, "bot_data", None)
+    if isinstance(bd, dict):
+        return bd.get(key)
+    return None
+
+
+def _get_library(ctx: ContextTypes.DEFAULT_TYPE) -> Library | None:
+    return _bot_data_get(ctx, "library")
+
+
+async def _set_run_status(ctx: ContextTypes.DEFAULT_TYPE, run_id: str,
+                          status: str, *, report_dir: str | None = None) -> None:
+    """Record a run's status transition in the registry.
+
+    Failures are logged loudly but never crash a Telegram handler —
+    losing a status row is recoverable; dying mid-delivery is not.
+    """
+    lib = _get_library(ctx)
+    if lib is None:
+        logger.warning("library not configured; run %s -> %s not recorded",
+                       run_id, status)
+        return
+    try:
+        await lib.set_run_status(run_id, status, report_dir=report_dir)
+    except Exception:
+        logger.exception("registry status update failed (%s -> %s)",
+                         run_id, status)
 
 # Per-chat last /video result pool. Keyed by thread_id; entries hold
 # (results list, timestamp). Capped to a TTL so we never leak if the
@@ -349,44 +399,51 @@ def _format_plan(plan: dict, length: str = DEFAULT_LENGTH) -> str:
     return "\n".join(lines)
 
 
-def _plan_keyboard(default_length: str = DEFAULT_LENGTH) -> InlineKeyboardMarkup:
+def _plan_keyboard(default_length: str = DEFAULT_LENGTH,
+                   run_id: str = "") -> InlineKeyboardMarkup:
     """T7.1 — five-button length selector at plan approval.
 
     Button order is tldr→lecture (cheapest→deepest). The button matching
     ``default_length`` gets a check-mark in its label so the user can
     see what they'll get if they tap nothing besides Approve.
+
+    v2: callback data is run-scoped (``len:long:<run8>``) so buttons on
+    an old plan message can never act on a newer run in the same chat.
     """
+    sfx = f":{run_id}" if run_id else ""
+
     def label(mode: str) -> str:
         return (_LENGTH_LABELS[mode]
                 + (" ✅" if mode == default_length else ""))
 
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(label("tldr"), callback_data="len:tldr"),
-            InlineKeyboardButton(label("short"), callback_data="len:short"),
-            InlineKeyboardButton(label("medium"), callback_data="len:medium"),
+            InlineKeyboardButton(label("tldr"), callback_data=f"len:tldr{sfx}"),
+            InlineKeyboardButton(label("short"), callback_data=f"len:short{sfx}"),
+            InlineKeyboardButton(label("medium"), callback_data=f"len:medium{sfx}"),
         ],
         [
-            InlineKeyboardButton(label("long"), callback_data="len:long"),
-            InlineKeyboardButton(label("lecture"), callback_data="len:lecture"),
+            InlineKeyboardButton(label("long"), callback_data=f"len:long{sfx}"),
+            InlineKeyboardButton(label("lecture"), callback_data=f"len:lecture{sfx}"),
         ],
         [
-            InlineKeyboardButton("✅ Approve", callback_data="plan:approve"),
-            InlineKeyboardButton("✏️ Edit", callback_data="plan:edit"),
-            InlineKeyboardButton("❌ Cancel", callback_data="plan:cancel"),
+            InlineKeyboardButton("✅ Approve", callback_data=f"plan:approve{sfx}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"plan:edit{sfx}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"plan:cancel{sfx}"),
         ],
     ])
 
 
-def _report_keyboard() -> InlineKeyboardMarkup:
+def _report_keyboard(run_id: str = "") -> InlineKeyboardMarkup:
+    sfx = f":{run_id}" if run_id else ""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📤 Send", callback_data="report:send"),
-            InlineKeyboardButton("🔎 Extend", callback_data="report:extend"),
+            InlineKeyboardButton("📤 Send", callback_data=f"report:send{sfx}"),
+            InlineKeyboardButton("🔎 Extend", callback_data=f"report:extend{sfx}"),
         ],
         [
-            InlineKeyboardButton("🔁 Revise", callback_data="report:revise"),
-            InlineKeyboardButton("❌ Cancel", callback_data="report:cancel"),
+            InlineKeyboardButton("🔁 Revise", callback_data=f"report:revise{sfx}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"report:cancel{sfx}"),
         ],
     ])
 
@@ -416,43 +473,52 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     chat_id = update.effective_chat.id
-    thread_id = f"tg:{chat_id}"
+    graph = _bot_data_get(ctx, "graph")
+    if graph is None:
+        await update.message.reply_text(
+            "⚠️ Bot not fully initialized (no graph) — restart the bot.")
+        return
+
+    # v2: every run gets its own id + checkpoint thread. Multiple runs
+    # per chat can coexist, and a run can be re-attached after a restart.
+    run_id = new_run_id()
+    thread_id = f"tg:{chat_id}:{run_id}"
+    lib = _get_library(ctx)
+    if lib is not None:
+        try:
+            await lib.create_run(run_id=run_id, thread_id=thread_id,
+                                 chat_id=chat_id, topic=topic, length=length)
+        except Exception:
+            logger.exception("create_run failed; continuing without registry row")
 
     progress = {"message_id": None}
     progress = await _stream_progress(ctx.application.bot, chat_id,
-        "🧠 *Starting research…*", progress)
+        f"🧠 *Starting research…*  run `{run_id}`", progress)
     await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    # Build a per-run saver. We must keep it alive across the HITL pause
-    # because the in-memory graph holds a reference to it as checkpointer.
-    # The saver is closed only when the run actually terminates
-    # (Send in _resume_after_report, Cancel in on_callback, /cancel_cmd,
-    # planner-abort in the `else` branch below, or any exception).
-    saver_cm = AsyncSqliteSaver.from_conn_string(str(s.checkpoint_db))
-    saver = await saver_cm.__aenter__()
-    keep_saver_alive = False
+    cfg = {"configurable": {"thread_id": thread_id}}
+    state_in: dict[str, Any] = {
+        "thread_id": thread_id,
+        "user_id": update.effective_user.id,
+        "user_request": topic,
+        "length": length,           # T7 — Length selector carry
+        "messages": [], "plan": None,
+        "sources": [], "fetched": [], "findings": [],
+        "draft_md": "", "revision_notes": [], "revision_rounds": 0,
+        "model_calls": [], "hitl": {"pending": False},
+    }
+    info: dict[str, Any] = {
+        "run_id": run_id, "chat_id": chat_id, "thread_id": thread_id,
+        "state": state_in, "stage": "intake", "length": length,
+        "cfg": cfg, "graph": graph,
+    }
+    _inflight[run_id] = info
     try:
-        graph = build_graph(checkpointer=saver)
-        cfg = {"configurable": {"thread_id": thread_id}}
-        state_in: dict[str, Any] = {
-            "thread_id": thread_id,
-            "user_id": update.effective_user.id,
-            "user_request": topic,
-            "length": length,           # T7 — Length selector carry
-            "messages": [], "plan": None,
-            "sources": [], "fetched": [], "findings": [],
-            "draft_md": "", "revision_notes": [], "revision_rounds": 0,
-            "model_calls": [], "hitl": {"pending": False},
-        }
-        _inflight[thread_id] = {
-            "state": state_in, "stage": "intake", "length": length,
-        }
-
-        # Stream until first interrupt.
+        # Stream until first interrupt (the plan-approval gate).
         async for ev in graph.astream(state_in, config=cfg,
                                       stream_mode="updates"):
             for node_name, delta in ev.items():
-                _inflight[thread_id]["stage"] = node_name
+                info["stage"] = node_name
                 if node_name == "intake":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"🎯 Mode detected: _{delta.get('mode','?')}_", progress)
@@ -483,36 +549,31 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         plan = cur.get("plan") or {}
         if plan:
             text = _format_plan(plan, length=length)
+            # Remember the base plan text so length taps can re-render it
+            # without stacking status suffixes on top of each other.
+            info["plan_text"] = text
             # _safe_send falls back to plain text if the plan body (topic /
             # sub-questions / URLs) contains markdown-special chars — so the
             # plan proposal ALWAYS renders instead of silently failing to send.
             await _safe_send(
                 ctx.application.bot, chat_id, text,
-                reply_markup=_plan_keyboard(default_length=length),
+                reply_markup=_plan_keyboard(default_length=length,
+                                            run_id=run_id),
                 parse_mode=ParseMode.MARKDOWN,
             )
-            # Hand the saver to the in-flight registry so _resume_after_plan
-            # can use the same live checkpointer. Do NOT close here — that's
-            # what produced the "resume failed: no active connection" error.
-            keep_saver_alive = True
-            _inflight[thread_id]["awaiting"] = "plan_approval"
-            _inflight[thread_id]["cfg"] = cfg
-            _inflight[thread_id]["graph"] = graph
-            _inflight[thread_id]["saver_cm"] = saver_cm
-            _inflight[thread_id]["saver"] = saver
+            info["awaiting"] = "plan_approval"
+            await _set_run_status(ctx, run_id, "awaiting_plan")
         else:
             await ctx.application.bot.send_message(
                 chat_id=chat_id,
                 text="(planner produced no plan; aborting.)",
             )
-            _inflight.pop(thread_id, None)
+            _inflight.pop(run_id, None)
+            await _set_run_status(ctx, run_id, "error")
     except Exception:
-        # On any error, drop the in-flight entry and let `finally` close the saver.
-        _inflight.pop(thread_id, None)
+        _inflight.pop(run_id, None)
+        await _set_run_status(ctx, run_id, "error")
         raise
-    finally:
-        if not keep_saver_alive:
-            await saver_cm.__aexit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -529,24 +590,36 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     question = " ".join(ctx.args)
     chat_id = update.effective_chat.id
-    thread_id = f"tg:{chat_id}"
+    graph = _bot_data_get(ctx, "quick_graph")
+    if graph is None:
+        await update.message.reply_text(
+            "⚠️ Bot not fully initialized (no graph) — restart the bot.")
+        return
     await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    saver_cm = AsyncSqliteSaver.from_conn_string(str(s.checkpoint_db))
-    saver = await saver_cm.__aenter__()
+    run_id = new_run_id()
+    thread_id = f"tg:{chat_id}:{run_id}"
+    lib = _get_library(ctx)
+    if lib is not None:
+        try:
+            await lib.create_run(run_id=run_id, thread_id=thread_id,
+                                 chat_id=chat_id, topic=question,
+                                 mode="quick", status="running")
+        except Exception:
+            logger.exception("create_run failed; continuing without registry row")
+
+    cfg = {"configurable": {"thread_id": thread_id}}
+    state_in: dict[str, Any] = {
+        "thread_id": thread_id,
+        "user_id": update.effective_user.id,
+        "user_request": question,
+        "length": DEFAULT_LENGTH,
+        "messages": [], "plan": None,
+        "sources": [], "fetched": [], "findings": [],
+        "draft_md": "", "revision_notes": [], "revision_rounds": 0,
+        "model_calls": [], "hitl": {"pending": False},
+    }
     try:
-        graph = quick_answer_graph(checkpointer=saver)
-        cfg = {"configurable": {"thread_id": thread_id}}
-        state_in: dict[str, Any] = {
-            "thread_id": thread_id,
-            "user_id": update.effective_user.id,
-            "user_request": question,
-            "length": DEFAULT_LENGTH,
-            "messages": [], "plan": None,
-            "sources": [], "fetched": [], "findings": [],
-            "draft_md": "", "revision_notes": [], "revision_rounds": 0,
-            "model_calls": [], "hitl": {"pending": False},
-        }
         answer_text = ""
         async for ev in graph.astream(state_in, config=cfg,
                                       stream_mode="updates"):
@@ -563,8 +636,10 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 answer_text or "(no answer)", parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await update.message.reply_text(answer_text or "(no answer)")
-    finally:
-        await saver_cm.__aexit__(None, None, None)
+        await _set_run_status(ctx, run_id, "done")
+    except Exception:
+        await _set_run_status(ctx, run_id, "error")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -841,44 +916,91 @@ async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /status, /cancel, /help
 # ---------------------------------------------------------------------------
 
+_STATUS_GLYPHS = {
+    "planning": "🧠", "awaiting_plan": "📋", "running": "🔄",
+    "awaiting_report": "📝", "done": "✅", "cancelled": "❌", "error": "⚠️",
+}
+
+
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Registry-backed status: live in-flight runs + recent run history."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
     chat_id = update.effective_chat.id
-    thread_id = f"tg:{chat_id}"
-    info = _inflight.get(thread_id)
-    if not info:
-        await update.message.reply_text("No in-flight run for this chat.")
+    lines: list[str] = []
+    entries = _chat_entries(chat_id)
+    if entries:
+        lines.append("*In flight:*")
+        for rid, i in entries.items():
+            lines.append(
+                f"- `{rid}` · stage `{i.get('stage','?')}` · awaiting "
+                f"`{i.get('awaiting','-')}` · length `{i.get('length','?')}`")
+    lib = _get_library(ctx)
+    runs: list[dict[str, Any]] = []
+    if lib is not None:
+        try:
+            runs = await lib.list_runs(chat_id=chat_id, limit=5)
+        except Exception:
+            logger.exception("status: list_runs failed")
+    if runs:
+        lines.append("*Recent runs:*")
+        for r in runs:
+            glyph = _STATUS_GLYPHS.get(r["status"], "·")
+            topic = (r["topic"] or "")[:48]
+            lines.append(
+                f"- {glyph} `{r['run_id']}` · {r['status']} · "
+                f"{r['length']} · {topic}")
+            if r.get("report_dir"):
+                lines.append(f"    `{r['report_dir']}`")
+    if not lines:
+        await update.message.reply_text("No runs recorded for this chat yet.")
         return
-    snap_lines = [
-        f"Stage: `{info.get('stage','?')}`",
-        f"Awaiting: `{info.get('awaiting','-')}`",
-        f"Length: `{info.get('length','?')}`",
-    ]
+    text = "\n".join(lines)
     try:
-        await update.message.reply_text("\n".join(snap_lines),
-                                        parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        await update.message.reply_text("\n".join(snap_lines))
+        await update.message.reply_text(text)
 
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/cancel [run-id|all] — cancel in-flight run(s) for this chat.
+
+    Without an argument: cancels when exactly one run is in flight,
+    otherwise lists the candidates (never guesses which one you meant).
+    """
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
     chat_id = update.effective_chat.id
-    thread_id = f"tg:{chat_id}"
-    info = _inflight.pop(thread_id, None)
-    # Close any held-over saver so we don't leak the connection.
-    if info and info.get("saver_cm"):
-        try:
-            await info["saver_cm"].__aexit__(None, None, None)
-        except Exception:
-            pass
-    await update.message.reply_text("In-flight run dropped from memory.")
+    target = (ctx.args[0].lower().strip() if ctx.args else "")
+    entries = _chat_entries(chat_id)
+    if not entries:
+        await update.message.reply_text("No in-flight runs for this chat.")
+        return
+    if target == "all":
+        picked = list(entries)
+    elif target:
+        picked = [rid for rid in entries if rid.startswith(target)]
+        if not picked:
+            await update.message.reply_text(
+                f"No in-flight run matches '{target}'. "
+                "In flight: " + ", ".join(entries))
+            return
+    elif len(entries) == 1:
+        picked = list(entries)
+    else:
+        await update.message.reply_text(
+            "Multiple runs in flight: " + ", ".join(entries)
+            + "\nUse /cancel <run-id> or /cancel all.")
+        return
+    for rid in picked:
+        _inflight.pop(rid, None)
+        await _set_run_status(ctx, rid, "cancelled")
+    await update.message.reply_text(
+        f"❌ Cancelled {len(picked)} run(s): " + ", ".join(picked))
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -900,86 +1022,122 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     q = update.callback_query
     await q.answer()
-    chat_id = q.message.chat.id if q.message else update.effective_chat.id
-    thread_id = f"tg:{chat_id}"
-    info = _inflight.get(thread_id)
-    if not info:
-        await q.edit_message_text("(no in-flight run)")
-        return
     data = q.data or ""
+    # v2: every callback is run-scoped — ``<ns>:<action>:<run8>``.
+    parts = data.split(":")
+    if len(parts) != 3:
+        # Buttons minted before the v2 upgrade (or garbage) — the run they
+        # belonged to cannot be identified; say so instead of guessing.
+        await q.edit_message_text("(stale button — start a new /research)")
+        return
+    ns, action, run_id = parts
+    info = _inflight.get(run_id)
+    if not info:
+        await q.edit_message_text(
+            f"(run {run_id} is not in flight — it may have finished, been "
+            "cancelled, or been lost in a bot restart)")
+        return
+
     # T7.1 + 2026-07-10 fix: length taps update the chosen length and
-    # re-render the plan message, but MUST NOT resume the graph.
-    # Resuming belongs to the Approve button. The previous behaviour
-    # (Length-tap auto-resumed and Approve-tap auto-resumed again)
-    # created two concurrent ``Command(resume=True)`` astream sessions
-    # on the same thread, which made the Approve button appear
-    # 'unpressable' and let the user skip past the plan review window
-    # — observed in the live 2026-07-10 logs. The Approve-tap path
-    # reads ``info["length"]`` so the chosen length carries through.
-    if data.startswith("len:"):
-        chosen = data.split(":", 1)[1]
+    # re-render the plan message, but MUST NOT resume the graph —
+    # resuming belongs to the Approve button (single resume gate).
+    if ns == "len":
+        chosen = action
         if chosen not in _LENGTH_LABELS:
             await q.edit_message_text("Unknown length mode.")
             return
         info["length"] = chosen
-        # NOTE: do NOT set plan_approved here — keep the gate single-step.
+        # Re-render from the stored base plan text (no suffix stacking)
+        # AND re-send the keyboard: Telegram's editMessageText REMOVES
+        # the inline keyboard when reply_markup is omitted, so the old
+        # code made the Approve button vanish after every length tap.
+        # Re-sending also moves the ✅ marker onto the tapped length.
+        base = info.get("plan_text") or (q.message.text or "")
         await _safe_edit_cb(
             q,
-            (q.message.text or "")
-            + f"\n\n_📏 Length set to *{_LENGTH_LABELS.get(chosen, chosen)}* "
-              "— tap ✅ Approve to continue._",
+            base + f"\n\n_📏 Length set to *{_LENGTH_LABELS[chosen]}* "
+                   "— tap ✅ Approve to continue._",
+            reply_markup=_plan_keyboard(default_length=chosen, run_id=run_id),
         )
         return
-    if data == "plan:approve":
-        info["plan_approved"] = True
-        await _safe_edit_cb(
-            q, (q.message.text or "") + "\n\n_✅ Approved — continuing._")
-        await _resume_after_plan(ctx, thread_id, info)
-    elif data == "plan:edit":
-        info["plan_approved"] = "edit"
-        info["plan_edit"] = True
-        await _safe_edit_cb(
-            q,
-            (q.message.text or "") + "\n\n_✏️ Edit mode — reply with your changes._")
-    elif data == "plan:cancel":
-        await _drop_inflight_with_saver(thread_id)
-        await q.edit_message_text("❌ Cancelled.")
-    elif data == "report:send":
-        await _resume_after_report(ctx, thread_id, info, q)
-    elif data == "report:extend":
-        # Phase 2 HITL: deepen the research. Set the graph flag, then reuse
-        # the plan-resume streamer — it drives deliver → extend_prep →
-        # fetcher → … → report_builder and shows the next preview.
-        graph = info["graph"]
-        cfg = info["cfg"]
-        try:
-            await graph.aupdate_state(cfg, {"extend_requested": True})
-        except Exception:
-            logger.exception("could not set extend_requested; aborting extend")
+
+    if ns == "plan":
+        if action == "approve":
+            if info.get("plan_approved") is True or info.get("resuming"):
+                # Double-tap guard — one resume per plan gate.
+                return
+            info["plan_approved"] = True
             await _safe_edit_cb(
-                q, (q.message.text or "") + "\n\n_⚠️ Extend failed to start._")
-            return
-        await _safe_edit_cb(
-            q,
-            (q.message.text or "") + "\n\n_🔎 Extending research — gathering more…_")
-        await _resume_after_plan(ctx, thread_id, info)
-    elif data == "report:revise":
-        info["report_revise"] = True
-        await _safe_edit_cb(
-            q, (q.message.text or "") + "\n\n_🔁 Revision requested._")
-        await _resume_after_report(ctx, thread_id, info, q,
-                                    revision_requested=True)
-    elif data == "report:cancel":
-        await _drop_inflight_with_saver(thread_id)
-        await q.edit_message_text("❌ Cancelled (report dropped).")
+                q, (info.get("plan_text") or q.message.text or "")
+                + "\n\n_✅ Approved — continuing._")
+            await _set_run_status(ctx, run_id, "running")
+            await _resume_after_plan(ctx, info)
+        elif action == "edit":
+            info["plan_approved"] = "edit"
+            info["plan_edit"] = True
+            base = info.get("plan_text") or (q.message.text or "")
+            await _safe_edit_cb(
+                q, base + "\n\n_✏️ Edit mode — reply with your changes._",
+                reply_markup=_plan_keyboard(
+                    default_length=info.get("length", DEFAULT_LENGTH),
+                    run_id=run_id),
+            )
+        elif action == "cancel":
+            _inflight.pop(run_id, None)
+            await _set_run_status(ctx, run_id, "cancelled")
+            await q.edit_message_text("❌ Cancelled.")
+        return
+
+    if ns == "report":
+        if action == "send":
+            await _resume_after_report(ctx, info, q)
+        elif action == "extend":
+            if info.get("resuming"):
+                return
+            # Phase 2 HITL: deepen the research. Set the graph flag, then
+            # reuse the plan-resume streamer — it drives deliver →
+            # extend_prep → fetcher → … → report_builder and shows the
+            # next preview.
+            graph = info["graph"]
+            cfg = info["cfg"]
+            try:
+                await graph.aupdate_state(cfg, {"extend_requested": True})
+            except Exception:
+                logger.exception("could not set extend_requested; aborting extend")
+                await _safe_edit_cb(
+                    q, (q.message.text or "") + "\n\n_⚠️ Extend failed to start._")
+                return
+            await _safe_edit_cb(
+                q,
+                (q.message.text or "") + "\n\n_🔎 Extending research — gathering more…_")
+            await _set_run_status(ctx, run_id, "running")
+            await _resume_after_plan(ctx, info)
+        elif action == "revise":
+            info["report_revise"] = True
+            await _safe_edit_cb(
+                q, (q.message.text or "") + "\n\n_🔁 Revision requested._")
+            await _resume_after_report(ctx, info, q, revision_requested=True)
+        elif action == "cancel":
+            _inflight.pop(run_id, None)
+            await _set_run_status(ctx, run_id, "cancelled")
+            await q.edit_message_text("❌ Cancelled (report dropped).")
+        return
 
 
-async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
-                              thread_id: str, info: dict):
-    """Resume the graph from the 'researcher' interrupt."""
+async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict):
+    """Resume the graph from the 'researcher' interrupt (or re-drive the
+    deliver→extend loop). Re-entrancy-guarded: only one astream session
+    per run may be live — a second resume on the same thread races the
+    first and produced the 'Approve unpressable' bug class."""
+    if info.get("resuming"):
+        logger.warning("resume already in flight for run %s; ignoring",
+                       info.get("run_id"))
+        return
+    info["resuming"] = True
     graph = info["graph"]
     cfg = info["cfg"]
-    chat_id = int(thread_id.split(":", 1)[1])
+    run_id = info["run_id"]
+    chat_id = info["chat_id"]
     progress = {"message_id": None}
 
     # T7.1 — push the chosen length back into the graph state BEFORE
@@ -991,15 +1149,6 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                      or DEFAULT_LENGTH)
     try:
         await graph.aupdate_state(cfg, {"length": chosen_length})
-    except AttributeError:
-        # Compiled graph without async API — fall back to sync.
-        try:
-            graph.update_state(cfg, {"length": chosen_length})
-        except Exception:
-            logger.exception(
-                "could not push length=%s into state; defaulting",
-                chosen_length,
-            )
     except Exception:
         logger.exception(
             "aupdate_state failed; defaulting length=%s", chosen_length,
@@ -1043,6 +1192,8 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
         info["awaiting"] = "report_preview"
         info["paths"] = paths
         info["length"] = chosen_length
+        await _set_run_status(ctx, run_id, "awaiting_report",
+                              report_dir=paths.get("folder"))
         if paths.get("md"):
             md = Path(paths["md"])
             text = (
@@ -1075,7 +1226,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                 await ctx.application.bot.send_message(
                     chat_id=chat_id,
                     text=html_body,
-                    reply_markup=_report_keyboard(),
+                    reply_markup=_report_keyboard(run_id),
                     parse_mode=ParseMode.HTML,
                 )
             except Exception as send_err:
@@ -1091,7 +1242,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                     await ctx.application.bot.send_message(
                         chat_id=chat_id,
                         text=plain_body,
-                        reply_markup=_report_keyboard(),
+                        reply_markup=_report_keyboard(run_id),
                     )
                 except Exception as plain_err:
                     # Last resort: surface the error rather than crash silently.
@@ -1105,27 +1256,30 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE,
                 chat_id=chat_id, text="(no report_paths found)")
     except Exception as e:
         logger.exception("resume failed")
+        await _set_run_status(ctx, run_id, "error")
         await ctx.application.bot.send_message(chat_id=chat_id,
             text=f"⚠️ resume failed: {e}")
+    finally:
+        info["resuming"] = False
 
 
 async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
-                                thread_id: str, info: dict, q,
+                                info: dict, q,
                                 revision_requested: bool = False):
-    graph = info["graph"]
-    cfg = info["cfg"]
-    chat_id = int(thread_id.split(":", 1)[1])
+    run_id = info["run_id"]
+    chat_id = info["chat_id"]
     paths = info.get("paths") or {}
     if revision_requested:
-        # Force another revision round by tweaking revision_notes (simplest
-        # way without rebuilding the graph: skip and ask user to retype).
+        # Honest stub until the in-graph revise loop lands (Phase 6 of
+        # the v2 rebuild): the report stays on disk and registered.
         await ctx.application.bot.send_message(
             chat_id=chat_id,
-            text=("Send your revision feedback as a reply — "
-                  "it will be appended to the next revision round."),
+            text=("🔁 In-place revision isn't wired yet — it arrives with "
+                  "the HITL upgrade. The report is saved; re-run /research "
+                  "with refined wording for now."),
         )
-        # For simplicity we stop here: the user re-runs /research.
-        await _drop_inflight_with_saver(thread_id)
+        _inflight.pop(run_id, None)
+        await _finalize_run(ctx, info, paths)
         return
     # Send the report files.
     try:
@@ -1144,22 +1298,36 @@ async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
         await ctx.application.bot.send_message(chat_id=chat_id,
             text=f"⚠️ send failed: {e}")
     finally:
-        await _drop_inflight_with_saver(thread_id)
+        _inflight.pop(run_id, None)
+        await _finalize_run(ctx, info, paths)
 
 
-async def _drop_inflight_with_saver(thread_id: str) -> None:
-    """Pop the in-flight entry and close its SqliteSaver if held.
-
-    Helper for all terminal paths (Cancel button, normal end of a run,
-    /cancel command) so the per-run saver connection is always released.
-    Without this, every research run would leak one aiosqlite connection.
-    """
-    info = _inflight.pop(thread_id, None)
-    if info and info.get("saver_cm"):
-        try:
-            await info["saver_cm"].__aexit__(None, None, None)
-        except Exception:
-            logger.exception("saver close on drop failed")
+async def _finalize_run(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
+                        paths: dict) -> None:
+    """Terminal bookkeeping: registry status → done, register the report
+    as a library asset, and write the human-readable run.md mirror into
+    the run's report folder."""
+    run_id = info["run_id"]
+    await _set_run_status(ctx, run_id, "done",
+                          report_dir=paths.get("folder"))
+    lib = _get_library(ctx)
+    if lib is None:
+        return
+    try:
+        if paths.get("md"):
+            md = Path(paths["md"])
+            size = md.stat().st_size if md.exists() else 0
+            topic = (info.get("state") or {}).get("user_request", "")
+            await lib.add_asset(
+                kind="report", path=str(md), title=topic, size_bytes=size,
+                meta={"folder": paths.get("folder", ""),
+                      "pdf": paths.get("pdf", "")},
+            )
+        run = await lib.get_run(run_id)
+        if run and run.get("report_dir"):
+            await asyncio.to_thread(mirror_run_md, run)
+    except Exception:
+        logger.exception("finalize (asset/mirror) failed for run %s", run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,11 +1351,60 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled bot error: %r", err, exc_info=err)
 
 
+async def _post_init(app: Application) -> None:
+    """Open the shared checkpoint saver + library and compile both graphs.
+
+    ONE AsyncSqliteSaver serves every run — isolation comes from per-run
+    thread ids, not per-run connections. This replaces the old per-run
+    saver keep-alive dance (and its connection leaks) entirely.
+    """
+    s = get_settings()
+    saver_cm = async_sqlite_saver_cm(str(s.checkpoint_db))
+    saver = await saver_cm.__aenter__()
+    lib = Library(s.library_db)
+    await lib.open()
+    app.bot_data["saver_cm"] = saver_cm
+    app.bot_data["saver"] = saver
+    app.bot_data["graph"] = build_graph(checkpointer=saver)
+    app.bot_data["quick_graph"] = quick_answer_graph(checkpointer=saver)
+    app.bot_data["library"] = lib
+    loop_name = type(asyncio.get_running_loop()).__name__
+    if "Proactor" not in loop_name and os.name == "nt":
+        # asyncio subprocesses (Phase 2 media engine) need the Proactor
+        # loop on Windows. PTB does not override the policy; this fires
+        # only if some future import does.
+        logger.warning("event loop is %s, not Proactor — asyncio "
+                       "subprocesses will not work on Windows", loop_name)
+    logger.info("post_init: saver + library + graphs ready (loop=%s, "
+                "library=%s)", loop_name, s.library_db)
+
+
+async def _post_shutdown(app: Application) -> None:
+    lib = app.bot_data.get("library")
+    if lib is not None:
+        try:
+            await lib.close()
+        except Exception:
+            logger.exception("library close on shutdown failed")
+    saver_cm = app.bot_data.get("saver_cm")
+    if saver_cm is not None:
+        try:
+            await saver_cm.__aexit__(None, None, None)
+        except Exception:
+            logger.exception("saver close on shutdown failed")
+
+
 def build_application() -> Application:
     s = get_settings()
     if not s.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing from .env")
-    app = Application.builder().token(s.telegram_bot_token).build()
+    app = (
+        Application.builder()
+        .token(s.telegram_bot_token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("research", research_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("video", video_cmd))
