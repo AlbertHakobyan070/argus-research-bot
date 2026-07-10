@@ -1,4 +1,4 @@
-"""Regression: planner must not invent URLs.
+"""Regression: planner must not invent URLs (and must fail cleanly).
 
 Bug observed 2026-07-08: when the strong tier fell back to llama-3.1-8b-instant,
 the planner emitted plausible-looking but fake URLs (e.g.
@@ -6,8 +6,14 @@ the planner emitted plausible-looking but fake URLs (e.g.
 Fix: PLANNER_SYSTEM prompt now bans invented URLs and forces kind=search_result
 when no exact URL is known. This file proves the prompt enforces the rule by
 regex-parsing it (no LLM in the test — that's `test_planner_node_integration`).
+
+Also: when the planner returns unparseable output, the fallback plan's
+``summary`` must be a neutral notice — NOT the raw LLM dump (Albert's
+2026-07-10 screenshot showed a raw ```json blob in the plan preview).
 """
 import re
+from types import SimpleNamespace
+
 import pytest
 
 from argus.graph.nodes import PLANNER_SYSTEM
@@ -83,3 +89,34 @@ def test_planner_prompt_no_longer_advertises_target_url_as_required() -> None:
         "Replace with explicit 'use kind='search_result' if you don't know "
         "the exact URL' guidance."
     )
+
+# --- fallback-plan integrity ---------------------------------------------------
+
+
+def test_planner_fallback_summary_is_neutral_not_raw_llm_dump(monkeypatch):
+    """When the planner LLM returns unparseable output, the fallback plan
+    must carry a NEUTRAL summary + an errors entry — never the raw LLM
+    text. The raw dump rendered as a ```json blob in the live plan
+    preview (2026-07-10 screenshot)."""
+    from argus.graph import nodes as nodes_mod
+
+    garbage = '```json\n{"sub_questions": [BORKED unparseable'
+
+    class _FakeChat:
+        def invoke(self, _msgs):
+            return SimpleNamespace(content=garbage, response_metadata={},
+                                   usage_metadata={})
+
+    monkeypatch.setattr(nodes_mod.llm, "chat_for_tier",
+                        lambda *a, **kw: _FakeChat())
+    monkeypatch.setattr(nodes_mod.llm, "resolve_tier", lambda t: "stub-model")
+
+    out = nodes_mod.planner_node({"user_request": "some topic"})
+
+    summary = out["plan"]["summary"]
+    assert "BORKED" not in summary and "```" not in summary, (
+        f"fallback summary must not leak the raw LLM output; got {summary!r}")
+    assert summary, "fallback summary must explain the fallback (not empty)"
+    assert any("planner" in e.lower() for e in out.get("errors", [])), (
+        "an unparseable planner response must surface in state['errors'] "
+        "so telemetry shows the degradation")

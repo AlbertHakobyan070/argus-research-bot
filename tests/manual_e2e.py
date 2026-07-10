@@ -6,7 +6,7 @@ and try to synthesise callback_query updates through the Bot API (which
 is impossible — Telegram only delivers callbacks from real user taps),
 we drive the *real* LangGraph with the *real* AsyncSqliteSaver and
 *real* FreeLLMAPI route, then resume past both HITL pause points
-(`interrupt_before=["researcher","deliver"]`) by re-invoking the graph
+(`interrupt_after=["researcher"]` + `interrupt_before=["deliver"]`) by re-invoking the graph
 on the same thread_id.
 
 Why this exists on top of tests/test_e2e_research.py
@@ -34,7 +34,7 @@ what the bot produces, without inviting a new asyncio race.
 What it verifies (acceptance criteria from t_52c6aec5)
 ------------------------------------------------------
 1. /research <topic> drives the full pipeline.
-2. First call hits `interrupt_before="researcher"` (plan-approval
+2. First call pauses AFTER `researcher` (grounded plan-approval gate;
    HITL): state["plan"] is populated, state["hitl"]["kind"] ==
    "report_preview" has NOT been set yet.
 3. Re-invoking on the same thread_id resumes past the researcher
@@ -103,7 +103,7 @@ def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
     """Run /research to first HITL pause, then through both resumes.
 
     Returns the final graph state. The graph's HITL pause points are
-    configured via ``interrupt_before=["researcher", "deliver"]``, so
+    configured via ``interrupt_after=["researcher"]`` + ``interrupt_before=["deliver"]``, so
     we expect three ``graph.invoke`` calls:
 
       1. Initial — pauses before "researcher" (plan approval).

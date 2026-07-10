@@ -67,10 +67,9 @@ def test_format_plan_basic():
 
 
 def test_format_plan_prefers_query_over_target_url():
-    """P1 — planner target_urls are now ignored by the researcher subgraph
-    (Phase-1 fix), so showing them in the plan preview is misleading. The
-    plan must show the search intent (query) instead and label any
-    fallback URL as a candidate that will be verified at fetch time."""
+    """Planner target_urls are LLM-invented (knowledge-cutoff fantasy) and
+    are ignored by the researcher subgraph. The plan preview must show
+    the search intent (query) and never the fabricated URL."""
     plan = {
         "summary": "Investigate X",
         "sub_questions": [],
@@ -82,18 +81,18 @@ def test_format_plan_prefers_query_over_target_url():
     }
     text = _format_plan(plan)
     # The fabricated URL the researcher will never use must not appear
-    # bare in the plan preview.
+    # anywhere in the plan preview.
     assert "blog.ought.com/fabricated-x" not in text
     # The query it WOULD search for must.
     assert "metacognitive RL transformers" in text
-    # And the provenance caveat ("candidate", "verified at fetch") must
-    # be visible enough that the reader knows URLs aren't claimed URLs.
-    assert "verified at fetch" in text
 
 
-def test_format_plan_fallback_url_labelled_candidate():
-    """When a planner source has ONLY a target_url (no query), show it
-    but label it as a candidate so the user knows it'll be re-checked."""
+def test_format_plan_never_shows_planner_urls():
+    """Even when a planner source has ONLY a target_url (no query), the
+    URL must NOT be shown — planner URLs are guesses, and displaying
+    them is exactly the 'garbage sources' Albert reported (2026-07-10:
+    thelema.org/officialdocs, github.com/otto-xyz/crowley…). Real URLs
+    come from the live-search results section instead."""
     plan = {
         "summary": "",
         "sub_questions": [],
@@ -103,8 +102,33 @@ def test_format_plan_fallback_url_labelled_candidate():
         ],
     }
     text = _format_plan(plan)
-    assert "example.com/x" in text
-    assert "candidate" in text.lower()
+    assert "example.com/x" not in text, (
+        "planner-invented URLs must never reach the plan preview")
+
+
+def test_format_plan_lists_live_found_sources():
+    """When real search results are passed in, the preview must list
+    them (title + URL) so the user approves ACTUAL sources."""
+    plan = {"summary": "s", "sub_questions": ["q"], "planned_sources": []}
+    sources = [
+        {"title": "Real repo", "url": "https://github.com/real/repo",
+         "kind": "repo"},
+        {"title": "Real paper", "url": "https://arxiv.org/abs/2501.00001",
+         "kind": "paper"},
+    ]
+    text = _format_plan(plan, sources=sources)
+    assert "Found sources" in text
+    assert "https://github.com/real/repo" in text
+    assert "Real paper" in text
+    assert "(2" in text or "2," in text or "2 " in text  # count visible
+
+
+def test_format_plan_warns_when_live_search_found_nothing():
+    plan = {"summary": "s", "sub_questions": ["q"], "planned_sources": []}
+    text = _format_plan(plan, sources=[])
+    assert "no sources" in text.lower(), (
+        "an empty live-search result must be called out loudly at the "
+        "gate — approving would fetch nothing")
 
 
 def test_format_plan_no_query_no_url_says_live_search():
