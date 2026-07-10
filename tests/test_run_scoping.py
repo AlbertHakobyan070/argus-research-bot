@@ -13,6 +13,7 @@ Phase 1 contracts:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,6 +21,7 @@ import pytest
 
 from argus import bot as bot_mod
 from argus.bot import _inflight, research_cmd
+from argus.config import Settings
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +29,29 @@ def _clear_inflight():
     _inflight.clear()
     yield
     _inflight.clear()
+
+
+@pytest.fixture(autouse=True)
+def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
+    """Handlers call get_settings() on entry; CI has no .env, so give
+    the bot module a synthetic Settings instead of requiring secrets."""
+    dummy = Settings(
+        freellmapi_base_url="http://127.0.0.1:3001/v1",
+        freellmapi_api_key="freellmapi-test",
+        telegram_bot_token="123:test",
+        telegram_allowed_user_id=1,
+        reports_root=Path("reports"),
+        checkpoint_db=Path("cp.sqlite"),
+        library_db=Path("lib.sqlite"),
+        vault_root=Path("vault"),
+        media_root=Path("vault/media"),
+        transcripts_root=Path("vault/transcripts"),
+        history_root=Path("vault/history"),
+        ffmpeg_path=None,
+        request_timeout_seconds=60.0,
+        max_revision_rounds=3,
+    )
+    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
 
 
 @pytest.fixture(autouse=True)
