@@ -155,7 +155,10 @@ async def arxiv_sub(state: ResearcherSubgraphState) -> dict:
     items: list[dict] = []
     try:
         try:
-            items = _arxiv_search(plan)
+            # _arxiv_search uses a BLOCKING httpx.Client; off-load it so
+            # this async sub doesn't stall the event loop (all three subs
+            # run concurrently under the subgraph's ainvoke).
+            items = await asyncio.to_thread(_arxiv_search, plan)
         except (IndexError, KeyError) as e:
             # Empty plan (no keywords, no sub_questions) → let the
             # user_request fallback path produce sources instead.
@@ -163,7 +166,8 @@ async def arxiv_sub(state: ResearcherSubgraphState) -> dict:
             items = []
         sources.extend(items)
         if not sources and state.get("user_request"):
-            items = _arxiv_search_raw(state["user_request"])
+            items = await asyncio.to_thread(_arxiv_search_raw,
+                                            state["user_request"])
             sources.extend(items)
     except Exception as e:
         error = f"arxiv_sub failed: {e!r}"
@@ -248,7 +252,10 @@ async def web_sub(state: ResearcherSubgraphState) -> dict:
         # paying the duckduckgo-search import cost at module load.
         try:
             from ..tools import ddgs_search  # type: ignore
-            results = ddgs_search(query, max_results=8)
+            # ddgs_search is BLOCKING (sync ddgs client) — off-load it so
+            # this async sub doesn't stall the loop.
+            results = await asyncio.to_thread(ddgs_search, query,
+                                              max_results=8)
             for r in results:
                 sources.append({
                     "kind": r.get("kind", "blog"),
@@ -410,16 +417,3 @@ def run_researcher_subgraph(
     }
 
     return diff
-# ---------------------------------------------------------------------------
-# Async convenience (used by nodes.py if it's already inside an event loop)
-# ---------------------------------------------------------------------------
-
-async def arun_researcher_subgraph(
-    state: dict[str, Any],
-    *,
-    subgraph: CompiledStateGraph | None = None,
-    config: dict | None = None,
-) -> dict[str, Any]:
-    """Async wrapper — runs the synchronous subgraph in a thread."""
-    return await asyncio.to_thread(run_researcher_subgraph, state,
-                                    subgraph=subgraph, config=config)

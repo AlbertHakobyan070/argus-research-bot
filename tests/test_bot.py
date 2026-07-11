@@ -41,6 +41,25 @@ def test_help_text_nonempty():
     assert "/ask" in HELP_TEXT
 
 
+def test_help_text_is_compact():
+    """The in-chat /help must stay short — the verbose guide lives in
+    docs/help.md (sent by /help full). Guard against it creeping back."""
+    assert len(HELP_TEXT) < 900, (
+        f"HELP_TEXT is {len(HELP_TEXT)} chars — keep it terse; put detail "
+        "in docs/help.md")
+    assert "full" in HELP_TEXT.lower(), "must point users at /help full"
+
+
+def test_help_md_exists_and_covers_commands():
+    from pathlib import Path
+    from argus.bot import _HELP_MD_PATH
+    assert _HELP_MD_PATH.exists(), "docs/help.md must ship with the bot"
+    body = Path(_HELP_MD_PATH).read_text(encoding="utf-8")
+    for cmd in ("/research", "/find", "/fetch", "/quality", "/transcripts",
+                "/runs", "/append", "/continue", "/delete"):
+        assert cmd in body, f"help.md must document {cmd}"
+
+
 def test_format_plan_basic():
     plan = {
         "summary": "Investigate X",
@@ -196,8 +215,10 @@ async def test_safe_edit_cb_falls_back_to_plain():
     assert calls and calls[-1] is None  # plain fallback used
 
 
-def test_help_mentions_video_command():
-    assert "/video" in HELP_TEXT
+def test_help_mentions_media_commands():
+    # /find replaced /video as the primary media-search entry point.
+    assert "/find" in HELP_TEXT
+    assert "/fetch" in HELP_TEXT
 
 
 def test_report_keyboard_has_extend_button():

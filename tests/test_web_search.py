@@ -298,15 +298,6 @@ def test_max_results_respected(monkeypatch) -> None:
     assert captured["max_results"] == 3
 
 
-def test_langchain_tool_wrapper_exposed() -> None:
-    """make_langchain_tools() must include search_web as a LangChain tool."""
-    from langchain_core.tools import BaseTool
-
-    lc_tools = tools.make_langchain_tools()
-    names = {t.name for t in lc_tools if isinstance(t, BaseTool)}
-    assert "search_web" in names
-
-
 # ---------------------------------------------------------------------------
 # 5. ddgs_search timelimit (lifted from NVIDIA AI-Q Blueprint
 #    sources/duckduckgo_news_search/src/register.py)

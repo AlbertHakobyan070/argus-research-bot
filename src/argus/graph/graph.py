@@ -19,12 +19,9 @@ Quick path (for /ask): intake → quick_answer → deliver.
 from __future__ import annotations
 
 import logging
-import os
-from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from .nodes import (
@@ -43,7 +40,8 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     """Construct the deep-research LangGraph.
 
     Pass ``checkpointer=None`` for an in-memory saver (tests). For prod,
-    pass a ``SqliteSaver`` rooted at the argus checkpoint DB.
+    pass the shared ``AsyncSqliteSaver`` (see ``async_sqlite_saver_cm``),
+    opened once at bot startup and reused across all runs.
     """
     g = StateGraph(ArgusState)
 
@@ -130,58 +128,11 @@ def quick_answer_graph(*, checkpointer=None) -> CompiledStateGraph:
     return g.compile(checkpointer=checkpointer)
 
 
-def sqlite_saver_cm(path: str):
-    """Return the context manager for the sync SqliteSaver.
-
-    Usage::
-
-        with sqlite_saver_cm(path) as saver:
-            graph = build_graph(checkpointer=saver)
-    """
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    return SqliteSaver.from_conn_string(path)
-
-
 def async_sqlite_saver_cm(path: str):
-    """Async counterpart of :func:`sqlite_saver_cm`."""
+    """Context manager for the production AsyncSqliteSaver checkpointer.
+
+    Opened once at bot startup (PTB ``post_init``); the compiled graph is
+    shared across all runs, isolated by per-run ``thread_id``.
+    """
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     return AsyncSqliteSaver.from_conn_string(path)
-
-
-# ---------------------------------------------------------------------------
-# Driver helpers — used by the Telegram bot and by tests.
-# ---------------------------------------------------------------------------
-
-def run_research_sync(graph, *, thread_id: str, user_id: int,
-                      user_request: str, recursion_limit: int = 40,
-                      config_overrides: dict | None = None) -> dict:
-    """Drive the deep graph to its first HITL pause and return state.
-
-    The bot layer should call this, inspect `state["hitl"]`, then resume
-    via `graph.invoke(Command(resume=...), config)` once the user clicks
-    Approve/Edit/Cancel.
-    """
-    cfg = {"configurable": {"thread_id": thread_id}}
-    if config_overrides:
-        cfg.update(config_overrides)
-    state_in: ArgusState = {
-        "thread_id": thread_id,
-        "user_id": user_id,
-        "user_request": user_request,
-        "messages": [],
-        "plan": None,
-        "sources": [],
-        "fetched": [],
-        "findings": [],
-        "draft_md": "",
-        "revision_notes": [],
-        "revision_rounds": 0,
-        "model_calls": [],
-        "hitl": {"pending": False},
-    }
-    # Stream until first interrupt.
-    last_state: dict = {}
-    for ev in graph.stream(state_in, config=cfg,
-                           recursion_limit=recursion_limit):
-        last_state = ev
-    return last_state
