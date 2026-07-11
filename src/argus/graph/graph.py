@@ -31,8 +31,8 @@ from .nodes import (
     credibility_node, deliver_node, extend_prep_node, fetcher_node,
     filter_node, intake_node, normalizer_node, planner_node,
     planner_reflect_node, quick_answer_node, report_builder_node,
-    researcher_node, reviewer_node, route_after_deliver, route_after_review,
-    synthesizer_node,
+    researcher_node, reviewer_node, revise_prep_node, route_after_deliver,
+    route_after_review, synthesizer_node,
 )
 from .state import ArgusState
 
@@ -60,6 +60,7 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     g.add_node("report_builder", report_builder_node)
     g.add_node("deliver", deliver_node)
     g.add_node("extend_prep", extend_prep_node)
+    g.add_node("revise_prep", revise_prep_node)
 
     g.add_edge(START, "intake")
 
@@ -93,9 +94,12 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     g.add_conditional_edges(
         "deliver",
         route_after_deliver,
-        {"extend": "extend_prep", "end": END},
+        {"extend": "extend_prep", "revise": "revise_prep", "end": END},
     )
     g.add_edge("extend_prep", "fetcher")
+    # revise re-synthesizes from the SAME evidence with the user's notes;
+    # rejoin at synthesizer (not fetcher — no new sources to gather).
+    g.add_edge("revise_prep", "synthesizer")
 
     if checkpointer is None:
         checkpointer = MemorySaver()
