@@ -123,14 +123,29 @@ know the right venue; otherwise emit `kind: "search_result"` with a query.
 
 
 def planner_node(state: ArgusState) -> dict:
-    """LLM drafts a research plan. Triggers HITL interrupt."""
+    """LLM drafts a research plan. Triggers HITL interrupt.
+
+    v2 Phase 6a — plan-edit: when the user replied to the plan gate with
+    changes, ``plan_feedback`` holds their text and ``plan`` holds the
+    previous draft. We show both to the LLM and ask it to REVISE, then
+    clear the feedback so it isn't reapplied on a later re-plan.
+    """
+    feedback = (state.get("plan_feedback") or "").strip()
+    prev_plan = state.get("plan") if feedback else None
+    if feedback:
+        human = (
+            f"Topic / question: {state['user_request']}\n\n"
+            f"PREVIOUS PLAN (JSON):\n{json.dumps(prev_plan or {}, indent=2)}\n\n"
+            f"USER FEEDBACK — revise the plan accordingly:\n{feedback}\n\n"
+            "Return the revised research plan as JSON."
+        )
+    else:
+        human = (f"Topic / question: {state['user_request']}\n\n"
+                 "Draft the research plan.")
     chat = llm.chat_for_tier("strong", temperature=0.2, max_tokens=1200)
     resp = chat.invoke([
         SystemMessage(content=PLANNER_SYSTEM),
-        HumanMessage(content=(
-            f"Topic / question: {state['user_request']}\n\n"
-            "Draft the research plan."
-        )),
+        HumanMessage(content=human),
     ])
     rec = llm.record_from_response("strong", llm.resolve_tier("strong"), resp)
     planner_errors: list[str] = []
@@ -157,6 +172,7 @@ def planner_node(state: ArgusState) -> dict:
         planner_errors.append(f"planner: unparseable output ({e})")
     return {
             "plan": plan.model_dump(),
+            "plan_feedback": "",   # consumed — don't reapply on a later re-plan
             "errors": planner_errors,
             "model_calls": [rec.model_dump()],
             "messages": [{"role": "assistant", "content": (
@@ -1876,22 +1892,37 @@ def report_builder_node(state: ArgusState) -> dict:
 MAX_EXTEND_ROUNDS = 2
 
 
+MAX_REVISE_ROUNDS = 2
+
+
 def _will_extend(state: ArgusState) -> bool:
     """True when the user asked to extend and we're under the round cap."""
     return bool(state.get("extend_requested")) and \
         int(state.get("extend_rounds") or 0) < MAX_EXTEND_ROUNDS
 
 
+def _will_revise(state: ArgusState) -> bool:
+    """True when the user asked to revise at the preview gate and we're
+    under the user-revise round cap (distinct from the reviewer's own
+    reflexion budget)."""
+    return bool(state.get("revision_requested")) and \
+        int(state.get("revise_rounds") or 0) < MAX_REVISE_ROUNDS
+
+
 def deliver_node(state: ArgusState) -> dict:
     """Records the paths; the Telegram bot layer does the actual send.
 
-    If the user asked to extend research at the preview gate (and we're under
-    the round cap), this is a no-op pass-through — ``route_after_deliver``
-    sends the run back through ``extend_prep`` instead of finalising.
+    If the user asked to extend or revise at the preview gate (and we're
+    under the respective round cap), this is a no-op pass-through —
+    ``route_after_deliver`` sends the run back through ``extend_prep`` or
+    ``revise_prep`` instead of finalising.
     """
     if _will_extend(state):
         return {"messages": [{"role": "assistant",
                               "content": "↪️ Extending research…"}]}
+    if _will_revise(state):
+        return {"messages": [{"role": "assistant",
+                              "content": "🔁 Revising report…"}]}
     paths = state.get("report_paths") or {}
     return {
         "hitl": {"pending": False},
@@ -1901,8 +1932,34 @@ def deliver_node(state: ArgusState) -> dict:
 
 
 def route_after_deliver(state: ArgusState) -> str:
-    """Loop back to deepen research, or end the run."""
-    return "extend" if _will_extend(state) else "end"
+    """Loop back to deepen research, revise the report, or end the run.
+
+    Extend wins over revise if somehow both are set (deepening subsumes
+    a re-synthesis)."""
+    if _will_extend(state):
+        return "extend"
+    if _will_revise(state):
+        return "revise"
+    return "end"
+
+
+def revise_prep_node(state: ArgusState) -> dict:
+    """v2 Phase 6a — prepare a user-requested revision pass.
+
+    Clears the request flag, bumps the user-revise counter, and resets
+    the reviewer's reflexion budget so the re-synthesis gets a fresh
+    review. The user's feedback is already in ``revision_notes`` (the bot
+    appended it before resuming); ``synthesizer_node`` injects those
+    notes into its prompt, so nothing else is needed here.
+    """
+    rnd = int(state.get("revise_rounds") or 0) + 1
+    return {
+        "revision_requested": False,
+        "revise_rounds": rnd,
+        "revision_rounds": 0,   # fresh reviewer budget for the revision
+        "messages": [{"role": "assistant",
+                      "content": f"🔁 Applying your revision (round {rnd})…"}],
+    }
 
 
 def extend_prep_node(state: ArgusState) -> dict:

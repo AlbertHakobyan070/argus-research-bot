@@ -211,6 +211,11 @@ _VIDEO_POOL_TTL_S = 1800   # 30 minutes — long enough for a follow-up,
                             # silently outlive its relevance.
 _video_pool: dict[str, dict[str, Any]] = {}
 
+# v2 Phase 6a — the next free-text message from a chat is interpreted as
+# a reply to a HITL prompt: {chat_id: (kind, run_id)} where kind is
+# "plan_edit" or "revise_feedback". Consumed once by on_text.
+_pending_reply: dict[int, tuple[str, str]] = {}
+
 
 def _pool_get(thread_id: str) -> list[dict[str, Any]] | None:
     """Return the cached /video result list for ``thread_id``, or None
@@ -1094,16 +1099,39 @@ async def transcripts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Free-text router. Phase 2: pasted media links get an action
-    keyboard. (Plan-edit / revise replies join here in the HITL phase.)"""
+    """Free-text router. Order: (1) a pending HITL reply (plan-edit /
+    revise feedback), (2) pasted media links → action keyboard, else
+    ignore."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         return  # silently ignore strangers
     text = (update.message.text or "") if update.message else ""
+    chat_id = update.effective_chat.id
+
+    # (1) pending HITL reply
+    pending = _pending_reply.get(chat_id)
+    if pending:
+        kind, run_id = pending
+        info = _inflight.get(run_id)
+        if info is None:
+            _pending_reply.pop(chat_id, None)
+            await update.message.reply_text(
+                "(that run is no longer active — reply ignored)")
+            return
+        if not text.strip():
+            await update.message.reply_text("Please send some text.")
+            return
+        _pending_reply.pop(chat_id, None)
+        if kind == "plan_edit":
+            await _replan_after_edit(ctx, info, text.strip())
+        elif kind == "revise_feedback":
+            await _revise_after_feedback(ctx, info, text.strip())
+        return
+
+    # (2) pasted media links
     urls = [u for u in extract_urls(text) if detect_platform(u)]
     if not urls:
         return
-    chat_id = update.effective_chat.id
     results = [{"title": u, "url": u, "platform": detect_platform(u)}
                for u in urls]
     _pool_put(f"tg:{chat_id}", results)
@@ -1113,6 +1141,83 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n".join(lines), reply_markup=_media_keyboard(len(results)),
         disable_web_page_preview=True)
+
+
+async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
+                             feedback: str) -> None:
+    """plan-edit: push the user's feedback into the checkpoint as if
+    intake just ran, then re-drive planner→planner_reflect→researcher to
+    the grounded plan gate and re-render the plan message."""
+    if info.get("resuming"):
+        return
+    info["resuming"] = True
+    graph = info["graph"]
+    cfg = info["cfg"]
+    run_id = info["run_id"]
+    chat_id = info["chat_id"]
+    progress = {"message_id": None}
+    await _stream_progress(ctx.application.bot, chat_id,
+                           "✏️ Redrafting the plan with your changes…",
+                           progress)
+    try:
+        # Fork positioned after intake → next node is planner. planner
+        # reads plan_feedback + the previous plan and revises.
+        await graph.aupdate_state(cfg, {"plan_feedback": feedback},
+                                  as_node="intake")
+        async for ev in graph.astream(None, config=cfg,
+                                      stream_mode="updates"):
+            for node_name, _delta in ev.items():
+                info["stage"] = node_name
+                if node_name == "researcher":
+                    n = len(_delta.get("sources") or [])
+                    progress = await _stream_progress(
+                        ctx.application.bot, chat_id,
+                        f"🔍 Re-searched: {n} source(s) — review the new plan.",
+                        progress)
+        snap = await graph.aget_state(cfg)
+        cur = snap.values if snap else {}
+        plan = cur.get("plan") or {}
+        length = info.get("length", DEFAULT_LENGTH)
+        text = _format_plan(plan, length=length,
+                            sources=cur.get("sources") or [])
+        info["plan_text"] = text
+        info["awaiting"] = "plan_approval"
+        await _safe_send(ctx.application.bot, chat_id, text,
+                         reply_markup=_plan_keyboard(default_length=length,
+                                                     run_id=run_id),
+                         parse_mode=ParseMode.MARKDOWN)
+        await _set_run_status(ctx, run_id, "awaiting_plan")
+    except Exception as e:
+        logger.exception("re-plan failed")
+        await ctx.application.bot.send_message(
+            chat_id=chat_id, text=f"⚠️ Re-plan failed: {e}")
+    finally:
+        info["resuming"] = False
+
+
+async def _revise_after_feedback(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
+                                 feedback: str) -> None:
+    """report-revise: append the user's feedback to revision_notes, set
+    revision_requested, then resume from the report-preview interrupt —
+    deliver passes through → revise_prep → synthesizer → … → new preview."""
+    if info.get("resuming"):
+        return
+    graph = info["graph"]
+    cfg = info["cfg"]
+    chat_id = info["chat_id"]
+    try:
+        snap = await graph.aget_state(cfg)
+        notes = list((snap.values if snap else {}).get("revision_notes") or [])
+        notes.append(f"USER REVISION REQUEST: {feedback}")
+        # revision_notes is a plain (last-value) channel — send the FULL list.
+        await graph.aupdate_state(
+            cfg, {"revision_requested": True, "revision_notes": notes})
+    except Exception as e:
+        logger.exception("could not queue revision")
+        await ctx.application.bot.send_message(
+            chat_id=chat_id, text=f"⚠️ Could not start the revision: {e}")
+        return
+    await _resume_after_plan(ctx, info)
 
 
 # ---------------------------------------------------------------------------
@@ -2012,11 +2117,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _set_run_status(ctx, run_id, "running")
             await _resume_after_plan(ctx, info)
         elif action == "edit":
-            info["plan_approved"] = "edit"
             info["plan_edit"] = True
+            _pending_reply[info["chat_id"]] = ("plan_edit", run_id)
             base = info.get("plan_text") or (q.message.text or "")
             await _safe_edit_cb(
-                q, base + "\n\n_✏️ Edit mode — reply with your changes._",
+                q, base + "\n\n_✏️ Reply with your changes and I'll redraft "
+                          "the plan (or tap ✅ Approve to keep this one)._",
                 reply_markup=_plan_keyboard(
                     default_length=info.get("length", DEFAULT_LENGTH),
                     run_id=run_id),
@@ -2052,10 +2158,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _set_run_status(ctx, run_id, "running")
             await _resume_after_plan(ctx, info)
         elif action == "revise":
-            info["report_revise"] = True
+            if info.get("resuming"):
+                return
+            _pending_reply[info["chat_id"]] = ("revise_feedback", run_id)
             await _safe_edit_cb(
-                q, (q.message.text or "") + "\n\n_🔁 Revision requested._")
-            await _resume_after_report(ctx, info, q, revision_requested=True)
+                q, (q.message.text or "")
+                + "\n\n_🔁 Reply with what to change and I'll revise the "
+                  "report._")
         elif action == "cancel":
             _inflight.pop(run_id, None)
             await _set_run_status(ctx, run_id, "cancelled")
@@ -2215,23 +2324,10 @@ async def _send_report_preview(ctx: ContextTypes.DEFAULT_TYPE,
 
 
 async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
-                                info: dict, q,
-                                revision_requested: bool = False):
+                                info: dict, q):
     run_id = info["run_id"]
     chat_id = info["chat_id"]
     paths = info.get("paths") or {}
-    if revision_requested:
-        # Honest stub until the in-graph revise loop lands (Phase 6 of
-        # the v2 rebuild): the report stays on disk and registered.
-        await ctx.application.bot.send_message(
-            chat_id=chat_id,
-            text=("🔁 In-place revision isn't wired yet — it arrives with "
-                  "the HITL upgrade. The report is saved; re-run /research "
-                  "with refined wording for now."),
-        )
-        _inflight.pop(run_id, None)
-        await _finalize_run(ctx, info, paths)
-        return
     # Send the report files.
     try:
         md_path = Path(paths["md"]) if paths.get("md") else None
