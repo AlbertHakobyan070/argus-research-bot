@@ -22,12 +22,31 @@ from typing import Literal
 
 import httpx
 from langchain_openai import ChatOpenAI
+from tenacity import (
+    AsyncRetrying, retry_if_exception_type, stop_after_attempt,
+    wait_exponential,
+)
 
 from .config import get_settings
 
 logger = logging.getLogger("argus.llm")
 
 Tier = Literal["cheap", "strong", "judge"]
+
+# Transient errors worth retrying: transport/timeout/5xx/rate-limit.
+# NEVER retry parse errors or 4xx (a bad request won't fix itself) — the
+# nodes' JSON-parse fallbacks handle malformed-but-delivered responses.
+try:
+    import openai as _openai
+    _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+        _openai.APIConnectionError, _openai.APITimeoutError,
+        _openai.RateLimitError, _openai.InternalServerError,
+        httpx.TransportError, httpx.TimeoutException,
+    )
+except Exception:  # pragma: no cover - openai always present via langchain
+    _TRANSIENT_EXC = (httpx.TransportError, httpx.TimeoutException)
+
+_RETRY_ATTEMPTS = int(os.environ.get("ARGUS_LLM_RETRIES", "3"))
 
 # Preferred model IDs per tier. We try these in order against the live
 # /v1/models list and pick the first one that's present. If none match
@@ -105,10 +124,21 @@ def fetch_live_models(force: bool = False) -> list[str]:
     s = get_settings()
     url = f"{s.freellmapi_base_url}/models"
     headers = {"Authorization": f"Bearer {s.freellmapi_api_key}"}
-    with httpx.Client(timeout=15.0) as c:
-        r = c.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+    import time
+    data = None
+    for i in range(1, 4):
+        try:
+            with httpx.Client(timeout=15.0) as c:
+                r = c.get(url, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+            break
+        except (httpx.TransportError, httpx.TimeoutException) as e:
+            if i >= 3:
+                raise
+            logger.warning("models fetch transient error (%s); retry %d/3",
+                           type(e).__name__, i)
+            time.sleep(min(4.0, 2.0 ** (i - 1)))
     ids = sorted({m["id"] for m in data.get("data", []) if "id" in m})
     _model_list_cache = ids
     _cache_signature = sig
@@ -192,6 +222,41 @@ def chat_for_tier(tier: Tier, *, temperature: float = 0.2,
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
     return ChatOpenAI(**kwargs)
+
+
+def invoke_with_retry(chat: ChatOpenAI, messages, *,
+                      attempts: int = _RETRY_ATTEMPTS):
+    """chat.invoke with bounded exponential-backoff retry on TRANSIENT
+    errors only (transport / timeout / 5xx / rate-limit). A delivered-but-
+    malformed response is NOT an exception here — the node's JSON-parse
+    fallback owns that. Sync: nodes run on LangGraph worker threads."""
+    import time
+    last: BaseException | None = None
+    for i in range(1, max(1, attempts) + 1):
+        try:
+            return chat.invoke(messages)
+        except _TRANSIENT_EXC as e:  # transient — back off and retry
+            last = e
+            if i >= attempts:
+                break
+            delay = min(8.0, 2.0 ** (i - 1))
+            logger.warning("LLM call transient error (%s); retry %d/%d in %.0fs",
+                           type(e).__name__, i, attempts, delay)
+            time.sleep(delay)
+    assert last is not None
+    raise last
+
+
+async def ainvoke_with_retry(chat: ChatOpenAI, messages, *,
+                             attempts: int = _RETRY_ATTEMPTS):
+    """Async counterpart of :func:`invoke_with_retry`."""
+    async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(max(1, attempts)),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            retry=retry_if_exception_type(_TRANSIENT_EXC),
+            reraise=True):
+        with attempt:
+            return await chat.ainvoke(messages)
 
 
 def record_from_response(tier: Tier, requested: str,

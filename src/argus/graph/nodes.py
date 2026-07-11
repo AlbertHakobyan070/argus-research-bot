@@ -55,7 +55,7 @@ def intake_node(state: ArgusState) -> dict:
     """Classify request as quick vs deep and clean it up."""
     raw = state.get("user_request") or ""
     chat = llm.chat_for_tier("cheap", temperature=0.0, max_tokens=200)
-    resp = chat.invoke([
+    resp = llm.invoke_with_retry(chat, [
         SystemMessage(content=INTAKE_SYSTEM),
         HumanMessage(content=raw[:4000]),
     ])
@@ -143,7 +143,7 @@ def planner_node(state: ArgusState) -> dict:
         human = (f"Topic / question: {state['user_request']}\n\n"
                  "Draft the research plan.")
     chat = llm.chat_for_tier("strong", temperature=0.2, max_tokens=1200)
-    resp = chat.invoke([
+    resp = llm.invoke_with_retry(chat, [
         SystemMessage(content=PLANNER_SYSTEM),
         HumanMessage(content=human),
     ])
@@ -527,145 +527,154 @@ def _arxiv_search(plan: ResearchPlan) -> list[dict]:
 # fetcher
 # ---------------------------------------------------------------------------
 
+_FETCH_CONCURRENCY = int(os.environ.get("ARGUS_FETCH_CONCURRENCY", "3"))
+
+
+def _fetch_one_source(src: dict) -> tuple[dict | None, list[str]]:
+    """Fetch ONE source into a FetchedItem dict (or None) + error strings.
+
+    Pure per-source worker so ``fetcher_node`` can run the blocking
+    subprocess fetches CONCURRENTLY across sources instead of serially
+    (each can take up to the tool timeout, ~120s). No shared state — the
+    node collects results in input order.
+    """
+    errors: list[str] = []
+    url = src.get("url")
+    # v2 Phase 4: appended LOCAL sources (vault transcripts, saved
+    # reports) carry ``local_path`` instead of a fetchable URL. They
+    # become FetchedItems with file:/// urls so the citation registry
+    # can reference them like any web source.
+    local_path = src.get("local_path")
+    if local_path:
+        try:
+            p = Path(local_path)
+            if not p.exists():
+                msg = f"fetcher: appended local file missing: {local_path}"
+                logger.warning(msg)
+                return None, [msg]
+            if p.suffix.lower() == ".md":
+                md_path = p
+            elif p.suffix.lower() == ".txt":
+                # Plain text (transcripts) → copy to a .md work file
+                # OUTSIDE the vault so we don't litter it.
+                work = Path(tempfile.gettempdir()) / "argus_local_md"
+                work.mkdir(parents=True, exist_ok=True)
+                md_path = work / (p.stem + ".md")
+                md_path.write_text(
+                    p.read_text(encoding="utf-8", errors="replace"),
+                    encoding="utf-8")
+            else:
+                res = normalize_to_markdown(str(p))
+                if not (res.ok and res.markdown_path):
+                    return None, [f"fetcher: could not normalize local file "
+                                  f"{p.name}: {res.error or 'not ok'}"]
+                md_path = Path(res.markdown_path)
+            return FetchedItem(
+                url="file:///" + str(p).replace("\\", "/"),
+                title=src.get("title") or p.stem,
+                markdown_path=str(md_path),
+                section=src.get("kind", "local"),
+                excerpt=_read_excerpt(str(md_path)),
+            ).model_dump(), []
+        except Exception as e:
+            msg = f"fetcher: local file {local_path} failed: {e!r}"
+            logger.warning(msg)
+            return None, [msg]
+    # T6 fix: a source without a URL is not fetchable. Record and skip
+    # without crashing. Old code raised KeyError on src["url"], caught by
+    # the broad except, logged only -> the user got a silent report.
+    if not url or not isinstance(url, str) or not url.startswith("http"):
+        msg = f"fetcher skipping source with no/empty/non-http URL: {src!r}"
+        logger.info(msg)
+        return None, [msg]
+    kind = src.get("kind", "search_result")
+    try:
+        # Pick tool based on kind.
+        if kind == "official_doc" or "github.com" in url or "arxiv.org" in url:
+            # use normalize (article_convert) — works for both
+            res = normalize_to_markdown(url)
+            if res.ok and res.markdown_path:
+                return FetchedItem(
+                    url=url, title=res.title or src.get("title", ""),
+                    markdown_path=res.markdown_path, section=kind,
+                    excerpt=(res.markdown_text or "")[:600],
+                ).model_dump(), []
+        if kind == "paper" and "arxiv.org/abs/" in url:
+            # convert abs to pdf url, then snatch as paper
+            pdf = url.replace("/abs/", "/pdf/") + ".pdf"
+            res = snatch_url(pdf, kind="papers")
+            # T5 fix: require markdown_path on disk, matching every other
+            # branch. Otherwise a silently-empty snatch (rc=0 but no file)
+            # records a fake "fetched" entry with no evidence.
+            if res.ok and res.markdown_path and Path(res.markdown_path).exists():
+                return FetchedItem(
+                    url=url, title=res.title or src.get("title", ""),
+                    markdown_path=res.markdown_path, section=kind,
+                    excerpt="",
+                ).model_dump(), []
+        # default: try snatch first
+        res = snatch_url(url, kind="auto")
+        if res.ok and res.markdown_path:
+            return FetchedItem(
+                url=url, title=res.title or src.get("title", ""),
+                markdown_path=res.markdown_path, section=kind,
+                excerpt=_read_excerpt(res.markdown_path),
+            ).model_dump(), []
+        # fallback: crawl
+        res = crawl_url(url, deep=False, max_pages=4)
+        if res.ok and res.markdown_path:
+            return FetchedItem(
+                url=url, title=src.get("title", ""),
+                markdown_path=res.markdown_path, section=kind,
+                excerpt=_read_excerpt(res.markdown_path),
+            ).model_dump(), []
+        # Phase 2 last resort: bot-walled / Cloudflare sites (the plain
+        # requests GET inside snatch/crawl returns 403 or a JS challenge).
+        # Retry once with Scrapling's stealth fetcher (camoufox). Kept
+        # last because it spins up a headless browser and is slow.
+        res = snatch_url(url, kind="auto", stealth=True)
+        if res.ok and res.markdown_path:
+            return FetchedItem(
+                url=url, title=res.title or src.get("title", ""),
+                markdown_path=res.markdown_path, section=kind,
+                excerpt=_read_excerpt(res.markdown_path),
+            ).model_dump(), []
+        # All fetch strategies (normalize/snatch/crawl/stealth) failed.
+        msg = f"fetch {url} failed: all tools returned not-ok (incl. stealth)"
+        logger.warning(msg)
+        return None, [msg]
+    except Exception as e:
+        msg = f"fetch {url} failed: {e!r}"
+        logger.warning(msg)
+        return None, [msg]
+
+
 def fetcher_node(state: ArgusState) -> dict:
     """Fetch each source URL into markdown via snatch/crawl/normalize.
 
-    Per-URL tool failures append to ``state["errors"]`` (via the
-    ``Annotated[list[str], operator.add]`` reducer) instead of being
-    silently logged-and-forgotten. If *every* URL failed we also append
-    a summary error so the report can surface "all fetches failed" rather
-    than the synthesizer running against an empty evidence list and
-    producing a vacuous "no evidence" report. See Argus T2 (Pattern E).
+    Sources are fetched CONCURRENTLY (bounded thread pool) — each fetch
+    shells out to a tool that can block for up to the tool timeout, so a
+    serial loop made an N-source run take N×(up to 120s). Results are
+    collected in input order (deterministic for ranking + tests).
+
+    Per-URL tool failures append to ``state["errors"]`` instead of being
+    silently logged-and-forgotten. If *every* URL failed we also append a
+    summary error so the report can surface "all fetches failed" rather
+    than the synthesizer running against empty evidence. See Argus T2.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     fetched: list[dict] = []
     errors: list[str] = []
     sources = state.get("sources") or []
-    for src in sources:
-        url = src.get("url")
-        # v2 Phase 4: appended LOCAL sources (vault transcripts, saved
-        # reports) carry ``local_path`` instead of a fetchable URL. They
-        # become FetchedItems with file:/// urls so the citation
-        # registry can reference them like any web source.
-        local_path = src.get("local_path")
-        if local_path:
-            try:
-                p = Path(local_path)
-                if not p.exists():
-                    msg = f"fetcher: appended local file missing: {local_path}"
-                    logger.warning(msg)
-                    errors.append(msg)
-                    continue
-                if p.suffix.lower() == ".md":
-                    md_path = p
-                elif p.suffix.lower() == ".txt":
-                    # Plain text (transcripts) → copy to a .md work file
-                    # OUTSIDE the vault so we don't litter it.
-                    work = Path(tempfile.gettempdir()) / "argus_local_md"
-                    work.mkdir(parents=True, exist_ok=True)
-                    md_path = work / (p.stem + ".md")
-                    md_path.write_text(
-                        p.read_text(encoding="utf-8", errors="replace"),
-                        encoding="utf-8")
-                else:
-                    res = normalize_to_markdown(str(p))
-                    if not (res.ok and res.markdown_path):
-                        msg = (f"fetcher: could not normalize local file "
-                               f"{p.name}: {res.error or 'not ok'}")
-                        errors.append(msg)
-                        continue
-                    md_path = Path(res.markdown_path)
-                fetched.append(FetchedItem(
-                    url="file:///" + str(p).replace("\\", "/"),
-                    title=src.get("title") or p.stem,
-                    markdown_path=str(md_path),
-                    section=src.get("kind", "local"),
-                    excerpt=_read_excerpt(str(md_path)),
-                ).model_dump())
-            except Exception as e:
-                msg = f"fetcher: local file {local_path} failed: {e!r}"
-                logger.warning(msg)
-                errors.append(msg)
-            continue
-        # T6 fix: a source without a URL is not fetchable. Record and
-        # skip without crashing the whole node. Old code raised
-        # KeyError on src["url"], caught by the broad except, logged
-        # only -> the user got a silent "no evidence" report.
-        if not url or not isinstance(url, str) or not url.startswith("http"):
-            msg = f"fetcher skipping source with no/empty/non-http URL: {src!r}"
-            logger.info(msg)
-            errors.append(msg)
-            continue
-        kind = src.get("kind", "search_result")
-        try:
-            # Pick tool based on kind.
-            if kind == "official_doc" or "github.com" in url or "arxiv.org" in url:
-                # use normalize (article_convert) — works for both
-                res = normalize_to_markdown(url)
-                if res.ok and res.markdown_path:
-                    fetched.append(FetchedItem(
-                        url=url, title=res.title or src.get("title", ""),
-                        markdown_path=res.markdown_path,
-                        section=kind,
-                        excerpt=(res.markdown_text or "")[:600],
-                    ).model_dump())
-                    continue
-            if kind == "paper" and "arxiv.org/abs/" in url:
-                # convert abs to pdf url, then snatch as paper
-                pdf = url.replace("/abs/", "/pdf/") + ".pdf"
-                res = snatch_url(pdf, kind="papers")
-                # T5 fix: also require markdown_path on disk, matching
-                # every other branch in this function. Otherwise a
-                # silently-empty snatch result (rc=0 but no file)
-                # would record a fake "fetched" entry with no evidence.
-                if res.ok and res.markdown_path and Path(res.markdown_path).exists():
-                    fetched.append(FetchedItem(
-                        url=url, title=res.title or src.get("title", ""),
-                        markdown_path=res.markdown_path,
-                        section=kind,
-                        excerpt="",
-                    ).model_dump())
-                    continue
-            # default: try snatch first
-            res = snatch_url(url, kind="auto")
-            if res.ok and res.markdown_path:
-                fetched.append(FetchedItem(
-                    url=url, title=res.title or src.get("title", ""),
-                    markdown_path=res.markdown_path,
-                    section=kind,
-                    excerpt=_read_excerpt(res.markdown_path),
-                ).model_dump())
-                continue
-            # fallback: crawl
-            res = crawl_url(url, deep=False, max_pages=4)
-            if res.ok and res.markdown_path:
-                fetched.append(FetchedItem(
-                    url=url, title=src.get("title", ""),
-                    markdown_path=res.markdown_path,
-                    section=kind,
-                    excerpt=_read_excerpt(res.markdown_path),
-                ).model_dump())
-                continue
-            # Phase 2 last resort: bot-walled / Cloudflare sites (the plain
-            # requests GET inside snatch/crawl returns 403 or a JS challenge).
-            # Retry once with Scrapling's stealth fetcher (camoufox). Kept
-            # last because it spins up a headless browser and is slow.
-            res = snatch_url(url, kind="auto", stealth=True)
-            if res.ok and res.markdown_path:
-                fetched.append(FetchedItem(
-                    url=url, title=res.title or src.get("title", ""),
-                    markdown_path=res.markdown_path,
-                    section=kind,
-                    excerpt=_read_excerpt(res.markdown_path),
-                ).model_dump())
-                continue
-            # All fetch strategies (normalize/snatch/crawl/stealth) failed.
-            msg = f"fetch {url} failed: all tools returned not-ok (incl. stealth)"
-            errors.append(msg)
-            logger.warning(msg)
-        except Exception as e:
-            msg = f"fetch {url} failed: {e!r}"
-            logger.warning(msg)
-            errors.append(msg)
+    if sources:
+        workers = max(1, min(_FETCH_CONCURRENCY, len(sources)))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="argus-fetch") as ex:
+            for item, errs in ex.map(_fetch_one_source, sources):
+                if item is not None:
+                    fetched.append(item)
+                errors.extend(errs)
     if sources and not fetched:
         # Every URL failed. Surface this as a single summary error so the
         # synthesizer's "no evidence" report can be replaced with an
@@ -1239,7 +1248,7 @@ def synthesizer_node(state: ArgusState) -> dict:
         f"{revision_block}\n\n"
         "Write the JSON response now."
     )
-    resp = chat.invoke([
+    resp = llm.invoke_with_retry(chat, [
         SystemMessage(content=_synth_prompt_for(length) + _grounding_warn),
         HumanMessage(content=user[:14000]),
     ])
@@ -1532,7 +1541,7 @@ def reviewer_node(state: ArgusState) -> dict:
         + "\n".join(f"- {u}" for u in list(fetched_urls)[:30])
         + "\n\nReturn JSON verdict now."
     )
-    resp = chat.invoke([
+    resp = llm.invoke_with_retry(chat, [
         SystemMessage(content=REVIEW_SYSTEM),
         HumanMessage(content=user[:14000]),
     ])
@@ -2030,7 +2039,7 @@ def quick_answer_node(state: ArgusState) -> dict:
     """Cheap single-shot answer. Still routes through FreeLLMAPI, so it
     is grounded in the model's training (no fabrication guarantees)."""
     chat = llm.chat_for_tier("cheap", temperature=0.3, max_tokens=600)
-    resp = chat.invoke([
+    resp = llm.invoke_with_retry(chat, [
         SystemMessage(content=(
             "You are Argus, a research assistant. Answer the user's question "
             "concisely and accurately. If you don't know, say so. No fake citations."

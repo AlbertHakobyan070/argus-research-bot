@@ -69,57 +69,33 @@ from .transcribe import transcribe_url
 
 logger = logging.getLogger("argus.bot")
 
+# Compact quick-reference. The full, explained guide lives in
+# ``docs/help.md`` and is sent by ``/help full``.
 HELP_TEXT = """\
-*Argus — multi-agent Telegram research bot* (brain: FreeLLMAPI proxy)
+*Argus* — research + media bot. `/help full` for the detailed guide.
 
-Commands:
-  /research <topic>                 — full deep loop with plan-approval + report-preview HITL gates
-  /research /length <m> <topic>     — pre-pin output length mode (see below)
-  /ask <question>                   — quick grounded single-shot answer
-  /find [yt|shorts|reddit] <query>  — search for videos, then tap ⬇ / 📝
-                                       buttons to download / transcribe
-  /fetch <url> [url…]               — download media links straight into
-                                       the DS vault (YouTube / X / Reddit
-                                       / Instagram; or just PASTE links)
-  /quality [auto|min|max|<height>]  — global download quality setting
-  /video [shorts] <query>           — search YouTube (videos or shorts)
-  /transcript <indices>             — fetch captions for picked videos
-                                       from the last /video or /find pool
-                                       (e.g. 2,4 or `all` or 1-3)
-  /transcripts                      — browse saved vault transcripts
-                                       (📤 buttons re-send any of them)
-  /runs                             — run history (ids for /continue & /append)
-  /append <run-id> <url|asset:N>    — queue sources for a run (vault
-                                       transcripts via their asset ids)
-  /continue <run-id>                — re-attach a paused run, or extend a
-                                       finished one (appended sources are
-                                       ingested; otherwise a fresh search
-                                       pass deepens it)
-  /delete                           — browse runs / media / transcripts
-                                       with sizes, multi-select, confirm,
-                                       and free up disk space
-  /status                           — in-flight runs + recent run history for this chat
-  /cancel [run-id|all]              — cancel an in-flight run (id optional when only one)
-  /help                             — this message
+*Research*
+  /research <topic> — deep report (plan → approve → preview)
+  /ask <question> — quick one-shot answer
 
-*Length modes* (selectable at plan approval):
-  • `tldr`     — single short paragraph
-  • `short`    — current report (~300-700 chars)
-  • `medium`   — 2-3 page MD (~3-6k chars, sub-headings)
-  • `long`     — 5-8 page MD (~10-15k chars, 10-15 findings)
-  • `lecture`  — 8-10 page MD, lecture format with Part I-IV + References + Appendix
+*Media → vault*
+  /find [yt|shorts|reddit] <query> — search, then ⬇/📝 buttons
+  /fetch <url…> — download links (or just paste them)
+  /quality [auto|min|max|<h>] — download quality
+  /transcript <indices> — captions for /find picks
+  /transcripts — browse saved transcripts
 
-Without `/length`, the default is `short`.
+*History*
+  /runs — list runs · /status — what's in flight
+  /append <id> <url|asset:N> — queue sources for a run
+  /continue <id> — resume or extend a run
+  /delete — free up space · /cancel [id] — stop a run
 
-Inline-keyboard buttons appear after the plan is drafted and after the
-report is built. Click *Approve* / *Send* to advance, *Cancel* to drop.
-The plan preview lists sources found by LIVE search (run before the
-gate) — planner URL guesses are never shown.
-
-Runs are checkpointed in SQLite (each run gets its own thread, so runs
-survive bot restarts); reports are persisted to the DS-vault
-research-history folder and registered in the Argus library.
+_Tip: paste any YouTube / X / Reddit / Instagram link for a download menu._
 """
+
+# Loaded lazily from docs/help.md (repo) for `/help full`.
+_HELP_MD_PATH = Path(__file__).resolve().parents[2] / "docs" / "help.md"
 
 # ---------------------------------------------------------------------------
 # Length selector (T7.1) — HITL keyboard button + /length CLI flag.
@@ -1988,7 +1964,21 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    full = bool(ctx.args) and ctx.args[0].lower() in ("full", "guide", "all")
+    if full and _HELP_MD_PATH.exists():
+        # Send the detailed guide as a document (it's longer than a
+        # single Telegram message and reads better as a file).
+        try:
+            with _HELP_MD_PATH.open("rb") as f:
+                await ctx.application.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=InputFile(f, filename="argus-help.md"),
+                    caption="📖 Argus — full command guide")
+            return
+        except Exception:
+            logger.exception("could not send help.md; falling back to text")
+    await _safe_send(ctx.application.bot, update.effective_chat.id,
+                     HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
