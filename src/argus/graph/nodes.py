@@ -1272,7 +1272,11 @@ def synthesizer_node(state: ArgusState) -> dict:
     synthesis_error: str = ""
     synthesis_no_evidence_reason: str = ""
     try:
-        data = _parse_json_obj(resp.content)
+        # require_any: never accept an inner {"claim":...} finding object
+        # as the whole response (the 2026-07-12 empty-report bug).
+        data = _parse_json_obj(
+            resp.content,
+            require_any=("findings", "draft_md", "no_evidence"))
         if data.get("no_evidence") is True:
             synthesis_outcome = "no_evidence"
             synthesis_no_evidence_reason = (
@@ -1304,21 +1308,43 @@ def synthesizer_node(state: ArgusState) -> dict:
                     f.id = f"f{i}"
                 findings.append(f)
             if (not findings) and (not (data.get("draft_md") or "").strip()):
-                synthesis_outcome = "empty_fallback"
-                synthesis_no_evidence_reason = (
-                    "Synthesizer returned empty findings[] and empty draft_md "
-                    "without the required no_evidence=true flag."
-                )
-                draft_md = _no_evidence_failure_md(
-                    state["user_request"], length=length,
-                    fetched_count=len(fetched),
-                    reason=synthesis_no_evidence_reason,
-                )
-                logger.warning(
-                    "synthesizer: empty findings[] with no no_evidence flag "
-                    "(length=%s, fetched=%d) - emitting loud failure block",
-                    length, len(fetched),
-                )
+                # Last-resort salvage: the model may have produced real
+                # findings inside a response whose surrounding JSON broke
+                # (unescaped newlines in draft_md). Recover them before
+                # declaring failure — this is the fix for the 2026-07-12
+                # LangChain/LangGraph "30 sources, empty report" bug.
+                salvaged = _salvage_findings(resp.content)
+                for i, fd in enumerate(salvaged):
+                    try:
+                        f = Finding.model_validate(fd)
+                    except Exception:
+                        continue
+                    if not f.id:
+                        f.id = f"f{i}"
+                    findings.append(f)
+                if findings:
+                    synthesis_outcome = "ok"
+                    draft_md = _draft_md_from_findings(
+                        state["user_request"], findings, length=length)
+                    logger.info(
+                        "synthesizer: salvaged %d finding(s) from a broken "
+                        "JSON response (length=%s)", len(findings), length)
+                else:
+                    synthesis_outcome = "empty_fallback"
+                    synthesis_no_evidence_reason = (
+                        "Synthesizer returned empty findings[] and empty "
+                        "draft_md without the required no_evidence=true flag."
+                    )
+                    draft_md = _no_evidence_failure_md(
+                        state["user_request"], length=length,
+                        fetched_count=len(fetched),
+                        reason=synthesis_no_evidence_reason,
+                    )
+                    logger.warning(
+                        "synthesizer: empty findings[] with no no_evidence "
+                        "flag (length=%s, fetched=%d) - emitting failure block",
+                        length, len(fetched),
+                    )
             else:
                 draft_md = data.get("draft_md") or _draft_md_from_findings(
                     state["user_request"], findings, length=length)
@@ -1327,18 +1353,37 @@ def synthesizer_node(state: ArgusState) -> dict:
             if mode.include_appendix:
                 lecture_appendix = _parse_lecture_appendix(data)
     except Exception as e:
-        synthesis_outcome = "synthesis_error"
-        synthesis_error = str(e)
-        logger.warning("Synthesizer returned non-JSON / failed parse: %s", e)
-        draft_md = (
-            f"# {state['user_request']}\n\n"
-            "⚠️ **Synthesis failed.**\n\n"
-            "- **Class:** `synthesis_error`\n"
-            f"- **Reason:** {synthesis_error[:500]}\n\n"
-            "The Argus pipeline could not produce a structured JSON response "
-            "on this attempt. Try `/research <topic>` again; if the failure "
-            "persists, narrow the scope.\n"
-        )
+        # Parse failed entirely — try to salvage findings from the raw
+        # response before declaring failure (a real report the model
+        # produced shouldn't be lost to a JSON syntax slip).
+        salvaged = _salvage_findings(resp.content)
+        for i, fd in enumerate(salvaged):
+            try:
+                f = Finding.model_validate(fd)
+            except Exception:
+                continue
+            if not f.id:
+                f.id = f"f{i}"
+            findings.append(f)
+        if findings:
+            synthesis_outcome = "ok"
+            draft_md = _draft_md_from_findings(
+                state["user_request"], findings, length=length)
+            logger.info("synthesizer: parse failed (%s) but salvaged %d "
+                        "finding(s) from raw response", e, len(findings))
+        else:
+            synthesis_outcome = "synthesis_error"
+            synthesis_error = str(e)
+            logger.warning("Synthesizer returned non-JSON / failed parse: %s", e)
+            draft_md = (
+                f"# {state['user_request']}\n\n"
+                "⚠️ **Synthesis failed.**\n\n"
+                "- **Class:** `synthesis_error`\n"
+                f"- **Reason:** {synthesis_error[:500]}\n\n"
+                "The Argus pipeline could not produce a structured JSON "
+                "response on this attempt. Try `/research <topic>` again; if "
+                "the failure persists, narrow the scope.\n"
+            )
 
     out: dict[str, Any] = {
         "findings": [f.model_dump() for f in findings],
@@ -2060,43 +2105,101 @@ def quick_answer_node(state: ArgusState) -> dict:
 # helpers
 # ---------------------------------------------------------------------------
 
-def _parse_json_obj(text: str, *, min_keys: int = 1) -> dict:
+def _repair_json(t: str) -> str:
+    """Escape literal control chars inside JSON string values.
+
+    The #1 cause of synthesizer parse failures (2026-07-12 LangChain/
+    LangGraph empty-report bug): a model writes a long ``draft_md``
+    markdown value with LITERAL newlines/tabs, which is invalid JSON.
+    We walk the text tracking whether we're inside a quoted string and
+    escape raw \\n \\r \\t so ``json.loads`` can recover the object.
+    """
+    out: list[str] = []
+    in_str = False
+    escaped = False
+    for ch in t:
+        if in_str:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    return "".join(out)
+
+
+def _parse_json_obj(text: str, *, min_keys: int = 1,
+                    require_any: tuple[str, ...] | None = None) -> dict:
     """Best-effort JSON parse; tolerates ```json fences and embedded JSON.
 
     Strategy:
-      1. Strip outer fences and try direct parse.
-      2. Balanced-brace match — find the outermost valid JSON object.
-      3. Fall back to a ```json fenced block (the model may have
-         embedded its real JSON inside a markdown code block).
+      1. Strip outer fences and try direct parse (raw, then repaired).
+      2. Balanced-brace match — outermost valid JSON object (raw, then
+         repaired), respecting ``require_any``.
+      3. Fall back to a ```json fenced block.
 
-    ``min_keys`` rejects trivially-empty objects like ``{}`` so callers
-    can force the fallback path to fire when the LLM produced no useful
-    structured output.
+    ``min_keys`` rejects trivially-empty objects like ``{}``.
+    ``require_any`` (e.g. ``("findings","draft_md","no_evidence")``) forces
+    the parser to accept ONLY an object containing at least one of those
+    top-level keys — so a truncated/newline-broken response can't cause it
+    to latch onto an inner ``{"claim":...}`` finding object and make the
+    synthesizer think it got empty findings.
     """
     raw = text or ""
 
-    def _accept(d: dict) -> dict | None:
+    def _accept(d) -> dict | None:
         if not isinstance(d, dict):
             return None
         if len(d) < min_keys:
             return None
+        if require_any and not any(k in d for k in require_any):
+            return None
         return d
 
-    # 1. Direct (after fence stripping).
+    def _try(candidate: str) -> dict | None:
+        for variant in (candidate, _repair_json(candidate)):
+            try:
+                d = _accept(json.loads(variant))
+                if d is not None:
+                    return d
+            except Exception:
+                continue
+        return None
+
+    # 1. Direct (after fence stripping), raw then repaired.
     t = raw.strip()
     t = re.sub(r"^```(?:json)?", "", t, flags=re.IGNORECASE).strip()
     t = re.sub(r"```$", "", t).strip()
-    try:
-        d = _accept(json.loads(t))
-        if d is not None:
-            return d
-    except Exception:
-        pass
-    # 2. Balanced braces — find the first '{' whose matching '}' yields
-    #    valid JSON.
+    d = _try(t)
+    if d is not None:
+        return d
+    # 2. Balanced braces — every top-level '{...}' span, outermost first.
+    #    With require_any set, inner finding objects are rejected by
+    #    _accept, so the scan keeps going until it finds the real object.
     s = t
-    for i, ch in enumerate(s):
-        if ch == "{":
+    i = 0
+    while i < len(s):
+        if s[i] == "{":
             depth = 0
             for j in range(i, len(s)):
                 if s[j] == "{":
@@ -2104,28 +2207,63 @@ def _parse_json_obj(text: str, *, min_keys: int = 1) -> dict:
                 elif s[j] == "}":
                     depth -= 1
                     if depth == 0:
-                        candidate = s[i:j + 1]
-                        try:
-                            d = _accept(json.loads(candidate))
-                            if d is not None:
-                                return d
-                        except Exception:
-                            break
-    # 3. Try json-fenced block (the model sometimes dumps JSON inside
-    #    a code fence that itself is in a string field).
+                        d = _try(s[i:j + 1])
+                        if d is not None:
+                            return d
+                        break
+            # advance past this '{' (whether or not it closed) so we try
+            # the next top-level object rather than re-scanning.
+            i += 1
+        else:
+            i += 1
+    # 3. Try json-fenced block.
     m = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL |
                   re.IGNORECASE)
     if m:
-        try:
-            d = _accept(json.loads(m.group(1)))
-            if d is not None:
-                return d
-        except Exception:
-            pass
+        d = _try(m.group(1))
+        if d is not None:
+            return d
     raise ValueError(
         f"no useful JSON object found in: {raw[:200]!r} "
-        f"(required >= {min_keys} keys)"
+        f"(required >= {min_keys} keys"
+        + (f", any of {require_any}" if require_any else "") + ")"
     )
+
+
+def _salvage_findings(text: str) -> list[dict]:
+    """Extract finding objects from a response whose overall JSON is
+    unrecoverable. Scans for ``{...}`` spans that look like a Finding
+    (have a ``claim`` and ``citation_urls``) and returns them in order.
+
+    Last-resort so a real report the model produced isn't thrown away
+    just because its ``draft_md`` broke the surrounding JSON.
+    """
+    out: list[dict] = []
+    s = text or ""
+    i = 0
+    while i < len(s):
+        if s[i] == "{":
+            depth = 0
+            for j in range(i, len(s)):
+                if s[j] == "{":
+                    depth += 1
+                elif s[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        span = s[i:j + 1]
+                        for variant in (span, _repair_json(span)):
+                            try:
+                                obj = json.loads(variant)
+                            except Exception:
+                                continue
+                            if (isinstance(obj, dict) and obj.get("claim")
+                                    and obj.get("citation_urls")):
+                                out.append(obj)
+                            break
+                        i = j
+                        break
+        i += 1
+    return out
 
 
 def _ts() -> str:
