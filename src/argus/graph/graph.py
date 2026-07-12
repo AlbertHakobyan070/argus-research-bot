@@ -1,18 +1,54 @@
 """Argus LangGraph: build_graph() + helpers.
 
 Architecture (deep path):
+Deep Research
 
-  intake ──► planner ──► planner_reflect ──► researcher (LIVE search)
-  ──HITL plan_approval (real found sources shown)──► fetcher ──►
-  normalizer ──► credibility ──► filter ──► synthesizer ──► reviewer
-  ──► (pass|revise) ▲                                │
-                     └──────────── revision loop ────┘
-                                                          ▼
-                                                    report_builder
-                                                          │
-                                                  HITL report_preview
-                                                          ▼
-                                                       deliver
+intake
+  │
+  ▼
+planner
+  │
+  ▼
+planner_reflect
+  │
+  ▼
+researcher (LIVE search)
+  │
+  ▼
+[HITL: Plan Approval]
+  │
+  ▼
+fetcher
+  │
+  ▼
+normalizer
+  │
+  ▼
+credibility
+  │
+  ▼
+filter
+  │
+  ▼
+synthesizer
+  │
+  ▼
+reviewer
+  ├── pass ───────────────────────────────► report_builder
+  └── revise ─► synthesizer (revision loop)
+
+report_builder
+  │
+  ▼
+[HITL: Report Preview]
+  │
+  ▼
+deliver
+
+
+Quick Path
+
+intake → quick_answer → deliver
 
 Quick path (for /ask): intake → quick_answer → deliver.
 """
