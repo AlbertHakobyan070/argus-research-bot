@@ -43,6 +43,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from langgraph.types import Command
@@ -2421,6 +2422,68 @@ async def _post_init(app: Application) -> None:
                        "subprocesses will not work on Windows", loop_name)
     logger.info("post_init: saver + library + graphs ready (loop=%s, "
                 "library=%s)", loop_name, s.library_db)
+    # Reconcile runs orphaned by the previous process (crash / restart):
+    # their in-memory _inflight is gone, so their inline buttons are dead.
+    # Recover what we can from checkpoints and tell each user.
+    try:
+        await _reconcile_orphaned_runs(app)
+    except Exception:
+        logger.exception("orphaned-run reconciliation failed")
+
+
+async def _reconcile_orphaned_runs(app: Application) -> None:
+    """A restart wipes _inflight, so any run left non-terminal is orphaned
+    (its plan/report buttons no longer resolve). For each, inspect the
+    checkpoint: if it's paused at a gate, mark it awaiting_* and DM the
+    user how to resume; otherwise mark it error. Bounded + best-effort."""
+    lib: Library | None = app.bot_data.get("library")
+    graph = app.bot_data.get("graph")
+    if lib is None or graph is None:
+        return
+    orphans = await lib.list_runs_by_status(
+        ("planning", "awaiting_plan", "running", "awaiting_report"), limit=25)
+    if not orphans:
+        return
+    logger.info("reconciling %d orphaned run(s) from a prior process",
+                len(orphans))
+    for run in orphans:
+        run_id = run["run_id"]
+        cfg = {"configurable": {"thread_id": run["thread_id"]}}
+        try:
+            snap = await graph.aget_state(cfg)
+        except Exception:
+            logger.exception("reconcile: aget_state failed for %s", run_id)
+            snap = None
+        nxt = tuple(snap.next) if (snap and snap.next) else ()
+        topic = (run.get("topic") or "")[:48]
+        if nxt == ("fetcher",):
+            await _set_run_status(app_ctx(app), run_id, "awaiting_plan")
+            msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
+                   f"restart at the plan step.\nSend /continue {run_id} to "
+                   "review the plan and resume.")
+        elif nxt == ("deliver",):
+            await _set_run_status(app_ctx(app), run_id, "awaiting_report")
+            msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
+                   f"restart at the report preview.\nSend /continue {run_id} "
+                   "to see the report.")
+        else:
+            await _set_run_status(app_ctx(app), run_id, "error")
+            msg = (f"⚠️ Run `{run_id}` ({topic}) was interrupted by a bot "
+                   "restart and can't be resumed from where it stopped.\n"
+                   "Please /research it again.")
+        try:
+            await app.bot.send_message(chat_id=run["chat_id"], text=msg,
+                                       parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            logger.warning("reconcile: could not notify chat %s about %s",
+                           run.get("chat_id"), run_id)
+
+
+def app_ctx(app: Application):
+    """Minimal shim exposing ``.application`` so the registry helpers
+    (_set_run_status / _get_library) work from post_init, where there's
+    no real Context object yet."""
+    return SimpleNamespace(application=app)
 
 
 async def _post_shutdown(app: Application) -> None:

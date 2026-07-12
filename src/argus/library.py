@@ -213,6 +213,25 @@ class Library:
             rows = await cur.fetchall()
         return [_row_to_run(r) for r in rows]
 
+    async def list_runs_by_status(self, statuses: tuple[str, ...],
+                                  limit: int = 50) -> list[dict[str, Any]]:
+        """All runs currently in any of ``statuses`` (newest first).
+
+        Used at startup to find runs orphaned by a crash/restart — those
+        left in a non-terminal state (planning/awaiting_*/running) whose
+        owning process is gone.
+        """
+        if not statuses:
+            return []
+        db = self._conn()
+        marks = ",".join("?" * len(statuses))
+        async with db.execute(
+                f"SELECT * FROM runs WHERE status IN ({marks})"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                [*statuses, limit]) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_run(r) for r in rows]
+
     async def set_run_status(self, run_id: str, status: str, *,
                              report_dir: str | None = None) -> bool:
         """Update a run's status (and optionally its report folder).
