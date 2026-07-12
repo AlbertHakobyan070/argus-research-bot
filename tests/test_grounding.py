@@ -211,10 +211,11 @@ def test_banner_non_empty_with_counts_when_not_grounded():
 # --- Behavioural / threshold defaults --------------------------------
 
 def test_default_threshold_constant_matches_documented():
-    """DEFAULT_GROUNDING_THRESHOLD=3 is the engineered value. We hold
-    this constant so future hyperparameter sweeps can sweep from a
-    known baseline (see handoff §6 P5 note)."""
-    assert DEFAULT_GROUNDING_THRESHOLD == 3
+    """DEFAULT_GROUNDING_THRESHOLD=2 after the 2026-07-12 depth rebalance
+    (was 3). Threshold-3 over-fired the strict-conservatism warning on
+    normal topics; 2 still catches genuinely thin entities (0-1 credible
+    mentions) while letting well-covered topics synthesize freely."""
+    assert DEFAULT_GROUNDING_THRESHOLD == 2
 
 
 def test_empty_state_grounds_trivially():

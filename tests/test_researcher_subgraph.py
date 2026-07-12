@@ -300,9 +300,11 @@ def test_merge_research_dedupes_by_url():
     assert out["final_sources"][0]["title"] == "a"
 
 
-def test_merge_research_caps_at_18():
+def test_merge_research_caps_at_30():
+    # Cap raised 18 -> 30 in the 2026-07-12 depth rebalance (more evidence
+    # for deeper synthesis).
     many = [{"url": f"https://x.com/{i}", "title": f"t{i}"}
-            for i in range(30)]
+            for i in range(40)]
     state = {
         "pre_seeded_sources": [],
         "sub_results": [
@@ -312,7 +314,7 @@ def test_merge_research_caps_at_18():
         ],
     }
     out = merge_research(state)
-    assert len(out["final_sources"]) == 18
+    assert len(out["final_sources"]) == 30
 
 
 def test_merge_research_preserves_pre_seeded_priority():

@@ -24,7 +24,10 @@ from urllib.parse import urlparse
 from .state import FetchedItem
 
 
-CREDIBILITY_FLOOR = 0.4
+# Lowered 0.40 -> 0.35 (2026-07-12 depth rebalance): with the widened
+# tier scale below, legit reference/curated domains comfortably clear
+# this while content farms (tier "low" ~0.05) stay well under it.
+CREDIBILITY_FLOOR = 0.35
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,12 @@ _DOMAIN_TABLE: tuple[tuple[str, str], ...] = (
     ("nih.gov", "primary"),
     ("nasa.gov", "primary"),
     ("europa.eu", "primary"),
+    ("semanticscholar.org", "primary"),
+    ("aaai.org", "primary"),
+    ("biorxiv.org", "primary"),
+    ("medrxiv.org", "primary"),
+    ("ar5iv.org", "primary"),
+    ("ar5iv.labs.arxiv.org", "primary"),
     # TLD-based primaries — substring match means ".edu" in host
     # (e.g. "cs.stanford.edu") catches the whole .edu namespace.
     (".edu", "primary"),
@@ -128,14 +137,24 @@ _DOMAIN_TABLE: tuple[tuple[str, str], ...] = (
     (".ac.jp", "primary"),
     # ---- trusted blogs / curated ------------------------------------
     ("github.com", "trusted"),
+    ("gitlab.com", "trusted"),
     ("huggingface.co", "trusted"),
+    ("paperswithcode.com", "trusted"),
     ("openai.com", "trusted"),
     ("anthropic.com", "trusted"),
     ("deepmind.google", "trusted"),
     ("research.google", "trusted"),
+    ("ai.googleblog.com", "trusted"),
     ("ai.meta.com", "trusted"),
+    ("microsoft.com", "trusted"),
     ("bair.berkeley.edu", "trusted"),
     ("distill.pub", "trusted"),
+    # General reference / encyclopedic — legitimate, was scoring as noise
+    # (0.11) before the 2026-07-12 rebalance because it wasn't listed.
+    ("wikipedia.org", "trusted"),
+    ("wikimedia.org", "trusted"),
+    ("stackoverflow.com", "trusted"),
+    ("stackexchange.com", "trusted"),
     ("towardsdatascience.com", "trusted"),
     ("medium.com", "trusted"),
     ("substack.com", "trusted"),
@@ -195,11 +214,15 @@ def _looks_like_low_host(url: str) -> bool:
     return bool(_STRUCTURAL_LOW_HOST_RE.search(host))
 
 
+# 2026-07-12 depth rebalance: neutral 0.25 -> 0.50 so an unknown-but-not-
+# spammy domain lands near the floor (passes when on-topic, fails when
+# off-topic) instead of being auto-cut as noise. low nudged 0.05 -> 0.08
+# (still far below the 0.35 floor — content-farm guard fully intact).
 _TIER_SCORE: dict[str, float] = {
     "primary": 1.0,
     "trusted": 0.80,
-    "neutral": 0.25,
-    "low": 0.05,
+    "neutral": 0.50,
+    "low": 0.08,
 }
 
 
@@ -326,6 +349,12 @@ def credibility_score(item: FetchedItem, *, user_request: str) -> float:
         domain trust      0.55
         URL pattern bonus 0.20
         title relevance   0.25
+
+    2026-07-12: domain weight raised 0.45 -> 0.55 (and url 0.30 -> 0.20).
+    Title-overlap is a weak, noisy signal (titles rarely echo the full
+    query), so leaning harder on the curated domain tier keeps genuine
+    primary/curated sources above the floor instead of letting a near-
+    zero title score drag arXiv/GitHub/Wikipedia down under it.
     """
     url = item.url or ""
     host = _host(url)
@@ -353,7 +382,7 @@ def credibility_score(item: FetchedItem, *, user_request: str) -> float:
     # (c) Title relevance
     title_s = _title_relevance(item.title, user_request)
 
-    score = 0.45 * domain_s + 0.30 * url_s + 0.25 * title_s
+    score = 0.55 * domain_s + 0.20 * url_s + 0.25 * title_s
     # Penalise missing URL (cannot verify provenance) — push below floor
     if not url:
         score = min(score, 0.15)
