@@ -25,7 +25,12 @@ from dataclasses import dataclass, field
 
 # Default minimum credible-mention count required for a topic to be
 # considered "grounded". Below this, the synthesizer gets the warning.
-DEFAULT_GROUNDING_THRESHOLD = 3
+# Lowered 3 -> 2 (2026-07-12 depth rebalance): threshold-3 over-fired on
+# normal well-covered topics (only a couple of sources clear the floor
+# after fetch failures), triggering the strict-conservatism warning that
+# produced shallow, hedged reports. 2 still catches genuinely thin /
+# non-existent entities (0-1 credible mentions) — the GLM-5.2 case.
+DEFAULT_GROUNDING_THRESHOLD = 2
 
 _GROUNDING_STOPWORDS = frozenset({
     "the", "and", "for", "with", "from", "into", "this", "that",
@@ -87,7 +92,7 @@ class GroundingResult:
         )
 
 
-def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD, credibility_floor=0.4):
+def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD, credibility_floor=0.35):
     """Compute a grounding verdict for the current pipeline state.
 
     state: dict exposing user_request and fetched (FetchedItem list or model_dump() dicts).

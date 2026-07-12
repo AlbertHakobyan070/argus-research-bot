@@ -466,11 +466,11 @@ def _arxiv_search_raw(query: str) -> list[dict]:
         return []
     params = {
         "search_query": f"all:{q}",
-        "start": 0, "max_results": 8,
+        "start": 0, "max_results": 12,
         "sortBy": "relevance", "sortOrder": "descending",
     }
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as c:
+        with httpx.Client(timeout=25.0, follow_redirects=True) as c:
             r = c.get("https://export.arxiv.org/api/query", params=params)
             r.raise_for_status()
     except Exception:
@@ -489,7 +489,7 @@ def _arxiv_search_raw(query: str) -> list[dict]:
                 "kind": "paper", "title": title, "url": link,
                 "summary": summary, "source": "arxiv-raw",
             })
-    return out[:8]
+    return out[:12]
 
 
 def _arxiv_search(plan: ResearchPlan) -> list[dict]:
@@ -499,10 +499,10 @@ def _arxiv_search(plan: ResearchPlan) -> list[dict]:
     url = "https://export.arxiv.org/api/query"  # arXiv moved to HTTPS
     params = {
         "search_query": f"all:{query}",
-        "start": 0, "max_results": 6,
+        "start": 0, "max_results": 12,
         "sortBy": "relevance", "sortOrder": "descending",
     }
-    with httpx.Client(timeout=15.0, follow_redirects=True) as c:
+    with httpx.Client(timeout=25.0, follow_redirects=True) as c:
         r = c.get(url, params=params)
         r.raise_for_status()
     # Minimal Atom parse: extract <entry> blocks.
@@ -832,7 +832,9 @@ def filter_node(state: ArgusState) -> dict:
     ranked_pool.sort(
         key=lambda x: (x.relevance_score, x.credibility_score or 0.0),
         reverse=True)
-    cap = max(1, 14 - len(pinned))
+    # 2026-07-12 depth rebalance: 14 -> 20 so deeper modes have more
+    # evidence to synthesize from (the researcher now gathers up to ~30).
+    cap = max(1, 20 - len(pinned))
     full_ranked = ranked_pool[:cap]
 
     # P2 — enforce credibility floor with safety net. If dropping

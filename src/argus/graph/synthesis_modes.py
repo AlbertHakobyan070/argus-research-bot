@@ -108,11 +108,15 @@ SYNTHESIS_MODES: dict[Length, SynthesisMode] = {
     ),
     "short": SynthesisMode(
         key="short",
+        # 2026-07-12: the default mode was too thin (4 findings, ~900
+        # chars). Bumped to a fuller default while staying "short":
+        # 6 findings, ~600-1600 chars, ~2000 tokens. Medium/Long/Lecture
+        # remain the deep-dive options at the plan gate.
         label="Short",
-        target_chars_min=300,
-        target_chars_max=900,
-        target_findings=4,
-        max_tokens=1200,
+        target_chars_min=600,
+        target_chars_max=1600,
+        target_findings=6,
+        max_tokens=2000,
         temperature=0.3,
         template="flat",
     ),

@@ -29,7 +29,7 @@ The merge_research node then:
 - dedupes by URL,
 - tags each source with ``sub_kind`` so downstream nodes can see where
   it came from,
-- caps at 18 (legacy cap),
+- caps at 30,
 - records errors per sub (so a github_sub 0-results doesn't kill the
   arxiv + web outputs).
 
@@ -70,7 +70,7 @@ Tests
 - github_sub returns mocked github search entries;
 - web_sub returns mocked DDGS entries;
 - merge_research dedupes by URL across subs;
-- merge_research caps at 18;
+- merge_research caps at 30;
 - supervisor routes planned_source.kind="paper" → arxiv_sub,
   "repo" → github_sub, "blog/news/official_doc/search_result" → web_sub;
 - any sub raising an exception is logged and does not poison siblings.
@@ -199,14 +199,14 @@ async def github_sub(state: ResearcherSubgraphState) -> dict:
                                   "error": error}]}
     try:
         params = {"q": query, "sort": "stars",
-                  "order": "desc", "per_page": 6}
+                  "order": "desc", "per_page": 10}
         async with httpx.AsyncClient(timeout=12.0,
                                       follow_redirects=True) as c:
             r = await c.get("https://api.github.com/search/repositories",
                              params=params,
                              headers={"Accept": "application/vnd.github+json"})
             if r.status_code == 200:
-                for it in r.json().get("items", [])[:6]:
+                for it in r.json().get("items", [])[:10]:
                     sources.append({
                         "kind": "repo",
                         "title": it.get("full_name") or it.get("name", ""),
@@ -255,7 +255,7 @@ async def web_sub(state: ResearcherSubgraphState) -> dict:
             # ddgs_search is BLOCKING (sync ddgs client) — off-load it so
             # this async sub doesn't stall the loop.
             results = await asyncio.to_thread(ddgs_search, query,
-                                              max_results=8)
+                                              max_results=12)
             for r in results:
                 sources.append({
                     "kind": r.get("kind", "blog"),
@@ -292,7 +292,7 @@ def supervisor_node(state: ResearcherSubgraphState) -> dict:
 
 
 def merge_research(state: ResearcherSubgraphState) -> dict:
-    """Dedup sub-results by URL, tag with sub_kind, cap at 18.
+    """Dedup sub-results by URL, tag with sub_kind, cap at 30.
 
     Pre-seeded sources (from state["sources"]) come first so demos /
     deterministic tests retain priority, then union the three sub
@@ -322,8 +322,8 @@ def merge_research(state: ResearcherSubgraphState) -> dict:
                     final.append(dict(s))
                     seen.add(url)
 
-    # 3. Cap at 18 (legacy cap, matches researcher_node).
-    final = final[:18]
+    # 3. Cap at 30 (2026-07-12 depth rebalance).
+    final = final[:30]
     return {"final_sources": final, "errors": errors}  # type: ignore[return-value]
 
 
