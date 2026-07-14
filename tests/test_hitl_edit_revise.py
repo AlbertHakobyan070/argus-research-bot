@@ -1,12 +1,12 @@
-"""Phase 6a — real plan-edit and report-revise HITL loops.
+"""Real plan-edit and report-revise HITL loops (v3).
 
-plan:edit → user reply becomes plan_feedback → planner re-plans in-graph
+plan:edit → user reply becomes plan_feedback → brief re-drafts in-graph
 → pauses at the grounded plan gate again with a fresh plan.
 
 report:revise → user reply appends to revision_notes + sets
-revision_requested → deliver passes through → revise_prep → synthesizer
-(which already injects the notes) → reviewer → report_builder → new
-preview. Bounded by MAX_REVISE_ROUNDS.
+revision_requested → deliver passes through → revise_prep → compose
+(which injects the notes) → panel → report_builder → new preview.
+Bounded by MAX_REVISE_ROUNDS.
 """
 from __future__ import annotations
 
@@ -26,36 +26,43 @@ from argus.graph import nodes as nodes_mod
 
 
 # ---------------------------------------------------------------------------
-# planner consumes plan_feedback
+# brief consumes plan_feedback
 # ---------------------------------------------------------------------------
 
 
-def test_planner_incorporates_plan_feedback(monkeypatch):
+def test_brief_incorporates_plan_feedback(monkeypatch):
+    from argus.graph import brief as brief_mod
     seen = {}
 
     class _FakeChat:
         def invoke(self, msgs):
-            seen["prompt"] = "\n".join(getattr(m, "content", "") for m in msgs)
+            seen["prompt"] = "\n".join(getattr(m, "content", "")
+                                       for m in msgs)
             return SimpleNamespace(
-                content='{"sub_questions": ["revised"], '
-                        '"planned_sources": [], "must_have_keywords": [], '
+                content='{"sub_questions": ['
+                        '{"q": "How does the revised security angle work?"},'
+                        '{"q": "What mitigations exist for it?"},'
+                        '{"q": "Which deployments were affected?"}], '
+                        '"must_have_keywords": ["topic"], '
                         '"summary": "revised plan"}',
                 response_metadata={}, usage_metadata={})
 
-    monkeypatch.setattr(nodes_mod.llm, "chat_for_tier",
+    monkeypatch.setattr(brief_mod.llm, "chat_for_tier",
                         lambda *a, **k: _FakeChat())
-    monkeypatch.setattr(nodes_mod.llm, "resolve_tier", lambda t: "m")
+    monkeypatch.setattr(brief_mod.llm, "invoke_with_retry",
+                        lambda chat, msgs, **kw: chat.invoke(msgs))
+    monkeypatch.setattr(brief_mod.llm, "resolve_tier", lambda t: "m")
 
-    out = nodes_mod.planner_node({
+    out = brief_mod.brief_node({
         "user_request": "topic",
-        "plan": {"summary": "old", "sub_questions": ["old q"],
-                 "planned_sources": []},
+        "brief": {"summary": "old", "sub_questions": [
+            {"q": "old q", "kind": "web"}], "must_have_keywords": ["old"]},
         "plan_feedback": "focus on the security angle please",
     })
     assert "security angle" in seen["prompt"], (
-        "planner must feed the user's edit feedback into the prompt")
+        "brief must feed the user's edit feedback into the prompt")
     assert "old q" in seen["prompt"], (
-        "planner must show the previous plan so the LLM revises it")
+        "brief must show the previous brief so the LLM revises it")
     assert out["plan"]["summary"] == "revised plan"
     assert out.get("plan_feedback") == "", "feedback must be cleared after use"
 
@@ -70,27 +77,31 @@ _PLAN = {"summary": "s", "sub_questions": ["q"], "planned_sources": [],
 
 def _stub_pipeline(monkeypatch, synth_calls: list):
     monkeypatch.setattr(graph_mod, "intake_node", lambda s: {"mode": "deep"})
-    monkeypatch.setattr(graph_mod, "planner_node",
-                        lambda s: {"plan": dict(_PLAN)})
-    monkeypatch.setattr(graph_mod, "planner_reflect_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "researcher_node",
+    monkeypatch.setattr(graph_mod, "brief_node",
+                        lambda s: {"plan": dict(_PLAN),
+                                   "brief": {"sub_questions": [
+                                       {"q": "q?", "kind": "web"}],
+                                       "must_have_keywords": ["q"],
+                                       "summary": "s"}})
+    monkeypatch.setattr(graph_mod, "scout_node",
                         lambda s: {"sources": [{"kind": "web", "title": "W",
                                                 "url": "https://w.ex/x"}]})
-    monkeypatch.setattr(graph_mod, "fetcher_node",
+    monkeypatch.setattr(graph_mod, "research_node",
                         lambda s: {"fetched": [{"url": "https://w.ex/x",
-                                                "title": "W", "excerpt": "x"}]})
-    monkeypatch.setattr(graph_mod, "normalizer_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "credibility_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "filter_node", lambda s: {})
+                                                "title": "W", "excerpt": "x"}],
+                                   "evidence": [], "coverage": {}})
+    monkeypatch.setattr(graph_mod, "outline_node",
+                        lambda s: {"outline": {"sections": []}})
 
-    def synth(s):
+    def compose(s):
         synth_calls.append(list(s.get("revision_notes") or []))
-        return {"draft_md": "d", "findings": []}
+        return {"draft_md": "d", "findings": [], "sections": []}
 
-    monkeypatch.setattr(graph_mod, "synthesizer_node", synth)
-    monkeypatch.setattr(graph_mod, "reviewer_node",
-                        lambda s: {"review_verdict": {"verdict": "pass"}})
-    monkeypatch.setattr(graph_mod, "route_after_review",
+    monkeypatch.setattr(graph_mod, "compose_node", compose)
+    monkeypatch.setattr(graph_mod, "panel_node",
+                        lambda s: {"panel_verdict": {"verdict": "pass"},
+                                   "review_verdict": {"verdict": "pass"}})
+    monkeypatch.setattr(graph_mod, "route_after_panel",
                         lambda s: "report_builder")
     monkeypatch.setattr(graph_mod, "report_builder_node",
                         lambda s: {"report_paths": {"md": "r.md",
@@ -105,7 +116,7 @@ def _state(thread):
             "revision_rounds": 0, "model_calls": [], "hitl": {"pending": False}}
 
 
-def test_revise_loops_through_synthesizer_with_notes(monkeypatch):
+def test_revise_loops_through_compose_with_notes(monkeypatch):
     synth_calls: list = []
     _stub_pipeline(monkeypatch, synth_calls)
     g = graph_mod.build_graph(checkpointer=MemorySaver())
@@ -123,9 +134,9 @@ def test_revise_loops_through_synthesizer_with_notes(monkeypatch):
     snap = g.get_state(cfg)
     assert snap.next == ("deliver",), (
         f"revise must loop back to a fresh preview, got {snap.next!r}")
-    assert len(synth_calls) == 2, "synthesizer must run again for the revision"
+    assert len(synth_calls) == 2, "compose must run again for the revision"
     assert synth_calls[1] == ["USER: add more detail"], (
-        "the revision synthesis must see the user's feedback in revision_notes")
+        "the revision compose must see the user's feedback in revision_notes")
     assert int(snap.values.get("revise_rounds") or 0) == 1
 
 

@@ -1,10 +1,17 @@
 # Argus
 
 Multi-agent Telegram research bot. Its brain is your local **FreeLLMAPI**
-proxy (OpenAI-compatible, ~99 free-tier models behind one Bearer token).
-Argus plans → fetches primary sources → normalizes → ranks → synthesises
-→ adversarially reviews → renders an md + PDF report → delivers it to
-Telegram, with two human-in-the-loop gates and a bounded reflexion loop.
+proxy (OpenAI-compatible, free-tier models behind one Bearer token).
+The v3 research engine: brief → scout (live multi-query discovery over
+Exa/DDGS/arXiv/GitHub) → deep research (every fetched source is READ and
+digested into cited evidence notes, with gap-driven follow-up waves) →
+outline → parallel section writers → tripartite review panel
+(grounding/coverage/precision judges) → md + PDF report → Telegram,
+with two human-in-the-loop gates and bounded revision loops.
+
+Optional: set `EXA_API_KEY` in `.env` to enable Exa neural search
+(search + full page text in one call; auto-falls back to DDGS without
+it, and beyond `ARGUS_EXA_MAX_CALLS` per run).
 
 ## Quick start
 

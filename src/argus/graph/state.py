@@ -47,8 +47,77 @@ class FetchedItem(BaseModel):
     section: str = ""  # which planned-source bucket it came from
     excerpt: str = ""   # first 600 chars of the markdown
     relevance_score: float = 0.0
-    credibility_score: float | None = None  # set by credibility_node
+    credibility_score: float | None = None  # set by credibility scoring
     credibility_flag: str | None = None    # e.g. "low_credibility"
+    # v3 — which brief sub-questions (0-based indices) this source was
+    # gathered for, and the provider that surfaced it.
+    sub_qs: list[int] = Field(default_factory=list)
+    provider: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v3 research-engine models (brief / evidence / outline / panel)
+# ---------------------------------------------------------------------------
+
+SubQuestionKind = Literal["paper", "repo", "web", "mixed"]
+
+
+class SubQuestion(BaseModel):
+    """One brief sub-question with a source-kind hint for provider routing."""
+    q: str
+    kind: SubQuestionKind = "mixed"
+
+
+class ResearchBrief(BaseModel):
+    """v3 scoping artifact (replaces the v2 ResearchPlan as the driver;
+    a v2-compatible ``plan`` dict is still emitted for the Telegram
+    plan-gate renderer)."""
+    sub_questions: list[SubQuestion] = Field(default_factory=list)
+    must_have_keywords: list[str] = Field(default_factory=list)
+    summary: str = ""
+    success_criteria: list[str] = Field(default_factory=list)
+
+
+class EvidenceClaim(BaseModel):
+    """One atomic claim extracted from a source by the digest pass."""
+    text: str
+    quote: str = ""          # short supporting quote from the document
+    confidence: Literal["high", "medium", "low"] = "medium"
+
+
+class EvidenceNote(BaseModel):
+    """Digest of ONE fetched source, keyed to the sub-questions it was
+    gathered for. This is what the writers read — never raw excerpts.
+
+    ``source_id`` is the 1-based index of the source in ``state["fetched"]``
+    order; it is the [n] citation id used in the report body and the
+    ## Sources block.
+    """
+    source_id: int
+    source_url: str
+    title: str = ""
+    sub_qs: list[int] = Field(default_factory=list)
+    relevance: int = 0       # 0-5, judged by the digest LLM from full text
+    stance: Literal["supports", "mixed", "contradicts", "background"] = "background"
+    claims: list[EvidenceClaim] = Field(default_factory=list)
+
+
+class OutlineSection(BaseModel):
+    """One planned report section."""
+    title: str
+    focus: str = ""
+    sub_qs: list[int] = Field(default_factory=list)
+
+
+class PanelVerdict(BaseModel):
+    """Merged output of the 3-judge review panel."""
+    verdict: Verdict = "pass"
+    judge_verdicts: dict = Field(default_factory=dict)  # {judge: pass|revise}
+    notes: list[str] = Field(default_factory=list)
+    flagged_finding_ids: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(default_factory=list)
+    fabrication_flags: list[str] = Field(default_factory=list)
+    revise_sections: list[str] = Field(default_factory=list)  # section titles
 
 
 class Finding(BaseModel):
@@ -121,13 +190,23 @@ class ArgusState(TypedDict, total=False):
     plan_attempts: int              # T8: counter for planner_reflect_node re-plans
 
     # Research pipeline
-    sources: list[dict]             # candidate sources from researcher
+    sources: list[dict]             # candidate sources from scout/research
     fetched: list[dict]             # FetchedItem.model_dump() list
     findings: list[dict]            # Finding.model_dump() list
     draft_md: str                   # current draft markdown
-    review_verdict: dict | None     # ReviewVerdict.model_dump()
+    review_verdict: dict | None     # ReviewVerdict-compatible dict
     revision_notes: list[str]       # accumulated reviewer notes per round
     revision_rounds: int            # counter
+
+    # v3 research engine
+    brief: dict | None              # ResearchBrief.model_dump()
+    queries: list[dict]             # planned search queries (scout + waves)
+    evidence: list[dict]            # EvidenceNote.model_dump() list
+    coverage: dict                  # {sub_q_idx(str): strength int}
+    outline: dict | None            # {"sections": [OutlineSection...]}
+    sections: list[dict]            # [{"title", "md"}] composed sections
+    panel_verdict: dict | None      # PanelVerdict.model_dump()
+    research_rounds: int            # waves executed inside research_node
 
     # Delivery
     report_paths: dict              # {"md": str, "pdf": str, "folder": str}

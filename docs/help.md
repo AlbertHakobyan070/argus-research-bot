@@ -16,20 +16,24 @@ delivers.
 ### `/research <topic>`
 Runs the full deep-research loop with two human-in-the-loop (HITL) gates:
 
-1. **Plan gate** — Argus drafts a plan *and runs live search first*, then shows
-   you the sub-questions plus the **real sources it found** (title + URL). The
-   planner's own URL guesses are never shown, so you approve actual evidence.
+1. **Plan gate** — Argus drafts a research brief *and runs a live discovery
+   wave first* (Exa/DDGS/arXiv/GitHub), then shows you the sub-questions plus
+   the **real sources it found** (title + URL). The brief carries no URLs at
+   all, so hallucinated links are structurally impossible — you approve
+   actual evidence.
    Buttons:
    - **Length** (TL;DR / Short / Medium / Long / Lecture) — pick output depth.
    - **✅ Approve** — fetch the shown sources and continue.
    - **✏️ Edit** — reply with changes; Argus redrafts the plan and re-searches.
    - **❌ Cancel** — drop the run.
-2. **Report preview gate** — after synthesis + review, you see the report head.
+2. **Report preview gate** — after deep research (every source is read and
+   digested into evidence notes), sectioned composition, and a 3-judge review
+   panel, you see the report head.
    Buttons:
    - **📤 Send** — deliver the `.md` + `.pdf`.
    - **🔎 Extend** — another research pass to deepen it (capped).
-   - **🔁 Revise** — reply with what to change; Argus re-synthesizes with your
-     notes (capped).
+   - **🔁 Revise** — reply with what to change; Argus rewrites the report
+     from the same evidence with your notes (capped).
    - **❌ Cancel** — drop the report.
 
 Pre-pin the length without the keyboard: `/research /length long <topic>`.

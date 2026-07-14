@@ -27,7 +27,7 @@ T7 additions
 - 5-button length selector at plan approval (TLDR / Short / Medium /
   Long / Lecture). The chosen mode is pushed back into the graph
   checkpoint via ``graph.aupdate_state`` before ``Command(resume=)``,
-  so the synthesizer + report_builder see the user's HITL choice.
+  so the compose + report_builder nodes see the user's HITL choice.
 - /length flag in /research for users who want to skip the keyboard.
 - Validation summary on title page + per-section confidence in the
   markdown + redesigned PDF.
@@ -379,10 +379,10 @@ def _format_plan(plan: dict, length: str = DEFAULT_LENGTH,
                  sources: list[dict] | None = None) -> str:
     """Render the plan-approval preview.
 
-    v2 grounded gate: ``sources`` are the REAL results the researcher
-    found via live search (ddgs/arxiv/github) before this gate. Planner
-    ``target_url`` values are NEVER rendered — they are LLM guesses
-    (knowledge-cutoff fantasy links) and the researcher ignores them.
+    Grounded gate: ``sources`` are the REAL results the scout found via
+    live search (exa/ddgs/arxiv/github) before this gate. The brief
+    never contains URLs — hallucinated links are structurally
+    impossible at this stage.
     """
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
@@ -546,32 +546,33 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if node_name == "intake":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"🎯 Mode detected: _{delta.get('mode','?')}_", progress)
-                elif node_name == "planner":
+                elif node_name == "brief":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        "📋 Plan drafted — searching live sources…", progress)
-                elif node_name == "researcher":
+                        "📋 Brief drafted — scouting live sources…", progress)
+                elif node_name == "scout":
                     n = len(delta.get("sources") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🔍 Live search found {n} candidate source(s) — "
+                        f"🔍 Scout found {n} candidate source(s) — "
                         "awaiting your approval.", progress)
-                elif node_name == "fetcher":
+                elif node_name == "research":
                     n = len(delta.get("fetched") or [])
+                    ne = len(delta.get("evidence") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"📥 Fetched {n} items.", progress)
-                elif node_name == "synthesizer":
+                        f"📚 Read {n} sources → {ne} evidence notes.", progress)
+                elif node_name == "compose":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🧠 Synthesizing ({_LENGTH_LABELS.get(length,'?')})…",
+                        f"🧠 Composing ({_LENGTH_LABELS.get(length,'?')})…",
                         progress)
-                elif node_name == "reviewer":
+                elif node_name == "panel":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🔬 Reviewer: {delta.get('review_verdict',{}).get('verdict','?')}",
+                        f"🔬 Panel: {delta.get('review_verdict',{}).get('verdict','?')}",
                         progress)
 
         # Snapshot current state from the checkpointer.
         snap = await graph.aget_state(cfg)
         cur = snap.values if snap else {}
 
-        # First HITL = plan approval — grounded: the researcher already
+        # First HITL = plan approval — grounded: the scout already
         # ran, so the preview lists REAL sources from live search.
         plan = cur.get("plan") or {}
         if plan:
@@ -594,7 +595,7 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await ctx.application.bot.send_message(
                 chat_id=chat_id,
-                text="(planner produced no plan; aborting.)",
+                text="(brief produced no plan; aborting.)",
             )
             _inflight.pop(run_id, None)
             await _set_run_status(ctx, run_id, "error")
@@ -1123,8 +1124,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
                              feedback: str) -> None:
     """plan-edit: push the user's feedback into the checkpoint as if
-    intake just ran, then re-drive planner→planner_reflect→researcher to
-    the grounded plan gate and re-render the plan message."""
+    intake just ran, then re-drive brief→scout to the grounded plan
+    gate and re-render the plan message."""
     if info.get("resuming"):
         return
     info["resuming"] = True
@@ -1137,15 +1138,15 @@ async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
                            "✏️ Redrafting the plan with your changes…",
                            progress)
     try:
-        # Fork positioned after intake → next node is planner. planner
-        # reads plan_feedback + the previous plan and revises.
+        # Fork positioned after intake → next node is brief. brief
+        # reads plan_feedback + the previous brief and revises.
         await graph.aupdate_state(cfg, {"plan_feedback": feedback},
                                   as_node="intake")
         async for ev in graph.astream(None, config=cfg,
                                       stream_mode="updates"):
             for node_name, _delta in ev.items():
                 info["stage"] = node_name
-                if node_name == "researcher":
+                if node_name == "scout":
                     n = len(_delta.get("sources") or [])
                     progress = await _stream_progress(
                         ctx.application.bot, chat_id,
@@ -1176,7 +1177,7 @@ async def _revise_after_feedback(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
                                  feedback: str) -> None:
     """report-revise: append the user's feedback to revision_notes, set
     revision_requested, then resume from the report-preview interrupt —
-    deliver passes through → revise_prep → synthesizer → … → new preview."""
+    deliver passes through → revise_prep → compose → … → new preview."""
     if info.get("resuming"):
         return
     graph = info["graph"]
@@ -1776,11 +1777,11 @@ async def runs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _sources_from_refs(lib: Library,
                              pending: list[dict]) -> list[dict]:
-    """Map pending run_sources rows onto researcher-style source dicts.
+    """Map pending run_sources rows onto scout-style source dicts.
 
-    URLs become search_result sources the fetcher downloads; asset refs
+    URLs become search_result sources the research node fetches; asset refs
     (``asset:<id>``, e.g. vault transcripts) become local_path sources
-    the fetcher ingests from disk (file:/// citations).
+    the research node ingests from disk (file:/// citations).
     """
     out: list[dict] = []
     for row in pending:
@@ -1900,8 +1901,9 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     }
 
     nxt = tuple(snap.next or ())
-    if nxt == ("fetcher",):
+    if nxt in (("research",), ("fetcher",)):
         # Paused at the plan gate (possibly before a restart) — re-render.
+        # ("fetcher",) accepted for pre-v3 checkpoints.
         _inflight[run_id] = info
         info["awaiting"] = "plan_approval"
         plan = cur.get("plan") or {}
@@ -2132,7 +2134,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             # Phase 2 HITL: deepen the research. Set the graph flag, then
             # reuse the plan-resume streamer — it drives deliver →
-            # extend_prep → fetcher → … → report_builder and shows the
+            # extend_prep → research → … → report_builder and shows the
             # next preview.
             graph = info["graph"]
             cfg = info["cfg"]
@@ -2190,7 +2192,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
         resume_input = Command(resume=True)
 
     # T7.1 — push the chosen length back into the graph state BEFORE
-    # resuming, so the synthesizer + report_builder see the user's
+    # resuming, so the compose + report_builder nodes see the user's
     # HITL choice rather than the default. ``aupdate_state`` is the
     # canonical way to fork a thread checkpoint from outside.
     chosen_length = (info.get("length")
@@ -2204,7 +2206,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
         )
 
     progress = await _stream_progress(ctx.application.bot, chat_id,
-        "📥 Fetching approved sources…", progress)
+        "📚 Deep-researching approved sources…", progress)
 
     try:
         async for ev in graph.astream(resume_input, config=cfg,
@@ -2215,17 +2217,18 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
                     n = len(delta.get("sources") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
                         f"🔎 Extend: source pool now {n}.", progress)
-                elif node_name == "fetcher":
+                elif node_name == "research":
                     n = len(delta.get("fetched") or [])
+                    ne = len(delta.get("evidence") or [])
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"📥 {n} fetched + normalized.", progress)
-                elif node_name == "synthesizer":
+                        f"📚 Read {n} sources → {ne} evidence notes.", progress)
+                elif node_name == "compose":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🧠 Synthesizing ({_LENGTH_LABELS.get(chosen_length,'?')})…",
+                        f"🧠 Composing ({_LENGTH_LABELS.get(chosen_length,'?')})…",
                         progress)
-                elif node_name == "reviewer":
+                elif node_name == "panel":
                     progress = await _stream_progress(ctx.application.bot, chat_id,
-                        f"🔬 Reviewer verdict: "
+                        f"🔬 Panel verdict: "
                         f"{delta.get('review_verdict',{}).get('verdict','?')}",
                         progress)
                 elif node_name == "report_builder":
@@ -2267,26 +2270,44 @@ async def _send_report_preview(ctx: ContextTypes.DEFAULT_TYPE,
             chat_id=chat_id, text="(no report_paths found)")
         return
     md = Path(paths["md"])
+    # Use most of Telegram's 4096-char message budget for the excerpt
+    # (was 1200 — the handoff §6 "preview truncates" tech debt). The
+    # header + HTML <pre> wrapper + escaping expansion need headroom, so
+    # cap at 3000 raw chars and let the full file follow on Approve.
+    excerpt_cap = 3000
+    excerpt = ""
+    full_len = 0
+    try:
+        full_text = md.read_text(encoding="utf-8", errors="replace")
+        full_len = len(full_text)
+        excerpt = full_text[:excerpt_cap]
+    except Exception:
+        pass
+    tail_note = (f"_(first {min(full_len, excerpt_cap)} of {full_len} "
+                 f"chars below)_" if full_len > excerpt_cap
+                 else "_(full report below)_")
     text = (
         f"📝 *Report preview*  ·  {_LENGTH_LABELS.get(chosen_length,'?')}\n\n"
         f"Folder: `{_md_escape(paths.get('folder','?'))}`\n"
         f"Markdown: `{_md_escape(md.name)}`  "
         + (f"· PDF: `report.pdf`" if paths.get("pdf") else "· PDF: _failed_")
-        + f"\n\n_(first 1200 chars below)_"
+        + f"\n\n{tail_note}"
     )
-    excerpt = ""
-    try:
-        excerpt = md.read_text(encoding="utf-8", errors="replace")[:1200]
-    except Exception:
-        pass
 
     # HTML primary (tolerates arbitrary content), plain-text fallback —
     # legacy-markdown crashed on ``_ * [ &`` in excerpts (2026-07-08 bug).
-    html_body = _html_escape_for_tg(text) + (
-        ("\n\n<pre>" + _html_escape_for_tg(excerpt) + "</pre>")
-        if excerpt else ""
-    )
-    plain_body = text + ("\n\n```\n" + excerpt + "\n```" if excerpt else "")
+    # HTML-escaping expands text (& → &amp;), so shrink the excerpt until
+    # the whole message fits Telegram's 4096-char cap.
+    def _fit(exc: str) -> str:
+        return _html_escape_for_tg(text) + (
+            ("\n\n<pre>" + _html_escape_for_tg(exc) + "</pre>")
+            if exc else "")
+    html_body = _fit(excerpt)
+    while excerpt and len(html_body) > 4000:
+        excerpt = excerpt[:len(excerpt) - 200]
+        html_body = _fit(excerpt)
+    plain_body = (text + ("\n\n```\n" + excerpt + "\n```"
+                          if excerpt else ""))[:4000]
 
     try:
         await ctx.application.bot.send_message(
@@ -2456,7 +2477,7 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
             snap = None
         nxt = tuple(snap.next) if (snap and snap.next) else ()
         topic = (run.get("topic") or "")[:48]
-        if nxt == ("fetcher",):
+        if nxt in (("research",), ("fetcher",)):
             await _set_run_status(app_ctx(app), run_id, "awaiting_plan")
             msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    f"restart at the plan step.\nSend /continue {run_id} to "

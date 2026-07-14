@@ -1,14 +1,13 @@
-"""Argus graph tests — drive the full LangGraph in-memory.
+"""Argus graph tests — drive the full v3 LangGraph in-memory.
 
-These tests exercise the deep loop without Telegram: we capture the
-HITL interrupt, simulate an Approve, and verify a report lands on disk.
+LIVE tests (excluded from the hermetic CI subset): intake/brief/digest/
+compose/panel hit the REAL FreeLLMAPI proxy. The search wave and the
+page fetches are stubbed so the run is network-deterministic — the LLM
+reads controlled source content and must still produce a grounded,
+cited report through the v3 engine.
 """
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,7 +16,6 @@ from langgraph.types import Command
 
 from argus.config import get_settings
 from argus.graph import build_graph, quick_answer_graph
-from argus.graph.state import REPORT_MARKER
 
 
 def _make_state_in(thread_id: str, user_id: int, text: str) -> dict:
@@ -42,80 +40,100 @@ def test_quick_graph_runs():
     assert out["quick_answer"]
 
 
+_DOC = """# LLM agent benchmark survey (stub source)
+
+AgentBench evaluates LLM agents across 8 environments including web
+browsing, database querying, and operating-system tasks. GPT-4 scored
+4.01 overall while the best open model reached 2.89.
+
+SWE-bench measures repository-level code fixing; agents resolve under
+20 percent of issues without scaffolding. WebArena provides realistic
+self-hosted websites and reports a 14.4 percent success rate for the
+best 2024 agent versus 78 percent for humans.
+
+Benchmark contamination is a known weakness: static test sets leak into
+training data, inflating scores over time.
+"""
+
+
 def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
-    """First interrupt fires AFTER researcher (grounded plan gate): the
-    plan AND real search results must both be in state at the pause."""
-    # Force reports into a tmp folder via env var the report_builder reads.
+    """v3 live drive: first interrupt fires AFTER scout (grounded plan
+    gate) with plan + real sources in state; after Approve, research
+    digests the (stubbed-fetch) sources with the live LLM, compose
+    writes a sectioned report, panel reviews it, and a report lands on
+    disk."""
     monkeypatch.setenv("ARGUS_REPORTS_ROOT", str(tmp_path))
-    # Invalidate the cached settings so the report_builder picks it up.
     import importlib
     cfg_mod = importlib.import_module("argus.config")
     cfg_mod._cached = None
     s = get_settings()
     assert s.reports_root == tmp_path
 
-    # Patch the intel-stack tools so the test doesn't hit the network for
-    # real fetches.
-    from argus.graph import nodes as nodes_mod
+    from argus.graph import research as research_mod
+    from argus.graph import scout as scout_mod
 
-    def fake_harvest(*a, **kw):
-        from argus.tools import HarvestReport
-        return HarvestReport(folder=str(tmp_path), radar_md="", items=[],
-                             raw_stdout="", duration_s=0.0)
-    def fake_snatch(url, *a, **kw):
-        from argus.tools import SnatchResult
-        return SnatchResult(ok=True, folder=str(tmp_path / "x"),
-                            markdown_path=None, title="stub", url=url)
-    def fake_crawl(url, *a, **kw):
-        from argus.tools import CrawlResult
-        return CrawlResult(ok=False, error="stub", duration_s=0.0)
-    def fake_normalize(url, *a, **kw):
-        from argus.tools import NormalizeResult
-        return NormalizeResult(ok=True, markdown_path=None,
-                                markdown_text="stub", title="stub")
-    monkeypatch.setattr(nodes_mod, "harvest_sources", fake_harvest)
-    monkeypatch.setattr(nodes_mod, "snatch_url", fake_snatch)
-    monkeypatch.setattr(nodes_mod, "crawl_url", fake_crawl)
-    monkeypatch.setattr(nodes_mod, "normalize_to_markdown", fake_normalize)
+    # Controlled source: the wave "finds" one page; the fetch writes a
+    # real markdown document the live digest LLM must read.
+    doc_path = tmp_path / "stub_source.md"
+    doc_path.write_text(_DOC, encoding="utf-8")
 
-    # researcher_node now delegates to the 3-way subgraph, whose subs make
-    # real GitHub/arXiv/DDG calls. Stub the delegation so this graph-level
-    # test stays off the network (per-sub behaviour is covered hermetically
-    # in test_researcher_subgraph.py).
-    def fake_research(state, **kw):
-        return {
-            "sources": [{"kind": "repo", "title": "stub",
-                         "url": "https://github.com/stub/repo",
-                         "summary": "", "source": "github-search"}],
-            "messages": [], "errors": [],
-        }
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_research)
+    def fake_wave(queries, **kw):
+        hits = [{
+            "url": "https://example.org/llm-agent-benchmarks",
+            "title": "LLM agent benchmark survey",
+            "snippet": "AgentBench, SWE-bench, WebArena results",
+            "kind": "blog", "provider": "ddgs",
+            "sub_qs": sorted({i for q in queries
+                              for i in (q.get("sub_qs") or [])}),
+            "text": "", "published": "", "source": "ddgs",
+            "summary": "benchmark survey",
+        }]
+        return hits, []
+
+    monkeypatch.setattr(scout_mod, "run_query_wave", fake_wave)
+    monkeypatch.setattr(research_mod, "run_query_wave", fake_wave)
+
+    def fake_fetch(src):
+        from argus.graph.state import FetchedItem
+        return FetchedItem(
+            url=src.get("url", ""), title=src.get("title", ""),
+            markdown_path=str(doc_path), section=src.get("kind", ""),
+            excerpt=_DOC[:600], sub_qs=src.get("sub_qs") or [],
+            provider="stub",
+        ).model_dump(), []
+
+    monkeypatch.setattr(research_mod, "fetch_one_source", fake_fetch)
 
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "test:deep"}}
-    out = g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),
-                   config=cfg)
-    # After first invoke, we expect the grounded plan gate: paused AFTER
-    # researcher, before fetcher.
+    g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),
+             config=cfg)
+    # Grounded plan gate: paused AFTER scout, before research.
     snap = g.get_state(cfg)
-    assert snap.next == ("fetcher",), (
-        f"expected the grounded plan gate (next=fetcher), got {snap.next!r}")
+    assert snap.next == ("research",), (
+        f"expected the grounded plan gate (next=research), got {snap.next!r}")
     cur = snap.values
-    assert cur.get("plan"), "planner should have set the plan"
+    assert cur.get("brief"), "brief should be drafted"
+    assert cur.get("plan"), "v2-compatible plan must be present for the bot"
     assert cur.get("sources"), (
-        "live search results must be available at the plan gate")
-    # Approve -> resume
+        "live-search results must be available at the plan gate")
+
+    # Approve -> resume through research/outline/compose/panel.
     g.invoke(Command(resume=True), config=cfg)
     snap = g.get_state(cfg)
-    # After resume, should have advanced further; keep resuming until
-    # we hit deliver's pause or finish.
     for _ in range(6):
         if not snap.next:
             break
         g.invoke(Command(resume=True), config=cfg)
         snap = g.get_state(cfg)
-    # The graph should have built a report OR the tests are not hitting
-    # the real synthesizer; verify we at least have findings or draft_md.
     cur = snap.values
+
+    # Evidence actually flowed: digest notes exist and the report is real.
+    assert cur.get("evidence"), "digest must produce evidence notes"
+    assert cur.get("draft_md"), "compose must produce a draft"
     assert cur.get("findings") is not None
-    assert cur.get("draft_md") is not None
+    paths = cur.get("report_paths") or {}
+    assert paths.get("md") and Path(paths["md"]).exists(), paths
+    md = Path(paths["md"]).read_text(encoding="utf-8")
+    assert "example.org/llm-agent-benchmarks" in md, (
+        "the report must cite the fetched source")
