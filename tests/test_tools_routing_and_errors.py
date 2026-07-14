@@ -10,7 +10,7 @@ These tests pin the two behavior changes Argus T2 introduced:
   ``ModuleNotFoundError`` for feedparser / crawl4ai / markitdown /
   yt_dlp.
 
-* Fix #3 — ``fetcher_node`` and ``researcher_node`` MUST propagate
+* Fix #3 — the research fetch path MUST propagate
   tool failures into ``state["errors"]`` instead of swallowing them
   with ``logger.warning``. The ``errors`` field is an
   ``Annotated[list[str], operator.add]`` reducer, so any node can
@@ -28,8 +28,8 @@ from typing import Any
 import pytest
 
 from argus import tools
-from argus.graph import nodes as nodes_mod
-from argus.graph.nodes import fetcher_node, researcher_node
+from argus.graph import research as research_mod
+from argus.graph.research import _parallel_fetch
 from argus.graph.state import ArgusState, PlannedSource, ResearchPlan
 from argus.tools import (
     INTEL_PYTHON_BIN, PYTHON_BIN,
@@ -194,15 +194,13 @@ def test_harvest_sources_routes_through_intel_python(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_fetcher_node_propagates_exceptions_to_errors(monkeypatch):
-    """A raising snatch/crawl/normalize MUST appear in state["errors"].
+def test_parallel_fetch_propagates_exceptions_to_errors(monkeypatch):
+    """A raising snatch/crawl/normalize MUST surface as error strings.
 
-    Pre-fix behavior: the ``except Exception: logger.warning(...)``
-    branch silently returned ``fetched=[]`` — the synthesizer then
-    produced a vacuous "no evidence" report.
+    Pre-fix behavior (v2): the ``except Exception: logger.warning(...)``
+    branch silently returned ``fetched=[]`` — the writers then produced
+    a vacuous "no evidence" report.
     """
-    from argus.tools import CrawlResult, NormalizeResult, SnatchResult
-
     def boom_normalize(url, *a, **kw):
         raise RuntimeError("normalize exploded")
     def boom_snatch(url, *a, **kw):
@@ -210,41 +208,31 @@ def test_fetcher_node_propagates_exceptions_to_errors(monkeypatch):
     def boom_crawl(url, *a, **kw):
         raise RuntimeError("crawl exploded")
 
-    monkeypatch.setattr(nodes_mod, "normalize_to_markdown", boom_normalize)
-    monkeypatch.setattr(nodes_mod, "snatch_url", boom_snatch)
-    monkeypatch.setattr(nodes_mod, "crawl_url", boom_crawl)
+    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom_normalize)
+    monkeypatch.setattr(research_mod, "snatch_url", boom_snatch)
+    monkeypatch.setattr(research_mod, "crawl_url", boom_crawl)
 
-    state: ArgusState = _make_state(ResearchPlan())
-    state["sources"] = [
+    sources = [
         {"url": "https://a.example", "kind": "official_doc",
          "title": "A", "summary": ""},
         {"url": "https://b.example", "kind": "blog",
          "title": "B", "summary": ""},
     ]
-    out = fetcher_node(state)
-    # No items fetched (every tool raised).
-    assert out["fetched"] == []
-    # Errors must propagate — at minimum one entry per URL plus the
-    # "all sources failed" summary error.
-    errs = out["errors"]
-    assert isinstance(errs, list)
+    fetched, errs = _parallel_fetch(sources)
+    assert fetched == []
     assert any("https://a.example" in e for e in errs), errs
     assert any("https://b.example" in e for e in errs), errs
-    assert any("all" in e and "source" in e and "failed" in e
-                for e in errs), (
-        f"expected a summary 'all sources failed' error, got {errs!r}"
-    )
 
 
-def test_fetcher_node_partial_failure_mixes_fetched_and_errors(monkeypatch):
+def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(monkeypatch):
     """Successful URLs should land in fetched; failed URLs in errors —
     no silent swallowing."""
-    from argus.tools import CrawlResult, NormalizeResult, SnatchResult
+    from argus.tools import CrawlResult, NormalizeResult
 
     def ok_normalize(url, *a, **kw):
         return NormalizeResult(
             ok=True,
-            markdown_path="A:\\fake\\ok.md",
+            markdown_path="A:\fake\ok.md",
             markdown_text="x" * 700,
             title="OK Title",
         )
@@ -254,79 +242,46 @@ def test_fetcher_node_partial_failure_mixes_fetched_and_errors(monkeypatch):
         return CrawlResult(ok=False, error="down",
                            duration_s=0.0)
 
-    monkeypatch.setattr(nodes_mod, "normalize_to_markdown", ok_normalize)
-    monkeypatch.setattr(nodes_mod, "snatch_url", bad_snatch)
-    monkeypatch.setattr(nodes_mod, "crawl_url", bad_crawl)
+    monkeypatch.setattr(research_mod, "normalize_to_markdown", ok_normalize)
+    monkeypatch.setattr(research_mod, "snatch_url", bad_snatch)
+    monkeypatch.setattr(research_mod, "crawl_url", bad_crawl)
 
-    state: ArgusState = _make_state(ResearchPlan())
-    state["sources"] = [
+    sources = [
         {"url": "https://ok.example", "kind": "official_doc",
          "title": "OK", "summary": ""},
         {"url": "https://bad.example", "kind": "blog",
          "title": "BAD", "summary": ""},
     ]
-    out = fetcher_node(state)
-    # Successful URL must be in fetched.
-    assert len(out["fetched"]) == 1
-    assert out["fetched"][0]["url"] == "https://ok.example"
-    # The failed URL must be in errors (NOT silently dropped).
-    assert any("https://bad.example" in e for e in out["errors"]), out["errors"]
-    # And we should NOT have the "all sources failed" summary because
-    # at least one URL succeeded.
-    assert not any("all" in e and "failed to fetch" in e
-                   for e in out["errors"]), out["errors"]
+    fetched, errs = _parallel_fetch(sources)
+    assert len(fetched) == 1
+    assert fetched[0]["url"] == "https://ok.example"
+    assert any("https://bad.example" in e for e in errs), errs
 
 
-def test_researcher_node_propagates_subgraph_errors(monkeypatch):
-    """A sub-researcher failure captured by the subgraph must surface in
-    researcher_node's state["errors"] — never silently swallowed.
+def test_research_node_emits_all_failed_summary(monkeypatch):
+    """When every source fails to fetch, research_node must append the
+    'all sources failed' summary error (the v2 T2 contract, kept)."""
+    def boom(url, *a, **kw):
+        raise RuntimeError("down")
+    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom)
+    monkeypatch.setattr(research_mod, "snatch_url", boom)
+    monkeypatch.setattr(research_mod, "crawl_url", boom)
 
-    researcher_node now delegates to the 3-way subgraph (arxiv|github|web);
-    the deep per-sub behaviour is covered in test_researcher_subgraph.py, so
-    here we only assert the delegation contract at the node boundary.
-    """
-    def fake_run(state, **kw):
-        return {
-            "sources": [],
-            "messages": [{"role": "assistant", "content": "0 sources"}],
-            "errors": ["arxiv_sub failed: RuntimeError('arxiv exploded')",
-                       "web_sub failed: RuntimeError('ddg down')"],
-        }
-
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
-
-    state = _make_state(_plan_with_paper())
-    out = researcher_node(state)
+    state = {
+        "user_request": "attention transformers",
+        "brief": {"sub_questions": [{"q": "What is attention?",
+                                     "kind": "web"}],
+                  "must_have_keywords": ["attention"]},
+        "sources": [
+            {"url": "https://a.example", "kind": "blog", "title": "A",
+             "snippet": "attention", "sub_qs": [0]},
+        ],
+        "fetched": [], "evidence": [], "errors": [],
+    }
+    out = research_mod.research_node(state)
+    assert out["fetched"] == []
     errs = out["errors"]
-    assert isinstance(errs, list)
-    assert any("arxiv_sub failed" in e for e in errs), errs
-    assert any("web_sub failed" in e for e in errs), errs
-
-
-def test_researcher_node_returns_merged_sources(monkeypatch):
-    """Happy path: researcher_node passes through the subgraph's merged
-    sources and carries no failures on a clean run."""
-    def fake_run(state, **kw):
-        return {
-            "sources": [
-                {"kind": "paper", "title": "T",
-                 "url": "https://arxiv.org/abs/1", "summary": "S",
-                 "source": "arxiv"},
-            ],
-            "messages": [{"role": "assistant", "content": "1 source"}],
-            "errors": [],
-        }
-
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
-
-    state = _make_state(_plan_with_paper())
-    out = researcher_node(state)
-    # A clean run carries no error strings (an empty list is fine — the
-    # operator.add reducer treats it as a no-op).
-    assert not out.get("errors"), out.get("errors")
-    # Sources must include the arxiv item.
-    assert any(s["url"] == "https://arxiv.org/abs/1"
-                for s in out["sources"]), out["sources"]
+    assert any("all" in e and "failed to fetch" in e for e in errs), errs
 
 
 def test_errors_reducer_in_state_accepts_str_list():

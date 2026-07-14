@@ -331,40 +331,29 @@ def test_parse_article_convert_path_returns_none_when_missing() -> None:
 # T6: fetcher_node + researcher_node fallback paths
 # ----------------------------------------------------------------------
 
-def test_fetcher_skips_source_with_empty_url(fake_subprocess, monkeypatch):
-    """T6 fix: a source without a URL must be skipped, not crash.
+def test_fetch_skips_source_with_empty_url(fake_subprocess, monkeypatch):
+    """T6 fix, v3 shape: a source without a URL must be skipped, not
+    crash — each skipped source records an error string."""
+    from argus.graph.research import _parallel_fetch
 
-    Reproduces the 2026-07-08 bot failure where the planner emitted
-    pseudo-sources (search syntax or bare labels) with no `url` field.
-    Old fetcher raised KeyError, logged only, returned empty fetched.
-    New fetcher records an error and skips cleanly.
-    """
-    from argus.graph import nodes as nodes_mod
-
-    state = {
-        "sources": [
-            {"kind": "paper", "title": "X", "url": ""},
-            {"kind": "paper", "title": "Y"},  # missing 'url'
-            {"kind": "search_result", "title": "Z", "url": "site:arxiv.org foo"},
-        ],
-        "fetched": [], "findings": [], "errors": [],
-    }
-    # minimal state validator
-    out = nodes_mod.fetcher_node(state)
-    assert out["fetched"] == [], (
-        f"empty/non-http URLs must not be fetched; got {out['fetched']!r}"
+    sources = [
+        {"kind": "paper", "title": "X", "url": ""},
+        {"kind": "paper", "title": "Y"},  # missing 'url'
+        {"kind": "search_result", "title": "Z", "url": "site:arxiv.org foo"},
+    ]
+    fetched, errors = _parallel_fetch(sources)
+    assert fetched == [], (
+        f"empty/non-http URLs must not be fetched; got {fetched!r}"
     )
-    # At least 2 errors should be recorded (one per skipped source).
-    assert len(out["errors"]) >= 2, (
-        f"each skipped source must record an error; got {out['errors']!r}"
+    assert len(errors) >= 2, (
+        f"each skipped source must record an error; got {errors!r}"
     )
 
 
-def test_arxiv_search_raw_returns_list_for_valid_query(monkeypatch):
-    """T6 fix: helper exists and works on real arxiv call."""
-    from argus.graph import nodes as nodes_mod
+def test_arxiv_hits_returns_list_for_valid_query(monkeypatch):
+    """arXiv provider parses Atom entries (hermetic httpx stub)."""
+    from argus.graph import search_providers as sp
 
-    # monkeypatch httpx to a stub so the test is hermetic
     class _R:
         text = (
             '<entry><title>Real paper</title>'
@@ -378,111 +367,21 @@ def test_arxiv_search_raw_returns_list_for_valid_query(monkeypatch):
         def __exit__(self, *a): return False
         def get(self, *a, **kw): return _R()
 
-    import httpx
-    monkeypatch.setattr(httpx, "Client", lambda **kw: _C())
+    monkeypatch.setattr(sp.httpx, "Client", lambda **kw: _C())
 
-    items = nodes_mod._arxiv_search_raw("test query")
+    items, err = sp.arxiv_hits("test query")
+    assert err == ""
     assert isinstance(items, list)
     assert len(items) == 1
     assert items[0]["url"] == "http://arxiv.org/abs/2503.16581v1"
     assert items[0]["title"] == "Real paper"
 
 
-def test_arxiv_search_raw_handles_empty_query():
+def test_arxiv_hits_handles_empty_query():
     """Empty / None query must NOT raise."""
-    from argus.graph import nodes as nodes_mod
-    assert nodes_mod._arxiv_search_raw("") == []
-    assert nodes_mod._arxiv_search_raw(None) == []
-
-
-def test_researcher_node_delegates_to_subgraph(monkeypatch):
-    """researcher_node now delegates to the 3-way subgraph and returns its
-    merged sources verbatim.
-
-    The T6 orphan-topic arXiv fallback that used to live in researcher_node
-    now lives in ``arxiv_sub`` (covered by
-    test_researcher_subgraph.py::test_arxiv_sub_handles_empty_keywords_with_fallback),
-    and ``_arxiv_search_raw`` itself is still unit-tested above. Here we only
-    assert the delegation contract at the node boundary.
-    """
-    from argus.graph import nodes as nodes_mod
-    from argus.graph.state import ResearchPlan
-
-    def fake_run(state, **kw):
-        return {
-            "sources": [
-                {"kind": "paper", "title": "FB1",
-                 "url": "http://arxiv.org/abs/2503.99999",
-                 "summary": "from subgraph", "source": "arxiv-raw"},
-            ],
-            "messages": [{"role": "assistant", "content": "1 source"}],
-            "errors": [],
-        }
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
-
-    state = {
-        "user_request": "esoteric test topic",
-        "plan": ResearchPlan(
-            summary="dummy", sub_questions=["dummy"], planned_sources=[],
-            must_have_keywords=["esoteric", "test", "topic"],
-        ).model_dump(),
-        "sources": [],
-    }
-    out = nodes_mod.researcher_node(state)
-    assert len(out["sources"]) == 1
-    assert out["sources"][0]["url"] == "http://arxiv.org/abs/2503.99999"
-
-
-def test_researcher_node_does_not_inject_planner_urls(monkeypatch):
-    """Anti-hallucination regression guard.
-
-    The old node copied ``planned_source.target_url`` straight into
-    ``sources`` — that is how fabricated links (e.g.
-    ``https://nvidia.com/ai-blueprint``) reached the fetcher. The subgraph
-    searches fresh instead, so a planner-supplied URL must NOT appear in the
-    candidate set unless a sub-researcher independently found it. We assert
-    researcher_node adds nothing of its own beyond the subgraph's output.
-    """
-    from argus.graph import nodes as nodes_mod
-    from argus.graph.state import ResearchPlan, PlannedSource
-
-    def fake_run(state, **kw):
-        # Subgraph did NOT surface the planner's fabricated URL.
-        return {
-            "sources": [
-                {"kind": "repo", "title": "real repo",
-                 "url": "https://github.com/found/by-search",
-                 "summary": "", "source": "github-search"},
-            ],
-            "messages": [], "errors": [],
-        }
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_run)
-
-    bogus = "https://nvidia.com/ai-blueprint"  # a plausible-looking fake
-    state = {
-        "user_request": "any topic",
-        "plan": ResearchPlan(
-            summary="x", sub_questions=["x"],
-            planned_sources=[PlannedSource(
-                kind="official_doc", query="real", target_url=bogus,
-                rationale="test",
-            )],
-            must_have_keywords=["any"],
-        ).model_dump(),
-        "sources": [],
-    }
-    out = nodes_mod.researcher_node(state)
-    urls = [s.get("url") for s in out["sources"]]
-    assert bogus not in urls, (
-        f"planner target_url must not be injected by researcher_node; {urls!r}"
-    )
-    assert "https://github.com/found/by-search" in urls
-    # The fallback URL must NOT be in sources because the fallback did
-    # not fire. This is the negative assertion that proves the gate.
-    assert not any(s.get("url") == "http://arxiv.org/abs/2503.11111"
-                   for s in out["sources"]), (
-        f"fallback URL leaked into sources despite gate: {out['sources']!r}"
-    )
+    from argus.graph import search_providers as sp
+    assert sp.arxiv_hits("") == ([], "")
+    assert sp.arxiv_hits(None) == ([], "")
 
 
 def _make_empty_harvest():
@@ -518,11 +417,11 @@ def test_snatch_url_passes_stealth_and_transcript_flags(monkeypatch):
     assert "--transcript" not in captured["args"]
 
 
-def test_fetcher_retries_with_stealth_when_normal_fetch_fails(monkeypatch):
-    """When snatch (plain) + crawl both fail, fetcher_node retries once with
-    Scrapling stealth. A success there must land in fetched (bot-walled site
-    recovery)."""
-    from argus.graph import nodes as nodes_mod
+def test_fetch_retries_with_stealth_when_normal_fetch_fails(monkeypatch):
+    """When snatch (plain) + crawl both fail, the research fetch path
+    retries once with Scrapling stealth. A success there must land in
+    fetched (bot-walled site recovery)."""
+    from argus.graph import research as research_mod
     from argus.tools import SnatchResult, CrawlResult
 
     stealth_flags: list[bool] = []
@@ -538,18 +437,15 @@ def test_fetcher_retries_with_stealth_when_normal_fetch_fails(monkeypatch):
     def fake_crawl(url, *a, **kw):
         return CrawlResult(ok=False, error="403", duration_s=0.0)
 
-    monkeypatch.setattr(nodes_mod, "snatch_url", fake_snatch)
-    monkeypatch.setattr(nodes_mod, "crawl_url", fake_crawl)
+    monkeypatch.setattr(research_mod, "snatch_url", fake_snatch)
+    monkeypatch.setattr(research_mod, "crawl_url", fake_crawl)
 
-    state = {
-        "sources": [{"url": "https://walled.example", "kind": "blog",
-                     "title": "W", "summary": ""}],
-        "fetched": [], "errors": [],
-    }
-    out = nodes_mod.fetcher_node(state)
+    fetched, errors = research_mod._parallel_fetch(
+        [{"url": "https://walled.example", "kind": "blog",
+          "title": "W", "summary": ""}])
     assert True in stealth_flags, (
         f"stealth retry must fire after snatch+crawl fail; calls={stealth_flags!r}"
     )
-    assert len(out["fetched"]) == 1
-    assert out["fetched"][0]["url"] == "https://walled.example"
-    assert "errors" not in out or not out["errors"], out.get("errors")
+    assert len(fetched) == 1
+    assert fetched[0]["url"] == "https://walled.example"
+    assert not errors, errors

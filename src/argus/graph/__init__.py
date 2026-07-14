@@ -6,6 +6,10 @@ from .state import (
     FetchedItem,
     Finding,
     ReviewVerdict,
+    ResearchBrief,
+    SubQuestion,
+    EvidenceNote,
+    PanelVerdict,
     REPORT_MARKER,
 )
 from .graph import (
@@ -14,6 +18,7 @@ from .graph import (
 
 __all__ = [
     "ArgusState", "ResearchPlan", "PlannedSource", "FetchedItem",
-    "Finding", "ReviewVerdict", "REPORT_MARKER",
+    "Finding", "ReviewVerdict", "ResearchBrief", "SubQuestion",
+    "EvidenceNote", "PanelVerdict", "REPORT_MARKER",
     "build_graph", "quick_answer_graph", "async_sqlite_saver_cm",
 ]

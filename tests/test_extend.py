@@ -1,16 +1,17 @@
-"""Tests for the Phase 2 HITL 'extend research' loop.
+"""Tests for the HITL 'extend research' loop (v3).
 
-Covers the three new pieces of logic (deliver pass-through, routing, and
-extend_prep) plus the graph wiring. Hermetic: run_researcher_subgraph is
+Covers deliver pass-through, routing, and extend_prep plus the graph
+wiring. Hermetic: the follow-up query generation and the search wave are
 mocked so no network/LLM is touched.
 """
 from __future__ import annotations
 
-from argus.graph import nodes as nodes_mod
+from argus.graph import research as research_mod
+from argus.graph import search_providers as sp_mod
 from argus.graph.nodes import (
     MAX_EXTEND_ROUNDS, deliver_node, extend_prep_node, route_after_deliver,
 )
-from argus.graph.state import ResearchPlan
+from argus.graph.state import ResearchBrief, SubQuestion
 
 
 # --- routing -----------------------------------------------------------------
@@ -56,54 +57,67 @@ def test_deliver_node_delivers_at_cap_even_if_requested():
 
 # --- extend_prep --------------------------------------------------------------
 
-def test_extend_prep_broadens_keywords_bumps_round_and_merges(monkeypatch):
+def test_extend_prep_widens_queries_bumps_round_and_merges(monkeypatch):
     captured = {}
 
-    def fake_research(state, **kw):
-        captured["keywords"] = (state.get("plan") or {}).get("must_have_keywords")
-        return {"sources": [{"url": "https://new.example", "kind": "web"}],
-                "messages": [], "errors": []}
+    def fake_followups(brief, gaps, prior):
+        captured["gaps"] = list(gaps)
+        return ([{"query": "retrieval augmentation grounding",
+                  "provider": "ddgs", "sub_qs": [0]}], [])
 
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_research)
+    def fake_wave(queries, **kw):
+        captured["queries"] = queries
+        return ([{"url": "https://new.example", "kind": "web",
+                  "title": "n", "snippet": "", "provider": "ddgs",
+                  "sub_qs": [0], "text": "", "published": "",
+                  "source": "ddgs", "summary": ""}], [])
 
-    plan = ResearchPlan(
-        sub_questions=["How does retrieval augmentation improve grounding?"],
-        must_have_keywords=["rag"],
-        planned_sources=[], summary="s",
-    )
+    monkeypatch.setattr(research_mod, "followup_queries", fake_followups)
+    monkeypatch.setattr(sp_mod, "run_query_wave", fake_wave)
+
+    brief = ResearchBrief(
+        sub_questions=[SubQuestion(
+            q="How does retrieval augmentation improve grounding?")],
+        must_have_keywords=["rag"], summary="s")
     out = extend_prep_node({
-        "plan": plan.model_dump(),
+        "brief": brief.model_dump(),
         "extend_requested": True,
         "extend_rounds": 0,
         "revision_rounds": 3,
         "sources": [{"url": "https://old.example", "kind": "web"}],
     })
 
-    # Round bumped, flag cleared, review budget reset.
+    # Round bumped, flag cleared, review budget + stale panel reset.
     assert out["extend_rounds"] == 1
     assert out["extend_requested"] is False
     assert out["revision_rounds"] == 0
-    # Sources come from the (mocked) widened research pass.
-    assert any(s["url"] == "https://new.example" for s in out["sources"])
-    # Keywords were broadened with salient sub-question words (len > 4).
-    kw = out["plan"]["must_have_keywords"]
-    assert "rag" in kw
-    assert "retrieval" in kw and "augmentation" in kw and "grounding" in kw
-    # The widened keywords were actually passed to the research pass.
-    assert "retrieval" in (captured["keywords"] or [])
+    assert out["panel_verdict"] is None
+    # Every sub-question is treated as a gap for the widening wave.
+    assert captured["gaps"] == [0]
+    # New hits merge INTO the existing pool (old sources kept).
+    urls = [s["url"] for s in out["sources"]]
+    assert "https://old.example" in urls
+    assert "https://new.example" in urls
+    # The widened queries are recorded on state for later waves.
+    assert any(q["query"] == "retrieval augmentation grounding"
+               for q in out["queries"])
 
 
-def test_extend_prep_propagates_research_errors(monkeypatch):
-    monkeypatch.setattr(
-        nodes_mod, "run_researcher_subgraph",
-        lambda state, **kw: {"sources": [], "messages": [],
-                             "errors": ["web_sub failed: boom"]})
+def test_extend_prep_propagates_wave_errors(monkeypatch):
+    monkeypatch.setattr(research_mod, "followup_queries",
+                        lambda brief, gaps, prior: ([{"query": "x",
+                                                      "provider": "ddgs",
+                                                      "sub_qs": [0]}], []))
+    monkeypatch.setattr(sp_mod, "run_query_wave",
+                        lambda queries, **kw: ([], ["ddgs: boom"]))
     out = extend_prep_node({
-        "plan": ResearchPlan(must_have_keywords=["x"]).model_dump(),
+        "brief": ResearchBrief(
+            sub_questions=[SubQuestion(q="x?")],
+            must_have_keywords=["x"]).model_dump(),
         "extend_rounds": 1,
     })
     assert out["extend_rounds"] == 2
-    assert any("web_sub failed" in e for e in out.get("errors", []))
+    assert any("boom" in e for e in out.get("errors", []))
 
 
 # --- graph wiring -------------------------------------------------------------

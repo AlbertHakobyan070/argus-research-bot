@@ -6,7 +6,7 @@ and try to synthesise callback_query updates through the Bot API (which
 is impossible — Telegram only delivers callbacks from real user taps),
 we drive the *real* LangGraph with the *real* AsyncSqliteSaver and
 *real* FreeLLMAPI route, then resume past both HITL pause points
-(`interrupt_after=["researcher"]` + `interrupt_before=["deliver"]`) by re-invoking the graph
+(`interrupt_after=["scout"]` + `interrupt_before=["deliver"]`) by re-invoking the graph
 on the same thread_id.
 
 Why this exists on top of tests/test_e2e_research.py
@@ -34,12 +34,12 @@ what the bot produces, without inviting a new asyncio race.
 What it verifies (acceptance criteria from t_52c6aec5)
 ------------------------------------------------------
 1. /research <topic> drives the full pipeline.
-2. First call pauses AFTER `researcher` (grounded plan-approval gate;
+2. First call pauses AFTER `scout` (grounded plan-approval gate;
    HITL): state["plan"] is populated, state["hitl"]["kind"] ==
    "report_preview" has NOT been set yet.
-3. Re-invoking on the same thread_id resumes past the researcher
-   pause and runs fetcher -> normalizer -> filter -> synthesizer ->
-   reviewer (possibly with revision loops) -> report_builder.
+3. Re-invoking on the same thread_id resumes past the scout pause and
+   runs research (fetch+digest waves) -> outline -> compose -> panel
+   (possibly with revision loops) -> report_builder.
 4. Second call hits `interrupt_before="deliver"` (report-preview
    HITL): state["report_paths"]["md"] exists on disk and is
    non-empty, and state["hitl"]["kind"] == "report_preview".
@@ -103,10 +103,10 @@ def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
     """Run /research to first HITL pause, then through both resumes.
 
     Returns the final graph state. The graph's HITL pause points are
-    configured via ``interrupt_after=["researcher"]`` + ``interrupt_before=["deliver"]``, so
+    configured via ``interrupt_after=["scout"]`` + ``interrupt_before=["deliver"]``, so
     we expect three ``graph.invoke`` calls:
 
-      1. Initial — pauses before "researcher" (plan approval).
+      1. Initial — pauses after "scout" (plan approval).
       2. Resume  — pauses before "deliver" (report preview).
       3. Resume  — runs to END.
     """
@@ -135,12 +135,13 @@ def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
     print(f"  elapsed: {time.monotonic() - t0:.1f}s")
     print(f"  plan populated: {bool(state.get('plan'))} "
           f"(sub_keys={plan_keys[:4]})")
+    print(f"  sources found by scout: {len(state.get('sources') or [])}")
     print(f"  findings so far: {len(state.get('findings') or [])}")
     print(f"  fetched so far: {len(state.get('fetched') or [])}")
     print(f"  report_paths: {state.get('report_paths')!r}")
     print(f"  errors so far: {state.get('errors') or []}")
 
-    _banner("STEP 2: resume past researcher → fetcher/.../report_builder → "
+    _banner("STEP 2: resume past scout → research/outline/compose/panel → "
             "HITL report-preview pause")
     t0 = time.monotonic()
     # Second invoke resumes from the pause (no new state arg means
@@ -154,6 +155,9 @@ def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
     print(f"  fetched count: {len(state.get('fetched') or [])}")
     print(f"  fetched with real markdown_path: "
           f"{sum(1 for f in (state.get('fetched') or []) if f.get('markdown_path') and Path(f['markdown_path']).exists())}")
+    print(f"  evidence notes digested: {len(state.get('evidence') or [])}")
+    print(f"  coverage: {state.get('coverage')!r}")
+    print(f"  panel verdict: {(state.get('panel_verdict') or {}).get('judge_verdicts')!r}")
     print(f"  draft_md length: {len(state.get('draft_md') or '')}")
     print(f"  errors: {state.get('errors') or []}")
 
@@ -254,9 +258,9 @@ def main() -> int:
         if not pass_finding:
             print("  - Zero findings with citation_urls.")
             if not findings:
-                print("    * state['findings'] is empty (synthesizer produced none).")
+                print("    * state['findings'] is empty (compose extracted none).")
             else:
-                print("    * synthesizer produced findings but none carry citations.")
+                print("    * compose produced findings but none carry citations.")
                 for i, f in enumerate(findings[:3], 1):
                     print(f"      {i}. claim={f.get('claim','')[:120]!r} "
                           f"citations={f.get('citation_urls')!r}")

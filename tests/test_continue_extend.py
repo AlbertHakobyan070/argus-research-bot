@@ -1,15 +1,15 @@
-"""Phase 4 — /runs /append /continue mechanics.
+"""/runs /append /continue mechanics (v3).
 
 Covers, hermetically:
 1. The extend fork on a FINISHED run: ``aupdate_state(as_node="deliver",
    extend_requested, append_only, FULL sources)`` → ``astream(None)``
-   drives extend_prep→fetcher→…→report_builder → pauses at the next
+   drives extend_prep→research→…→report_builder → pauses at the next
    report preview.
-2. ``append_only`` skips the researcher subgraph (exactly the user's
-   appended sources, no fresh searches).
-3. fetcher_node's local_path branch (vault transcripts → file:///
-   FetchedItems; .md direct, .txt copied to a work .md, missing file →
-   loud error).
+2. ``append_only`` skips the search wave (exactly the user's appended
+   sources, no fresh searches).
+3. The research fetch path's local_path branch (vault transcripts →
+   file:/// FetchedItems; .md direct, .txt copied to a work .md,
+   missing file → loud error).
 4. Bot commands: /append queues run_sources; /continue forks a finished
    run with the merged FULL sources list; /continue re-attaches a
    plan-gate-paused run after a restart.
@@ -29,6 +29,8 @@ from argus.bot import _inflight, append_cmd, continue_cmd
 from argus.config import Settings
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
+from argus.graph import research as research_mod
+from argus.graph import search_providers as sp_mod
 
 
 # ---------------------------------------------------------------------------
@@ -41,26 +43,36 @@ _PLAN = {"summary": "s", "sub_questions": ["q"],
          "must_have_keywords": []}
 
 
+_BRIEF = {"sub_questions": [{"q": "q?", "kind": "web"}],
+          "must_have_keywords": ["q"], "summary": "s",
+          "success_criteria": []}
+
+
 def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the LLM/network nodes; keep deliver/extend_prep/routers REAL."""
     monkeypatch.setattr(graph_mod, "intake_node", lambda s: {"mode": "deep"})
-    monkeypatch.setattr(graph_mod, "planner_node",
-                        lambda s: {"plan": dict(_PLAN)})
-    monkeypatch.setattr(graph_mod, "planner_reflect_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "researcher_node", lambda s: {"sources": [
+    monkeypatch.setattr(graph_mod, "brief_node",
+                        lambda s: {"plan": dict(_PLAN),
+                                   "brief": dict(_BRIEF)})
+    monkeypatch.setattr(graph_mod, "scout_node", lambda s: {"sources": [
         {"kind": "web", "title": "W", "url": "https://w.example/x",
          "summary": "", "source": "web-search"}]})
-    monkeypatch.setattr(graph_mod, "fetcher_node", lambda s: {"fetched": [
+    # research stub: emulate fetch of every source (web url OR local
+    # file:/// url) so the extend/append paths can assert on fetched.
+    monkeypatch.setattr(graph_mod, "research_node", lambda s: {"fetched": [
         {"url": src.get("url", ""), "title": src.get("title", ""),
-         "excerpt": "x"} for src in (s.get("sources") or [])]})
-    monkeypatch.setattr(graph_mod, "normalizer_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "credibility_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "filter_node", lambda s: {})
-    monkeypatch.setattr(graph_mod, "synthesizer_node",
-                        lambda s: {"draft_md": "d", "findings": []})
-    monkeypatch.setattr(graph_mod, "reviewer_node",
-                        lambda s: {"review_verdict": {"verdict": "pass"}})
-    monkeypatch.setattr(graph_mod, "route_after_review",
+         "excerpt": "x"} for src in (s.get("sources") or [])],
+        "evidence": [], "coverage": {}, "sources": s.get("sources") or [],
+        "append_only": False})
+    monkeypatch.setattr(graph_mod, "outline_node",
+                        lambda s: {"outline": {"sections": []}})
+    monkeypatch.setattr(graph_mod, "compose_node",
+                        lambda s: {"draft_md": "d", "findings": [],
+                                   "sections": []})
+    monkeypatch.setattr(graph_mod, "panel_node",
+                        lambda s: {"panel_verdict": {"verdict": "pass"},
+                                   "review_verdict": {"verdict": "pass"}})
+    monkeypatch.setattr(graph_mod, "route_after_panel",
                         lambda s: "report_builder")
     monkeypatch.setattr(graph_mod, "report_builder_node",
                         lambda s: {"report_paths": {"md": "r.md",
@@ -91,7 +103,8 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
         raise AssertionError(
             "append_only /continue must NOT run fresh searches")
 
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", _boom)
+    monkeypatch.setattr(research_mod, "followup_queries", _boom)
+    monkeypatch.setattr(sp_mod, "run_query_wave", _boom)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont1"}}
@@ -115,7 +128,8 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
         f"{snap.next!r}")
     vals = snap.values
     assert vals.get("extend_rounds") == 1
-    assert vals.get("append_only") is False, "flag must be consumed"
+    assert vals.get("append_only") is False, (
+        "research_node must consume the flag after the append pass")
     # The fetch pass saw the appended source.
     fetched_urls = [f.get("url") for f in vals.get("fetched") or []]
     assert "file:///V/t.txt" in fetched_urls
@@ -125,14 +139,20 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
     _stub_pipeline(monkeypatch)
     calls: list = []
 
-    def fake_research(state, **kw):
+    def fake_followups(brief, gaps, prior):
         calls.append(1)
-        return {"sources": (state.get("sources") or []) + [
-            {"kind": "web", "title": "New", "url": "https://new.example/y",
-             "summary": "", "source": "web-search"}],
-            "errors": []}
+        return ([{"query": "widened q", "provider": "ddgs",
+                  "sub_qs": [0]}], [])
 
-    monkeypatch.setattr(nodes_mod, "run_researcher_subgraph", fake_research)
+    def fake_wave(queries, **kw):
+        return ([{"kind": "web", "title": "New",
+                  "url": "https://new.example/y", "snippet": "",
+                  "provider": "ddgs", "sub_qs": [0], "text": "",
+                  "published": "", "source": "web-search",
+                  "summary": ""}], [])
+
+    monkeypatch.setattr(research_mod, "followup_queries", fake_followups)
+    monkeypatch.setattr(sp_mod, "run_query_wave", fake_wave)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont2"}}
@@ -147,38 +167,38 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
 
     snap = g.get_state(cfg)
     assert snap.next == ("deliver",)
-    assert calls, "plain /continue must run the researcher subgraph"
+    assert calls, "plain /continue must run a fresh search wave"
     urls = [s.get("url") for s in snap.values.get("sources") or []]
     assert "https://new.example/y" in urls
 
 
 # ---------------------------------------------------------------------------
-# fetcher_node local_path branch
+# research fetch path: local_path branch
 # ---------------------------------------------------------------------------
 
 
-def _fetch(sources: list[dict]) -> dict:
-    return nodes_mod.fetcher_node({"sources": sources})
+def _fetch(sources: list[dict]) -> tuple[list[dict], list[str]]:
+    return research_mod._parallel_fetch(sources)
 
 
-def test_fetcher_ingests_local_md(tmp_path):
+def test_fetch_ingests_local_md(tmp_path):
     md = tmp_path / "notes.md"
     md.write_text("# my notes", encoding="utf-8")
-    out = _fetch([{"kind": "local", "title": "Notes",
-                   "local_path": str(md)}])
-    assert len(out["fetched"]) == 1
-    item = out["fetched"][0]
+    fetched, errors = _fetch([{"kind": "local", "title": "Notes",
+                               "local_path": str(md)}])
+    assert len(fetched) == 1
+    item = fetched[0]
     assert item["url"].startswith("file:///")
     assert item["markdown_path"] == str(md)
     assert item["title"] == "Notes"
 
 
-def test_fetcher_ingests_local_txt_via_work_copy(tmp_path):
+def test_fetch_ingests_local_txt_via_work_copy(tmp_path):
     txt = tmp_path / "transcript.txt"
     txt.write_text("spoken words here", encoding="utf-8")
-    out = _fetch([{"kind": "local", "local_path": str(txt)}])
-    assert len(out["fetched"]) == 1
-    item = out["fetched"][0]
+    fetched, errors = _fetch([{"kind": "local", "local_path": str(txt)}])
+    assert len(fetched) == 1
+    item = fetched[0]
     mp = Path(item["markdown_path"])
     assert mp.suffix == ".md" and mp.exists()
     assert "spoken words here" in mp.read_text(encoding="utf-8")
@@ -187,10 +207,11 @@ def test_fetcher_ingests_local_txt_via_work_copy(tmp_path):
     assert "spoken words here" in item["excerpt"]
 
 
-def test_fetcher_missing_local_file_is_loud(tmp_path):
-    out = _fetch([{"kind": "local", "local_path": str(tmp_path / "gone.txt")}])
-    assert out["fetched"] == []
-    assert any("missing" in e for e in out.get("errors", []))
+def test_fetch_missing_local_file_is_loud(tmp_path):
+    fetched, errors = _fetch([{"kind": "local",
+                               "local_path": str(tmp_path / "gone.txt")}])
+    assert fetched == []
+    assert any("missing" in e for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +370,7 @@ async def test_continue_reattaches_plan_gate_paused_run():
                        "planned_sources": []},
               "sources": [{"title": "W", "url": "https://w.example/x"}],
               "length": "long"}
-    graph = _FakeGraph(values=values, nxt=("fetcher",))
+    graph = _FakeGraph(values=values, nxt=("research",))
     update = _update()
     ctx = _ctx(["ab12"], lib, graph)
 
@@ -398,26 +419,84 @@ def test_credibility_trusts_user_provided_local_files():
     assert scored.credibility_flag in (None, "user_provided")
 
 
-def test_filter_pins_appended_local_sources(monkeypatch):
+def test_triage_pins_appended_local_sources():
     """The live E2E (2026-07-10) showed an appended transcript being cut
-    by filter_node's top-N ranking — an explicitly appended source must
-    always survive filtering."""
-    fetched = [{
+    by top-N ranking — an explicitly appended source must always survive
+    selection (v3: triage takes local_path sources unconditionally)."""
+    from argus.graph.research import triage
+    from argus.graph.state import ResearchBrief, SubQuestion
+    brief = ResearchBrief(
+        sub_questions=[SubQuestion(q="keyword topic?")],
+        must_have_keywords=["keyword"])
+    sources = [{
         "url": f"https://site{i}.example/x", "title": "keyword match topic",
-        "markdown_path": "m.md", "excerpt": "keyword " * 20,
-        "relevance_score": 0.9, "credibility_score": 0.9,
+        "snippet": "keyword " * 5, "sub_qs": [0],
     } for i in range(16)]
-    fetched.append({
-        "url": "file:///V/transcripts/clip.txt",
-        "title": "Appended transcript", "markdown_path": "t.md",
-        "excerpt": "totally unrelated spoken words",
-        "relevance_score": 0.0, "credibility_score": 0.9,
+    sources.append({
+        "title": "Appended transcript",
+        "local_path": r"V:\transcripts\clip.txt",
+        "snippet": "totally unrelated spoken words",
     })
-    out = nodes_mod.filter_node({
-        "fetched": fetched,
-        "plan": {"must_have_keywords": ["keyword"]},
-        "user_request": "keyword topic",
+    picked = triage(sources, set(), brief, cap=4)
+    assert any(s.get("local_path") for s in picked), (
+        "appended local sources must be pinned through triage")
+
+
+def test_compose_pins_local_evidence_notes():
+    """A user-appended note must be rendered to the writers even at low
+    relevance, and must count as usable evidence."""
+    from argus.graph.compose import render_notes
+    notes = [{
+        "source_id": i + 1, "source_url": f"https://s{i}.example/x",
+        "title": "web", "sub_qs": [0], "relevance": 5, "stance": "supports",
+        "claims": [{"text": "web claim", "quote": "", "confidence": "high"}],
+    } for i in range(10)]
+    notes.append({
+        "source_id": 11, "source_url": "file:///V/transcripts/clip.txt",
+        "title": "Appended transcript", "sub_qs": [], "relevance": 1,
+        "stance": "background",
+        "claims": [{"text": "spoken words claim", "quote": "",
+                    "confidence": "medium"}],
     })
-    urls = [f["url"] for f in out["fetched"]]
-    assert "file:///V/transcripts/clip.txt" in urls, (
-        "appended local sources must be pinned through the filter")
+    block = render_notes(notes, [0], max_chars=2000)
+    assert "[11]" in block, (
+        "pinned local note must be rendered first, not crowded out")
+
+
+def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
+    """The REAL research_node must never run fresh search waves when
+    append_only is set — it ingests the appended sources and clears the
+    flag. (Regression: extend_prep used to clear the flag before
+    research_node could see it.)"""
+    md = tmp_path / "clip.md"
+    md.write_text("appended transcript content " * 30, encoding="utf-8")
+
+    def _boom(*a, **kw):
+        raise AssertionError("append_only must NOT run search waves")
+
+    monkeypatch.setattr(research_mod, "followup_queries", _boom)
+    monkeypatch.setattr(research_mod, "run_query_wave", _boom)
+
+    def fake_digest(item, source_id, brief, user_request):
+        return ({"source_id": source_id, "source_url": item["url"],
+                 "title": item["title"], "sub_qs": [],
+                 "relevance": 3, "stance": "background",
+                 "claims": [{"text": "c", "quote": "", "confidence":
+                             "medium"}]}, None, "")
+
+    monkeypatch.setattr(research_mod, "digest_one", fake_digest)
+    monkeypatch.setattr(research_mod, "score_fetched",
+                        lambda items, user_request: items)
+
+    out = research_mod.research_node({
+        "user_request": "topic",
+        "append_only": True,
+        "brief": {"sub_questions": [{"q": "q?", "kind": "web"}],
+                  "must_have_keywords": ["topic"]},
+        "sources": [{"kind": "local", "title": "Clip",
+                     "local_path": str(md)}],
+        "fetched": [], "evidence": [],
+    })
+    assert out["append_only"] is False, "flag must be consumed"
+    assert any(f["url"].startswith("file:///") for f in out["fetched"])
+    assert out["evidence"], "appended source must be digested"

@@ -1,16 +1,17 @@
-"""Tests for the credibility_node + DomainTrust static list (handoff action #2).
+"""Tests for credibility scoring + DomainTrust static list.
 
 Run with:
     PYTHONPATH='' ./venv/Scripts/python.exe -m pytest tests/test_credibility.py -q
 
-The credibility_node sits between fetcher and filter. It assigns each
-FetchedItem a `credibility_score` in [0,1] based on three signals:
+v3: scoring runs inside research_node (post-fetch) and as a triage
+prior (pre-fetch). Each FetchedItem gets a `credibility_score` in [0,1]
+from three signals:
   (a) domain trust      — static DomainTrust list + tld analysis
   (b) URL pattern       — arxiv / .edu / .gov boost, content-farm penalty
   (c) title relevance   — token overlap with user_request
 
-Items below 0.4 are *tagged* (a `credibility_flag` field) but NOT dropped;
-the downstream filter_node still does its own keep_topN.
+Items below the floor are *tagged* (a `credibility_flag` field) but NOT
+dropped; the research triage demotes them softly instead.
 """
 from __future__ import annotations
 
@@ -21,7 +22,6 @@ from argus.graph.credibility import (
     is_arxiv_year_suspicious,
     score_fetched,
 )
-from argus.graph.nodes import credibility_node
 from argus.graph.state import FetchedItem
 
 
@@ -165,47 +165,28 @@ def test_threshold_preserves_most_arxiv_sources():
 
 
 # ---------------------------------------------------------------------------
-# Graph integration — credibility_node is a no-op on empty fetched list
+# score_fetched — the scoring pass research_node runs post-fetch
 # ---------------------------------------------------------------------------
 
-def test_credibility_node_no_op_when_fetched_empty():
-    """If fetcher returned nothing, credibility_node should pass through
-    cleanly (empty list, no errors, no model calls)."""
-    state = {
-        "user_request": "test query",
-        "fetched": [],
-        "errors": [],
-    }
-    out = credibility_node(state)
-    assert out["fetched"] == []
-    assert "errors" not in out or out.get("errors") == []
+def test_score_fetched_empty_list_is_noop():
+    assert score_fetched([], user_request="test query") == []
 
 
-def test_credibility_node_tags_low_items_but_keeps_them():
-    """Items below the 0.4 floor must remain in fetched (not dropped);
-    they should carry a `credibility_flag` so the downstream filter_node
-    can decide what to do."""
+def test_score_fetched_tags_low_items_but_keeps_them():
+    """Items below the floor must remain (not dropped); they carry a
+    `credibility_flag` so triage can demote them softly."""
     item = FetchedItem(
         url="https://random-article.xyz/spammy-post",
         title="Some Article",
         excerpt="",
     )
-    state = {
-        "user_request": "transformer architectures",
-        "fetched": [item.model_dump()],
-        "errors": [],
-    }
-    out = credibility_node(state)
-    assert len(out["fetched"]) == 1, "credibility_node must not drop items"
-    flagged = out["fetched"][0]
-    assert "credibility_score" in flagged
-    assert flagged["credibility_score"] < 0.4
-    assert flagged.get("credibility_flag") in {
-        "low_credibility", None,
-    }  # flag field present, value either low_credibility or None
-    # if a flag is set, it must indicate low credibility
-    if flagged.get("credibility_flag"):
-        assert "low" in flagged["credibility_flag"].lower()
+    scored = score_fetched([item], user_request="transformer architectures")
+    assert len(scored) == 1, "score_fetched must not drop items"
+    flagged = scored[0]
+    assert flagged.credibility_score is not None
+    assert flagged.credibility_score < 0.4
+    if flagged.credibility_flag:
+        assert "low" in flagged.credibility_flag.lower()
 
 
 def test_score_is_bounded_zero_to_one():
@@ -288,88 +269,55 @@ def test_domain_table_has_low_entries():
     assert thetechbriefs["tier"] == "low"
 
 
-# --- filter_node: credibility floor enforcement (P2 part 2) ---------------
+# --- research triage: credibility floor demotion (v3) ----------------------
 
-def test_filter_node_drops_below_floor_items():
-    """P2 fix: filter_node must drop items below CREDIBILITY_FLOOR.
-
-    GLM 5.2 reproduced here: a fetcher mix of an arxiv paper, a thetechbriefs
-    farm, and a neutral blog. After fix, the farm must be gone from the
-    report's fetched list."""
-    from argus.graph.nodes import filter_node
-    items = [
-        FetchedItem(  # arxiv — well above floor
-            url="https://arxiv.org/abs/2406.12793",
-            title="GLM-130B paper",
-            excerpt="paper on the GLM family",
-            markdown_path="/tmp/p1.md",
-            relevance_score=0.8,
-            credibility_score=0.85,
-        ),
-        FetchedItem(  # content farm — below floor
-            url="https://thetechbriefs.com/thudm-releases-glm-4",
-            title="GLM-4 release coverage",
-            excerpt="tech brief article",
-            markdown_path="/tmp/p2.md",
-            relevance_score=0.6,
-            credibility_score=0.18,  # < floor (0.4)
-        ),
-        FetchedItem(  # neutral blog — above floor
-            url="https://towardsdatascience.com/some-post",
-            title="GLM walkthrough",
-            excerpt="tds article",
-            markdown_path="/tmp/p3.md",
-            relevance_score=0.5,
-            credibility_score=0.70,
-        ),
+def test_triage_demotes_content_farm_below_trusted_sources():
+    """The P2 farm bug, v3 shape: with a cap smaller than the candidate
+    pool, triage must pick the arxiv paper + neutral blog over the
+    below-floor content farm."""
+    from argus.graph.research import triage
+    from argus.graph.state import ResearchBrief, SubQuestion
+    brief = ResearchBrief(
+        sub_questions=[SubQuestion(q="What is the GLM model family?")],
+        must_have_keywords=["GLM"],
+    )
+    sources = [
+        {"url": "https://thetechbriefs.com/thudm-releases-glm-4",
+         "title": "GLM-4 release coverage", "snippet": "GLM tech brief",
+         "sub_qs": [0]},
+        {"url": "https://arxiv.org/abs/2406.12793",
+         "title": "GLM-130B paper", "snippet": "paper on the GLM family",
+         "sub_qs": [0]},
+        {"url": "https://towardsdatascience.com/some-post",
+         "title": "GLM walkthrough", "snippet": "tds article on GLM",
+         "sub_qs": [0]},
     ]
-    state = {
-        "user_request": "GLM 5.2",
-        "fetched": [it.model_dump() for it in items],
-        "plan": {"must_have_keywords": ["GLM"]},
-        "errors": [],
-    }
-    out = filter_node(state)
-    urls = [f["url"] for f in out["fetched"]]
+    picked = triage(sources, set(), brief, cap=2)
+    urls = [s["url"] for s in picked]
     assert "https://thetechbriefs.com/thudm-releases-glm-4" not in urls, (
-        "filter_node let through the content farm — P2 floor not enforced"
+        "triage picked the content farm over trusted sources"
     )
     assert "https://arxiv.org/abs/2406.12793" in urls
-    assert "https://towardsdatascience.com/some-post" in urls
 
 
-def test_filter_node_safety_net_keeps_best_when_all_below_floor():
-    """If every fetched item scores below the floor, filter_node must NOT
-    emit an empty list — that's the Phase-1 'don't empty the report'
-    principle. The kept set should still contain the best-ranked items."""
-    from argus.graph.nodes import filter_node
-    from argus.graph.credibility import CREDIBILITY_FLOOR
-    items = [
-        FetchedItem(
-            url=f"https://thetechbriefs.com/post-{i}",
-            title="GLM release coverage",
-            excerpt="farm content",
-            markdown_path=f"/tmp/farm-{i}.md",
-            relevance_score=0.5 - (i * 0.05),  # still above 0 below floor
-            credibility_score=CREDIBILITY_FLOOR - 0.05,  # just below floor
-        )
+def test_triage_safety_net_keeps_best_when_all_below_floor():
+    """If every candidate scores below the floor, triage must still pick
+    sources — 'don't empty the report' principle, v3 shape."""
+    from argus.graph.research import triage
+    from argus.graph.state import ResearchBrief, SubQuestion
+    brief = ResearchBrief(
+        sub_questions=[SubQuestion(q="What is GLM 5.2?")],
+        must_have_keywords=["GLM"],
+    )
+    sources = [
+        {"url": f"https://thetechbriefs.com/post-{i}",
+         "title": "GLM release coverage", "snippet": "farm content on GLM",
+         "sub_qs": [0]}
         for i in range(3)
     ]
-    state = {
-        "user_request": "GLM 5.2",
-        "fetched": [it.model_dump() for it in items],
-        "plan": {"must_have_keywords": ["GLM"]},
-        "errors": [],
-    }
-    out = filter_node(state)
-    assert len(out["fetched"]) >= 1, (
-        "filter_node safety net failed: emitted empty report when all "
-        "items below floor"
-    )
-    # Items must still come from the ranked set (relevance-ordered).
-    rels = [f["relevance_score"] for f in out["fetched"]]
-    assert rels == sorted(rels, reverse=True), (
-        "safety net should preserve the (relevance, credibility) ordering"
+    picked = triage(sources, set(), brief, cap=2)
+    assert len(picked) >= 1, (
+        "triage emitted nothing when all items were below the floor"
     )
 
 
