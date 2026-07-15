@@ -299,7 +299,14 @@ def report_builder_node(state: ArgusState) -> dict:
         # helper imports playwright at runtime, so if it isn't in the
         # argus venv we delegate to the intel-stack venv python.
         try:
-            markdown_to_pdf(md_text, str(pdf_path), title=topic)
+            # NB: pass the raw human-readable topic (not the filesystem
+            # slug) — the renderer uses this only for PDF metadata /
+            # title-page treatment, never as a second literal heading
+            # (the body's own "# {topic}" line, written by
+            # render_title_block, is the single source of the visible
+            # title — see the 2026-07-16 double-title bug fix).
+            markdown_to_pdf(md_text, str(pdf_path),
+                            title=state["user_request"])
             pdf_ok = pdf_path.exists()
         except (ModuleNotFoundError, ImportError) as e:
             # Fallback: render via intel-stack's python + the _common helper.

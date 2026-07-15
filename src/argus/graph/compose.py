@@ -179,9 +179,11 @@ Rules:
    evidence.
 4. Where sources conflict, present both sides with their citations.
 5. Write tight, information-dense prose. ### sub-headings allowed.
-6. Output RAW MARKDOWN for the section BODY ONLY — no JSON, no code
-   fences, do NOT repeat the section heading (it is added for you), no
-   Sources list (added automatically).
+6. Output RAW MARKDOWN for the section BODY ONLY. Do NOT start with a
+   heading, title, or bolded restatement of the section name — it is
+   rendered separately; begin directly with the first sentence of
+   prose. No JSON, no code fences, no Sources list (added
+   automatically).
 """
 
 FLAT_SYSTEM = """You write a complete short grounded research report in
@@ -278,6 +280,7 @@ def _write_section(section: dict, brief: ResearchBrief, state: dict,
         call = llm.record_from_response(
             "strong", llm.resolve_tier("strong"), resp).model_dump()
         md = _strip_fences(resp.content)
+        md = _strip_duplicate_heading(md, section.get("title", ""))
         if len(md.strip()) < 40:
             return "", call, (f"compose: section '{section.get('title')}' "
                               "came back empty")
@@ -292,6 +295,45 @@ def _strip_fences(text: str) -> str:
     t = re.sub(r"^```(?:markdown|md)?\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*```$", "", t)
     return t
+
+
+_HEADING_PREFIX_RE = re.compile(r"^#{1,6}\s*")
+_EMPHASIS_MARKER_RE = re.compile(r"^\*{1,2}|\*{1,2}$")
+
+
+def _normalize_heading_text(s: str) -> str:
+    """Normalize a heading candidate for duplicate comparison: strip
+    markdown heading markers and bold/italic markers, then casefold."""
+    s = _HEADING_PREFIX_RE.sub("", s.strip())
+    s = _EMPHASIS_MARKER_RE.sub("", s.strip())
+    return s.strip().rstrip(":.-").casefold()
+
+
+def _strip_duplicate_heading(md: str, title: str) -> str:
+    """Drop a leading line that just repeats the section title.
+
+    Section writers are told not to repeat the heading (the assembler
+    renders it separately), but weaker proxy-routed models often
+    disregard that instruction and open the section with
+    ``## <title>`` or ``**<title>**`` anyway — producing a visibly
+    duplicated heading in the rendered report. This is a structural
+    guard rather than relying on prompt compliance: it removes at most
+    ONE leading line, and only when it is a near-exact echo of the
+    title, so a section that legitimately opens with a sentence
+    sharing a few words with the title is left untouched.
+    """
+    if not title:
+        return md
+    lines = md.splitlines()
+    if not lines:
+        return md
+    target = _normalize_heading_text(title)
+    if not target or _normalize_heading_text(lines[0]) != target:
+        return md
+    rest = lines[1:]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    return "\n".join(rest)
 
 
 def _write_flat(state: dict, brief: ResearchBrief, *, length: str,
