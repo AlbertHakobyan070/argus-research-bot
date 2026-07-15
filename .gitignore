@@ -24,3 +24,5 @@ tonight/HANDOFF-*.md
 HANDOFF-*.md
 WAKEUP-README.md
 WAKEUP-*.md
+# Demo/run artifacts (generated at runtime)
+demo_output/

@@ -1,10 +1,11 @@
 # Argus — full command guide
 
 Argus is a single-user Telegram research + media bot. It runs a multi-agent
-LangGraph pipeline for deep research (grounded in **live** web/arXiv/GitHub
-search, not the model's memory), downloads real media from YouTube / X /
-Reddit / Instagram into your DS vault, transcribes it, and keeps a resumable
-history of every run.
+LangGraph engine for deep research (grounded in **live** Exa / web / arXiv /
+GitHub search, not the model's memory — every source is fetched and read
+into cited evidence notes), downloads real media from YouTube / X / Reddit /
+Instagram into your vault, transcribes it, and keeps a resumable history of
+every run.
 
 Send `/help` for the compact quick-reference; this file is what `/help full`
 delivers.
