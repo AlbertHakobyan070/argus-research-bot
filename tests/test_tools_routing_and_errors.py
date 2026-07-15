@@ -260,12 +260,20 @@ def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(monkeypatch):
 
 def test_research_node_emits_all_failed_summary(monkeypatch):
     """When every source fails to fetch, research_node must append the
-    'all sources failed' summary error (the v2 T2 contract, kept)."""
+    'all sources failed' summary error (the v2 T2 contract, kept).
+
+    Hermetic: with 0 fetched items the wave loop's coverage check finds
+    a gap and would otherwise launch a REAL follow-up search wave
+    (network) — mock it away so this test only exercises the
+    fetch-failure path it's named for.
+    """
     def boom(url, *a, **kw):
         raise RuntimeError("down")
     monkeypatch.setattr(research_mod, "normalize_to_markdown", boom)
     monkeypatch.setattr(research_mod, "snatch_url", boom)
     monkeypatch.setattr(research_mod, "crawl_url", boom)
+    monkeypatch.setattr(research_mod, "followup_queries",
+                        lambda brief, gaps, prior: ([], []))
 
     state = {
         "user_request": "attention transformers",

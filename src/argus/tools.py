@@ -529,165 +529,335 @@ def markdown_to_pdf(md_text: str, pdf_path: str, *, title: str = "") -> None:
     mod.markdown_to_pdf(md_text, Path(pdf_path), title=title)
 
 
-def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
-    """T7 — designed PDF via ReportLab (Chromium-free fallback path).
+# ---------------------------------------------------------------------------
+# PDF type system — "old money" editorial design (2026-07-16 redesign).
+#
+# Two serif families instead of the old sans-heading/serif-body mismatch:
+#   Cardo        — display face for the title page + section headings
+#                  (a Renaissance book-face, dignified rather than loud)
+#   Crimson Text — body face (warm, literary, reads like a printed book)
+#   Cormorant SC — small caps, used only for the tracked title-page kicker
+#
+# Bundled as static TTFs under assets/fonts/ (OFL-licensed, see OFL.txt in
+# that folder) so rendering is identical on any machine/CI runner — never
+# dependent on whatever happens to be installed in Windows' font list.
+# ---------------------------------------------------------------------------
 
-    We render headings, paragraphs, bullet lists, code blocks, blockquotes,
-    and tables with a real stylesheet (sans headings + serif body + monospace
-    code + tinted dividers + coloured confidence markers). ReportLab is the
-    fallback when the intel-stack Chromium renderer is unavailable; the
-    primary Chromium route in ``_common.markdown_to_pdf`` produces the
-    same visual identity via CSS.
+FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+
+_REPORT_FONT_ROLES: dict[str, str] | None = None
+
+
+def _register_report_fonts() -> dict[str, str]:
+    """Register the bundled report fonts once per process.
+
+    Returns a role -> registered-font-name map so callers never need to
+    know the underlying file names. Falls back to ReportLab's built-in
+    base14 fonts (with a logged warning) if a font file is missing —
+    a font problem must never stop a report from being delivered.
+    """
+    global _REPORT_FONT_ROLES
+    if _REPORT_FONT_ROLES is not None:
+        return _REPORT_FONT_ROLES
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    custom = {
+        "display": "Cardo-Regular", "display_bold": "Cardo-Bold",
+        "display_italic": "Cardo-Italic",
+        "body": "CrimsonText-Regular", "body_italic": "CrimsonText-Italic",
+        "body_semibold": "CrimsonText-SemiBold",
+        "body_bold": "CrimsonText-Bold",
+        "body_bold_italic": "CrimsonText-BoldItalic",
+        "caps": "CormorantSC-SemiBold",
+    }
+    try:
+        for name in dict.fromkeys(custom.values()):
+            pdfmetrics.registerFont(TTFont(name, str(FONTS_DIR / f"{name}.ttf")))
+        pdfmetrics.registerFontFamily(
+            "Cardo", normal="Cardo-Regular", bold="Cardo-Bold",
+            italic="Cardo-Italic", boldItalic="Cardo-Bold")
+        pdfmetrics.registerFontFamily(
+            "CrimsonText", normal="CrimsonText-Regular",
+            bold="CrimsonText-Bold", italic="CrimsonText-Italic",
+            boldItalic="CrimsonText-BoldItalic")
+        _REPORT_FONT_ROLES = custom
+    except Exception as e:
+        logger.warning("bundled report fonts unavailable (%s); "
+                       "falling back to base14", e)
+        _REPORT_FONT_ROLES = {
+            "display": "Times-Bold", "display_bold": "Times-Bold",
+            "display_italic": "Times-Italic",
+            "body": "Times-Roman", "body_italic": "Times-Italic",
+            "body_semibold": "Times-Bold",
+            "body_bold": "Times-Bold", "body_bold_italic": "Times-BoldItalic",
+            "caps": "Times-Bold",
+        }
+    return _REPORT_FONT_ROLES
+
+
+# Emoji / pictograph ranges — Argus's chat-facing strings (progress
+# messages, appendix headings) use emoji freely, which is correct for
+# Telegram but renders as a missing-glyph box ("▯▯") in every text font
+# available to ReportLab (base14 and the bundled serifs alike, since none
+# carry color/symbol glyphs). Stripped only in the PDF text path — the
+# .md file and Telegram messages keep their emoji untouched.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # pictographs, symbols, supplemental, emoticons
+    "\U00002600-\U000027BF"   # misc symbols + dingbats (incl. warning sign)
+    "\U0001F1E6-\U0001F1FF"   # regional indicator flags
+    "\U00002190-\U000021FF"   # arrows
+    "\U0000FE0F"              # variation selector-16 (emoji presentation)
+    "\U0000200D"              # zero-width joiner
+    "]+\\s?",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(text: str) -> str:
+    return _EMOJI_RE.sub("", text or "")
+
+
+def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
+    """Old-money editorial PDF via ReportLab (Chromium-free fallback path).
+
+    Design: warm ivory page, a single hairline frame, one serif type
+    system throughout (Cardo for display/headings, Crimson Text for
+    body, Cormorant SC for the tracked title-page kicker), an oxblood
+    + brass accent palette instead of the old flat blue, and grouped
+    "card" treatment for blockquotes/warnings/the quality summary
+    (previously each blockquote LINE rendered as its own fragment —
+    the quality summary read as loose italic lines, not a cohesive
+    box). ReportLab is the primary render path (fast, deterministic,
+    no browser); the Chromium route in ``_common.markdown_to_pdf`` is
+    the fallback if ReportLab itself is unavailable.
 
     Why still maintain a ReportLab path
     -----------------------------------
     Some Windows machines (Albert's is one) have flaky pagefile behaviour
     when Chromium spins up. The ReportLab path is ~50ms and produces a
-    deterministic, font-safe PDF even on a constrained host. The Chromium
-    path is preferred because CSS gives us callouts/tables/dividers, but
-    if it fails, the ReportLab fallback must not look like 1995.
+    deterministic, font-safe PDF even on a constrained host.
     """
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.lib.enums import TA_LEFT
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                     Preformatted, Table, TableStyle,
-                                     KeepTogether, HRFlowable)
+    from reportlab.platypus import (
+        BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer,
+        Preformatted, Table, TableStyle, HRFlowable, Flowable,
+    )
     from reportlab.lib import colors
 
-    # Colour palette mirrors the Chromium CSS so the two paths look the same.
-    INK = colors.HexColor("#0f172a")        # heading ink
-    BODY = colors.HexColor("#1a1a1a")       # body ink
-    MUTED = colors.HexColor("#475569")      # meta / captions
-    RULE = colors.HexColor("#1e40af")       # primary accent
-    TINT = colors.HexColor("#f1f5f9")       # h2 background tint
-    CODE_BG = colors.HexColor("#f8fafc")    # inline-code background
-    CODE_INK = colors.HexColor("#0f172a")
-    DIVIDER = colors.HexColor("#94a3b8")    # dashed hr
-    QUALITY_BG = colors.HexColor("#eff6ff")
-    QUALITY_BORDER = colors.HexColor("#2563eb")
-    CONF_HIGH = colors.HexColor("#047857")
-    CONF_MED = colors.HexColor("#b45309")
-    CONF_LOW = colors.HexColor("#b91c1c")
+    fonts = _register_report_fonts()
 
-    styles = getSampleStyleSheet()
+    # ---- palette: warm ivory paper, oxblood + brass accents ------------
+    PAPER = colors.HexColor("#FBF7EE")       # page background
+    PAPER_EDGE = colors.HexColor("#F1E8D6")  # zebra / card fill tint
+    INK = colors.HexColor("#2A2420")         # body ink (warm near-black)
+    INK_SOFT = colors.HexColor("#5B5044")    # meta / caption ink
+    ACCENT = colors.HexColor("#6E2A34")      # oxblood -- headings, rules, cites
+    GOLD = colors.HexColor("#9C7A3C")        # brass -- fine rules, borders
+    GOLD_SOFT = colors.HexColor("#C9AE7C")
+    QUALITY_BG = colors.HexColor("#F4ECDD")
+    WARNING_BG = colors.HexColor("#F3E4DC")
+    WARNING_ACCENT = colors.HexColor("#8C3229")
+    CODE_BG = colors.HexColor("#F1E9D8")
+    CODE_INK = colors.HexColor("#2A2420")
+    CODE_DARK_BG = colors.HexColor("#2A2420")
+    CODE_DARK_INK = colors.HexColor("#EDE3CF")
+    PAGE_W, PAGE_H = A4
+    MARGIN = 20 * mm
+    FRAME_INSET = 10 * mm
+    content_width = PAGE_W - 2 * MARGIN
+
+    # ---- styles ------------------------------------------------------------
     h1 = ParagraphStyle(
-        "ArgusH1", parent=styles["Heading1"],
-        fontName="Helvetica-Bold", fontSize=22, leading=26,
-        textColor=INK, spaceAfter=8, spaceBefore=0,
+        "ArgusH1", fontName=fonts["display_bold"], fontSize=25, leading=30,
+        textColor=INK, alignment=TA_LEFT, spaceAfter=0, spaceBefore=0,
+    )
+    kicker = ParagraphStyle(
+        "ArgusKicker", fontName=fonts["caps"], fontSize=13, leading=16,
+        textColor=ACCENT, spaceAfter=6,
     )
     h2 = ParagraphStyle(
-        "ArgusH2", parent=styles["Heading2"],
-        fontName="Helvetica-Bold", fontSize=14, leading=18,
-        textColor=INK, spaceBefore=14, spaceAfter=6,
-        backColor=TINT, borderPadding=(4, 6, 4, 6),
-        leftIndent=0,
+        "ArgusH2", fontName=fonts["display_bold"], fontSize=15, leading=19,
+        textColor=ACCENT, spaceBefore=16, spaceAfter=3,
     )
     h3 = ParagraphStyle(
-        "ArgusH3", parent=styles["Heading3"],
-        fontName="Helvetica-Bold", fontSize=12, leading=15,
-        textColor=INK, spaceBefore=10, spaceAfter=4,
+        "ArgusH3", fontName=fonts["display_italic"], fontSize=12.5,
+        leading=16, textColor=INK, spaceBefore=11, spaceAfter=4,
     )
     h4 = ParagraphStyle(
-        "ArgusH4", parent=styles["Heading4"],
-        fontName="Helvetica-Oblique", fontSize=10.5, leading=13,
-        textColor=colors.HexColor("#334155"),
-        spaceBefore=8, spaceAfter=2,
+        "ArgusH4", fontName=fonts["body_italic"], fontSize=10.5, leading=13,
+        textColor=INK_SOFT, spaceBefore=8, spaceAfter=2,
     )
     body = ParagraphStyle(
-        "ArgusBody", parent=styles["BodyText"],
-        fontName="Times-Roman", fontSize=10.5, leading=14.5,
-        textColor=BODY, spaceAfter=4, alignment=TA_LEFT,
+        "ArgusBody", fontName=fonts["body"], fontSize=10.7, leading=15.5,
+        textColor=INK, spaceAfter=5, alignment=TA_LEFT,
     )
     bullet = ParagraphStyle(
         "ArgusBullet", parent=body, leftIndent=14, bulletIndent=4,
-        spaceAfter=2,
+        spaceAfter=3,
     )
-    quote = ParagraphStyle(
-        "ArgusQuote", parent=body, leftIndent=18, rightIndent=8,
-        textColor=MUTED, fontName="Times-Italic",
-        borderPadding=(4, 6, 4, 8),
+    card_text = ParagraphStyle(
+        "ArgusCardText", parent=body, fontName=fonts["body_italic"],
+        textColor=INK_SOFT, spaceAfter=0,
     )
     code = ParagraphStyle(
-        "ArgusCode", parent=body, fontName="Courier",
-        fontSize=9, leading=11, leftIndent=8,
-        textColor=CODE_INK, backColor=CODE_BG,
+        "ArgusCode", parent=body, fontName="Courier", fontSize=9, leading=11,
+        leftIndent=8, textColor=CODE_INK, backColor=CODE_BG,
     )
     codeblock = ParagraphStyle(
-        "ArgusCodeBlock", parent=code,
-        backColor=colors.HexColor("#0f172a"),
-        textColor=colors.HexColor("#e2e8f0"),
-        fontSize=8.5, leading=11,
-        borderPadding=(6, 8, 6, 8),
+        # Colour comes from the wrapping Table in _code_card (below), not
+        # from this style's backColor — Preformatted does not reliably
+        # paint a ParagraphStyle backColor, which left fenced code blocks
+        # rendering as near-invisible pale text with no visible panel.
+        "ArgusCodeBlock", parent=code, backColor=None,
+        textColor=CODE_DARK_INK, fontSize=8.5, leading=11,
     )
     meta = ParagraphStyle(
-        "ArgusMeta", parent=body, fontName="Helvetica",
-        fontSize=8.5, textColor=MUTED, leading=11,
+        "ArgusMeta", parent=body, fontName=fonts["body_italic"],
+        fontSize=8.7, textColor=INK_SOFT, leading=11,
     )
-    quality = ParagraphStyle(
-        "ArgusQuality", parent=body,
-        backColor=QUALITY_BG, borderColor=QUALITY_BORDER,
-        borderWidth=0, leftBorderColor=QUALITY_BORDER,
-        leftBorderWidth=3,
-        borderPadding=(8, 10, 8, 10),
-        fontSize=10, leading=13,
-        fontName="Helvetica",
-    )
-    conf_high = ParagraphStyle("ConfHigh", parent=body, fontName="Helvetica-Bold",
-                                textColor=CONF_HIGH, fontSize=10)
-    conf_med = ParagraphStyle("ConfMed", parent=body, fontName="Helvetica-Bold",
-                               textColor=CONF_MED, fontSize=10)
-    conf_low = ParagraphStyle("ConfLow", parent=body, fontName="Helvetica-Bold",
-                               textColor=CONF_LOW, fontSize=10)
-    divider = HRFlowable(
-        width="100%", thickness=3,
-        color=RULE, spaceBefore=14, spaceAfter=10,
-        hAlign="CENTER",
-    )
-
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;")
                  .replace("<", "&lt;")
                  .replace(">", "&gt;"))
 
-    def conf_style(level: str) -> ParagraphStyle:
-        return {"high": conf_high, "medium": conf_med,
-                "low": conf_low}.get(level.lower(), conf_med)
+    def _track(s: str) -> str:
+        """Manual letter-spacing for the small-caps kicker (ReportLab
+        ParagraphStyle has no native tracking support). Word gaps use
+        THREE plain spaces so they stay visually distinct from the
+        single-space inter-letter tracking regardless of how the
+        renderer collapses consecutive space glyphs."""
+        return "   ".join(" ".join(w) for w in s.split(" ") if w)
 
     def md_inline_to_rl(text: str) -> str:
-        """Light inline-MD -> ReportLab miniHTML: **bold**, *em*, `code`, [n].
-
-        We deliberately do NOT try to be a full markdown renderer here;
-        we just upgrade the bold/em/inline-code/inline-link spans so the
-        body has the same visual rhythm as the Chromium route.
-        """
-        import re as _re
-        # Escape first so user content can't inject miniHTML.
+        """Light inline-MD -> ReportLab miniHTML: **bold**, *em*, `code`, [n]."""
         s = esc(text)
-        # Inline code: `...`
-        s = _re.sub(r"`([^`]+)`",
-                    r'<font name="Courier" color="#0f172a" '
-                    r'backColor="#f8fafc">\1</font>', s)
-        # Bold: **...**
-        s = _re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
-        # Italic: *...*  (single-asterisk, non-greedy)
-        s = _re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", s)
-        # [n] -> superscript number badge
-        s = _re.sub(r"\[(\d+)\]", r'<font color="#1d4ed8"><b>[\1]</b></font>', s)
+        s = re.sub(r"`([^`]+)`",
+                   r'<font name="Courier" color="#2A2420" '
+                   r'backColor="#F1E9D8">\1</font>', s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+        s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", s)
+        s = re.sub(r"\[(\d+)\]",
+                   r'<font color="#6E2A34"><b>[\1]</b></font>', s)
         return s
 
-    flow = []
-    if title:
-        flow.append(Paragraph(esc(title), h1))
-        flow.append(divider)
+    class _OrnamentalRule(Flowable):
+        """A slender hairline-gap-hairline rule with a small centred
+        diamond mark -- a chapter-break flourish in place of a flat solid
+        divider bar. Pure vector drawing so it never depends on a
+        dingbat/fleuron glyph being present in the text fonts."""
 
+        def __init__(self, width: float, mark_size: float = 3.0):
+            super().__init__()
+            self.width = width
+            self.mark_size = mark_size
+            self.height = mark_size * 2 + 10
+
+        def wrap(self, availWidth, availHeight):
+            return (availWidth, self.height)
+
+        def draw(self):
+            c = self.canv
+            y = self.height / 2.0
+            s = self.mark_size
+            gap = s * 2.6
+            mid = self.width / 2.0
+            c.setStrokeColor(GOLD)
+            c.setLineWidth(0.7)
+            c.line(0, y, mid - gap, y)
+            c.line(mid + gap, y, self.width, y)
+            c.setFillColor(ACCENT)
+            p = c.beginPath()
+            p.moveTo(mid, y + s)
+            p.lineTo(mid + s, y)
+            p.lineTo(mid, y - s)
+            p.lineTo(mid - s, y)
+            p.close()
+            c.drawPath(p, fill=1, stroke=0)
+
+    def _card(lines_html: list, *, border, accent, fill):
+        """One or more already-inline-formatted lines rendered as a
+        single bordered, tinted card with a coloured left accent bar --
+        used for the quality summary, warnings, and blockquotes. Replaces
+        the old per-line paragraph rendering, which fragmented a single
+        callout into loose disconnected lines."""
+        para = Paragraph("<br/>\n".join(lines_html), card_text)
+        tbl = Table([[para]], colWidths=[content_width - 6])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), fill),
+            ("BOX", (0, 0), (-1, -1), 0.6, border),
+            ("LINEBEFORE", (0, 0), (0, -1), 3, accent),
+            ("TOPPADDING", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+            ("LEFTPADDING", (0, 0), (-1, -1), 13),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ]))
+        return [tbl, Spacer(1, 9)]
+
+    def _code_card(text: str) -> list:
+        """Fenced code block as a dark panel — Table-painted background
+        (reliable) rather than Preformatted's own backColor (proved to
+        not paint reliably, leaving code nearly invisible pale-on-pale)."""
+        pre = Preformatted(text, codeblock)
+        tbl = Table([[pre]], colWidths=[content_width - 6])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), CODE_DARK_BG),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        return [tbl, Spacer(1, 8)]
+
+    # ---- page background + hairline frame -----------------------------
+    def _draw_page(canvas, _doc):
+        canvas.saveState()
+        canvas.setFillColor(PAPER)
+        canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+        canvas.setStrokeColor(GOLD_SOFT)
+        canvas.setLineWidth(0.8)
+        fx, fy = FRAME_INSET, FRAME_INSET
+        fw, fh = PAGE_W - 2 * FRAME_INSET, PAGE_H - 2 * FRAME_INSET
+        canvas.rect(fx, fy, fw, fh, fill=0, stroke=1)
+        # Small corner ticks -- a restrained engraved-stationery detail.
+        canvas.setStrokeColor(ACCENT)
+        canvas.setLineWidth(1.1)
+        tick = 6
+        for cx, cy, dx, dy in (
+            (fx, fy + fh, 1, -1), (fx + fw, fy + fh, -1, -1),
+            (fx, fy, 1, 1), (fx + fw, fy, -1, 1),
+        ):
+            canvas.line(cx, cy, cx + dx * tick, cy)
+            canvas.line(cx, cy, cx, cy + dy * tick)
+        canvas.restoreState()
+
+    doc = BaseDocTemplate(
+        str(pdf_path), pagesize=A4,
+        title=title or "Argus report",
+        author="Argus (coding-app)",
+        subject=f"Research report: {title or 'report'}",
+    )
+    text_frame = Frame(
+        MARGIN, MARGIN, content_width, PAGE_H - 2 * MARGIN,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+    )
+    doc.addPageTemplates([
+        PageTemplate(id="argus", frames=[text_frame], onPage=_draw_page),
+    ])
+
+    # ---- markdown -> flowables ------------------------------------------
+    flow: list = []
     in_code = False
     code_buf: list[str] = []
-    # Table support: collects lines between | markers, then flushes.
     table_buf: list[str] = []
     in_table = False
-    last_was_quality = False
+    quote_buf: list[tuple] = []  # (raw_marker_text, html_text)
+    in_quote = False
+    seen_h1 = False
 
     def flush_table() -> list:
         if not table_buf:
@@ -696,37 +866,67 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
         for row in table_buf:
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
             rows.append([Paragraph(md_inline_to_rl(c), body) for c in cells])
-        if len(rows) >= 2 and all(set(c.replace("|","").replace(":","").replace("-","").strip()) == set()
-                                   for c in table_buf[1]):
-            # second row is the markdown alignment marker (---|---|) — drop it
+        if len(rows) >= 2 and all(
+            set(c.replace("|", "").replace(":", "").replace("-", "").strip()) == set()
+            for c in table_buf[1]
+        ):
             rows.pop(1)
-        tbl = Table(rows, hAlign="LEFT")
+        tbl = Table(rows, hAlign="LEFT", colWidths=None)
         tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), RULE),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#f8fafc")),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,-1), 9),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-            ("TOPPADDING", (0,0), (-1,-1), 5),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#cbd5e1")),
-            ("ROWBACKGROUNDS", (0,1), (-1,-1),
-             [colors.white, colors.HexColor("#f8fafc")]),
+            ("BACKGROUND", (0, 0), (-1, 0), ACCENT),
+            ("TEXTCOLOR", (0, 0), (-1, 0), PAPER),
+            ("FONTNAME", (0, 0), (-1, 0), fonts["body_bold"]),
+            ("FONTNAME", (0, 1), (-1, -1), fonts["body"]),
+            ("FONTSIZE", (0, 0), (-1, -1), 9.3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.4, GOLD_SOFT),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [PAPER, PAPER_EDGE]),
         ]))
         return [tbl, Spacer(1, 8)]
 
+    def _is_quote_line(s: str) -> bool:
+        # A bare ">" (no trailing space) is a blank blockquote-continuation
+        # line — render_title_block emits exactly this between "Quality
+        # summary" and its metrics. Treating only "> " as a quote line
+        # broke the continuation there, splitting one card into two with
+        # a stray literal ">" rendered as plain body text in between.
+        t = s.lstrip()
+        return t == ">" or t.startswith("> ")
+
+    def _quote_marker(s: str) -> str:
+        t = s.lstrip()
+        return "" if t == ">" else t[2:].strip()
+
+    def flush_quote() -> list:
+        if not quote_buf:
+            return []
+        raw0 = quote_buf[0][0]
+        html_lines = [h for _, h in quote_buf]
+        if raw0.startswith("**Quality summary"):
+            return _card(html_lines, border=GOLD, accent=ACCENT,
+                        fill=QUALITY_BG)
+        if raw0.upper().startswith("WARNING"):
+            return _card(html_lines, border=WARNING_ACCENT,
+                        accent=WARNING_ACCENT, fill=WARNING_BG)
+        return _card(html_lines, border=GOLD_SOFT, accent=GOLD,
+                    fill=PAPER_EDGE)
+
     for raw in (md_text or "").splitlines():
-        line = raw.rstrip()
-        # Flush table if we hit a non-table line.
+        line = _strip_emoji(raw.rstrip())
         if in_table and not line.lstrip().startswith("|"):
             flow.extend(flush_table())
             table_buf = []
             in_table = False
-        # Code fences
+        if in_quote and not _is_quote_line(line):
+            flow.extend(flush_quote())
+            quote_buf = []
+            in_quote = False
         if line.strip().startswith("```"):
             if in_code:
-                flow.append(Preformatted("\n".join(code_buf), codeblock))
+                flow.extend(_code_card("\n".join(code_buf)))
                 code_buf = []
                 in_code = False
             else:
@@ -735,7 +935,6 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
         if in_code:
             code_buf.append(line)
             continue
-        # Tables
         if line.lstrip().startswith("|"):
             in_table = True
             table_buf.append(line)
@@ -744,61 +943,58 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
             flow.append(Spacer(1, 4))
             continue
         if line.startswith("# "):
-            # If the previous flow item was a quality block, separate visually.
-            if last_was_quality:
-                flow.append(divider)
-            flow.append(Paragraph(esc(line[2:].strip()), h1))
-            flow.append(divider)
-            last_was_quality = False
+            text = line[2:].strip()
+            if not seen_h1:
+                flow.append(Paragraph(_track(esc("ARGUS RESEARCH DOSSIER")),
+                                      kicker))
+                flow.append(Paragraph(esc(text), h1))
+                flow.append(Spacer(1, 8))
+                flow.append(_OrnamentalRule(content_width))
+                flow.append(Spacer(1, 6))
+                seen_h1 = True
+            else:
+                flow.append(Paragraph(esc(text), h1))
+                flow.append(Spacer(1, 6))
+                flow.append(HRFlowable(width="100%", thickness=0.8,
+                                       color=GOLD, spaceBefore=2,
+                                       spaceAfter=8))
         elif line.startswith("## "):
-            flow.append(Spacer(1, 4))
+            flow.append(Spacer(1, 3))
             flow.append(Paragraph(esc(line[3:].strip()), h2))
-            last_was_quality = False
+            flow.append(HRFlowable(width="100%", thickness=0.6,
+                                   color=GOLD_SOFT, spaceBefore=1,
+                                   spaceAfter=7, hAlign="LEFT"))
         elif line.startswith("### "):
             flow.append(Paragraph(esc(line[4:].strip()), h3))
         elif line.startswith("#### "):
             flow.append(Paragraph(esc(line[5:].strip()), h4))
-        elif line.lstrip().startswith("> "):
-            text = md_inline_to_rl(line.lstrip("> ").strip())
-            if text.startswith("**Quality"):
-                # Promote Argus quality blockquote to the tinted callout.
-                flow.append(Paragraph(text, quality))
-                last_was_quality = True
-            else:
-                flow.append(Paragraph(text, quote))
-                last_was_quality = False
+        elif _is_quote_line(line):
+            in_quote = True
+            raw_marker = _quote_marker(line)
+            html = md_inline_to_rl(raw_marker) if raw_marker else ""
+            quote_buf.append((raw_marker, html))
         elif line.lstrip().startswith("- "):
             text = md_inline_to_rl(line.lstrip("- ").strip())
             flow.append(Paragraph(text, bullet, bulletText="•"))
         elif line.lstrip()[:2].isdigit() and line.lstrip()[2:4] == ". ":
-            # numbered list
             text = md_inline_to_rl(line.strip())
             flow.append(Paragraph(text, bullet, bulletText="•"))
         elif line.strip() == "---":
-            flow.append(HRFlowable(width="60%", thickness=0.6,
-                                    color=DIVIDER, spaceBefore=8, spaceAfter=8,
-                                    hAlign="CENTER"))
-        elif line.startswith("_") and line.endswith("_"):
-            flow.append(Paragraph(md_inline_to_rl(line), meta))
+            flow.append(HRFlowable(width="55%", thickness=0.6,
+                                   color=GOLD_SOFT, spaceBefore=10,
+                                   spaceAfter=10, hAlign="CENTER"))
+        elif line.startswith("_") and line.endswith("_") and len(line) > 1:
+            flow.append(Paragraph(md_inline_to_rl(line.strip("_")), meta))
         else:
             flow.append(Paragraph(md_inline_to_rl(line), body))
 
-    # Tail-flushes.
     if in_table:
         flow.extend(flush_table())
+    if in_quote:
+        flow.extend(flush_quote())
     if in_code and code_buf:
-        flow.append(Preformatted("\n".join(code_buf), codeblock))
+        flow.extend(_code_card("\n".join(code_buf)))
 
-    doc = SimpleDocTemplate(
-        str(pdf_path), pagesize=A4,
-        leftMargin=18 * mm, rightMargin=18 * mm,
-        topMargin=18 * mm, bottomMargin=18 * mm,
-        title=title or "Argus report",
-        # Show the report topic in the PDF metadata so Acrobat / Preview
-        # show "Argus - <topic>" in the title bar.
-        author="Argus (coding-app)",
-        subject=f"Length mode: {title or 'report'}",
-    )
     doc.build(flow)
 
 
