@@ -1,16 +1,20 @@
 """Argus credibility scoring — DomainTrust static list + per-URL scoring.
 
-Sits between fetcher_node and filter_node. Assigns every FetchedItem a
-``credibility_score`` in [0, 1] based on three signals:
+v3 uses it twice in research.py: ``triage`` ranks un-fetched candidates
+with ``credibility_score`` (URL + search-hit title against the brief
+keywords), and ``research_node`` re-scores each fetched batch with
+``score_fetched`` (adds the arXiv year check and the flags). Every item
+gets a ``credibility_score`` in [0, 1] from three signals:
 
   (a) Domain trust      — curated DomainTrust list + TLD analysis
   (b) URL pattern       — arxiv / .edu / .gov boost, content-farm penalty,
                           arxiv year-fabrication flag (P2.5, 2026-07-10)
   (c) Title relevance   — token overlap with the user_request
 
-Items below the 0.4 floor are tagged (``credibility_flag = "low_credibility"``)
-but NOT dropped — the downstream ``filter_node`` still does its own
-``keep_topN`` so dropping here would just double-filter.
+Items below ``CREDIBILITY_FLOOR`` are tagged
+(``credibility_flag = "low_credibility"``) but never dropped: triage only
+demotes them, and ``grounding.check_grounding`` stops counting them.
+(v2 had a downstream ``filter_node`` doing ``keep_topN``; v3 has none.)
 
 Reference: HANDOFF-RESEARCH-2026-07-08.md §4 (lines 110-135) and §6 row #2.
 """
@@ -42,11 +46,16 @@ CREDIBILITY_FLOOR = 0.35
 # year < 2015 is impossible, the format was introduced 2015-01).
 #
 # We surface those URLs with ``credibility_flag = "fabricated_path"``
-# AND drag the score below CREDIBILITY_FLOOR so the existing
-# filter_node P2 enforcement drops them. Real arxiv URLs aren't
-# affected: 2015 ≤ year ≤ current_year with MM ≤ 6 and a 5-digit
-# sequence will trip the heuristic in the early year, but those are
-# vanishingly rare in real submissions anyway.
+# AND drag the score below CREDIBILITY_FLOOR (v3 has no filter_node to
+# drop them; the effect is that grounding.check_grounding stops counting
+# the source).
+#
+# KNOWN FALSE POSITIVE (probe-verified): every new-format id since 2015
+# has a 5-digit sequence, so the "current year, MM <= 6, 5 digits" rule
+# flags EVERY real paper from January-June of the current year
+# (``2603.01234`` in 2026 -> suspicious), while a genuinely future month
+# above 6 (``2611.x`` in September 2026) passes. A correct check needs
+# "YYMM later than today" or the real per-month sequence ceiling.
 #
 # Old-format IDs (``/abs/1706037``) are intentionally NOT handled here.
 # They're rare in 2026 LLM output and would need a different parser.
@@ -90,11 +99,11 @@ def is_arxiv_year_suspicious(url: str, *, current_year: int | None = None
 
 # ---------------------------------------------------------------------------
 # DomainTrust — curated static list. Hand-tuned for Argus's research-bot use.
-# Tiers:
-#   "primary"   0.55  — arxiv, .edu, .gov, official docs, named journals
-#   "trusted"   0.40  — known-quality blogs / curated publications
-#   "neutral"   0.20  — generic commercial / news
-#   "low"       0.05  — content farms, SEO spam, parked domains
+# Tiers (their scores live in ``_TIER_SCORE`` below):
+#   "primary"   — arxiv, .edu, .gov, official docs, named journals
+#   "trusted"   — known-quality blogs / curated publications
+#   "neutral"   — generic commercial / news
+#   "low"       — content farms, SEO spam, parked domains
 # ---------------------------------------------------------------------------
 
 

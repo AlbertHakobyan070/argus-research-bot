@@ -43,32 +43,33 @@ class SynthesisMode:
     label
         Human-readable label for the HITL button and progress messages.
     target_chars_min / target_chars_max
-        Soft character budget for the rendered markdown report. The
-        synthesizer LLM is prompted to land inside this range; the
-        report_builder can warn if the actual draft is far outside it
-        (e.g. lecture came back at 1500 chars -> probably short mode
-        was meant).
+        Soft character budget. compose puts it in the writer prompts
+        (flat modes: the whole range; sectioned modes: max ÷ number of
+        sections, floored at 400). Nothing checks the actual length
+        against it afterwards.
     target_findings
-        How many ``Finding`` items the synthesizer should aim for.
-        Acts as a structural prompt hint, *not* a hard cap.
+        Not read by any v3 node — compose extracts findings from the
+        prose after writing. Informational only.
     max_tokens
-        ``max_tokens`` for the synthesizer LLM call. Sized to roughly
-        cover the upper target char count plus JSON overhead.
+        ``max_tokens`` for the flat (tldr/short) writer call. Sectioned
+        modes size each section call from ``compose._MODE_SECTION_TOKENS``
+        instead.
     temperature
-        ``temperature`` for the synthesizer LLM call. Lower for short
+        ``temperature`` for the compose writer calls. Lower for short
         factual modes, slightly higher for lecture (more prose-y).
     template
-        Which markdown template to apply to the synthesizer output.
+        Descriptive only in v3 — no code branches on it; the flat vs
+        sectioned choice comes from ``compose._MODE_SECTIONS``. Values:
         ``"minimal"``      - single TL;DR paragraph
         ``"flat"``         - current behaviour: TL;DR + numbered findings
         ``"sectioned"``    - adds ## Background / ## Current state / ##
                              Open problems / ## Sources headings
         ``"lecture"``      - full Parts I-IV + References + Appendix
     include_validated_assessment
-        If True, the synthesizer LLM is also asked to return a
-        ``validated_assessment`` block (per-section confidence +
-        open_challenges) and the report_builder surfaces it on the
-        title page. Long + lecture always include this; shorter modes
+        If True, compose builds a ``validated_assessment`` block
+        deterministically (``compose.build_assessment``: per-section
+        confidence + open challenges, no LLM call) and report_builder
+        surfaces it on the title page. Long + lecture include it; shorter modes
         skip it (Albert's bar: validated assessment is a deep-mode
         affordance).
     include_appendix

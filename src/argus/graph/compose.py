@@ -251,6 +251,11 @@ def _write_section(section: dict, brief: ResearchBrief, state: dict,
     mode = get_mode(length)
     grounding_warn = grounding_warning_prompt(
         check_grounding(state), state.get("user_request") or "")
+    # Only the FIRST 8 notes reach the prompt. revision_notes grows by the
+    # panel's notes every revise round and bot.py appends the user's
+    # revise request LAST, so after a panel revise round the user's
+    # request can fall outside this slice and silently never reach the
+    # writer (probe-verified; _write_flat has the same cap).
     notes_extra = ""
     if extra_notes:
         notes_extra = ("\n\nREVISION NOTES (must address):\n"
@@ -345,6 +350,7 @@ def _write_flat(state: dict, brief: ResearchBrief, *, length: str,
     grounding_warn = grounding_warning_prompt(
         check_grounding(state), state.get("user_request") or "")
     system = TLDR_SYSTEM if length == "tldr" else FLAT_SYSTEM
+    # Same 8-note cap as _write_section (see the note there).
     notes_extra = ""
     if extra_notes:
         notes_extra = ("\n\nREVISION NOTES (must address):\n"
@@ -513,7 +519,7 @@ def build_assessment(sections: list[dict], findings: list[dict],
             "claims_per_section": claims_per_section,
             "citations_per_claim": round(n_cites / n_findings, 2)
             if n_findings else 0.0,
-            "conflict_markers": 0,
+            "conflict_markers": 0,   # not computed in v3 — always 0
         },
         "reviewer_unsupported": [],
         "reviewer_fabrication_flags": [],
@@ -568,6 +574,10 @@ def compose_node(state) -> dict:
     if not usable:
         reason = ("No digested evidence note reached relevance >= 2 with "
                   "at least one claim.")
+        # NB: synthesis_outcome / synthesis_no_evidence_reason /
+        # synthesis_error (here and below) are not ArgusState keys, so
+        # LangGraph drops them from the update. Downstream only sees
+        # findings == [] — which is what panel_node's skip really keys off.
         return {
             "draft_md": _no_evidence_md(
                 state.get("user_request") or "", length=length,

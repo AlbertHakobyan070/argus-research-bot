@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,14 @@ import pytest
 from argus import media
 from argus.media import (
     MediaResult,
+    _build_argv,
     detect_platform,
     download_media,
+    explain_error,
     extract_urls,
     parse_progress_line,
     quality_format,
+    quality_sort,
     reddit_search,
 )
 
@@ -76,10 +80,10 @@ def test_extract_urls_empty_for_plain_text():
 # ---------------------------------------------------------------------------
 
 
-def test_quality_auto_with_ffmpeg_merges_capped_1080():
+def test_quality_auto_with_ffmpeg_merges_and_caps():
     fmt = quality_format("auto", ffmpeg_available=True)
     assert "+" in fmt, "with ffmpeg, auto should merge video+audio"
-    assert "1080" in fmt
+    assert "2160" in fmt, "auto caps both dimensions at 2x the 1080 short side"
 
 
 def test_quality_auto_without_ffmpeg_is_single_file():
@@ -97,7 +101,30 @@ def test_quality_max_and_min():
 
 def test_quality_numeric_height():
     fmt = quality_format("720", ffmpeg_available=True)
-    assert "720" in fmt and "+" in fmt
+    assert "1440" in fmt and "+" in fmt
+
+
+def test_quality_cap_does_not_reject_vertical_1080p():
+    """Regression: ``height<=1080`` treats portrait video as oversized.
+
+    A normal 1080p vertical clip is 1080x1922, and the old filter threw
+    it away in favour of a 480p rung — verified live against a 1080x1222
+    tweet, which downgraded to 720x814. The cap must bound the SHORT
+    side, so both dimensions get 2x headroom.
+    """
+    fmt = quality_format("auto", ffmpeg_available=True)
+    assert "[height<=1080]" not in fmt, (
+        "a bare height cap silently downgrades vertical video")
+    # 1080x1922 (portrait 1080p) must survive both bounds.
+    assert "[width<=2160][height<=2160]" in fmt
+
+
+def test_quality_sort_uses_res_for_orientation_independence():
+    # `res` is yt-dlp's min(width, height) — the orientation-neutral one.
+    assert quality_sort("auto") == "res:1080"
+    assert quality_sort("720") == "res:720"
+    assert quality_sort("max") is None, "max/min are already extremes"
+    assert quality_sort("min") is None
 
 
 def test_quality_rejects_garbage():
@@ -190,6 +217,140 @@ async def test_download_media_rejects_unknown_platform(tmp_path):
     r = await download_media("https://example.com/x", dest_root=tmp_path)
     assert r.ok is False
     assert "platform" in (r.error or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# download hardening: fragment concurrency, stall watchdog, salvage
+# ---------------------------------------------------------------------------
+
+
+def test_argv_requests_parallel_fragments_and_retries():
+    """Serial m3u8 fragments are why long X videos timed out. Measured on
+    a real 2-hour tweet: 30.1 MB/45s serial vs 135.9 MB/45s at -N 8."""
+    argv = _build_argv("u", "x", Path("/tmp"), "bv*+ba", Path("/tmp/m"),
+                       None, "res:1080")
+    assert "--concurrent-fragments" in argv
+    assert int(argv[argv.index("--concurrent-fragments") + 1]) > 1
+    # A single flaky fragment out of ~900 must not kill the whole run.
+    assert "--fragment-retries" in argv
+    assert "--socket-timeout" in argv
+    assert argv[argv.index("-S") + 1] == "res:1080"
+
+
+def test_argv_omits_sort_when_not_applicable():
+    argv = _build_argv("u", "x", Path("/tmp"), "bv*+ba", Path("/tmp/m"),
+                       None, None)
+    assert "-S" not in argv
+
+
+# A downloader that prints one line then sleeps forever — the shape of a
+# wedged connection. The watchdog must reap it via the stall timeout.
+_STUB_STALL = textwrap.dedent("""\
+    import sys, time
+    print("ARGUSP|  5.0%|10:00", flush=True)
+    time.sleep(600)
+""")
+
+
+async def test_stalled_download_is_killed_by_the_stall_watchdog(
+        tmp_path, monkeypatch):
+    """A blanket wall-clock limit cannot tell a healthy 70-minute
+    download from a dead one. Silence can."""
+    _install_stub(tmp_path, monkeypatch, _STUB_STALL)
+    monkeypatch.setattr(media, "_WATCHDOG_TICK_S", 0.05)
+
+    t0 = time.monotonic()
+    r = await download_media("https://x.com/u/status/9",
+                             dest_root=tmp_path / "vault",
+                             timeout_s=600, stall_s=1)
+    elapsed = time.monotonic() - t0
+
+    assert r.ok is False
+    assert elapsed < 30, (
+        f"stalled download should die in ~1s, took {elapsed:.1f}s")
+    assert "stall" in (r.error or "").lower()
+    # and the user is told what to do about it
+    assert "resume" in (r.error or "").lower()
+
+
+async def test_stall_kill_reaps_grandchildren(tmp_path, monkeypatch):
+    """yt-dlp spawns ffmpeg to merge. Killing only the parent left ffmpeg
+    writing into the vault long after the user was told it failed."""
+    beacon = tmp_path / "grandchild_survived.txt"
+    stub = textwrap.dedent(f"""\
+        import subprocess, sys, time
+        # stand-in for the ffmpeg child yt-dlp spawns
+        subprocess.Popen([sys.executable, "-c",
+            "import time; time.sleep(6);"
+            "open(r'{beacon}', 'w').write('alive')"])
+        print("ARGUSP|  5.0%|10:00", flush=True)
+        time.sleep(600)
+    """)
+    _install_stub(tmp_path, monkeypatch, stub)
+    monkeypatch.setattr(media, "_WATCHDOG_TICK_S", 0.05)
+
+    r = await download_media("https://x.com/u/status/9",
+                             dest_root=tmp_path / "vault",
+                             timeout_s=600, stall_s=1)
+    assert r.ok is False
+    await asyncio.sleep(8)  # outlive the grandchild's own sleep
+    assert not beacon.exists(), (
+        "grandchild survived the kill — it will keep writing into the "
+        "vault after we already reported failure")
+
+
+# Produces the output file, then exits non-zero (a post-processing step
+# failing, or our own watchdog landing just after the file was moved).
+_STUB_FILE_THEN_NONZERO = textwrap.dedent("""\
+    import json, sys
+    from pathlib import Path
+    argv = sys.argv[1:]
+    dest = Path(argv[argv.index("-P") + 1])
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / "20260101_fake1_stub-video.mp4"
+    out.write_bytes(b"y" * 2048)
+    (dest / "20260101_fake1_stub-video.info.json").write_text(
+        json.dumps({"title": "Salvaged", "id": "fake1", "duration": 9.0}),
+        encoding="utf-8")
+    Path(argv[argv.index("--print-to-file") + 2]).write_text(
+        str(out), encoding="utf-8")
+    sys.exit(1)
+""")
+
+
+async def test_completed_file_is_kept_even_when_ytdlp_exits_nonzero(
+        tmp_path, monkeypatch):
+    """Two fully-downloaded videos (647 MB and 106 MB) sat in the vault
+    unregistered because a non-zero rc discarded a finished file."""
+    _install_stub(tmp_path, monkeypatch, _STUB_FILE_THEN_NONZERO)
+    r = await download_media("https://x.com/u/status/9",
+                             dest_root=tmp_path / "vault")
+    assert r.ok is True, r.error
+    assert Path(r.path).exists()
+    assert r.title == "Salvaged"
+    assert r.size_bytes == 2048
+
+
+# ---------------------------------------------------------------------------
+# error hints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw,needle", [
+    ("ERROR: [twitter] No video could be found in this tweet", "cookies"),
+    ("ERROR: Sign in to confirm your age", "cookies"),
+    ("ERROR: Requested format is not available", "/quality auto"),
+    ("download stalled — no progress for 300s", "resume"),
+])
+def test_explain_error_adds_an_actionable_hint(raw, needle):
+    out = explain_error(raw)
+    assert raw.strip() in out, "the raw downloader error must survive"
+    assert needle.lower() in out.lower()
+
+
+def test_explain_error_passes_unknown_errors_through():
+    assert explain_error("ERROR: something novel") == "ERROR: something novel"
+    assert explain_error("") == ""
 
 
 # ---------------------------------------------------------------------------

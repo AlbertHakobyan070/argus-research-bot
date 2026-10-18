@@ -98,7 +98,11 @@ def parse_json_obj(text: str, *, min_keys: int = 1,
     d = _try(t)
     if d is not None:
         return d
-    # 2. Balanced braces — every top-level '{...}' span, outermost first.
+    # 2. Balanced braces — try the span that starts at each '{', left to
+    #    right. A failed span advances one character, so inner objects
+    #    are tried too (``require_any`` stops it latching onto one).
+    #    Brace counting is not string-aware: a '{' inside a string value
+    #    shifts the span.
     s = t
     i = 0
     while i < len(s):
@@ -134,9 +138,16 @@ def parse_json_obj(text: str, *, min_keys: int = 1,
 def salvage_objects(text: str, *, required_keys: tuple[str, ...]) -> list[dict]:
     """Extract objects with the given keys from unrecoverable JSON.
 
-    Scans for ``{...}`` spans that contain every key in ``required_keys``
-    and returns them in order. Last-resort so real content the model
-    produced isn't thrown away because its wrapper JSON broke.
+    Scans for ``{...}`` spans whose every key in ``required_keys`` is
+    present AND truthy, and returns them in order. Last-resort so real
+    content the model produced isn't thrown away because its wrapper
+    JSON broke.
+
+    It rescues TRUNCATED output: the wrapper's opening brace never
+    closes, so the scan walks on into the inner objects. A wrapper that
+    DOES close but is broken in the middle (e.g. an unescaped quote) is
+    tried as one span, fails, and is skipped whole — the valid objects
+    inside it are never revisited, so the result is ``[]``.
     """
     out: list[dict] = []
     s = text or ""

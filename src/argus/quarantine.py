@@ -27,6 +27,12 @@ to the reader. Pass ``mode="remove"`` to drop the sentences entirely
 (useful when the claim is repeated nowhere else and is structurally
 harmful).
 
+In v3 this legacy path runs only when the review verdict carries claim
+texts but no ``flagged_finding_ids`` (or there are no findings) —
+typically when only the precision judge flagged sentences; see
+report_builder_node. Unlike the id-based path, it really does cut the
+matched sentences out of the body.
+
 Pure functions, no I/O. Module-level so any helper can unit test it
 without spinning up the graph.
 """

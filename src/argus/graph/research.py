@@ -121,6 +121,12 @@ def triage(sources: list[dict], fetched_urls: set[str],
 # Fetch — one source → FetchedItem dict (moved from v2 nodes.py; the
 # battle-tested tool-routing + local-file handling is kept verbatim,
 # with one v3 addition: Exa full-text short-circuit).
+#
+# Every network rung below shells out to the intel-stack scripts
+# (tools._run_script). On a host without them (INTEL_STACK_DIR /
+# INTEL_PYTHON missing) each rung raises and the source is DROPPED —
+# there is no fallback to the search snippet. Only Exa full-text hits and
+# local .md/.txt appends survive there.
 # ---------------------------------------------------------------------------
 
 def _read_excerpt(md_path: str | None, limit: int = 600) -> str:

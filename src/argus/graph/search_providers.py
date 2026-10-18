@@ -8,8 +8,11 @@ back as an error string so one provider's outage can't poison a wave
 Exa (https://exa.ai) is optional: enabled iff ``EXA_API_KEY`` is set.
 Its killer feature for Argus is search + full page text in ONE call —
 hits that carry text skip the fetch stage entirely. The free plan is
-~1000 requests/month, so calls per run are capped
-(``ARGUS_EXA_MAX_CALLS``, default 6) and DDGS takes the overflow.
+~1000 requests/month, so Exa calls are capped (``ARGUS_EXA_MAX_CALLS``,
+default 6) and DDGS takes the overflow. The cap applies PER QUERY WAVE,
+not per run: every ``run_query_wave`` call starts a fresh budget, and
+scout, each research follow-up wave and each extend_prep wave is one
+call — so one run can spend the cap several times over.
 """
 from __future__ import annotations
 
@@ -229,7 +232,8 @@ def run_query_wave(queries: list[dict], *,
     Sync entrypoint (nodes are sync; they run on LangGraph worker
     threads). Internally fans out with asyncio.to_thread, matching the
     proven v2 subgraph pattern. Exa queries beyond ``exa_budget`` are
-    transparently downgraded to DDGS.
+    transparently downgraded to DDGS. The budget covers THIS call only —
+    no caller passes a running total, so it resets every wave.
     """
     budget = exa_max_calls() if exa_budget is None else exa_budget
     planned: list[dict] = []

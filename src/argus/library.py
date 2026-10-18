@@ -1,7 +1,7 @@
 """SQLite registry for Argus research runs and vault assets.
 
 Phase 1 of the v2 rebuild. One aiosqlite connection, opened once at bot
-startup (PTB ``post_init``) and closed at shutdown. Three tables:
+startup (PTB ``post_init``) and closed at shutdown. Tables:
 
 - ``runs``         — one row per /research or /ask run. ``thread_id`` is
                      the per-run LangGraph checkpoint thread
@@ -13,6 +13,8 @@ startup (PTB ``post_init``) and closed at shutdown. Three tables:
                      duplicating.
 - ``run_sources``  — sources appended to a run (/append) awaiting the
                      next /continue. ``ref`` is a URL or ``asset:<id>``.
+- ``settings``     — global key/value toggles, e.g. ``media_quality``
+                     (the /quality setting).
 
 The DB itself lives in the project directory (NOT the synced Obsidian
 vault — SQLite WAL + sync tooling is a corruption hazard). The vault

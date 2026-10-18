@@ -120,6 +120,9 @@ def panel_node(state) -> dict:
 
     # A no-evidence / error draft skips review — report_builder surfaces
     # the classified failure; judging a failure block is noise.
+    # ``synthesis_outcome`` never survives compose's state update (it is
+    # not an ArgusState key), so in practice ``not findings`` is what
+    # triggers this skip.
     if state.get("synthesis_outcome") in ("no_evidence", "synthesis_error") \
             or not findings:
         verdict = PanelVerdict(verdict="pass")
@@ -198,6 +201,9 @@ def panel_node(state) -> dict:
     g = results.get("grounding") or {}
     c = results.get("coverage") or {}
     p = results.get("precision") or {}
+    # A judge that failed returned {} and so votes "pass" here: a proxy
+    # outage degrades to a less-reviewed report (the failure is recorded
+    # in state["errors"]), never to a stuck revise loop.
     judge_verdicts = {
         "grounding": g.get("verdict", "pass"),
         "coverage": c.get("verdict", "pass"),
@@ -268,6 +274,10 @@ def _to_review_verdict(pv: PanelVerdict) -> dict:
 
 
 def route_after_panel(state) -> str:
+    """``revision_rounds`` counts revise VERDICTS (panel_node bumps it
+    before this runs), so ARGUS_MAX_REVISIONS=N allows N-1 compose
+    rewrites — the Nth revise verdict ships the report as-is. The env
+    var is read directly; ``Settings.max_revision_rounds`` is unused."""
     v = (state.get("panel_verdict") or {}).get("verdict")
     rounds = int(state.get("revision_rounds") or 0)
     max_rounds = int(os.environ.get("ARGUS_MAX_REVISIONS", "3"))

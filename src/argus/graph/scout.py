@@ -144,6 +144,11 @@ def scout_node(state) -> dict:
     errors.extend(wave_errors)
 
     # Pre-seeded sources (demos / deterministic tests / appended) first.
+    # This also catches a plan-edit re-run: bot._replan_after_edit does
+    # not clear state["sources"], so the PREVIOUS wave's hits keep their
+    # slots (and their sub_qs tags, which index the old brief). When that
+    # wave already filled SCOUT_SOURCE_CAP, no new-wave hit survives the
+    # cap below.
     seen: set[str] = set()
     final: list[dict] = []
     for s in state.get("sources") or []:

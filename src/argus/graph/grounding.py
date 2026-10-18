@@ -96,8 +96,14 @@ def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD, credibility_fl
     """Compute a grounding verdict for the current pipeline state.
 
     state: dict exposing user_request and fetched (FetchedItem list or model_dump() dicts).
-    threshold: minimum credible-mentions required to count as grounded. Default 3.
-    credibility_floor: items below this score are NOT counted (noise filter). Default 0.4.
+    threshold: minimum credible-mentions required to count as grounded.
+        Default ``DEFAULT_GROUNDING_THRESHOLD``.
+    credibility_floor: items below this score are NOT counted (noise filter).
+        The default mirrors ``credibility.CREDIBILITY_FLOOR`` but is a
+        separate literal — change both together.
+
+    A "mention" is an entity token found in an item's title + ``excerpt``
+    (the document's opening characters), not in its full text.
     """
     user_request = state.get("user_request") or ""
     fetched = state.get("fetched") or []

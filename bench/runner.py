@@ -4,10 +4,11 @@ Drives the Argus graph against each query in queries.jsonl, captures
 the final markdown report, and writes per-query JSONL records to
 results/raw.jsonl.
 
-Designed for offline / hermetic comparison runs:
-  - Sets a thread-local model override (env-driven) so the bench is
-    reproducible across runs even when the proxy's tier resolution
-    changes.
+Designed for comparison runs against the LIVE proxy + live search
+(nothing is stubbed):
+  - No model pinning: tiers resolve through llm.resolve_tier against
+    the live proxy, so runs are comparable only while it serves the
+    same models.
   - Auto-resumes through LangGraph interrupts (plan approval + report
     preview) without user input — the goal is to measure the graph's
     output, not the HITL UX.
@@ -22,8 +23,14 @@ Usage:
 Notes:
     - Always uses a fresh checkpointer per query (MemorySaver), so
       thread_ids don't collide and previous state doesn't leak.
-    - Skips the credibility_node etc. via the same interrupt path
-      the bot uses — we just auto-approve.
+    - Pauses at the same two static interrupts the bot uses (plan gate
+      after scout, report gate before deliver) and resumes each with
+      ``Command(resume=True)``; LangGraph emits ``__interrupt__`` for
+      static breakpoints in stream_mode="updates" (verified on 1.2.8).
+    - ``report_md`` is compose's ``draft_md`` (pre-report_builder: no
+      title block, no citation sanitising). The finished report.md is
+      written under Settings.reports_root — the vault unless
+      ARGUS_REPORTS_ROOT is set.
     - Output is one JSON object per line; downstream scorer.py reads
       this directly.
 """
@@ -76,7 +83,7 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
         "revision_rounds": 0,
         "model_calls": [],
         "hitl": {"pending": False},
-        "plan_approved": True,  # skip plan-approval interrupt
+        "plan_approved": True,  # no effect in v3: the gate still fires; _drive resumes it
     }
 
     record = {
@@ -97,7 +104,7 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
     }
     t0 = time.monotonic()
     try:
-        # First leg: planner → researcher interrupt.
+        # Drive intake → … → scout, then auto-resume through both gates.
         async def _drive(initial_input, max_steps: int = 60):
             """Stream the graph, auto-resume on interrupt. Returns final state."""
             steps = 0

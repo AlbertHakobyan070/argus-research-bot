@@ -1,7 +1,14 @@
 """Argus LangGraph state — TypedDict with append-only reducers for log fields.
 
-The graph is checkpointed with SqliteSaver keyed on thread_id = Telegram
-chat_id, so each user's in-flight research run survives a bot restart.
+The graph is checkpointed by ONE shared AsyncSqliteSaver (opened in the
+bot's ``post_init``); every run gets its own thread
+``tg:<chat_id>:<run8>``, so each run — not just one per chat — survives
+a bot restart and can be re-attached with /continue.
+
+``ArgusState`` is also the update contract: LangGraph silently DROPS any
+key a node returns that is not declared here (verified on langgraph
+1.2.8). The ``messages`` note below is one casualty of that rule;
+compose's ``synthesis_outcome`` is another.
 """
 from __future__ import annotations
 
@@ -123,22 +130,22 @@ class PanelVerdict(BaseModel):
 class Finding(BaseModel):
     """One cited claim in the synthesized report.
 
-    ``id`` is a stable per-run identifier assigned by the synthesizer
-    (e.g. ``"f3"``). It is the join key for post-synthesis passes
-    (quarantine, fabrication detector, grounding verifier) — those
-    passes operate on ``finding_id`` rather than substring-matching the
-    prose, so a sentence that recurs in multiple sections is matched
-    exactly once instead of partially. See
-    ``src/argus/post_synthesis.py`` for the consumers.
+    ``id`` is assigned by compose (``"f0"``, ``"f1"``… in extraction
+    order) and is re-assigned on every compose pass, so it is stable
+    only within one draft. It is the join key between the panel's
+    grounding judge (which flags findings by id) and report_builder's
+    ``post_synthesis.quarantine_by_id`` — matching by id instead of
+    substring-matching the prose means a sentence that recurs in
+    several sections is routed exactly once.
     """
-    id: str = ""  # set by synthesizer; empty only for legacy findings
+    id: str = ""  # set by compose; empty only for legacy findings
     claim: str
     citation_urls: list[str]  # at least one FetchedItem URL
     confidence: Literal["high", "medium", "low"] = "medium"
-    # Optional section anchor for finding-id routing. Set by the
-    # synthesizer when the LLM places the claim under a specific
-    # heading (e.g. "## Current state"). Used by report_builder to
-    # group findings under sections.
+    # Section anchor: compose sets it to the title of the section the
+    # claim was extracted from ("Report" in flat modes). The panel uses
+    # it to turn flagged finding ids into the list of sections to
+    # rewrite; build_assessment counts claims per section with it.
     section: str = ""
 
 
@@ -152,11 +159,12 @@ class ReviewVerdict(BaseModel):
 class ValidatedAssessment(BaseModel):
     """T7.6 — per-section self-assessment of the synthesized report.
 
-    The synthesizer LLM produces one entry per major section it wrote,
-    rating confidence and flagging open challenges. The reviewer verifier
-    annotates unsupported claims. Surfaced to the reader in the document
-    so they can calibrate trust per section rather than trust the whole
-    report as a monolith.
+    v3: computed deterministically by ``compose.build_assessment`` from
+    the extracted findings and per-sub-question coverage — no LLM
+    self-grading. report_builder then merges the panel's unsupported /
+    fabrication flags in (``merge_reviewer_into_assessment``). Surfaced
+    on the title page so the reader can calibrate trust per section
+    rather than trust the whole report as a monolith.
     """
 
     sections: list[dict] = Field(default_factory=list)  # each: {name, confidence, open_challenges, claim_count}
@@ -173,7 +181,7 @@ REPORT_MARKER = "<!-- ARGUS_REPORT_END -->"
 
 class ArgusState(TypedDict, total=False):
     # Identity
-    thread_id: str                  # = telegram chat id
+    thread_id: str                  # "tg:<chat_id>:<run8>" — one thread per run
     user_id: int
     user_request: str               # raw text after the command
     mode: Mode                      # "quick" or "deep"
@@ -185,9 +193,9 @@ class ArgusState(TypedDict, total=False):
     # message overwrote the history it claimed to append to.
     messages: Annotated[list[dict], operator.add]
     length: Length                  # T7: chosen at plan-approval HITL
-    plan: dict | None               # ResearchPlan.model_dump()
-    plan_approved: bool             # set by HITL resume
-    plan_attempts: int              # T8: counter for planner_reflect_node re-plans
+    plan: dict | None               # v2-shaped dict from brief.brief_to_plan (plan-gate renderer reads it)
+    plan_approved: bool             # legacy: no node reads it (bot tracks approval in _inflight)
+    plan_attempts: int              # legacy v2 (planner_reflect_node is gone; brief re-drafts inline)
 
     # Research pipeline
     sources: list[dict]             # candidate sources from scout/research
@@ -195,7 +203,8 @@ class ArgusState(TypedDict, total=False):
     findings: list[dict]            # Finding.model_dump() list
     draft_md: str                   # current draft markdown
     review_verdict: dict | None     # ReviewVerdict-compatible dict
-    revision_notes: list[str]       # accumulated reviewer notes per round
+    revision_notes: list[str]       # panel notes (grow each revise round) + user revise
+                                    # requests, which bot.py appends LAST
     revision_rounds: int            # counter
 
     # v3 research engine

@@ -1,12 +1,14 @@
 """Argus Telegram bot layer.
 
-python-telegram-bot v22 async, long-polling. Commands:
-  /research <topic>              — full deep loop with both HITL gates
-  /research /length <m> <topic>  — pre-set output length mode (T7)
-  /ask <question>                — quick grounded answer
-  /status                        — show in-flight run for this chat
-  /cancel                        — drop in-flight run
-  /help                          — usage
+python-telegram-bot v22 async, long-polling. Commands (registered in
+``build_application``; ``HELP_TEXT`` is the user-facing list):
+  research  /research [/length <m>] <topic> (both HITL gates) · /ask <q>
+            (one ungrounded cheap-tier answer — no search)
+  media     /find [yt|shorts|reddit] <q> · /video [shorts] <q> · /fetch <url…>
+            · /quality · /transcript <indices> · /transcripts · pasted links
+  history   /runs · /status · /append <id> <ref…> · /continue <id>
+            · /delete · /cancel [id|all]
+  /help [full]
 
 The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety.
 
@@ -257,6 +259,7 @@ def _parse_indices(text: str) -> list[int]:
 
 
 def _allowed(settings: Settings, user_id: int | None) -> bool:
+    # Unset (0) allows nobody — the bot still starts, then refuses everyone.
     if not settings.telegram_allowed_user_id:
         return False
     return user_id == settings.telegram_allowed_user_id
@@ -771,6 +774,16 @@ async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _TG_UPLOAD_CAP_BYTES = 49 * 1024 * 1024
 _MEDIA_PROGRESS_INTERVAL_S = 3.0
 
+# Network timeouts for the Telegram HTTP client (see build_application).
+# Uploads are the slow path: a 49 MB video on a 2 Mbit/s uplink needs
+# ~200s of write time alone, then Telegram transcodes before replying.
+_TG_CONNECT_TIMEOUT_S = float(os.environ.get("ARGUS_TG_CONNECT_TIMEOUT", "30"))
+_TG_READ_TIMEOUT_S = float(os.environ.get("ARGUS_TG_READ_TIMEOUT", "180"))
+_TG_WRITE_TIMEOUT_S = float(os.environ.get("ARGUS_TG_WRITE_TIMEOUT", "120"))
+_TG_POOL_TIMEOUT_S = float(os.environ.get("ARGUS_TG_POOL_TIMEOUT", "60"))
+_TG_MEDIA_WRITE_TIMEOUT_S = float(
+    os.environ.get("ARGUS_TG_MEDIA_WRITE_TIMEOUT", "1800"))
+
 
 def _media_keyboard(n: int) -> InlineKeyboardMarkup:
     """One row per result: download / transcript / both, index-scoped.
@@ -856,22 +869,39 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
                     chat_id=chat_id, video=f,
                     caption=(r.title or Path(r.path).name)[:1024],
                     supports_streaming=True)
-        except Exception:
-            logger.warning("send_video failed; retrying as document")
+        except Exception as e_vid:
+            logger.warning("send_video failed (%s); retrying as document",
+                           e_vid)
             try:
                 with Path(r.path).open("rb") as f:
                     await bot.send_document(
                         chat_id=chat_id, document=f,
                         filename=Path(r.path).name,
                         caption=(r.title or "")[:1024])
-            except Exception:
-                logger.exception("document send failed too; path was "
-                                 "already delivered in the summary")
+            except Exception as e_doc:
+                # Both sends failed. Say so — the old code only logged,
+                # so the user saw "✅ Saved" and silently got no file.
+                logger.exception("document send failed too")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=("📁 Saved to the vault, but Telegram delivery "
+                          f"failed ({type(e_doc).__name__}: "
+                          f"{str(e_doc)[:200]}).\nThe file is intact at the "
+                          "path above."))
     else:
+        # Name the cause. At /quality max this fires on almost every long
+        # video, and "over the cap" alone doesn't tell the user that their
+        # own quality setting is what put it there.
+        why = (f"\n\nYour /quality is `{quality}`, which takes the largest "
+               "available stream. `/quality 720` keeps most clips under "
+               "the cap and deliverable here."
+               if quality == "max" else "")
         await bot.send_message(
             chat_id=chat_id,
-            text=(f"📁 File is {size_mb:.0f} MB (over Telegram's bot upload "
-                  "cap) — it stays in the vault at the path above."))
+            text=(f"📁 File is {size_mb:.0f} MB — over Telegram's 50 MB bot "
+                  f"upload cap, so it stays in the vault at the path "
+                  f"above.{why}"),
+            parse_mode=ParseMode.MARKDOWN)
 
 
 async def _transcript_for_item(app, chat_id: int, item: dict) -> None:
@@ -1125,7 +1155,10 @@ async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
                              feedback: str) -> None:
     """plan-edit: push the user's feedback into the checkpoint as if
     intake just ran, then re-drive brief→scout to the grounded plan
-    gate and re-render the plan message."""
+    gate and re-render the plan message.
+
+    NB: ``state["sources"]`` is not cleared here, so scout re-seeds the
+    previous wave's hits first (see the note in ``scout_node``)."""
     if info.get("resuming"):
         return
     info["resuming"] = True
@@ -1205,12 +1238,14 @@ async def _revise_after_feedback(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
 
 async def transcript_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/transcript <indices|all> — fetch YouTube auto-captions for the
-    picked videos from the last /video result pool.
+    picked videos from this chat's result pool (filled by /video, /find
+    or a pasted link; 30-minute TTL).
 
     Index syntax: ``2``, ``2,4``, ``2 4``, ``1-3``, ``all``, ``*``.
     Each fetched transcript is delivered as:
       - a short Telegram message with the title + a preview snippet, then
-      - a ``.txt`` file attachment carrying the FULL plain text.
+      - a ``.txt`` attachment carrying the FULL plain text (with
+        ``format=srt``: the raw VTT, timestamps kept, named ``.srt``).
     """
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
@@ -1452,6 +1487,12 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     Without an argument: cancels when exactly one run is in flight,
     otherwise lists the candidates (never guesses which one you meant).
+
+    Bookkeeping only: it forgets the run and marks it cancelled. A graph
+    that is mid-stream is NOT interrupted — ``_resume_after_plan`` keeps
+    running, then sets the status back to awaiting_report and sends a
+    preview whose buttons no longer resolve (probe-verified). Runs that
+    are paused at a gate are genuinely stopped.
     """
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
@@ -2434,6 +2475,16 @@ async def _post_init(app: Application) -> None:
         logger.warning("ffmpeg NOT found — media downloads fall back to "
                        "single-file formats (set ARGUS_FFMPEG or install "
                        "imageio-ffmpeg)")
+    # Surface the downloader version up front. When a platform changes its
+    # API this is the first thing to check, and a missing yt-dlp should
+    # not first show up as a failed download half an hour later.
+    try:
+        from yt_dlp.version import __version__ as ytdlp_version
+        logger.info("yt-dlp: %s (if a platform breaks, update it: "
+                    "uv pip install -U --pre yt-dlp)", ytdlp_version)
+    except Exception:
+        logger.error("yt-dlp is NOT importable — every media download will "
+                     "fail. Install it into this venv: uv pip install yt-dlp")
     loop_name = type(asyncio.get_running_loop()).__name__
     if "Proactor" not in loop_name and os.name == "nt":
         # asyncio subprocesses (Phase 2 media engine) need the Proactor
@@ -2526,9 +2577,21 @@ def build_application() -> Application:
     s = get_settings()
     if not s.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing from .env")
+    # Timeouts. PTB's defaults (connect/read/write 5s, pool 1s,
+    # media_write 20s) are sized for text messages and silently break
+    # file delivery: a 40 MB video cannot leave a home uplink in 20s, so
+    # send_video raised TimedOut, the send_document fallback timed out
+    # too, and the user got "✅ Saved <path>" with no file ever arriving.
+    # media_write_timeout covers the upload body; read_timeout covers
+    # Telegram transcoding the video server-side before it answers.
     app = (
         Application.builder()
         .token(s.telegram_bot_token)
+        .connect_timeout(_TG_CONNECT_TIMEOUT_S)
+        .read_timeout(_TG_READ_TIMEOUT_S)
+        .write_timeout(_TG_WRITE_TIMEOUT_S)
+        .pool_timeout(_TG_POOL_TIMEOUT_S)
+        .media_write_timeout(_TG_MEDIA_WRITE_TIMEOUT_S)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
@@ -2561,7 +2624,8 @@ def main():
     )
     app = build_application()
     logger.info("Argus bot starting; long-polling…")
-    # Trim persistent /transcript cache. Best-effort, exception-tolerant.
+    # Age out the legacy tempdir transcript cache (current callers write
+    # to the vault instead). Best-effort, exception-tolerant.
     _removed = cleanup_argus_ytt_cache()
     if _removed:
         logger.info(

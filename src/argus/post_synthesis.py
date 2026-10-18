@@ -44,6 +44,11 @@ What this module provides
   all four concurrently via ``asyncio.gather`` and returns a single
   ``PostSynthesisReport`` describing what was kept/quarantined/dropped.
 
+Status in v3: ``report_builder_node`` calls only ``assign_finding_ids``,
+``quarantine_by_id`` and ``render_quarantine_appendix``. The async
+passes, their orchestrator and ``render_body_from_findings`` are
+exercised by the tests only.
+
 All functions are pure / I/O-free and unit-testable without spinning
 up the graph or the LLM.
 """
@@ -131,7 +136,7 @@ class PostSynthesisReport:
     """Combined output of :func:`run_post_synthesis_passes_async`.
 
     The report builder consumes ``kept_findings`` + ``quarantined_findings``
-    to render the body + appendix, and surfaces ``grouding`` +
+    to render the body + appendix, and surfaces ``grounding`` +
     ``fabrication_flags`` in the title block.
     """
     kept_findings: list[FindingRecord]
@@ -519,7 +524,12 @@ def render_body_from_findings(
 def render_quarantine_appendix(findings: list[FindingRecord]) -> str:
     """Render the ``## ⚠️ Unverified / flagged claims`` appendix from
     the quarantined findings (structured). Replaces the legacy
-    string-quarantine appendix."""
+    string-quarantine appendix.
+
+    Its text says the findings "were removed from the body". That held
+    when the body was rebuilt from the kept findings; v3's
+    report_builder appends this to compose's unchanged draft, so the
+    flagged claims are still in the body as well."""
     if not findings:
         return ""
     parts = ["", "---", "",

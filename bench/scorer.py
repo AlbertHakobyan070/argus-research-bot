@@ -4,7 +4,8 @@ Reads results/raw.jsonl from the runner and computes per-query scores:
 
   - citation_integrity   (0.0–1.0): fraction of inline URLs in the report
                           pointing at known primary-source domains
-                          (arxiv/github/.edu/.org/official docs).
+                          (arxiv/github/.edu plus the curated list in
+                          PRIMARY_DOMAINS — not all of .org).
                           Proxy for the new SourceRegistry's effectiveness.
   - url_count            (int): total inline URLs (markdown + bare).
   - primary_url_count    (int): URLs pointing at known primary domains.

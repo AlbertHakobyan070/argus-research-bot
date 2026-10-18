@@ -1,10 +1,12 @@
 """Persistent-cache ageing utilities.
 
-The ``/transcript`` command persists each transcript's plain text at
-``tempfile.gettempdir()/argus_ytt_out/<video_id>.txt`` so it can be
-attached to a Telegram chat. That directory grows unbounded across
-restarts; ``cleanup_argus_ytt_cache()`` is invoked once at bot
-startup and drops files older than ``max_age_seconds``.
+``tools.youtube_video_transcript`` persists its deliverable at
+``tempfile.gettempdir()/argus_ytt_out/<video_id>.txt`` when called
+WITHOUT ``out_dir``. Since v2 Phase 3 both callers (bot.transcript_cmd
+and transcribe.transcribe_url) pass the vault ``out_dir``, so this cache
+now mostly holds files from older versions. It grows unbounded across
+restarts; ``cleanup_argus_ytt_cache()`` is invoked once at bot startup
+and drops files older than ``max_age_seconds``.
 
 Lifecycle:
 
