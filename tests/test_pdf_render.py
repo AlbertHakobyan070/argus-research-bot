@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from argus.tools import _register_report_fonts, _strip_emoji, markdown_to_pdf
 
 
@@ -162,3 +164,84 @@ def test_markdown_to_pdf_survives_missing_font_dir(tmp_path, monkeypatch):
     fonts = tools_mod._register_report_fonts()
     assert fonts["display"] == "Times-Bold"
     assert fonts["body"] == "Times-Roman"
+
+
+# ---------------------------------------------------------------------------
+# No hidden PDF fallback (v4 WP-0b): ReportLab is the only renderer.
+# ---------------------------------------------------------------------------
+
+def test_markdown_to_pdf_raises_without_chromium_fallback(tmp_path, monkeypatch):
+    """When ReportLab fails, ``markdown_to_pdf`` re-raises. It must not try
+    the intel-stack Chromium renderer.
+
+    A canary ``_common.py`` stands in for the intel-stack helper, so a
+    regression (the fallback coming back) fails here by name instead of
+    launching a real browser.
+    """
+    import argus.tools as tools_mod
+
+    (tmp_path / "_common.py").write_text(
+        "def markdown_to_pdf(*a, **kw):\n"
+        "    raise AssertionError('Chromium fallback was invoked')\n",
+        encoding="utf-8")
+    monkeypatch.setattr(tools_mod, "INTEL_STACK_DIR", tmp_path)
+
+    def boom(*a, **kw):
+        raise RuntimeError("reportlab exploded")
+
+    monkeypatch.setattr(tools_mod, "_render_pdf_reportlab", boom)
+
+    with pytest.raises(RuntimeError, match="reportlab exploded"):
+        markdown_to_pdf("# t\n\nbody\n", str(tmp_path / "r.pdf"), title="t")
+
+
+def test_report_builder_records_pdf_failure(tmp_path, monkeypatch):
+    """A PDF failure is never hidden: report_builder_node reports the PDF as
+    missing and puts the exception in the run's ``errors``. The markdown
+    report is still produced."""
+    import types
+
+    from argus import config as config_mod
+    from argus.graph import nodes as nodes_mod
+
+    monkeypatch.setattr(config_mod, "get_settings",
+                        lambda: types.SimpleNamespace(reports_root=tmp_path))
+
+    def boom(*a, **kw):
+        raise RuntimeError("reportlab exploded")
+
+    monkeypatch.setattr(nodes_mod, "markdown_to_pdf", boom)
+
+    out = nodes_mod.report_builder_node({
+        "user_request": "pdf failure probe", "length": "short",
+        "draft_md": "# probe\n\nBody text.\n",
+    })
+
+    assert out["report_paths"]["pdf"] is None
+    assert out["hitl"]["ctx"]["paths"]["pdf"] is None
+    errors = out.get("errors") or []
+    assert len(errors) == 1 and errors[0].startswith("pdf: "), errors
+    assert "reportlab exploded" in errors[0]
+    assert Path(out["report_paths"]["md"]).exists()
+
+
+def test_report_builder_returns_pdf_path_on_success(tmp_path, monkeypatch):
+    """Success path of the same node: the real ReportLab render yields a PDF
+    path on disk and adds nothing to ``errors``."""
+    import types
+
+    from argus import config as config_mod
+    from argus.graph import nodes as nodes_mod
+
+    monkeypatch.setattr(config_mod, "get_settings",
+                        lambda: types.SimpleNamespace(reports_root=tmp_path))
+
+    out = nodes_mod.report_builder_node({
+        "user_request": "pdf success probe", "length": "short",
+        "draft_md": "# probe\n\nBody text.\n",
+    })
+
+    pdf = Path(out["report_paths"]["pdf"])
+    assert pdf.exists() and pdf.stat().st_size > 5_000
+    assert out["hitl"]["ctx"]["paths"]["pdf"] == str(pdf)
+    assert "errors" not in out

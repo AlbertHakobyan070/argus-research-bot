@@ -2,13 +2,12 @@
 
 These tests pin the two behavior changes Argus T2 introduced:
 
-* Fix #2 — every intel-stack tool wrapper (``harvest_sources``,
-  ``snatch_url``, ``crawl_url``, ``normalize_to_markdown``) MUST
-  invoke the intel-stack interpreter (INTEL_PYTHON_BIN). Previously
-  only ``harvest_sources`` did so; the other three silently fell
-  back to the argus venv's python and immediately raised
-  ``ModuleNotFoundError`` for feedparser / crawl4ai / markitdown /
-  yt_dlp.
+* Fix #2 — every intel-stack tool wrapper (``snatch_url``,
+  ``crawl_url``, ``normalize_to_markdown``) MUST invoke the
+  intel-stack interpreter (INTEL_PYTHON_BIN). Previously they
+  silently fell back to the argus venv's python and immediately
+  raised ``ModuleNotFoundError`` for feedparser / crawl4ai /
+  markitdown / yt_dlp.
 
 * Fix #3 — the research fetch path MUST propagate
   tool failures into ``state["errors"]`` instead of swallowing them
@@ -30,39 +29,15 @@ import pytest
 from argus import tools
 from argus.graph import research as research_mod
 from argus.graph.research import _parallel_fetch
-from argus.graph.state import ArgusState, PlannedSource, ResearchPlan
 from argus.tools import (
     INTEL_PYTHON_BIN, PYTHON_BIN,
-    _run_script, crawl_url, harvest_sources, normalize_to_markdown,
-    snatch_url,
+    _run_script, crawl_url, normalize_to_markdown, snatch_url,
 )
 
 
 # ---------------------------------------------------------------------------
 # Fix #2 — every tool wrapper routes through INTEL_PYTHON_BIN
 # ---------------------------------------------------------------------------
-
-
-def _plan_with_paper() -> ResearchPlan:
-    """A minimal plan that triggers researcher_node's arXiv branch."""
-    return ResearchPlan(
-        sub_questions=["x"],
-        planned_sources=[
-            PlannedSource(kind="paper", query="attention is all you need",
-                          target_url=None, rationale="primary"),
-        ],
-        must_have_keywords=["attention"],
-        summary="probe",
-    )
-
-
-def _make_state(plan: ResearchPlan) -> ArgusState:
-    return {
-        "plan": plan.model_dump(),
-        "sources": [],
-        "fetched": [],
-        "errors": [],
-    }
 
 
 class _FakeProc:
@@ -164,29 +139,6 @@ def test_all_tools_route_through_intel_python(monkeypatch, tool_name,
     )
     assert captured["cmd"][0] != str(PYTHON_BIN)
     assert captured["cmd"][1].endswith(script)
-
-
-def test_harvest_sources_routes_through_intel_python(monkeypatch):
-    """harvest_sources used to pass python_bin explicitly; it now relies
-    on the default. Pin that the spawned interpreter is still INTEL."""
-    captured: dict[str, Any] = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return _FakeProc(rc=0,
-                          stdout='{"dir": "A:\\\\fake\\\\radar"}\n',
-                          stderr="")
-
-    monkeypatch.setattr(tools.subprocess, "run", fake_run)
-
-    class _FakeFolder:
-        def __init__(self, p): self.p = p
-        def __truediv__(self, name): return self
-        def exists(self): return False
-    monkeypatch.setattr(tools, "Path", _FakeFolder)
-    harvest_sources(hours=24, top=3, sections="papers", timeout=10)
-
-    assert captured["cmd"][0] == str(INTEL_PYTHON_BIN)
 
 
 # ---------------------------------------------------------------------------

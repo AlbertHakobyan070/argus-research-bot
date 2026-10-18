@@ -9,10 +9,8 @@ extend/revise preps, and the quick-answer path. Each node is a function
 from __future__ import annotations
 
 import logging
-import os
 import re
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -87,8 +85,8 @@ def report_builder_node(state: ArgusState) -> dict:
     5. Write ``metadata.json`` sidecar with the same fields + the full
        validated_assessment + lecture_appendix blobs.
     6. Render markdown -> PDF via ``tools.markdown_to_pdf`` (ReportLab
-       first, intel-stack Chromium in-process second), with a
-       last-resort subprocess render under the intel-stack venv.
+       only, no fallback). A render failure sets ``report_paths["pdf"]``
+       to None and appends ``"pdf: <exc>"`` to ``errors``.
     7. Trigger the report-preview HITL gate.
     """
     from ..config import get_settings
@@ -296,56 +294,23 @@ def report_builder_node(state: ArgusState) -> dict:
 
     md_path.write_text(md_text, encoding="utf-8")
 
-    pdf_ok = False
+    # ReportLab is the only renderer and there is no fallback: a failure is
+    # logged, the PDF is reported as missing (report_paths["pdf"] is None) and
+    # the exception goes into the run's errors, so it is visible downstream.
+    pdf_error: str | None = None
     try:
-        # markdown_to_pdf tries ReportLab first and only falls back to
-        # intel-stack's _common.py (Chromium/playwright) in-process. If
-        # that import fails in the argus venv, the except-branch below
-        # re-runs the helper under the intel-stack venv's python.
-        try:
-            # NB: pass the raw human-readable topic (not the filesystem
-            # slug) — the renderer uses this only for PDF metadata /
-            # title-page treatment, never as a second literal heading
-            # (the body's own "# {topic}" line, written by
-            # render_title_block, is the single source of the visible
-            # title — see the 2026-07-16 double-title bug fix).
-            markdown_to_pdf(md_text, str(pdf_path),
-                            title=state["user_request"])
-            pdf_ok = pdf_path.exists()
-        except (ModuleNotFoundError, ImportError) as e:
-            # Fallback: render via intel-stack's python + the _common helper.
-            logger.info("argus venv missing playwright; delegating PDF render")
-            import importlib.util
-            import subprocess
-            helper_path = (Path(os.environ.get(
-                "INTEL_STACK_DIR",
-                r"A:\Hermes\Agents\intel-stack\scripts")) / "_common.py")
-            helper_path.parent.mkdir(parents=True, exist_ok=True)
-            # We need a small wrapper: write the md to disk, call _common.
-            tmp_py = folder / "_render_pdf.py"
-            tmp_py.write_text(
-                "import sys, os\n"
-                f"sys.path.insert(0, r'{helper_path.parent}')\n"
-                "os.environ.pop('PYTHONPATH', None)\n"
-                f"from _common import markdown_to_pdf\n"
-                f"markdown_to_pdf(open(r'{md_path}','r',encoding='utf-8').read(),\n"
-                f"                  r'{pdf_path}', title=r'{topic}')\n",
-                encoding="utf-8",
-            )
-            intel_py = os.environ.get(
-                "INTEL_PYTHON",
-                r"A:\Hermes\Agents\intel-stack\venv\Scripts\python.exe",
-            )
-            res = subprocess.run(
-                [intel_py, str(tmp_py)],
-                capture_output=True, text=True, timeout=120,
-                env={**os.environ, "PYTHONPATH": ""},
-            )
-            if res.returncode != 0:
-                logger.warning("PDF fallback failed: %s", res.stderr[-500:])
-            pdf_ok = pdf_path.exists()
+        # NB: pass the raw human-readable topic (not the filesystem
+        # slug) — the renderer uses this only for PDF metadata /
+        # title-page treatment, never as a second literal heading
+        # (the body's own "# {topic}" line, written by
+        # render_title_block, is the single source of the visible
+        # title — see the 2026-07-16 double-title bug fix).
+        markdown_to_pdf(md_text, str(pdf_path),
+                        title=state["user_request"])
     except Exception as e:
         logger.warning("PDF render failed: %s", e)
+        pdf_error = f"pdf: {type(e).__name__}: {e}"
+    pdf_ok = pdf_error is None
 
     meta = build_sidecar_metadata(
         topic=state["user_request"],
@@ -364,7 +329,7 @@ def report_builder_node(state: ArgusState) -> dict:
     (folder / "metadata.json").write_text(
         sidecar_to_json(meta), encoding="utf-8",
     )
-    return {
+    result: dict[str, Any] = {
         "report_paths": {
             "folder": str(folder),
             "md": str(md_path),
@@ -380,6 +345,9 @@ def report_builder_node(state: ArgusState) -> dict:
                       "content": f"📝 Report ready ({mode.label}). "
                                  "Awaiting your sign-off."}],
     }
+    if pdf_error:
+        result["errors"] = [pdf_error]
+    return result
 
 
 # ---------------------------------------------------------------------------

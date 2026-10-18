@@ -3,7 +3,6 @@ and YouTube helpers — plain functions the graph nodes and the bot call
 (not LangChain ``@tool`` objects).
 
 These wrap, do not reimplement:
-  - harvest.py  (primary-source harvester / intel-radar; no v3 caller)
   - snatch.py   (universal downloader / web-hunter)
   - crawl.py    (crawl4ai wrapper)
   - article_convert.py (URL/local file -> clean markdown)
@@ -27,8 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,24 +67,6 @@ INTEL_PYTHON_BIN = Path(os.environ.get(
 )).expanduser()
 
 DEFAULT_TIMEOUT_S = int(os.environ.get("ARGUS_TOOL_TIMEOUT", "120"))
-
-
-class HarvestResult(BaseModel):
-    """A single primary-source item surfaced by harvest.py."""
-    section: str
-    title: str
-    url: str
-    summary: str = ""
-    published: str = ""
-    source: str = ""
-
-
-class HarvestReport(BaseModel):
-    folder: str
-    radar_md: str = ""
-    items: list[HarvestResult] = Field(default_factory=list)
-    raw_stdout: str = ""
-    duration_s: float = 0.0
 
 
 class SnatchResult(BaseModel):
@@ -213,175 +192,6 @@ def _parse_article_convert_path(out: str, *, prefer: str = "md") -> str | None:
                         pdf_path = candidate
                 break
     return md_path or pdf_path
-
-
-def harvest_sources(*, hours: int = 72, top: int = 8,
-                    sections: str = "papers,repos,news,blogs",
-                    date: str | None = None,
-                    timeout: int = DEFAULT_TIMEOUT_S) -> HarvestReport:
-    """Run intel-stack harvest.py and parse its JSON output.
-
-    harvest.py prints a single JSON line on stdout like
-    ``{"ok": true, "dir": "A:\\...\\radar\\2026-07-07", "new_items": 213, ...}``.
-    We read radar.md from that dir to extract primary-source items.
-
-    Uses the intel-stack venv's python (which has feedparser, crawl4ai,
-    scrapling, markitdown, yt_dlp installed).
-    """
-    args = ["--hours", str(hours), "--top", str(top),
-            "--sections", sections]
-    if date:
-        args += ["--date", date]
-    t0 = time.time()
-    rc, out, err = _run_script("harvest.py", args, timeout=timeout)
-    duration = time.time() - t0
-    items: list[HarvestResult] = []
-    radar_md = ""
-    folder = ""
-    if rc == 0:
-        # harvest prints a single JSON line as its final stdout line.
-        for line in reversed((out or "").strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    payload = json.loads(line)
-                    folder = payload.get("dir") or folder
-                    break
-                except Exception:
-                    continue
-        radar_path = Path(folder) / "radar.md" if folder else None
-        if radar_path and radar_path.exists():
-            radar_md = radar_path.read_text(encoding="utf-8", errors="replace")
-            items = _parse_radar_md(radar_md)
-    return HarvestReport(
-        folder=folder,
-        radar_md=radar_md[:8000],  # truncate for state
-        items=items,
-        raw_stdout=out[-2000:],
-        duration_s=duration,
-    )
-
-
-# A very small markdown linker — extracts items from radar.md.
-# Supports both `- [title](url)` bullets and `### [title](url)` headings.
-def _parse_radar_md(text: str) -> list[HarvestResult]:
-    out: list[HarvestResult] = []
-    section = "general"
-    current_item_title: str | None = None
-    current_item_url: str | None = None
-    current_item_score: str = ""
-    current_item_summary: list[str] = []
-
-    def _split_md_link(inner: str) -> tuple[str, str] | None:
-        """Return (title, url) from a markdown [title](url) fragment.
-
-        The URL may itself contain ')'. Walk to the LAST ') ' that is
-        followed by content (so we don't truncate `https://.../x)`).
-        """
-        if "](" not in inner:
-            return None
-        title = inner.split("](", 1)[0].lstrip("[").strip()
-        rest = inner.split("](", 1)[1]
-        # Look for a closing `)` that is followed by space or end-of-string.
-        # Find the last `)` that's followed by whitespace or end.
-        idx = -1
-        for i, ch in enumerate(rest):
-            if ch == ")" and (i == len(rest) - 1 or rest[i + 1] in " \t\n"):
-                idx = i
-        if idx == -1:
-            # fallback: last `)`
-            idx = rest.rfind(")")
-        if idx == -1:
-            return None
-        url = rest[:idx].strip()
-        return title, url
-
-    def _flush():
-        nonlocal current_item_title, current_item_url, current_item_score
-        nonlocal current_item_summary
-        if current_item_title and current_item_url:
-            summary_text = current_item_summary[-1] if current_item_summary else ""
-            out.append(HarvestResult(
-                section=section,
-                title=current_item_title,
-                url=current_item_url,
-                summary=summary_text,
-                published=current_item_score,
-            ))
-        current_item_title = None
-        current_item_url = None
-        current_item_score = ""
-        current_item_summary = []
-
-    def _find_url_end(s: str, start: int) -> int:
-        """Return the index just past the URL in `s[start:]`.
-
-        A URL char is alnum + /-_.?&=:%~+. We stop at the first ')' that
-        is followed by a non-URL char (so we don't truncate
-        `https://x(y)foo`).
-        """
-        url_chars = set(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789-_.~:/?#[]@!$&'()*+,;=%"
-        )
-        i = start
-        n = len(s)
-        while i < n:
-            ch = s[i]
-            if ch == ")":
-                # If next char is non-URL (space, tab, newline, end) OR
-                # next char is a markdown delimiter, this is our URL end.
-                nxt = s[i + 1] if i + 1 < n else ""
-                if not nxt or nxt in " \t\n*_`[":
-                    return i + 1
-                # Otherwise, the ')' is part of URL. Continue.
-            i += 1
-        return n
-
-    for line in text.splitlines():
-        stripped = line.rstrip()
-        if stripped.startswith("## "):
-            _flush()
-            section = stripped[3:].strip().lower()
-            continue
-        if stripped.startswith("### "):
-            _flush()
-            inner = stripped[4:].strip()
-            if "](" in inner:
-                title_end = inner.index("](")
-                title = inner[:title_end].lstrip("[").strip()
-                url_start = title_end + 2
-                url_end_idx = _find_url_end(inner, url_start)
-                # url_end_idx points at the position AFTER ')'. Drop it.
-                url = inner[url_start:url_end_idx - 1].strip()
-                rest = inner[url_end_idx:].strip()
-                current_item_title = title
-                current_item_url = url
-                current_item_score = rest
-            else:
-                current_item_title = inner
-                current_item_url = ""
-            continue
-        if stripped.startswith("- "):
-            try:
-                link, _, rest = stripped[2:].partition(") ")
-                parsed = _split_md_link(link) if "](" in link else None
-                if parsed:
-                    title, url = parsed
-                    summary = rest.strip()
-                    if title and url:
-                        out.append(HarvestResult(
-                            section=section, title=title, url=url,
-                            summary=summary,
-                        ))
-            except Exception:
-                continue
-            continue
-        if stripped.startswith(">") and (current_item_title
-                                          or current_item_url):
-            current_item_summary.append(stripped.lstrip("> ").strip())
-    _flush()
-    return out
 
 
 def snatch_url(url: str, *, kind: str = "auto",
@@ -512,26 +322,13 @@ def normalize_to_markdown(source: str, *, md_only: bool = True,
 
 
 def markdown_to_pdf(md_text: str, pdf_path: str, *, title: str = "") -> None:
-    """Render markdown -> PDF.
+    """Render markdown -> PDF with ReportLab Platypus (no browser).
 
-    Primary path: ReportLab Platypus (fast, no browser needed, reliable
-    in the argus venv). Falls back to the intel-stack Chromium path
-    (slow + memory hungry + breaks on some Windows pagefile configs)
-    if ReportLab is not available.
+    ReportLab is the only renderer. A failure is raised to the caller;
+    there is no Chromium / intel-stack fallback. ``report_builder_node``
+    catches it and records ``pdf: <exc>`` in the run's errors.
     """
-    try:
-        _render_pdf_reportlab(md_text, pdf_path, title=title)
-        return
-    except Exception as e:
-        logger.warning("ReportLab render failed (%s); trying Chromium.", e)
-    # Fallback: chromium via the intel-stack helper.
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "_intel_common", INTEL_STACK_DIR / "_common.py")
-    mod = importlib.util.module_from_spec(spec)  # type: ignore
-    assert spec and spec.loader
-    spec.loader.exec_module(mod)  # type: ignore
-    mod.markdown_to_pdf(md_text, Path(pdf_path), title=title)
+    _render_pdf_reportlab(md_text, pdf_path, title=title)
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +422,7 @@ def _strip_emoji(text: str) -> str:
 
 
 def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
-    """Old-money editorial PDF via ReportLab (Chromium-free primary path).
+    """Old-money editorial PDF via ReportLab (no browser).
 
     Design: warm ivory page, a single hairline frame, one serif type
     system throughout (Cardo for display/headings, Crimson Text for
@@ -634,12 +431,11 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
     "card" treatment for blockquotes/warnings/the quality summary
     (previously each blockquote LINE rendered as its own fragment —
     the quality summary read as loose italic lines, not a cohesive
-    box). ReportLab is the primary render path (fast, deterministic,
-    no browser); the Chromium route in ``_common.markdown_to_pdf`` is
-    the fallback if ReportLab itself is unavailable.
+    box). ReportLab is the only render path (fast, deterministic, no
+    browser); a failure propagates to the caller.
 
-    Why still maintain a ReportLab path
-    -----------------------------------
+    Why ReportLab and not a browser
+    -------------------------------
     Some Windows machines (Albert's is one) have flaky pagefile behaviour
     when Chromium spins up. The ReportLab path is ~50ms and produces a
     deterministic, font-safe PDF even on a constrained host.
@@ -1007,27 +803,10 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
 # Web search (handoff action #4 — see HANDOFF-RESEARCH-2026-07-08.md §6)
 # ---------------------------------------------------------------------------
 #
-# Background: Argus's planner is bad at producing real URLs. The fix is to
-# give it a tool to find them. ``search_web`` is a thin unified wrapper
-# that returns ``list[{url, title, snippet, source}]`` so the graph nodes
-# can substitute planner URLs with real ones.
-#
-# Two backends:
-#   * ``perplexity`` — https://api.perplexity.ai (requires PERPLEXITY_API_KEY).
-#     Free tier is fine; we use the Search endpoint with model='sonar'.
-#     If the key is missing we return [] with a logged warning (don't crash).
-#   * ``ddgs`` — duckduckgo-search library, free, no key, hits duckduckgo.com.
-#
-# Both fail soft: any exception (network, parse, library bug) degrades to
-# [] + a warning. The graph never crashes because a search backend is down.
-#
-# v3: the research engine reaches only ``ddgs_search`` (through
-# graph/search_providers.py); ``search_web`` / ``perplexity_search`` have
-# no caller in src/ and are kept for their tests.
-
-PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search"
-PERPLEXITY_MODEL = "sonar"
-DEFAULT_WEB_TIMEOUT_S = 20
+# ``ddgs_search`` — the duckduckgo-search library, free, no key — returns
+# ``list[{url, title, snippet, source}]``. The research engine reaches it
+# through graph/search_providers.py. Fail-soft: any exception (network,
+# parse, library bug) degrades to [] + a warning.
 
 
 def _normalize_web_hit(
@@ -1040,76 +819,6 @@ def _normalize_web_hit(
         "snippet": (snippet or "").strip(),
         "source": source,
     }
-
-
-def perplexity_search(query: str, *, max_results: int = 8) -> list[dict[str, str]]:
-    """Call Perplexity's Search endpoint and return hits in our unified schema.
-
-    Returns ``[]`` (with a logged warning) when ``PERPLEXITY_API_KEY`` is
-    not set in the environment, so the graph never crashes for a missing
-    optional key.
-    """
-    api_key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
-    if not api_key:
-        logger.warning(
-            "perplexity_search: PERPLEXITY_API_KEY is not set; returning []"
-        )
-        return []
-    if not (query or "").strip():
-        return []
-
-    payload = json.dumps({
-        "query": query,
-        "max_results": max(1, int(max_results)),
-        "model": PERPLEXITY_MODEL,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        PERPLEXITY_SEARCH_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_WEB_TIMEOUT_S) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-        obj = json.loads(body)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-            json.JSONDecodeError, OSError) as e:
-        logger.warning("perplexity_search: HTTP/parse failure (%s); returning []", e)
-        return []
-
-    # The Search endpoint returns {"results": [{title, url, snippet, ...}, ...]}.
-    # Some Perplexity responses wrap a single "result" string; we tolerate
-    # both shapes because the contract has drifted over time.
-    raw = obj.get("results")
-    if isinstance(raw, list):
-        hits_iter = raw
-    elif isinstance(obj.get("result"), str):
-        # No structured list — synthesise a single hit pointing at the API
-        # answer text so the planner still gets *something* useful.
-        return [_normalize_web_hit(
-            url="", title="Perplexity answer",
-            snippet=obj["result"][:600], source="perplexity",
-        )]
-    else:
-        logger.warning("perplexity_search: unexpected payload shape; returning []")
-        return []
-
-    out: list[dict[str, str]] = []
-    for h in hits_iter[: max(1, int(max_results))]:
-        if not isinstance(h, dict):
-            continue
-        out.append(_normalize_web_hit(
-            url=h.get("url", ""),
-            title=h.get("title", ""),
-            snippet=h.get("snippet", ""),
-            source="perplexity",
-        ))
-    return out
 
 
 def _validate_timelimit(timelimit: str | None) -> str | None:
@@ -1180,33 +889,6 @@ def ddgs_search(query: str, *, max_results: int = 8,
             source="ddgs",
         ))
     return out
-
-
-def search_web(
-    query: str, *, max_results: int = 8, engine: str = "ddgs",
-    timelimit: str | None = None,
-) -> list[dict[str, str]]:
-    """Unified web-search API for the Argus graph.
-
-    Returns a list of ``{url, title, snippet, source}`` dicts. Fail-soft:
-    any backend error (missing key, network, parse) returns ``[]`` so the
-    graph never crashes because a search backend is unavailable.
-
-    Args:
-        query: The search query string. Empty/whitespace -> ``[]``.
-        max_results: Hint forwarded to the backend. Defaults to 8.
-        engine: ``'ddgs'`` (default, free) or ``'perplexity'`` (needs key).
-            Unknown engines log a warning and return ``[]``.
-    """
-    if not (query or "").strip():
-        return []
-    engine = (engine or "ddgs").strip().lower()
-    if engine == "ddgs":
-        return ddgs_search(query, max_results=max_results, timelimit=timelimit)
-    if engine == "perplexity":
-        return perplexity_search(query, max_results=max_results)
-    logger.warning("search_web: unknown engine %r; returning []", engine)
-    return []
 
 
 # ---------------------------------------------------------------------------

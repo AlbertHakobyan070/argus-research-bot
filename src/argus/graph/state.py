@@ -30,22 +30,6 @@ VALID_LENGTHS: tuple[Length, ...] = (
     "tldr", "short", "medium", "long", "lecture")
 
 
-class PlannedSource(BaseModel):
-    """One source the planner intends to consult."""
-    kind: Literal["paper", "repo", "news", "blog", "official_doc",
-                  "search_result"] = "search_result"
-    query: str = ""
-    target_url: str | None = None
-    rationale: str = ""
-
-
-class ResearchPlan(BaseModel):
-    sub_questions: list[str] = Field(default_factory=list)
-    planned_sources: list[PlannedSource] = Field(default_factory=list)
-    must_have_keywords: list[str] = Field(default_factory=list)
-    summary: str = ""
-
-
 class FetchedItem(BaseModel):
     """A piece of evidence already fetched + normalized."""
     url: str

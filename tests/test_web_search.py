@@ -1,30 +1,16 @@
-"""Hermetic tests for ``argus.tools.search_web`` and the two backend
-implementations (``perplexity_search``, ``ddgs_search``) it dispatches to.
+"""Hermetic tests for ``argus.tools.ddgs_search``.
 
-Handoff background (HANDOFF-RESEARCH-2026-07-08.md §3 + §6, action #4):
-Argus's planner is bad at producing real URLs. The fix is to give it a
-tool to find them. ``search_web`` is a thin unified wrapper that returns
-``list[{url, title, snippet, source}]`` so the graph nodes can substitute
-planner URLs with real ones.
+DDGS is faked by a class injected into ``argus.tools.DDGS``: no network,
+no real library calls. Pinned contracts:
 
-We pin four behavioral contracts here so future refactors don't drift:
-
-1. ``search_web`` returns a list of dicts with the four required keys
-   (``url``, ``title``, ``snippet``, ``source``).
-2. Empty input -> ``[]`` (no exception, no network call).
-3. ``engine='perplexity'`` with no ``PERPLEXITY_API_KEY`` -> ``[]`` and a
-   logged warning (we never crash the graph for a missing optional key).
-4. ``engine='ddgs'`` returns the DDGS result list verbatim (mapped through
-   the unified schema).
-
-Everything is mocked: Perplexity HTTP via a fake ``urlopen`` (monkeypatched
-onto ``argus.tools.urllib.request.urlopen``) and DDGS via a fake class
-injected into ``argus.tools.DDGS``. No network. No real library calls.
+1. Hits are mapped to the unified ``{url, title, snippet, source}`` schema
+   (``source == "ddgs"``).
+2. A DDGS failure degrades to ``[]`` (logged warning), never a raise.
+3. ``max_results`` and ``timelimit`` are forwarded to ``DDGS().text(...)``;
+   an invalid ``timelimit`` raises ``ValueError``.
 """
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
 import pytest
@@ -74,159 +60,8 @@ class _CapturingDDGS(_FakeDDGS):
         return super().text(query, max_results=max_results, **_kwargs)
 
 
-class _FakeResponse:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self._payload = payload
-
-    def read(self) -> bytes:
-        return json.dumps(self._payload).encode("utf-8")
-
-    def __enter__(self) -> "_FakeResponse":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        return None
-
-
 # ---------------------------------------------------------------------------
-# 1. Schema contract
-# ---------------------------------------------------------------------------
-
-
-def test_search_web_returns_dicts_with_required_keys(monkeypatch):
-    """search_web('ddgs') returns list of {url,title,snippet,source} dicts."""
-    monkeypatch.setattr(tools, "DDGS", lambda: _FakeDDGS())
-
-    out = tools.search_web("anything", engine="ddgs")
-
-    assert isinstance(out, list)
-    assert out, "expected at least one result from the fake DDGS"
-    for row in out:
-        assert set(row.keys()) == {"url", "title", "snippet", "source"}
-        assert row["source"] == "ddgs"
-        assert row["url"].startswith("http")
-        assert row["title"]
-        assert row["snippet"]
-
-
-# ---------------------------------------------------------------------------
-# 2. Empty input -> []
-# ---------------------------------------------------------------------------
-
-
-def test_search_web_empty_query_returns_empty_list(monkeypatch):
-    """Empty / whitespace input must short-circuit to [] without calling backends."""
-
-    called = {"ddgs": 0, "perplexity": 0}
-
-    def _fake_ddgs_factory() -> _FakeDDGS:
-        called["ddgs"] += 1
-        return _FakeDDGS()
-
-    def _fake_urlopen(*a: Any, **kw: Any) -> Any:
-        called["perplexity"] += 1
-        return _FakeResponse({"results": []})
-
-    monkeypatch.setattr(tools, "DDGS", _fake_ddgs_factory)
-    monkeypatch.setattr(tools.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
-
-    assert tools.search_web("", engine="ddgs") == []
-    assert tools.search_web("   ", engine="ddgs") == []
-    assert tools.search_web("", engine="perplexity") == []
-
-    assert called["ddgs"] == 0, "DDGS must not be invoked for empty queries"
-    assert called["perplexity"] == 0, "Perplexity must not be invoked for empty queries"
-
-
-# ---------------------------------------------------------------------------
-# 3. perplexity without API key -> [] + warning (NOT exception)
-# ---------------------------------------------------------------------------
-
-
-def test_perplexity_without_api_key_returns_empty_and_warns(
-    monkeypatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """No PERPLEXITY_API_KEY in env -> [] + a logged warning, never a raise."""
-    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
-
-    # If we accidentally hit the network, the test fails loudly.
-    def _explode(*a: Any, **kw: Any) -> Any:
-        raise AssertionError("urlopen must NOT be called when API key is missing")
-
-    monkeypatch.setattr(tools.urllib.request, "urlopen", _explode)
-
-    with caplog.at_level(logging.WARNING, logger="argus.tools"):
-        out = tools.search_web("anything", engine="perplexity")
-
-    assert out == []
-    assert any("PERPLEXITY_API_KEY" in rec.message for rec in caplog.records), (
-        "expected a warning mentioning PERPLEXITY_API_KEY, got: "
-        + repr([r.message for r in caplog.records])
-    )
-
-
-def test_perplexity_with_api_key_parses_response(monkeypatch) -> None:
-    """With a key, perplexity HTTP path returns the unified schema."""
-    monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
-
-    api_payload = {
-        "results": [
-            {
-                "title": "Perplexity Hit 1",
-                "url": "https://pplx.example/1",
-                "snippet": "first snippet",
-            },
-            {
-                "title": "Perplexity Hit 2",
-                "url": "https://pplx.example/2",
-                "snippet": "second snippet",
-            },
-        ]
-    }
-
-    captured: dict[str, Any] = {}
-
-    def _fake_urlopen(req: Any, timeout: float = 0) -> Any:
-        captured["url"] = req.full_url
-        captured["headers"] = dict(req.headers)
-        captured["body"] = req.data.decode("utf-8") if req.data else ""
-        captured["timeout"] = timeout
-        return _FakeResponse(api_payload)
-
-    monkeypatch.setattr(tools.urllib.request, "urlopen", _fake_urlopen)
-
-    out = tools.search_web("hello", engine="perplexity", max_results=5)
-
-    assert captured["url"].startswith("https://api.perplexity.ai/"), captured
-    assert "test-key" in captured["headers"].get("Authorization", "")
-    assert json.loads(captured["body"])["query"] == "hello"
-    assert captured["timeout"] >= 1
-
-    assert len(out) == 2
-    assert {r["source"] for r in out} == {"perplexity"}
-    for row in out:
-        assert set(row.keys()) == {"url", "title", "snippet", "source"}
-    assert out[0]["url"] == "https://pplx.example/1"
-
-
-def test_perplexity_http_failure_returns_empty(monkeypatch) -> None:
-    """Network errors must degrade to [] (logged warning), not crash the graph."""
-    import urllib.error
-
-    monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
-
-    def _fake_urlopen(*a: Any, **kw: Any) -> Any:
-        raise urllib.error.URLError("boom")
-
-    monkeypatch.setattr(tools.urllib.request, "urlopen", _fake_urlopen)
-
-    out = tools.search_web("anything", engine="perplexity")
-    assert out == []
-
-
-# ---------------------------------------------------------------------------
-# 4. ddgs returns the (mapped) mocked result
+# 1. ddgs returns the (mapped) mocked result
 # ---------------------------------------------------------------------------
 
 
@@ -260,26 +95,8 @@ def test_ddgs_failure_returns_empty(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Misc: dispatch + default engine
+# 2. max_results is forwarded
 # ---------------------------------------------------------------------------
-
-
-def test_unknown_engine_returns_empty_and_warns(caplog: pytest.LogCaptureFixture) -> None:
-    """Unknown engine -> [] with a warning (fail-soft, never raise)."""
-    with caplog.at_level(logging.WARNING, logger="argus.tools"):
-        out = tools.search_web("x", engine="bogus-engine")
-
-    assert out == []
-    assert any("bogus-engine" in rec.message for rec in caplog.records)
-
-
-def test_default_engine_is_ddgs(monkeypatch) -> None:
-    """search_web's default engine must be 'ddgs' (free, no key needed)."""
-    monkeypatch.setattr(tools, "DDGS", lambda: _FakeDDGS())
-
-    # Don't pass engine; should still hit DDGS path.
-    out = tools.search_web("test")
-    assert out and out[0]["source"] == "ddgs"
 
 
 def test_max_results_respected(monkeypatch) -> None:
@@ -294,12 +111,12 @@ def test_max_results_respected(monkeypatch) -> None:
 
     monkeypatch.setattr(tools, "DDGS", lambda: _SpyDDGS())
 
-    tools.search_web("hi", engine="ddgs", max_results=3)
+    tools.ddgs_search("hi", max_results=3)
     assert captured["max_results"] == 3
 
 
 # ---------------------------------------------------------------------------
-# 5. ddgs_search timelimit (lifted from NVIDIA AI-Q Blueprint
+# 3. ddgs_search timelimit (lifted from NVIDIA AI-Q Blueprint
 #    sources/duckduckgo_news_search/src/register.py)
 # ---------------------------------------------------------------------------
 # AI-Q's news-search wrapper forwards ``timelimit='d' | 'w' | 'm' | 'y' | None``
@@ -346,23 +163,3 @@ def test_ddgs_search_timelimit_rejects_invalid_value():
     for bad in ["z", "week", "7", "hour", 5, True]:
         with pytest.raises(ValueError):
             tools.ddgs_search("anything", timelimit=bad)
-
-
-def test_search_web_forwards_timelimit(monkeypatch):
-    """The unified ``search_web(engine='ddgs', timelimit=...)`` API must also
-    accept and forward timelimit, so callers don't need to know about
-    engine-specific kwargs."""
-    captured_kwargs: dict[str, Any] = {}
-
-    class _SpyDDGS:
-        def text(self, query: str, max_results: int | None = None,
-                 **kwargs: Any) -> list[dict[str, str]]:
-            captured_kwargs.update(kwargs)
-            return [{"href": "https://x", "title": "t", "body": "b"}]
-
-    monkeypatch.setattr(tools, "DDGS", lambda: _SpyDDGS())
-
-    tools.search_web("news", engine="ddgs", timelimit="w")
-    assert captured_kwargs.get("timelimit") == "w", (
-        "search_web(engine='ddgs', timelimit=...) must forward the kwarg."
-    )

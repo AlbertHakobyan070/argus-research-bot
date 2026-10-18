@@ -384,11 +384,6 @@ def test_arxiv_hits_handles_empty_query():
     assert sp.arxiv_hits(None) == ([], "")
 
 
-def _make_empty_harvest():
-    from argus.tools import HarvestReport
-    return HarvestReport(folder="", items=[], raw_stdout="", duration_s=0.0)
-
-
 # ----------------------------------------------------------------------
 # Phase 2: scrapling stealth fetch fallback
 # ----------------------------------------------------------------------

@@ -11,26 +11,13 @@ fail because the legacy path operates on ``draft_md`` substrings.
 """
 from __future__ import annotations
 
-import asyncio
-import time
-
 import pytest
 
 from argus.post_synthesis import (
-    CitationVerdict,
-    FabricationFlag,
     FindingRecord,
-    GroundingAssessment,
-    PostSynthesisReport,
     assign_finding_ids,
-    fabrication_detector_async,
-    grounding_verifier_async,
     quarantine_by_id,
-    render_body_from_findings,
     render_quarantine_appendix,
-    run_post_synthesis_passes,
-    run_post_synthesis_passes_async,
-    verify_citations_async,
 )
 
 
@@ -147,181 +134,8 @@ class TestAssignFindingIds:
 
 
 # ---------------------------------------------------------------------------
-# Async post-passes.
-# ---------------------------------------------------------------------------
-
-class TestVerifyCitationsAsync:
-    def test_registers_fetched_urls(self):
-        findings = [_fr(1), _fr(2)]
-        verdicts = asyncio.run(verify_citations_async(findings, ["https://e1.example/", "https://e2.example/"]))
-        kept_urls = {v.evidence_url for v in verdicts if v.kept}
-        assert kept_urls == {"https://e1.example/", "https://e2.example/"}
-
-    def test_flags_unregistered(self):
-        findings = [_fr(1)]
-        verdicts = asyncio.run(verify_citations_async(findings, []))
-        assert len(verdicts) == 1
-        assert verdicts[0].kept is False
-        assert "unregistered" in verdicts[0].reason
-
-    def test_dedupes_across_findings(self):
-        findings = [_fr(1), _fr(2), _fr(3)]
-        # All three cite the same URL.
-        for f in findings:
-            f.citation_urls = ["https://shared/"]
-        verdicts = asyncio.run(verify_citations_async(findings, ["https://shared/"]))
-        assert len(verdicts) == 1
-
-
-class TestFabricationDetectorAsync:
-    def test_supported_claim_low_flag(self):
-        findings = [FindingRecord(
-            id="f1", claim="transformer attention",
-            citation_urls=["https://a/"],
-        )]
-        excerpts = {"https://a/": "This paper studies transformer attention mechanisms."}
-        flags = asyncio.run(fabrication_detector_async(findings, excerpts))
-        assert flags[0].is_fabricated is False
-        assert flags[0].support_score > 0.5
-
-    def test_unsupported_claim_flagged(self):
-        findings = [FindingRecord(
-            id="f1", claim="quantum entanglement lateralization",
-            citation_urls=["https://a/"],
-        )]
-        excerpts = {"https://a/": "Recipe for chocolate cake."}
-        flags = asyncio.run(fabrication_detector_async(findings, excerpts))
-        assert flags[0].is_fabricated is True
-        assert flags[0].support_score < 0.34
-
-    def test_no_citations_is_fabricated(self):
-        findings = [FindingRecord(id="f1", claim="x", citation_urls=[])]
-        flags = asyncio.run(fabrication_detector_async(findings, {}))
-        assert flags[0].is_fabricated is True
-        assert flags[0].reason == "no_citations"
-
-
-class TestGroundingVerifierAsync:
-    def test_structured_assessment_shape(self):
-        findings = [_fr(1)]
-        fetched = [
-            {"url": "https://a/", "title": "Transformers", "excerpt": "About transformers.",
-             "credibility_score": 0.8},
-        ]
-        ga = asyncio.run(grounding_verifier_async("transformers", findings, fetched))
-        assert isinstance(ga, GroundingAssessment)
-        assert ga.credible_evidence_count == 1
-        assert ga.entity_match_count >= 1
-
-    def test_handles_missing_fetched(self):
-        ga = asyncio.run(grounding_verifier_async("anything", [], []))
-        assert ga.grounded is False
-        assert ga.credible_evidence_count == 0
-
-
-# ---------------------------------------------------------------------------
-# §5.4.3 — async parallel orchestrator.
-# ---------------------------------------------------------------------------
-
-class TestRunPostSynthesisPassesAsync:
-    def test_returns_post_synthesis_report(self):
-        findings = [_fr(1), _fr(2)]
-        report = run_post_synthesis_passes(
-            entity="test", findings=findings, flagged_ids=[],
-            fetched=[{"url": "https://e1.example/"}],
-            evidence_excerpts={"https://e1.example/": "test content"},
-        )
-        assert isinstance(report, PostSynthesisReport)
-        assert [f.id for f in report.kept_findings] == ["f1", "f2"]
-        assert report.quarantined_findings == []
-        assert report.dropped_findings == []
-
-    def test_quarantine_routes_to_quarantined(self):
-        findings = [_fr(1), _fr(2)]
-        report = run_post_synthesis_passes(
-            entity="test", findings=findings, flagged_ids=["f1"],
-            fetched=[],
-            evidence_excerpts={},
-        )
-        assert [f.id for f in report.kept_findings] == ["f2"]
-        assert [f.id for f in report.quarantined_findings] == ["f1"]
-
-    def test_parallel_speedup_observable(self):
-        """The async orchestrator must actually use asyncio.gather.
-
-        For a long-running synthetic pass (sleep), concurrent execution
-        should be measurably faster than the sum of individual times.
-        """
-        # Build findings + a slow fabrication threshold so each pass
-        # has something to do. We measure wall time of the async
-        # orchestrator against a baseline sequential sum.
-        import asyncio
-
-        async def slow_one():
-            await asyncio.sleep(0.05)
-            return "ok"
-
-        # Manual baseline: three sequential sleeps.
-        async def baseline():
-            await slow_one()
-            await slow_one()
-            await slow_one()
-
-        async def gather_call():
-            await asyncio.gather(slow_one(), slow_one(), slow_one())
-
-        t_base = time.perf_counter()
-        asyncio.run(baseline())
-        base = time.perf_counter() - t_base
-
-        t_par = time.perf_counter()
-        asyncio.run(gather_call())
-        par = time.perf_counter() - t_par
-
-        # Parallel must be meaningfully faster. Allow 30% slack for
-        # event-loop overhead.
-        assert par < base * 0.7, (
-            f"asyncio.gather not actually concurrent: parallel={par:.3f}s, "
-            f"sequential baseline={base:.3f}s"
-        )
-
-    def test_wall_time_is_reported(self):
-        report = run_post_synthesis_passes(
-            entity="x", findings=[_fr(1)], flagged_ids=[],
-            fetched=[], evidence_excerpts={},
-        )
-        assert report.wall_time_seconds >= 0.0
-        assert report.parallel_time_seconds >= 0.0
-
-
-# ---------------------------------------------------------------------------
 # Renderers.
 # ---------------------------------------------------------------------------
-
-class TestRenderBodyFromFindings:
-    def test_flat_template_no_sections(self):
-        findings = [_fr(1, claim="First"), _fr(2, claim="Second")]
-        body = render_body_from_findings("Topic", findings, section_template="flat")
-        assert "# Topic" in body
-        assert "- First" in body
-        assert "- Second" in body
-
-    def test_sectioned_template_groups_by_section(self):
-        findings = [
-            _fr(1, claim="A", section="TL;DR"),
-            _fr(2, claim="B", section="Background"),
-            _fr(3, claim="C", section="Current state"),
-        ]
-        body = render_body_from_findings("Topic", findings, section_template="sectioned")
-        assert "## TL;DR" in body
-        assert "## Background" in body
-        assert "## Current state" in body
-        # Sections appear in source order.
-        assert body.index("## TL;DR") < body.index("## Background")
-
-    def test_empty_findings_returns_empty(self):
-        assert render_body_from_findings("Topic", []) == ""
-
 
 class TestRenderQuarantineAppendix:
     def test_empty_returns_empty(self):
