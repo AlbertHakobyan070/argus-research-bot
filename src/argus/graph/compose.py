@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .. import llm
+from .assemble import build_sources_block, strip_duplicate_heading, strip_fences
 from .grounding import check_grounding, grounding_warning_prompt
 from .jsonx import parse_json_obj, salvage_objects
 from .state import OutlineSection, ResearchBrief
@@ -284,8 +284,8 @@ def _write_section(section: dict, brief: ResearchBrief, state: dict,
         ])
         call = llm.record_from_response(
             "strong", llm.resolve_tier("strong"), resp).model_dump()
-        md = _strip_fences(resp.content)
-        md = _strip_duplicate_heading(md, section.get("title", ""))
+        md = strip_fences(resp.content)
+        md = strip_duplicate_heading(md, section.get("title", ""))
         if len(md.strip()) < 40:
             return "", call, (f"compose: section '{section.get('title')}' "
                               "came back empty")
@@ -293,52 +293,6 @@ def _write_section(section: dict, brief: ResearchBrief, state: dict,
     except Exception as e:
         return "", None, (f"compose: section '{section.get('title')}' "
                           f"failed ({e})")
-
-
-def _strip_fences(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"^```(?:markdown|md)?\s*", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s*```$", "", t)
-    return t
-
-
-_HEADING_PREFIX_RE = re.compile(r"^#{1,6}\s*")
-_EMPHASIS_MARKER_RE = re.compile(r"^\*{1,2}|\*{1,2}$")
-
-
-def _normalize_heading_text(s: str) -> str:
-    """Normalize a heading candidate for duplicate comparison: strip
-    markdown heading markers and bold/italic markers, then casefold."""
-    s = _HEADING_PREFIX_RE.sub("", s.strip())
-    s = _EMPHASIS_MARKER_RE.sub("", s.strip())
-    return s.strip().rstrip(":.-").casefold()
-
-
-def _strip_duplicate_heading(md: str, title: str) -> str:
-    """Drop a leading line that just repeats the section title.
-
-    Section writers are told not to repeat the heading (the assembler
-    renders it separately), but weaker proxy-routed models often
-    disregard that instruction and open the section with
-    ``## <title>`` or ``**<title>**`` anyway — producing a visibly
-    duplicated heading in the rendered report. This is a structural
-    guard rather than relying on prompt compliance: it removes at most
-    ONE leading line, and only when it is a near-exact echo of the
-    title, so a section that legitimately opens with a sentence
-    sharing a few words with the title is left untouched.
-    """
-    if not title:
-        return md
-    lines = md.splitlines()
-    if not lines:
-        return md
-    target = _normalize_heading_text(title)
-    if not target or _normalize_heading_text(lines[0]) != target:
-        return md
-    rest = lines[1:]
-    while rest and not rest[0].strip():
-        rest.pop(0)
-    return "\n".join(rest)
 
 
 def _write_flat(state: dict, brief: ResearchBrief, *, length: str,
@@ -370,7 +324,7 @@ def _write_flat(state: dict, brief: ResearchBrief, *, length: str,
         ])
         call = llm.record_from_response(
             "strong", llm.resolve_tier("strong"), resp).model_dump()
-        return _strip_fences(resp.content), [call], []
+        return strip_fences(resp.content), [call], []
     except Exception as e:
         return "", [], [f"compose: flat write failed ({e})"]
 
@@ -392,28 +346,9 @@ def _write_tldr(state: dict, body: str) -> tuple[str, list[dict], list[str]]:
         ])
         call = llm.record_from_response(
             "cheap", llm.resolve_tier("cheap"), resp).model_dump()
-        return _strip_fences(resp.content), [call], []
+        return strip_fences(resp.content), [call], []
     except Exception as e:
         return "", [], [f"compose: tldr write failed ({e})"]
-
-
-_CITE_RE = re.compile(r"\[(\d{1,3})\]")
-
-
-def build_sources_block(body: str, fetched: list[dict]) -> str:
-    """## Sources listing every source id cited in the body, id order."""
-    cited = sorted({int(m) for m in _CITE_RE.findall(body)})
-    by_id: dict[int, dict] = {i + 1: f for i, f in enumerate(fetched)}
-    lines = ["", "## Sources", ""]
-    for i in cited:
-        f = by_id.get(i)
-        if not f:
-            continue
-        title = (f.get("title") or "").strip() or f.get("url", "")
-        lines.append(f"{i}. [{title[:90]}]({f.get('url')})")
-    if len(lines) == 3:
-        return ""
-    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +675,6 @@ def compose_node(state) -> dict:
 
 
 __all__ = ["outline_node", "compose_node", "render_notes",
-           "build_sources_block", "build_assessment", "default_outline",
+           "build_assessment", "default_outline",
            "SECTION_SYSTEM", "FLAT_SYSTEM", "OUTLINE_SYSTEM",
            "EXTRACT_SYSTEM"]
