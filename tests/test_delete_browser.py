@@ -9,10 +9,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from telegram import InlineKeyboardMarkup
 
-from argus import bot as bot_mod
-from argus.bot import (
-    _delete_sessions, _fmt_bytes, _inflight, _perform_delete,
-    _render_delete_page, _safe_to_delete, on_callback,
+from argus.bot import app as bot_app
+from argus.bot import common as bot_common
+from argus.bot import delete as bot_delete
+from argus.bot.app import on_callback
+from argus.bot.common import _fmt_bytes
+from argus.bot.delete import (
+    _delete_sessions, _perform_delete, _render_delete_page, _safe_to_delete,
 )
 from argus.config import Settings
 from argus.library import Library
@@ -21,15 +24,15 @@ from argus.library import Library
 @pytest.fixture(autouse=True)
 def _clean():
     _delete_sessions.clear()
-    _inflight.clear()
+    bot_common._inflight.clear()
     yield
     _delete_sessions.clear()
-    _inflight.clear()
+    bot_common._inflight.clear()
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_app, "_allowed", lambda _s, _uid: True)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -52,7 +55,8 @@ def _settings(tmp_path: Path) -> Settings:
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     s = _settings(tmp_path)
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: s)
+    monkeypatch.setattr(bot_app, "get_settings", lambda: s)
+    monkeypatch.setattr(bot_delete, "get_settings", lambda: s)
     return s
 
 
@@ -185,7 +189,7 @@ async def test_perform_delete_run_removes_dir_checkpoint_and_row(tmp_path,
 
 
 async def test_perform_delete_refuses_inflight_run(tmp_path, settings):
-    _inflight["live1234"] = {"run_id": "live1234", "chat_id": 1}
+    bot_common._inflight["live1234"] = {"run_id": "live1234", "chat_id": 1}
     sess = {"category": "runs", "page": 0, "selected": {0},
             "items": [{"kind": "run", "run_id": "live1234",
                        "thread_id": "tg:1:live1234", "report_dir": None,

@@ -19,16 +19,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from argus import bot as bot_mod
-from argus.bot import _inflight, research_cmd
+from argus.bot import common as bot_common
+from argus.bot import research as bot_research
+from argus.bot.research import research_cmd
 from argus.config import Settings
 
 
 @pytest.fixture(autouse=True)
 def _clear_inflight():
-    _inflight.clear()
+    bot_common._inflight.clear()
     yield
-    _inflight.clear()
+    bot_common._inflight.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -51,12 +52,12 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         request_timeout_seconds=60.0,
         max_revision_rounds=3,
     )
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_research, "get_settings", lambda: dummy)
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_research, "_allowed", lambda _s, _uid: True)
 
 
 class _FakeGraph:
@@ -119,8 +120,8 @@ async def test_each_research_gets_its_own_thread_id():
             f"thread id must look like tg:<chat>:<run8>, got {t!r}")
 
     # Both runs are individually tracked in flight, keyed by run id.
-    assert len(_inflight) == 2
-    for run_id, info in _inflight.items():
+    assert len(bot_common._inflight) == 2
+    for run_id, info in bot_common._inflight.items():
         assert info["thread_id"].endswith(run_id)
         assert info["awaiting"] == "plan_approval"
 
@@ -130,7 +131,7 @@ async def test_plan_keyboard_of_each_run_is_scoped_to_it():
     ctx = _make_ctx(graph)
     await research_cmd(_make_update(778), ctx)
 
-    (run_id,) = list(_inflight)
+    (run_id,) = list(bot_common._inflight)
     # The plan message was sent through bot.send_message with the keyboard.
     sends = ctx.application.bot.send_message.await_args_list
     markups = [c.kwargs.get("reply_markup") for c in sends

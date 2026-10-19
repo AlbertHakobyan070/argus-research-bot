@@ -6,7 +6,7 @@ Hermetic: yt-dlp is never actually invoked — we monkeypatch
 from __future__ import annotations
 
 from argus import tools
-from argus.bot import _fmt_duration
+from argus.bot.common import _fmt_duration
 
 
 # One JSON object per line, as `yt-dlp --dump-json --flat-playlist` emits.

@@ -59,7 +59,7 @@ if command -v powershell.exe >/dev/null 2>&1; then
     echo "  powershell.exe -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object { \\\$_.CommandLine -like '*argus*' } | Select-Object ProcessId, Name, CommandLine\"" >&2
     echo "" >&2
     echo "Likely causes: a Cursor / VS Code / PyCharm 'Run File' config for" >&2
-    echo "src/argus/bot.py, or an LLM agent that re-execs the bot on crash." >&2
+    echo "src/argus/bot/, or an LLM agent that re-execs the bot on crash." >&2
     echo "Stop the offending tool, then re-run this script." >&2
     exit 1
   fi

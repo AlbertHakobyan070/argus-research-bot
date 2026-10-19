@@ -34,8 +34,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram import InlineKeyboardMarkup
 
-from argus import bot as bot_mod
-from argus.bot import _inflight, on_callback
+from argus.bot import app as bot_app
+from argus.bot import common as bot_common
+from argus.bot import research as bot_research
+from argus.bot.app import on_callback
 from argus.config import Settings
 
 RUN_ID = "ab12cd34"
@@ -61,7 +63,7 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         request_timeout_seconds=60.0,
         max_revision_rounds=3,
     )
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +75,16 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
 def _clear_inflight():
     """Each test starts with a clean in-flight registry so a leaked
     entry from a prior test doesn't pollute the assertion."""
-    _inflight.clear()
+    bot_common._inflight.clear()
     yield
-    _inflight.clear()
+    bot_common._inflight.clear()
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
     """Force ``_allowed(...)`` to return True for any user id, so the
     dispatcher actually runs instead of rejecting the mock user."""
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _settings, _uid: True)
+    monkeypatch.setattr(bot_app, "_allowed", lambda _settings, _uid: True)
 
 
 def _seed_plan_inflight(*, run_id: str = RUN_ID, chat_id: int = 10001,
@@ -113,7 +115,7 @@ def _seed_plan_inflight(*, run_id: str = RUN_ID, chat_id: int = 10001,
         "cfg": fake_cfg,
         "graph": fake_graph,
     }
-    _inflight[run_id] = entry
+    bot_common._inflight[run_id] = entry
     return entry
 
 
@@ -160,10 +162,10 @@ async def test_len_tap_does_NOT_resume_graph():
                                    callback_data=f"len:long:{RUN_ID}")
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(update, ctx)
 
-    entry = _inflight[RUN_ID]
+    entry = bot_common._inflight[RUN_ID]
     assert entry["length"] == "long", (
         f"Length tap should update info['length'], got {entry['length']!r}")
     assert resume.await_count == 0, (
@@ -183,7 +185,7 @@ async def test_len_tap_re_renders_plan_with_updated_label_AND_keyboard():
                                    callback_data=f"len:lecture:{RUN_ID}")
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()):
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()):
         await on_callback(update, ctx)
 
     update.callback_query.edit_message_text.assert_awaited()
@@ -212,7 +214,7 @@ async def test_repeated_len_taps_do_not_stack_status_suffixes():
     '📏 Length set to …' line forever."""
     _seed_plan_inflight(chat_id=10015)
     ctx = _make_ctx()
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()):
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()):
         for mode in ("long", "tldr", "lecture"):
             await on_callback(
                 _make_callback_update(chat_id=10015,
@@ -223,7 +225,7 @@ async def test_repeated_len_taps_do_not_stack_status_suffixes():
     # the entry's plan_text invariant instead: the suffix must appear once.
     # (The 3rd tap's rendered text is not directly reachable here, so we
     # assert on the stored base staying clean.)
-    assert _inflight[RUN_ID]["plan_text"] == "Plan text", (
+    assert bot_common._inflight[RUN_ID]["plan_text"] == "Plan text", (
         "Base plan text must never accumulate status suffixes.")
 
 
@@ -240,13 +242,13 @@ async def test_approve_tap_DOES_resume_graph_with_chosen_length():
                                    callback_data=f"plan:approve:{RUN_ID}")
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(update, ctx)
 
     assert resume.await_count == 1, (
         f"Approve tap must call _resume_after_plan exactly once, got "
         f"{resume.await_count}.")
-    assert _inflight[RUN_ID]["length"] == "long", (
+    assert bot_common._inflight[RUN_ID]["length"] == "long", (
         "Approve must preserve the previously-chosen length.")
 
 
@@ -254,7 +256,7 @@ async def test_len_then_approve_runs_resume_only_once():
     _seed_plan_inflight(chat_id=10013)
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(
             _make_callback_update(chat_id=10013,
                                   callback_data=f"len:short:{RUN_ID}"), ctx)
@@ -272,7 +274,7 @@ async def test_double_approve_resumes_only_once():
     _seed_plan_inflight(chat_id=10016)
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         for _ in range(2):
             await on_callback(
                 _make_callback_update(chat_id=10016,
@@ -289,11 +291,11 @@ async def test_edit_tap_does_not_resume_and_keeps_keyboard():
                                    callback_data=f"plan:edit:{RUN_ID}")
     ctx = _make_ctx()
 
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(update, ctx)
 
     assert resume.await_count == 0, "Edit tap must not resume the graph."
-    entry = _inflight[RUN_ID]
+    entry = bot_common._inflight[RUN_ID]
     assert entry.get("plan_edit") is True, (
         "Edit tap must set info['plan_edit'] so the bot recognises "
         "the next reply as revision feedback.")
@@ -313,7 +315,7 @@ async def test_callback_for_unknown_run_is_answered_not_applied():
     update = _make_callback_update(chat_id=10017,
                                    callback_data="plan:approve:deadbeef")
     ctx = _make_ctx()
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(update, ctx)
     assert resume.await_count == 0, (
         "A button for a run that is not in flight must never resume "
@@ -331,7 +333,7 @@ async def test_stale_pre_v2_button_gets_notice():
     _seed_plan_inflight(chat_id=10018)
     update = _make_callback_update(chat_id=10018, callback_data="plan:approve")
     ctx = _make_ctx()
-    with patch.object(bot_mod, "_resume_after_plan", new=AsyncMock()) as resume:
+    with patch.object(bot_research, "_resume_after_plan", new=AsyncMock()) as resume:
         await on_callback(update, ctx)
     assert resume.await_count == 0
     update.callback_query.edit_message_text.assert_awaited()

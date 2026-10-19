@@ -22,18 +22,19 @@ import inspect
 
 import pytest
 
-from argus import bot as argus_bot
+from argus.bot import common as bot_common
+from argus.bot import research as bot_research
 
 
 # --- helper signature check --------------------------------------------------
 
 def test_helper_html_escape_for_tg_exists() -> None:
     """Argus must expose a HTML escape helper used by the report-preview path."""
-    assert hasattr(argus_bot, "_html_escape_for_tg"), (
+    assert hasattr(bot_common, "_html_escape_for_tg"), (
         "Add _html_escape_for_tg() to bot.py. It must escape `&`, `<`, `>` "
         "for Telegram's HTML parser."
     )
-    assert callable(argus_bot._html_escape_for_tg)
+    assert callable(bot_common._html_escape_for_tg)
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -48,7 +49,7 @@ def test_helper_html_escape_for_tg_exists() -> None:
     ("line1\nline2", "line1\nline2"),
 ])
 def test_html_escape_for_tg_basic(raw: str, expected: str) -> None:
-    assert argus_bot._html_escape_for_tg(raw) == expected
+    assert bot_common._html_escape_for_tg(raw) == expected
 
 
 def test_html_escape_for_tg_handles_code_fence_unescaped() -> None:
@@ -57,7 +58,7 @@ def test_html_escape_for_tg_handles_code_fence_unescaped() -> None:
     plain text inside <pre>. We just verify the helper doesn't mangle
     the body chars that would normally be HTML-dangerous."""
     excerpt = "```python\nx = 1 < 2\n```"
-    out = argus_bot._html_escape_for_tg(excerpt)
+    out = bot_common._html_escape_for_tg(excerpt)
     # `&` and `<` from the Python snippet become &amp; / &lt;
     assert "&lt;" in out
     assert "&amp;" not in out  # no `&` in this example
@@ -75,7 +76,7 @@ def test_report_preview_send_uses_html_or_safe_fallback() -> None:
     We verify by reading the source text of the resume_after_report
     function and asserting at least one of these patterns is present.
     """
-    src = inspect.getsource(argus_bot._resume_after_plan)
+    src = inspect.getsource(bot_research._resume_after_plan)
     assert "ParseMode.MARKDOWN" not in src or "ParseMode.HTML" in src, (
         "bot._resume_after_plan still uses ParseMode.MARKDOWN for the "
         "report preview. Switch to ParseMode.HTML with proper escaping, "

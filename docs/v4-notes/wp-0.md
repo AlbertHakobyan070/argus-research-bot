@@ -240,3 +240,132 @@ Total: 26 removed, 3 added.
 - **Focused run** (`test_pdf_render`, `test_web_search`, `test_config_tools`, `test_tools_routing_and_errors`, `test_tools_truth`, `test_post_synthesis`, `test_quarantine`): all passed.
 - **Static checks.** A stdlib `ast` scan found no import orphaned by the deletions and no undefined name in the edited modules (there is no linter in the venv). `import argus.tools, argus.post_synthesis, argus.graph, argus.graph.nodes` succeeds.
 - **Full suite after the change:** 530 passed, 1 skipped, 2 failed. The two failures were `tests/test_graph.py::test_quick_graph_runs` and `::test_deep_graph_pauses_for_plan_approval`, again FreeLLMAPI 429 at the first LLM node: the baseline run had just spent the proxy's quota. Re-running `tests/test_graph.py` after the quota window gave 2 passed. That includes the deep graph running through `report_builder_node` and the real ReportLab render. Together: 532 passed, 1 skipped, which is the 555 of the baseline minus 26 removed plus 3 added.
+
+## WP-0c — split `bot.py` into the `bot/` package (Task 3)
+
+Spec: `docs/argus-v4-design.md` §3 WP-0 item 3 and §1.2. A pure move: no behaviour change and no re-export shims. The orchestrator added two items during the task: a `POST_STOP_HOOKS` list run from a `post_stop` callback, and the rule that the shared mutable objects are reached only as attributes of their owning module and are never rebound.
+
+### Symbol → module mapping
+
+Written before anything moved, and covering every top-level statement of `bot.py`. A symbol is "placed" when item 3 names it or names the feature it belongs to. Anything item 3 does not place goes to `common.py` and is listed as such.
+
+`common.py`:
+- Named in item 3: `HELP_TEXT`, `_LENGTH_LABELS`, `_parse_length`, `_inflight`, `_pending_reply`, `_bot_data_get`, `_get_library`, `_set_run_status`, `_parse_indices`, `_allowed`, `_safe_send`, `_safe_edit_cb`, `_stream_progress`, `_html_escape_for_tg`, `_md_escape`, `_fmt_duration`, `_STATUS_GLYPHS`, `_fmt_bytes`, and the `_TG_*` constants (`_TG_UPLOAD_CAP_BYTES`, `_TG_CONNECT_TIMEOUT_S`, `_TG_READ_TIMEOUT_S`, `_TG_WRITE_TIMEOUT_S`, `_TG_POOL_TIMEOUT_S`, `_TG_MEDIA_WRITE_TIMEOUT_S`).
+- Not placed by item 3, so here by the brief's rule:
+  - `_HELP_MD_PATH`: the `/help full` guide path, beside `HELP_TEXT`. Used by `history.help_cmd`.
+  - `_chat_entries`: a query over `_inflight`. Used by `history.status_cmd` and `history.cancel_cmd`.
+  - `_send_md_doc`: a send helper beside `_safe_send`. Used by `research._resume_after_report`.
+
+`research.py` (research/ask commands, plan/report keyboards and formatters, HITL callbacks and resume paths):
+- `_format_plan`, `_plan_keyboard`, `_report_keyboard`, `research_cmd`, `ask_cmd`, `_replan_after_edit`, `_revise_after_feedback`, `_resume_after_plan`, `_send_report_preview`, `_resume_after_report`, `_finalize_run`.
+- From `on_text`: the pending HITL reply branch, as `handle_pending_reply`.
+- From `on_callback`: the run lookup with its not-in-flight notice, and the `len:*`, `plan:*` and `report:*` branches, as `handle_callback`.
+
+`media.py` (video/find/fetch/quality/transcript(s), pools, `m:*`, `t:send`, the media branch of `on_text`):
+- Pools: `_VIDEO_POOL_TTL_S`, `_video_pool`, `_pool_get`, `_pool_put`.
+- Commands: `video_cmd`, `fetch_cmd`, `find_cmd`, `quality_cmd`, `transcript_cmd`, `transcripts_cmd`.
+- Helpers used only by those commands and buttons: `_MEDIA_PROGRESS_INTERVAL_S` (the download progress throttle; its neighbour `_TG_UPLOAD_CAP_BYTES` goes to `common.py` under `_TG_*`), `_media_keyboard`, `_get_media_quality`, `_fetch_one_media`, `_transcript_for_item`.
+- From `on_text`: the pasted-media-link branch, as `handle_text`.
+- From `on_callback`: the `m:*` and `t:send` branches, as `handle_callback`.
+
+`history.py`: `runs_cmd`, `status_cmd`, `cancel_cmd`, `append_cmd`, `continue_cmd`, `help_cmd`, `_sources_from_refs`. It imports `_format_plan`, `_plan_keyboard`, `_resume_after_plan` and `_send_report_preview` from `research`.
+
+`delete.py` (browser + `del:*`): `_DELETE_PAGE_SIZE`, `_delete_sessions`, `_DEL_CATEGORY_LABELS`, `_dir_size`, `_safe_to_delete`, `_render_delete_page`, `_delete_load_items`, `delete_cmd`, `_perform_delete`, `_on_delete_callback`. From `on_callback`: the `del:*` dispatch line, as `handle_callback`.
+
+`app.py`: `_on_error`, `_post_init`, `_reconcile_orphaned_runs`, `app_ctx`, `_post_shutdown`, `build_application`, `main`. The shared preambles of `on_text` (ACL, text, chat id) and `on_callback` (ACL, answer, the 3-part split, the stale-button notice) stay here as the two dispatchers.
+
+`__init__.py`: the module docstring, and `main` imported from `app` (the only name the package exports). `__main__.py`: the `if __name__ == "__main__": main()` guard.
+
+Every module that logs keeps `logger = logging.getLogger("argus.bot")`, the logger name `bot.py` used.
+
+New names, as the interfaces later WPs build on:
+- `app.py`: `HANDLER_MODULES`, `POST_INIT_HOOKS`, `POST_STOP_HOOKS`, `POST_SHUTDOWN_HOOKS`, and `_post_stop`, which runs `POST_STOP_HOOKS`.
+- `register(app)` on `research`, `media`, `history` and `delete`.
+- `research.handle_callback`, `research.handle_pending_reply`, `media.handle_callback`, `media.handle_text`, `delete.handle_callback`.
+
+### What changed
+
+- `src/argus/bot.py` is replaced by the package above. Each moved statement is its original source text, comments included. Only these location adaptations differ:
+  - The shared mutable dicts are reached as attributes of their owning module. `research`, `history` and `delete` read and mutate `common._inflight` and `common._pending_reply`. Nothing outside `media` reads `_video_pool`. None of them is rebound outside its owner.
+  - The three function-level `from .tools import …` in `media` become `from ..tools import …`.
+  - `_HELP_MD_PATH` uses `parents[3]` instead of `parents[2]`, so it still resolves to the repo's `docs/help.md` from one directory deeper. `test_help_md_exists_and_covers_commands` pins it.
+  - `json`, unused in `bot.py`, is not imported anywhere.
+- New code, as listed above:
+  - The module docstrings.
+  - `HANDLER_MODULES`, and one `register(app)` per handler module.
+  - The `POST_INIT_HOOKS`, `POST_STOP_HOOKS` and `POST_SHUTDOWN_HOOKS` lists, shipped empty, and `_post_stop`.
+  - The two dispatchers, and the `handle_*` functions carved out of their branches.
+- How the new code is wired:
+  - `_post_init` ends by awaiting `POST_INIT_HOOKS`, and `_post_shutdown` starts by awaiting `POST_SHUTDOWN_HOOKS`.
+  - `build_application` adds `.post_stop(_post_stop)` and replaces its block of `CommandHandler` lines with the `register` loop.
+  - PTB calls `post_stop` only after `Application.stop()`, which awaits the tasks started with `app.create_task`.
+  - `research.handle_pending_reply` returns `True` wherever the old branch returned, and `False` when no reply is pending. `on_text` then falls through to `media.handle_text`, as before.
+- Command registration order:
+  - `/delete` is now registered last, because `delete` is last in `HANDLER_MODULES`. `bot.py` registered it between `/continue` and `/status`.
+  - Every handler is still in group 0, and each command handler matches only its own command, so no update reaches a different handler (see the evidence below).
+- `scripts/run.sh`: the FATAL respawn hint names `src/argus/bot/` instead of `src/argus/bot.py`. Both launch scripts still run `python -m argus.bot`, which `__main__.py` serves. `run_mac.sh` is unchanged.
+- Stale prose left alone, because it is outside this step's file list:
+  - The `README.md` tree still shows `bot.py`.
+  - Comments in `src/argus/graph/compose.py`, `src/argus/graph/state.py` and `src/argus/graph/report_builder_helpers.py` still say `bot.py`.
+  - Test docstrings and assert messages still say `bot.py` or `bot._…`.
+  - The package docstring, moved verbatim, still says the commands are registered in `build_application`.
+
+### Behaviour changes for handoff.md
+
+None.
+
+### New env vars
+
+None.
+
+### Test files touched
+
+How the tests were updated:
+- Imports point at the module that defines each name.
+- Patches target the module that looks the name up. A name the old test patched once on `bot.py` is now patched on every module that looks it up along the test's path.
+- The shared dicts are reached as `bot_common._inflight`, `bot_common._pending_reply` and `bot_media._video_pool`. They are mutated in place and never rebound.
+- The test bodies are otherwise unchanged.
+
+Per file:
+- Imports only: `tests/test_bot.py`, `tests/test_bot_markdown_fallback.py`, `tests/test_youtube.py`, and `tests/test_orphan_reconcile.py`, whose unused `from argus import bot as bot_mod` from the base commit stays.
+- `tests/test_continue_extend.py`: `_allowed`, `get_settings` and `_resume_after_plan` patched on `history`.
+- `tests/test_delete_browser.py`: `_allowed` patched on `app`, and `get_settings` on `app` and `delete`.
+- `tests/test_e2e_research.py` (opt-in e2e): the in-flight registry reached through `bot_common`.
+- `tests/test_hitl_edit_revise.py`: `_allowed` and `get_settings` patched on `app`, and `_replan_after_edit` and `_resume_after_plan` on `research`.
+- `tests/test_media_bot.py`: `_allowed` and `get_settings` patched on `app` and `media`, and `reddit_search` and `download_media` on `media`.
+- `tests/test_plan_hitl_gating.py`: `_allowed` and `get_settings` patched on `app`, and `_resume_after_plan` on `research`.
+- `tests/test_run_scoping.py`: `_allowed` and `get_settings` patched on `research`.
+- `tests/test_transcript.py`: `_parse_indices` taken from `common`; the pool helpers, `_video_pool` and the `time` module reference taken from `media`.
+
+### Verification evidence (2026-10-19)
+
+The previous implementer generated the package with a script that copies each moved block by its original line span. It stopped before the tests were finished. Its own equivalence check compared ASTs, which ignores comments, and compared the command handlers only as a sorted set. So this round re-verified everything against `bot.py` at `3e7a51f`, with its own scripts in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t3\`.
+
+- **Verbatim move, by source text** (`verify_move.py`): PASS.
+  - Each top-level statement of `bot.py` is compared as exact source text, with the comment block directly above it, against its new home.
+  - It must appear in exactly one module. The one exception is `logger`, an identical line in each module that logs.
+  - A difference passes only if one of the adaptations above, applied to the original text, reproduces it exactly.
+  - `on_text` and `on_callback` are compared piece by piece with the dispatchers and the `handle_*` bodies.
+  - Every non-blank line of `bot.py` is accounted for; the section-header comments moved with their code.
+- **Shared state** (`verify_shared.py`, over the package and every test that touches the bot): PASS. There is no bare-name use outside the owner, no name import and no rebinding. Run before this round's test edits, it flagged the two tests that still imported `_inflight` by name.
+- **Handler registration** (`compare_handlers.py`): PASS. It builds the `bot.py` application and the package's application with a dummy token, without polling or network.
+  - The handlers are the same, all in group 0, with the same handler type at every position.
+  - The error handler, `post_init`, `post_shutdown` and the request timeouts are the same. `post_stop` is now `_post_stop`, and all three hook lists are empty.
+  - The only difference in order is the `/delete` command handler.
+  - Synthetic updates were routed through both handler lists the way `Application.process_update` picks a handler:
+    - every command, with and without arguments;
+    - `@`-addressed, unknown and upper-case commands;
+    - plain text and a pasted link;
+    - every callback namespace, including stale and garbage data.
+
+    Each update lands on the same callback in both applications, and none matches more than one handler.
+- **Patch targets** (`bot_patchcheck.py`, a diagnostic pytest plugin): no divergences, and every bot test file passes under it.
+  - It wraps every bot-module binding of the names the tests patch.
+  - It flags any call to an unpatched binding while the same name is patched in another bot module. In the single-namespace original, that call would have hit the patch.
+  - A deliberately wrong target was flagged.
+- **Static names** (`check_names.py`, from the previous implementer's scratchpad): no undefined names in the package or the touched tests. The unused imports left in the tests are the same as at the base commit.
+- **Import order**: the first imports of `argus.*` happen in the same order as before, except that `cache_cleanup` now loads before `config`. `cache_cleanup` imports only stdlib modules and reads no environment.
+- **Import check**: `./venv/Scripts/python.exe -c "import argus.bot, argus.bot.app, argus.engines.schema, argus.graph.run_config, argus.graph.assemble"` exits 0.
+- **Full suite** (`PYTHONPATH="" ./venv/Scripts/python.exe -m pytest -q`): green on the first run. It has the same count as after Task 2, and the only skip is the opt-in `tests/test_e2e_research.py`.
+  - The live-proxy tests (the `test_llm.py` smoke test and `test_graph.py`) passed in that run.
+  - The only warning is the pre-existing `SyntaxWarning` at `tests/test_tools_routing_and_errors.py:187`, in a file this step does not touch.

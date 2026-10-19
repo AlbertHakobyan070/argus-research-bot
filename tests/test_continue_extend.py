@@ -24,8 +24,9 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
-from argus import bot as bot_mod
-from argus.bot import _inflight, append_cmd, continue_cmd
+from argus.bot import common as bot_common
+from argus.bot import history as bot_history
+from argus.bot.history import append_cmd, continue_cmd
 from argus.config import Settings
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
@@ -221,14 +222,14 @@ def test_fetch_missing_local_file_is_loud(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _clear_inflight():
-    _inflight.clear()
+    bot_common._inflight.clear()
     yield
-    _inflight.clear()
+    bot_common._inflight.clear()
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_history, "_allowed", lambda _s, _uid: True)
 
 
 @pytest.fixture(autouse=True)
@@ -244,7 +245,7 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         history_root=Path("vault/history"), ffmpeg_path=None,
         request_timeout_seconds=60.0, max_revision_rounds=3,
     )
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_history, "get_settings", lambda: dummy)
 
 
 class _FakeLib:
@@ -346,7 +347,7 @@ async def test_continue_finished_run_forks_with_full_sources():
             "Command(resume=True)")
         info["awaiting"] = "report_preview"
 
-    with patch.object(bot_mod, "_resume_after_plan",
+    with patch.object(bot_history, "_resume_after_plan",
                       side_effect=fake_resume) as rp:
         await continue_cmd(_update(), _ctx(["ab12"], lib, graph))
 
@@ -376,8 +377,8 @@ async def test_continue_reattaches_plan_gate_paused_run():
 
     await continue_cmd(update, ctx)
 
-    assert "ab12cd34" in _inflight
-    info = _inflight["ab12cd34"]
+    assert "ab12cd34" in bot_common._inflight
+    info = bot_common._inflight["ab12cd34"]
     assert info["awaiting"] == "plan_approval"
     assert info["length"] == "long"
     # Plan message re-rendered with the run-scoped keyboard.

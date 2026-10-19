@@ -18,8 +18,10 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
-from argus import bot as bot_mod
-from argus.bot import _inflight, _pending_reply, on_callback, on_text
+from argus.bot import app as bot_app
+from argus.bot import common as bot_common
+from argus.bot import research as bot_research
+from argus.bot.app import on_callback, on_text
 from argus.config import Settings
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
@@ -169,16 +171,16 @@ def test_revise_is_bounded(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clean():
-    _inflight.clear()
-    _pending_reply.clear()
+    bot_common._inflight.clear()
+    bot_common._pending_reply.clear()
     yield
-    _inflight.clear()
-    _pending_reply.clear()
+    bot_common._inflight.clear()
+    bot_common._pending_reply.clear()
 
 
 @pytest.fixture(autouse=True)
 def _acl(monkeypatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _u: True)
+    monkeypatch.setattr(bot_app, "_allowed", lambda _s, _u: True)
 
 
 @pytest.fixture(autouse=True)
@@ -191,7 +193,7 @@ def _settings(monkeypatch):
         vault_root=Path("v"), media_root=Path("v/m"),
         transcripts_root=Path("v/t"), history_root=Path("v/h"),
         ffmpeg_path=None, request_timeout_seconds=60.0, max_revision_rounds=3)
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
 
 
 def _seed(run_id="ab12cd34", chat_id=5, awaiting="plan_approval"):
@@ -201,7 +203,7 @@ def _seed(run_id="ab12cd34", chat_id=5, awaiting="plan_approval"):
             "awaiting": awaiting, "plan_text": "Plan text",
             "cfg": {"configurable": {"thread_id": f"tg:{chat_id}:{run_id}"}},
             "graph": MagicMock()}
-    _inflight[run_id] = info
+    bot_common._inflight[run_id] = info
     return info
 
 
@@ -244,25 +246,25 @@ async def test_plan_edit_tap_arms_pending_reply():
     _seed(chat_id=5)
     ctx = _ctx()
     await on_callback(_cb(5, "plan:edit:ab12cd34"), ctx)
-    assert _pending_reply.get(5) == ("plan_edit", "ab12cd34")
+    assert bot_common._pending_reply.get(5) == ("plan_edit", "ab12cd34")
 
 
 async def test_plan_edit_reply_triggers_replan(monkeypatch):
     info = _seed(chat_id=5)
-    _pending_reply[5] = ("plan_edit", "ab12cd34")
+    bot_common._pending_reply[5] = ("plan_edit", "ab12cd34")
     replan = AsyncMock()
-    monkeypatch.setattr(bot_mod, "_replan_after_edit", replan)
+    monkeypatch.setattr(bot_research, "_replan_after_edit", replan)
     await on_text(_text_update(5, "focus on security"), _ctx())
     replan.assert_awaited_once()
     assert replan.await_args.args[2] == "focus on security"
-    assert 5 not in _pending_reply, "pending reply consumed"
+    assert 5 not in bot_common._pending_reply, "pending reply consumed"
 
 
 async def test_revise_tap_arms_pending_reply_not_stub():
     _seed(chat_id=6, awaiting="report_preview")
     ctx = _ctx()
     await on_callback(_cb(6, "report:revise:ab12cd34"), ctx)
-    assert _pending_reply.get(6) == ("revise_feedback", "ab12cd34")
+    assert bot_common._pending_reply.get(6) == ("revise_feedback", "ab12cd34")
 
 
 async def test_revise_reply_resumes_with_notes(monkeypatch):
@@ -273,9 +275,9 @@ async def test_revise_reply_resumes_with_notes(monkeypatch):
         values={"revision_notes": ["prior note"]}))
     graph.aupdate_state = AsyncMock()
     info["graph"] = graph
-    _pending_reply[6] = ("revise_feedback", "ab12cd34")
+    bot_common._pending_reply[6] = ("revise_feedback", "ab12cd34")
     resume = AsyncMock()
-    monkeypatch.setattr(bot_mod, "_resume_after_plan", resume)
+    monkeypatch.setattr(bot_research, "_resume_after_plan", resume)
 
     await on_text(_text_update(6, "tighten the intro"), _ctx())
 
@@ -286,7 +288,7 @@ async def test_revise_reply_resumes_with_notes(monkeypatch):
     assert "prior note" in payload["revision_notes"], (
         "revision_notes is a plain channel — must carry the FULL list")
     resume.assert_awaited_once()
-    assert 6 not in _pending_reply
+    assert 6 not in bot_common._pending_reply
 
 
 async def test_plain_text_without_pending_reply_still_does_url_paste():

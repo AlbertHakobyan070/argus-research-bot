@@ -174,14 +174,15 @@ def test_research_full_loop_delivers_markdown_with_sources(
     # have heavy imports that we'd rather skip when the test won't run.
     from telegram.ext import Application
 
-    from argus.bot import on_callback, research_cmd
+    from argus.bot.app import on_callback
+    from argus.bot.research import research_cmd
     from argus.config import Settings, get_settings
 
     # Pull the live configured user id and force reports_root into a
     # tmp folder so we don't pollute A:\Hermes\Downloads\reports with
     # an e2e test artifact. We also wipe the argus in-flight registry
     # on entry so a leftover state from a prior run doesn't poison us.
-    import argus.bot as bot_mod
+    import argus.bot.common as bot_common
 
     s = get_settings()
     user_id = s.telegram_allowed_user_id
@@ -199,8 +200,8 @@ def test_research_full_loop_delivers_markdown_with_sources(
     monkeypatch.setenv("ARGUS_REPORTS_ROOT", str(tmp_path))
     # Invalidate the cached settings singleton so the report_builder
     # picks up the tmp dir.
-    bot_mod._inflight.clear()
-    bot_mod._cached = None if hasattr(bot_mod, "_cached") else None
+    bot_common._inflight.clear()
+    bot_common._cached = None if hasattr(bot_common, "_cached") else None
     from argus import config as cfg_mod
     cfg_mod._cached = None
 
@@ -236,7 +237,7 @@ def test_research_full_loop_delivers_markdown_with_sources(
         # plan_approval entry for our thread. If it doesn't, the planner
         # produced nothing or an exception fired — surface that.
         thread_id = f"tg:{chat_id}"
-        info = bot_mod._inflight.get(thread_id)
+        info = bot_common._inflight.get(thread_id)
         if not info:
             sent = [c.kwargs for c in fake_bot.send_message.await_args_list]
             raise AssertionError(
@@ -256,7 +257,7 @@ def test_research_full_loop_delivers_markdown_with_sources(
         approve_ctx = _make_ctx(fake_bot, app)
         await on_callback(approve_update, approve_ctx)
 
-        info = bot_mod._inflight.get(thread_id)
+        info = bot_common._inflight.get(thread_id)
         if not info:
             raise AssertionError(
                 "in-flight run dropped after plan:approve; "
@@ -333,7 +334,7 @@ def test_research_full_loop_delivers_markdown_with_sources(
 
     # Light sanity checks on the in-flight bookkeeping so a future
     # refactor that drops the cleanup path fails loudly here.
-    assert bot_mod._inflight.get(f"tg:{chat_id}") is None, (
+    assert bot_common._inflight.get(f"tg:{chat_id}") is None, (
         "in-flight registry was not cleaned up after report:send; "
         "the saver connection is leaking."
     )

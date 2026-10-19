@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 from telegram.constants import ParseMode
 
-from argus.bot import (
-    HELP_TEXT, build_application, _format_plan, _plan_keyboard,
-    _safe_send, _safe_edit_cb, _stream_progress, video_cmd,
+from argus.bot.app import build_application
+from argus.bot.common import (
+    HELP_TEXT, _safe_send, _safe_edit_cb, _stream_progress,
 )
+from argus.bot.media import video_cmd
+from argus.bot.research import _format_plan, _plan_keyboard
 
 
 class _FakeBot:
@@ -52,7 +54,7 @@ def test_help_text_is_compact():
 
 def test_help_md_exists_and_covers_commands():
     from pathlib import Path
-    from argus.bot import _HELP_MD_PATH
+    from argus.bot.common import _HELP_MD_PATH
     assert _HELP_MD_PATH.exists(), "docs/help.md must ship with the bot"
     body = Path(_HELP_MD_PATH).read_text(encoding="utf-8")
     for cmd in ("/research", "/find", "/fetch", "/quality", "/transcripts",
@@ -222,7 +224,7 @@ def test_help_mentions_media_commands():
 
 
 def test_report_keyboard_has_extend_button():
-    from argus.bot import _report_keyboard
+    from argus.bot.research import _report_keyboard
     labels = [b.text for row in _report_keyboard().inline_keyboard for b in row]
     assert any("Extend" in l for l in labels)
     assert any("Send" in l for l in labels)
