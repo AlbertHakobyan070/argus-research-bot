@@ -8,3 +8,9 @@
 {"id": "q008", "query": "How does PostgreSQL LISTEN/NOTIFY work for real-time event streaming?", "expected_domains": ["postgresql.org"], "difficulty": "easy"}
 {"id": "q009", "query": "Best practices for testing citation-grounded LLM outputs", "expected_domains": ["arxiv.org"], "difficulty": "hard"}
 {"id": "q010", "query": "What is the LangGraph interrupt mechanism and how do agents resume?", "expected_domains": ["langchain-ai.github.io"], "difficulty": "medium"}
+{"id": "q011", "query": "gold price outlook for the next month", "expected_domains": [], "difficulty": ""}
+{"id": "q012", "query": "Bitcoin market trends this quarter", "expected_domains": [], "difficulty": ""}
+{"id": "q013", "query": "Quantum Lattice Transformer by Nebulon AI benchmark results", "expected_domains": [], "difficulty": ""}
+{"id": "q014", "query": "Helixon-9 protein design model release notes", "expected_domains": [], "difficulty": ""}
+{"id": "q015", "query": "psychological and social factors behind doomscrolling", "expected_domains": [], "difficulty": ""}
+{"id": "q016", "query": "Mediterranean vs Nordic diet for longevity — which is better supported", "expected_domains": [], "difficulty": ""}

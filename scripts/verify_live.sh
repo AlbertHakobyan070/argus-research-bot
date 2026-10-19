@@ -17,8 +17,8 @@ echo "== 2. live LLM tier + graph tests (need the proxy) =="
 ./venv/Scripts/python.exe -m pytest tests/test_llm.py tests/test_graph.py \
   tests/test_reflexion.py -q
 
-echo "== 3. graph-direct deep run to report (manual_e2e) =="
-./venv/Scripts/python.exe tests/manual_e2e.py
+echo "== 3. graph-direct live check: q010 medium, acceptance table (scripts/live_check.py) =="
+./venv/Scripts/python.exe scripts/live_check.py --query q010 --length medium
 
 echo
 echo "All live checks passed. Now drive it from Telegram:"

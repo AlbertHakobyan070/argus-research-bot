@@ -395,6 +395,9 @@ async def test_ask_cmd_records_the_run_config_in_checkpoint_and_library(monkeypa
 
 async def test_bench_run_records_its_run_config_and_dumps_the_final_state(graph, tmp_path):
     from bench import runner
+    (tmp_path / "report.md").write_text("d", encoding="utf-8")      # WP-G: the runner copies the
+    (tmp_path / "report").mkdir()                                    # report files report_builder wrote
+    (tmp_path / "report" / "metadata.json").write_text("{}", encoding="utf-8")
     rec = await runner._run_one({"id": "q900", "query": "topic"}, length="medium", depth="deep",
                                 engines=fake_engines_snapshot(), timeout_s=60,
                                 state_dir=tmp_path / "results")

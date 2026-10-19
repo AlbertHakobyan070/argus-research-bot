@@ -2,7 +2,16 @@
 
 Drives the Argus graph against each query in queries.jsonl, captures
 the final markdown report, and writes per-query JSONL records to
-results/raw.jsonl.
+results/raw.jsonl, plus the bench v2 result layout per query (v4 spec
+§3 WP-G), which ``bench.metrics`` and ``bench.compare`` read:
+
+    <out dir>/<qid>/state.json      the full final state
+    <out dir>/<qid>/report.md       copies of the run's report files, when
+    <out dir>/<qid>/metadata.json   it reached report_builder
+    <out dir>/<qid>/evidence.json   (once WP-C writes it)
+    <out dir>/<qid>/record.json     the run's record (status, duration_s, …)
+
+``scripts/live_check.py`` drives its one run through ``_run_one`` too.
 
 Designed for comparison runs against the LIVE proxy + live search
 (nothing is stubbed):
@@ -35,6 +44,9 @@ Notes:
       after scout, report gate before deliver) and resumes each with
       ``Command(resume=True)``; LangGraph emits ``__interrupt__`` for
       static breakpoints in stream_mode="updates" (verified on 1.2.8).
+      Every astream call passes ``stream_mode=["updates", "custom"]``,
+      ``durability="sync"`` and the run's one ``control=RunControl()``
+      (spec §1.1); nothing here requests a drain.
     - ``report_md`` is compose's ``draft_md`` (pre-report_builder: no
       title block, no citation sanitising). The finished report.md is
       written under Settings.reports_root — the vault unless
@@ -49,11 +61,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.runtime import RunControl
 from langgraph.types import Command
 
 from argus.engines import registry
@@ -82,18 +96,35 @@ async def _engines_snapshot(profile: str | None) -> EnginesSnapshot:
     return await registry.active_snapshot()
 
 
+def _copy_report_files(paths: dict, qdir: Path) -> None:
+    """The run's report.md and metadata.json (report_builder writes both in its
+    folder) and its evidence.json when there is one, next to its state.json."""
+    if not paths.get("md"):
+        return
+    qdir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(paths["md"], qdir / "report.md")
+    shutil.copyfile(Path(paths["folder"]) / "metadata.json", qdir / "metadata.json")
+    if paths.get("evidence"):
+        shutil.copyfile(paths["evidence"], qdir / "evidence.json")
+
+
 async def _run_one(query_obj: dict, *, length: str, depth: str | None,
-                   engines: EnginesSnapshot, timeout_s: int, state_dir: Path) -> dict:
-    """Run a single query end-to-end. Auto-resume through interrupts."""
+                   engines: EnginesSnapshot, timeout_s: int | None, state_dir: Path,
+                   origin: str = "bench", overrides: dict | None = None) -> dict:
+    """Run a single query end-to-end. Auto-resume through interrupts.
+    ``timeout_s`` None: no limit (the live check); ``overrides``: dotted
+    RunConfig keys, e.g. ``{"recency": "m"}``."""
     qid = query_obj["id"]
     query = query_obj["query"]
     thread_id = f"bench-{qid}-{uuid.uuid4().hex[:8]}"
     user_id = 0  # bench user
-    rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, origin="bench")
+    rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, overrides=overrides,
+                               origin=origin)
 
     # Fresh checkpointer per query — no state leakage.
     graph = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": thread_id}}
+    control = RunControl()
 
     state_in = {
         "thread_id": thread_id,
@@ -147,14 +178,12 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
             while steps < max_steps:
                 steps += 1
                 interrupted = False
-                async for ev in graph.astream(current_input, config=config, stream_mode="updates",
-                                              durability="sync"):
-                    for node_name, delta in ev.items():
-                        if node_name == "__interrupt__":
-                            interrupted = True
-                            last_interrupt = delta
-                            break
-                    if interrupted:
+                async for mode, chunk in graph.astream(current_input, config=config,
+                                                       stream_mode=["updates", "custom"],
+                                                       durability="sync", control=control):
+                    if mode == "updates" and "__interrupt__" in chunk:
+                        interrupted = True
+                        last_interrupt = chunk["__interrupt__"]
                         break
                 if not interrupted:
                     break
@@ -174,6 +203,7 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
         fetched = final.get("fetched") or []
         findings = final.get("findings") or []
         paths = final.get("report_paths") or {}
+        _copy_report_files(paths, state_dir / qid)
 
         record.update({
             "status": "ok",
@@ -189,16 +219,20 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
         })
     except Exception as e:  # pragma: no cover — defensive
         logger.exception("runner: query %s failed", qid)
-        record.update({"status": "error", "error": repr(e)})
+        # str(), not repr(): an OSError's repr drops the file name
+        record.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
     record["duration_s"] = round(time.monotonic() - t0, 2)
     # The full final state — after a timeout or an error, the last checkpoint.
     snap = await graph.aget_state(cfg)
+    qdir = state_dir / qid
+    qdir.mkdir(parents=True, exist_ok=True)
     if snap.created_at is not None:
-        state_path = state_dir / qid / "state.json"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path = qdir / "state.json"
         state_path.write_text(json.dumps(snap.values, indent=2, ensure_ascii=False, default=str),
                               encoding="utf-8")
         record["state_path"] = str(state_path)
+    (qdir / "record.json").write_text(json.dumps(record, indent=2, ensure_ascii=False),
+                                      encoding="utf-8")
     return record
 
 

@@ -1,107 +1,115 @@
 # Argus Deep Research Bench
 
-Eval harness for measuring whether Argus graph improvements actually
-move the needle on report quality.
+Eval harness for measuring whether Argus graph changes actually move the
+needle on report quality. Bench v2 (v4 spec §3 WP-G) measures with
+**deterministic metrics** computed from each run's full final state; no LLM
+judges a report.
 
 ## What it measures
 
-For each query in `queries.jsonl`:
+`bench/metrics.py` computes, per query, metrics for depth (unique sources,
+duplicates, fetch success, evidence strength, coverage, gap waves, quote
+verification, claims per primary source, source age), trust (unresolved
+citation markers, the Sources block, flagged claims still in the body,
+cross-section duplicates, judged / total, the compose budget), engines and
+cost (logical calls by role, reroute rate, `routed_via` capture, judge/writer
+model family, degradations, JSON parse failures, Exa spend, wall clock) and
+insight proxies (takeaways and their confidence labels, a disagreement section
+when sources conflict, scenarios for forecasts). The module docstring defines
+each one.
 
-- **`citation_integrity`** — fraction of inline URLs in the report that
-  point at known primary-source domains (arxiv.org, github.com, .edu,
-  official documentation sites). Proxy for the `SourceRegistry`'s
-  effectiveness: if the citation registry is working, fabricated URLs
-  should be stripped before they reach the report.
-- **`citation_density`** — URLs per 1000 chars of report.
-- **`domain_coverage`** — fraction of `expected_domains` (per query)
-  actually cited.
-- **`length_ok`** — report length within ±50% of target for the mode.
-- **Duration, sources fetched, findings count** — efficiency metrics.
+A metric that needs a field the run did not have is `n/a`, never 0: the v3
+baseline in `results/v3-baseline/` predates every v4 field.
+
+`bench/scorer.py` keeps the original URL metrics (citation integrity, density,
+domain coverage, length) over `raw.jsonl`, for continuity.
 
 ## Layout
 
 ```
 bench/
-├── README.md           # this file
-├── __init__.py
-├── queries.jsonl       # {id, query, expected_domains, difficulty}
-├── runner.py           # drives the Argus graph per query
-├── scorer.py           # computes scores from raw.jsonl
-└── results/
-    ├── raw.jsonl       # runner output (one record per query)
-    ├── score.json      # scorer output (machine-readable)
-    └── score.md        # scorer output (human-readable)
+├── README.md
+├── queries.jsonl          # {id, query, expected_domains, difficulty}; ids are stable
+├── runner.py              # drives the graph per query (auto-approves both gates)
+├── metrics.py             # deterministic metrics per query → markdown table
+├── compare.py             # metric deltas between two result folders
+├── scorer.py              # v1 URL metrics over raw.jsonl
+└── results/               # gitignored
+    ├── v3-baseline/<qid>/ # the "before" of every v4 comparison
+    └── <label>/
+        ├── raw.jsonl      # runner output, one record per query
+        └── <qid>/         # state.json, report.md, metadata.json,
+                           # evidence.json (once WP-C writes it), record.json
 ```
 
 ## Usage
 
-```bash
-# 1. Run the bench (5–30 min depending on length mode and proxy speed)
-cd "A:\Hermes\Agents\argus"
-set PYTHONPATH=
-venv\Scripts\python.exe -m bench.runner ^
-    --queries bench\queries.jsonl ^
-    --out bench\results\raw.jsonl ^
-    --length short ^
-    --timeout 300
-
-# 2. Score the results
-venv\Scripts\python.exe -m bench.scorer ^
-    --raw bench\results\raw.jsonl ^
-    --queries bench\queries.jsonl ^
-    --out bench\results\score.json ^
-    --md bench\results\score.md ^
-    --length short
-
-# 3. Read score.md
-type bench\results\score.md
-```
-
-## Comparing branches (the actual reason this exists)
+From the repo root, in Git Bash:
 
 ```bash
-# Baseline: checkout yesterday's state
-git checkout feat/argus-v1
-venv\Scripts\python.exe -m bench.runner --out bench/results/baseline.jsonl ...
-venv\Scripts\python.exe -m bench.scorer --raw bench/results/baseline.jsonl ...
+# 1. Run the bench (live proxy + live search; minutes per query)
+PYTHONPATH="" ./venv/Scripts/python.exe -m bench.runner \
+    --queries bench/queries.jsonl --out bench/results/<label>/raw.jsonl \
+    --length short [--depth standard] [--profile free-proxy] [--timeout 300]
 
-# Head: today's fixes
-git checkout feat/argus-fixes
-venv\Scripts\python.exe -m bench.runner --out bench/results/head.jsonl ...
-venv\Scripts\python.exe -m bench.scorer --raw bench/results/head.jsonl ...
+# 2. Metrics per query, then the deltas against the v3 baseline
+PYTHONPATH="" ./venv/Scripts/python.exe -m bench.metrics --results bench/results/<label>
+PYTHONPATH="" ./venv/Scripts/python.exe -m bench.compare \
+    --a bench/results/v3-baseline --b bench/results/<label>
 
-# Diff
-diff bench/results/baseline.md bench/results/head.md
+# 3. The v1 URL scores (optional)
+PYTHONPATH="" ./venv/Scripts/python.exe -m bench.scorer \
+    --raw bench/results/<label>/raw.jsonl --queries bench/queries.jsonl \
+    --out bench/results/<label>/score.json --md bench/results/<label>/score.md --length short
 ```
 
-If `mean_citation_integrity` goes UP after today's `SourceRegistry`
-work, the citation lift actually moved the needle. If it stays flat,
-we shipped complexity for nothing.
+## The live check
+
+`scripts/live_check.py` drives one query through the runner's own `_run_one`
+(`origin="live_check"`), writes the same `<out>/<qid>/` layout (default out:
+`argus_live_check` in the system temp folder) and prints an acceptance table:
+it exits 1 when a check fails. `--query` takes a bench id or the query text.
+
+```bash
+PYTHONPATH="" PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe scripts/live_check.py \
+    --query q010 --length medium [--depth standard] [--recency m] [--expect-banner]
+```
+
+`--expect-banner` is for the nonexistent-entity queries: it expects the
+grounding banner and at most 3 findings.
+
+## Queries
+
+Hand-curated technical questions, plus forecasts and time-sensitive topics
+(q011, q012; run with `--recency`), nonexistent entities (q013, q014; run the
+live check with `--expect-banner`), a non-technical explainer (q015) and a
+comparison (q016). Keep ids stable so runs stay comparable; add queries at the
+end.
 
 ## Constraints
 
-- The bench always uses a fresh `MemorySaver` per query (no SQLite
-  checkpoints, no thread-id collisions).
-- The runner auto-resumes through LangGraph interrupts (`researcher`
-  and `deliver`) without user input — the goal is to measure graph
-  output, not HITL UX.
-- Default timeout per query is 300s. Increase with `--timeout` for
-  `long` / `lecture` modes.
-- The bench uses the same FreeLLMAPI as the bot, so results will
-  drift if the proxy's tier resolution changes mid-run. Pin model
-  via env var if reproducibility matters: `ARGUS_BENCH_MODEL=...`.
+- A fresh `MemorySaver` per query: no SQLite checkpoints, no thread-id
+  collisions.
+- The runner auto-resumes through the plan gate and the report gate; the goal
+  is to measure the graph's output, not the HITL UX.
+- The engines are resolved once per bench run from the committed
+  `argus_engines.json` plus the local file (`--profile` picks a profile); the
+  bot's `/engines` changes are not read. The free proxy reroutes every
+  request, so runs are comparable only while it serves the same models.
+- The runner's finished `report.md` is written under `Settings.reports_root`
+  (the vault unless `ARGUS_REPORTS_ROOT` is set) and copied into
+  `<label>/<qid>/`; the live check sets `ARGUS_REPORTS_ROOT` under its out
+  folder.
 
-## Limitations (documented honestly)
+## Limitations
 
-- **No GAIA / HotpotQA integration.** The 10-query set in
-  `queries.jsonl` is hand-curated. Wiring GAIA would add 2–3h and
-  isn't worth it for the first bench iteration.
-- **Primary-domain heuristic.** Citation integrity is computed by
-  matching against a hardcoded list of "good" domains. A URL like
-  `nytimes.com/2026/ai-breakthrough.html` would be scored as
-  non-primary even if it points at a legitimate source. A more
-  robust scorer would use a domain-authority signal (Majestic,
-  Moz, etc.) — out of scope for v1.
-- **No human eval.** The bench measures objective signals only.
-  Whether a report is *useful* to a human reader still needs an
-  Albert eyeball check.
+- **No GAIA / HotpotQA integration.** The query set is hand-curated.
+- **One sample per query.** The proxy picks a different model per call, so a
+  single row is a sample, not a measurement of the mean.
+- **Heuristic definitions.** "Primary source" is the scorer's domain list;
+  cross-section duplicates are claims at ≥ 0.85 text similarity; the
+  canonical URL follows the spec's rule list. Each definition is fixed, so
+  before/after comparisons stay fair, but none is a human judgement.
+- **No human eval.** Whether a report is *useful* still needs an Albert
+  eyeball check. An LLM bench judge (RACE-lite / FACT-lite) is optional /
+  later.
