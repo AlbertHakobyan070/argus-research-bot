@@ -812,15 +812,18 @@ def test_an_exa_total_must_be_a_finite_number(net, monkeypatch, total):
     ("FREELLMAPI_BASE_URL", "http://proxy..example.net:3001/v1", "proxy..example.net"),     # an empty label
     ("ARGUS_WEBAPP_PUBLIC_URL", f"https://{'a' * 70}.example.net", f"{'a' * 70}.example.net"),  # a 70-char label
     ("FREELLMAPI_BASE_URL", "http://proxy.example.net:99999/v1", "proxy.example.net"),     # a port out of range
+    ("FREELLMAPI_BASE_URL", "http://user:pw@proxy..example.net/v1", "proxy..example.net"),  # credentials in the URL
 ])
 def test_a_malformed_own_endpoint_is_one_config_error(net, monkeypatch, env, url, host):
     """An own-endpoint URL the guard cannot read is one EngineConfigError naming the
-    variable and the host — the bot shows it — never a bare UnicodeError / ValueError
-    out of every fetch(). (At 1d69139 every fetch() raised UnicodeError.)"""
+    variable and the host only — the bot shows it, and it is logged, so the value's
+    ``user:password@`` never appears — never a bare UnicodeError / ValueError out of
+    every fetch(). (At 1d69139 every fetch() raised UnicodeError.)"""
     monkeypatch.setenv(env, url)
     with pytest.raises(EngineConfigError) as ei:
         _fetch({"url": "https://docs.example.org/page"})
     assert env in str(ei.value) and host in str(ei.value), ei.value
+    assert "pw" not in str(ei.value), ei.value
     with pytest.raises(EngineConfigError):             # the node stops on it, not one error line per source
         research._parallel_fetch([{"url": "https://docs.example.org/a"}, {"url": "https://docs.example.org/b"}],
                                  cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)

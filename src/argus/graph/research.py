@@ -408,10 +408,12 @@ _MD_LINK = re.compile(r"!?\[([^\[\]]*)\]\([^)\]]*\)")     # a markdown link or i
 _LIST_MARKER = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)  # an ordered-list marker at a line start
 _BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)    # blockquote markers at a line start: ">", ">>", "> >"
 # whole numbers (a sign only when no word character precedes it, . , : only between digits, a trailing %),
-# the comparison symbols, words: "0.5%" ≠ "5%", "-5%" ≠ "5%", "≤" ≠ "≥"
-_TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?|\d+(?:[.,:]\d+)*%?|[<>≤≥≠±=]|\w+")
+# the comparison symbols, words: "0.5%" ≠ "5%", "-5%" ≠ "5%", "≤" ≠ "≥"; a number glued to letters is one
+# word ("50m", "2nd", "10x"), so "$50" ≠ "$50M"
+_TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?(?!\w)|[<>≤≥≠±=]|\w+")
 _NEGATORS = frozenset("not never cannot cant dont doesnt isnt arent wasnt werent wont wouldnt shouldnt "
-                      "couldnt without".split())          # the fold deletes apostrophes: don't → dont
+                      "couldnt didnt hasnt havent hadnt aint mustnt neednt mightnt shant oughtnt without"
+                      .split())                           # the fold deletes apostrophes: don't → dont
 _ELLIPSIS = re.compile(r"\.\.\.|…")
 _SEGMENT_GAP = 3000          # chars from one ellipsis segment's end to the next one's first character
 _MAX_SEGMENTS = 8            # a quote with more ellipsis segments never verifies (bounds the occurrence scan)

@@ -191,17 +191,19 @@ def _own_endpoints() -> set[tuple[str, int]]:
     console's public URL — as normalised ``(host, port)`` pairs. Never compared by
     address: a public endpoint's address is shared (a CDN, a tunnel edge), and a
     private one is refused by the private-address rule anyway. A variable the guard
-    cannot read is an ``EngineConfigError`` naming it: no fetch can be checked."""
+    cannot read is an ``EngineConfigError`` naming it and its host — never its value,
+    which may carry ``user:password@`` into the chat and the log: no fetch can be checked."""
     own: set[tuple[str, int]] = set()
     for env in ("FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
-        value = os.environ.get(env, "").strip()
+        parts = None
         try:
-            parts = urlsplit(value)
+            parts = urlsplit(os.environ.get(env, "").strip())
             host = _norm_host(parts.hostname or "")
             if host:
                 own.add((host, _port(parts)))
         except ValueError as e:      # UnicodeError (an empty or overlong label), a bad port, an unclosed bracket
-            raise EngineConfigError(f"{env}={value!r} is not a valid endpoint URL ({type(e).__name__}: {e})") from e
+            where = f" (host {parts.hostname!r})" if parts is not None else ""     # urlsplit failed: no host to name
+            raise EngineConfigError(f"{env}{where} is not a valid endpoint URL ({type(e).__name__}: {e})") from e
     return own
 
 

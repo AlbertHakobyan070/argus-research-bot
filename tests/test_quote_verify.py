@@ -102,6 +102,9 @@ PROSE = (
     "> > so that a restart loses nothing at all.\n"
     "> 1. Clone the repository.\n"
     "> 2. Run the installer.\n"
+    # WP-B closeout: a number glued to letters is one word token
+    "The startup raised $50M in 2024. The model has 70B parameters and is 10x faster on a CPU at 2.5GHz; its "
+    "latency is 100ms, training used 8k GPUs, and it was the 2nd place finisher in the benchmark. "
 )
 PROSE_IDX = QuoteIndex(_doc(30_000, seed=3) + " " + PROSE + _doc(30_000, seed=5))
 PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every knob outside a preset keeps "
@@ -153,6 +156,14 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
     ("a mid-line > → <", "passes when x < 5 holds for every sample"),
     (">= → <= at the start of a quote", "<= 300 requests per second at peak"),
     ("a blockquoted figure changed", "Python 3.12 or newer is required for the Functional API"),
+    # WP-B closeout (the rounds 4–5 re-review): a quote may not drop a number's suffix
+    ("$50M quoted as $50", "raised $50"),
+    ("70B quoted as 70", "has 70"),
+    ("10x quoted as 10", "is 10"),
+    ("2.5GHz quoted as 2.5", "at 2.5"),
+    ("100ms quoted as 100", "is 100"),
+    ("8k quoted as 8", "used 8"),
+    ("2nd quoted as nd", "nd place finisher"),
 ])
 def test_an_altered_quote_never_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is False, label
@@ -194,9 +205,28 @@ def test_an_altered_quote_never_verifies(label, quote):
     ("a blockquoted ordered list", "Clone the repository. Run the installer."),
     ("a mid-line > in the source", "passes when x > 5 holds for every sample"),
     (">= at the start of a quote", ">= 300 requests per second at peak"),
+    # WP-B closeout: a number glued to letters, quoted whole
+    ("an amount with its magnitude suffix", "raised $50M"),
+    ("an ordinal", "2nd place finisher"),
+    ("a count with its unit", "70B parameters"),
 ])
 def test_a_legitimate_quote_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is True, label
+
+
+NEGATORS = ["not", "never", "cannot", "can't", "don't", "doesn't", "isn't", "aren't", "wasn't", "weren't", "won't",
+            "wouldn't", "shouldn't", "couldn't", "without",
+            # WP-B closeout: the rest of the n't contractions (spec §2.8)
+            "didn't", "hasn't", "haven't", "hadn't", "ain't", "mustn't", "needn't", "mightn't", "shan't", "oughtn't"]
+
+
+@pytest.mark.parametrize("negator", NEGATORS)
+def test_an_excerpt_never_cuts_a_negation_off(negator):
+    quote = "retry failed jobs after a timeout."
+    negated = f"In this release the scheduler {negator} retry failed jobs after a timeout."
+    assert quote_verified(quote, QuoteIndex(negated)) is False
+    later = f"{negated} The next release will retry failed jobs after a timeout."
+    assert quote_verified(quote, QuoteIndex(later)) is True, "a later occurrence no negator precedes still matches"
 
 
 def test_ellipsis_segments_must_be_in_order_and_near():
@@ -244,10 +274,12 @@ def test_indexing_stays_linear(label):
     bracket. (At 1d69139, 20 000 unclosed "[" took seconds to index.)"""
     doc = ADVERSARIAL[label]
     assert len(doc) == 60_000
-    t0 = time.perf_counter()
-    QuoteIndex(doc)
-    took = time.perf_counter() - t0
-    assert took <= 0.050, f"{label}: indexing took {took:.2f} s"
+    best = float("inf")
+    for _ in range(3):                       # best of three, as for the verification bound
+        t0 = time.perf_counter()
+        QuoteIndex(doc)
+        best = min(best, time.perf_counter() - t0)
+    assert best <= 0.050, f"{label}: {best * 1000:.1f} ms to index"
 
 
 @pytest.mark.parametrize("case", ["exact", "altered", "miss"])
