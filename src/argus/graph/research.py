@@ -402,24 +402,32 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
 
 # quote marks and emphasis asterisks dropped, dashes unified, "_" a space (``_x_`` emphasis, snake_case alike)
 _QUOTE_FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»‹›*"), **dict.fromkeys("–—‐‑−", "-"), "_": " "})
-_FOOTNOTE = re.compile(r"\[\d+\](?:\([^)]*\))?")          # a footnote marker, [3] (or linked: [3](#fn3))
-_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")         # a markdown link or image → its text
+# no run here crosses a "]" (link text: nor a "["), so the scans never overlap: linear on many unclosed "[" / "]("
+_FOOTNOTE = re.compile(r"\[\d+\](?:\([^)\]]*\))?")        # a footnote marker, [3] (or linked: [3](#fn3))
+_MD_LINK = re.compile(r"!?\[([^\[\]]*)\]\([^)\]]*\)")     # a markdown link or image → its text
 _LIST_MARKER = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)  # an ordered-list marker at a line start
-_WORD = re.compile(r"\w+")
+# whole numbers (a sign only when no word character precedes it, . , : only between digits, a trailing %),
+# the comparison symbols, words: "0.5%" ≠ "5%", "-5%" ≠ "5%", "≤" ≠ "≥"
+_TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?|\d+(?:[.,:]\d+)*%?|[<>≤≥≠±=]|\w+")
+_NEGATORS = frozenset("not never cannot cant dont doesnt isnt arent wasnt werent wont wouldnt shouldnt "
+                      "couldnt without".split())          # the fold deletes apostrophes: don't → dont
 _ELLIPSIS = re.compile(r"\.\.\.|…")
-_SEGMENT_GAP = 3000          # chars from one ellipsis segment's end to the next one's start
+_SEGMENT_GAP = 3000          # chars from one ellipsis segment's end to the next one's first character
+_MAX_SEGMENTS = 8            # a quote with more ellipsis segments never verifies (bounds the occurrence scan)
 
 
 def _words(text: str) -> str:
     """``text`` normalised — case, quote marks, dashes, markdown links and images
-    (their text), footnote markers, ordered-list markers at line starts — as its
-    ``\\w+`` tokens, one space before each and after the last."""
+    (their text), footnote markers, ordered-list markers at line starts, ``<=``
+    ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` — as its tokens (``_TOKEN``), one space before
+    each and after the last."""
     text = _LIST_MARKER.sub("", _MD_LINK.sub(r"\1", _FOOTNOTE.sub("", text)))
-    return " " + "".join(w + " " for w in _WORD.findall(text.translate(_QUOTE_FOLD).lower()))
+    text = text.translate(_QUOTE_FOLD).lower().replace("<=", "≤").replace(">=", "≥").replace("!=", "≠")
+    return " " + "".join(t + " " for t in _TOKEN.findall(text))
 
 
 class QuoteIndex:
-    """One document's normalised word tokens (``_words``), built once per document."""
+    """One document's normalised tokens (``_words``), built once per document."""
 
     def __init__(self, text: str):
         self.words = _words(text or "")
@@ -428,22 +436,28 @@ class QuoteIndex:
 def quote_verified(quote: str, idx: QuoteIndex) -> bool | None:
     """Is ``quote`` verbatim in the document (spec §2.8)? ``None``: no quote.
 
-    The quote's word tokens, normalised as the document's, must occur
-    contiguously and in order; an ellipsis (``...`` / ``…``) splits it into
-    segments that must each occur so, in order, each starting within
-    ``_SEGMENT_GAP`` chars (of the normalised document) of the previous one's
-    end. A substituted, added or dropped word or number fails."""
+    The quote's tokens, normalised as the document's, must occur contiguously
+    and in order, the first not right after a negator (an excerpt may not cut a
+    negation off); an ellipsis (``...`` / ``…``) splits it into at most
+    ``_MAX_SEGMENTS`` segments that must each occur so, in order, each one's first
+    character at most ``_SEGMENT_GAP`` chars (of the normalised document) after the
+    previous one's end. A substituted, added or dropped word, number or symbol fails."""
     segments = [w for w in (_words(part) for part in _ELLIPSIS.split(quote or "")) if w != " "]
     if not segments:
         return None
+    if len(segments) > _MAX_SEGMENTS:
+        return False
     ends: list[int] | None = None
     for seg in segments:
         starts, at = [], idx.words.find(seg)
         while at >= 0:
             starts.append(at)
             at = idx.words.find(seg, at + 1)
-        if ends is not None:                      # after a previous end, within the gap
-            starts = [s for s in starts if (i := bisect.bisect_right(ends, s)) and s - ends[i - 1] <= _SEGMENT_GAP]
+        if ends is None:                          # the first segment: not right after a negator token
+            starts = [s for s in starts if idx.words[idx.words.rfind(" ", 0, s) + 1:s] not in _NEGATORS]
+        else:                                     # after a previous end; its first char (s + 1) within the gap
+            starts = [s for s in starts
+                      if (i := bisect.bisect_right(ends, s)) and s + 1 - ends[i - 1] <= _SEGMENT_GAP]
         if not starts:
             return False
         ends = [s + len(seg) - 1 for s in starts]     # the trailing space, where the next segment may start
@@ -506,7 +520,7 @@ def _digest_chunks(text: str, research) -> list[str]:
 def _word_cut(text: str, limit: int) -> str:
     """``text`` cut to at most ``limit`` chars at the last whitespace at or before
     ``limit`` (a single token longer than ``limit`` keeps the hard cut), so a quote
-    shortened here never ends in a word fragment the token rule rejects."""
+    shortened here never ends in a word fragment, which ``quote_verified`` rejects."""
     if len(text) <= limit:
         return text
     cut = next((i for i in range(limit, 0, -1) if text[i].isspace()), 0)

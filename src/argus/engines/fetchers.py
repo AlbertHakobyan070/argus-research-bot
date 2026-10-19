@@ -33,15 +33,18 @@ Guards (spec §2.8, WP-B review):
   any other ``Content-Encoding`` is refused. Text on disk is capped at
   ``max_chars_on_disk``.
 
-A rung's expected failures — HTTP status, network and timeout errors, size, a
-third-party parser's exception — are its own error type, recorded with the
-exception type; anything else propagates. ``rungs_tried`` lists every rung tried
-with its error (``""`` for the one that succeeded), on success too.
+A rung's expected failures — HTTP status, network and timeout errors, a body
+that does not decode, size, a third-party parser's exception — are its own
+error type, recorded with the exception type; anything else propagates (an
+own-endpoint variable the guard cannot read is an ``EngineConfigError``).
+``rungs_tried`` lists every rung tried with its error (``""`` for the one that
+succeeded), on success too.
 """
 from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import socket
@@ -60,6 +63,7 @@ import trafilatura
 
 from .. import tools
 from ..tools import crawl_url, snatch_url
+from .registry import EngineConfigError
 from .urls import canonical_url
 
 if TYPE_CHECKING:
@@ -186,13 +190,18 @@ def _own_endpoints() -> set[tuple[str, int]]:
     """This server's own endpoints — the proxy (``FREELLMAPI_BASE_URL``) and the
     console's public URL — as normalised ``(host, port)`` pairs. Never compared by
     address: a public endpoint's address is shared (a CDN, a tunnel edge), and a
-    private one is refused by the private-address rule anyway."""
+    private one is refused by the private-address rule anyway. A variable the guard
+    cannot read is an ``EngineConfigError`` naming it: no fetch can be checked."""
     own: set[tuple[str, int]] = set()
     for env in ("FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
-        parts = urlsplit(os.environ.get(env, "").strip())
-        host = _norm_host(parts.hostname or "")
-        if host:
-            own.add((host, _port(parts)))
+        value = os.environ.get(env, "").strip()
+        try:
+            parts = urlsplit(value)
+            host = _norm_host(parts.hostname or "")
+            if host:
+                own.add((host, _port(parts)))
+        except ValueError as e:      # UnicodeError (an empty or overlong label), a bad port, an unclosed bracket
+            raise EngineConfigError(f"{env}={value!r} is not a valid endpoint URL ({type(e).__name__}: {e})") from e
     return own
 
 
@@ -431,7 +440,7 @@ def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned
         with _http_client(cfg) as client:
             r = client.post(_EXA_CONTENTS, json={"urls": [url], "text": {"maxCharacters": cfg.max_chars_on_disk}},
                             headers={"x-api-key": key})
-    except httpx.TransportError as e:
+    except (httpx.TransportError, httpx.DecodingError) as e:     # network, timeout; a body that does not decode
         raise _RungError(f"{type(e).__name__}: {e}") from e
     if r.status_code >= 400:
         raise _RungError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -447,8 +456,8 @@ def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned
 
 def _exa_reply(data, ledger: SpendLedger) -> tuple[str, str]:
     """The first result's text and title from a ``/contents`` reply, with
-    ``costDollars.total`` added to the ledger first (it was billed). A reply of
-    any other shape is this rung's ``malformed reply: …`` error."""
+    ``costDollars.total`` (a finite number) added to the ledger first (it was
+    billed). A reply of any other shape is this rung's ``malformed reply: …`` error."""
     def kind(value) -> str:
         return "missing" if value is None else f"a JSON {type(value).__name__}"
 
@@ -460,8 +469,14 @@ def _exa_reply(data, ledger: SpendLedger) -> tuple[str, str]:
     total = cost.get("total")
     if isinstance(total, bool) or not isinstance(total, int | float):
         raise _RungError(f"malformed reply: costDollars.total is {kind(total)}, not a number")
-    if total:
-        ledger.add_usd(float(total))
+    try:
+        usd = float(total)
+    except OverflowError as e:                           # an integer beyond any float
+        raise _RungError(f"malformed reply: costDollars.total is not a finite number (OverflowError: {e})") from e
+    if not math.isfinite(usd):                           # NaN, ±Infinity, 1e999
+        raise _RungError(f"malformed reply: costDollars.total is {usd}, not a finite number")
+    if usd:
+        ledger.add_usd(usd)
     results = data.get("results")
     if not isinstance(results, list):
         raise _RungError(f"malformed reply: results is {kind(results)}, not a list")

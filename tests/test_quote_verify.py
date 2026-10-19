@@ -1,11 +1,14 @@
 """Verbatim quote verification (v4 spec §2.8, B4): the document and the quote
 are normalised alike — case, whitespace, quote marks, dashes, markdown links and
-images (their text), footnote markers, ordered-list markers at line starts — and
-split into ``\\w+`` tokens. A quote verifies when its tokens occur contiguously
-and in order in the document's; an ellipsis splits it into segments that must
-each occur so, in order, each starting within 3 000 chars of the previous one's
-end. Any substituted, added or dropped word or number fails. The bound: ≤ 50 ms
-per 250-char quote on a 60 000-char document."""
+images (their text), footnote markers, ordered-list markers at line starts,
+``<=`` ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` — and split into tokens: whole numbers
+(sign, ``.``/``,``/``:`` between digits, ``%``), the symbols ``< > ≤ ≥ ≠ ± =`` and
+``\\w+`` words. A quote verifies when its tokens occur contiguously and in order in
+the document's, the first segment not right after a negator; an ellipsis splits it
+into at most 8 segments that must each occur so, in order, each starting within
+3 000 chars of the previous one's end. Any substituted, added or dropped word,
+number or symbol fails. The bounds: ≤ 50 ms per 250-char quote on a 60 000-char
+document; indexing stays linear."""
 from __future__ import annotations
 
 import json
@@ -82,6 +85,14 @@ PROSE = (
     "Revenue rose from 5% of sales in 2023 to 12% of sales in 2024 across the whole group. "
     "In the benchmark the OpenAI model outperformed the Google model on every reasoning task we ran. "
     "A request is retried at most three times, and at least one attempt is always logged for audit. "
+    # WP-B fix round 4: numbers, symbols and negators
+    "The latency bound is <= 20 ms on every route, and p < 0.05 for every arm of the trial. "
+    "Profit fell to -5% in 2024, while growth of 0.5% of users came from referrals. "
+    "We served 1,000 users and 1,000 requests per second in 2024. "
+    "COVID-19 cases rose between 2019–2020 in the region; the ratio was 3.14 at its peak. "
+    "The drug is not effective in children. The update ships without breaking changes. "
+    "Users don't need an account to read the docs. "
+    "Version 2 does not support webhooks; version 3 does support webhooks. "
 )
 PROSE_IDX = QuoteIndex(_doc(30_000, seed=3) + " " + PROSE + _doc(30_000, seed=5))
 PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every knob outside a preset keeps "
@@ -117,6 +128,18 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
     # dropped and added words
     ("a dropped word", "nothing is lost while the graph waits for a human to answer question"),
     ("an added word", "nothing is ever lost while the graph waits for a human to answer the question"),
+    # WP-B fix round 4 (the third re-review's residuals): numbers and symbols are whole tokens
+    ("≤ → ≥", "Performance bound (test): ≥ 50 ms per 250-char quote on a 60 000-char document."),
+    ("<= in the source, >= in the quote", "The latency bound is >= 20 ms on every route"),
+    ("< → >", "p > 0.05 for every arm of the trial"),
+    ("-5% → 5%", "Profit fell to 5% in 2024"),
+    ("0.5% quoted as 5%", "5% of users came from referrals"),
+    ("1,000 → 1.000", "1.000 requests per second in 2024"),
+    # ... and an excerpt may not cut a negation off
+    ("starts right after 'not'", "effective in children"),
+    ("starts right after 'without'", "breaking changes"),
+    ("starts right after 'don't'", "need an account to read the docs"),
+    ("an ellipsis first, then right after 'not'", "… effective in children"),
 ])
 def test_an_altered_quote_never_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is False, label
@@ -135,6 +158,17 @@ def test_an_altered_quote_never_verifies(label, quote):
     ("ordered-list markers in the source", "Install the package. Start the server with the token."),
     ("ellipsis segments in order", "Presets are the shipped defaults … an override is recorded in overrides_applied"),
     ("a word elided with an ellipsis", "nothing is lost while the graph ... for a human to answer the question"),
+    # WP-B fix round 4: number and symbol tokens
+    ("a year before a full stop", "1,000 requests per second in 2024"),
+    ("decimals", "p < 0.05 for every arm of the trial"),
+    ("a decimal and a percentage", "growth of 0.5% of users came from referrals"),
+    ("a signed percentage", "Profit fell to -5% in 2024"),
+    ("a thousands separator", "We served 1,000 users"),
+    ("COVID-19", "COVID-19 cases rose"),
+    ("a year range, en dash in the source", "between 2019-2020 in the region; the ratio was 3.14 at its peak"),
+    ("<= in the source, ≤ in the quote", "The latency bound is ≤ 20 ms on every route"),
+    ("a quote that starts with the negator", "not effective in children"),
+    ("another occurrence not after a negator", "support webhooks"),
 ])
 def test_a_legitimate_quote_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is True, label
@@ -148,6 +182,47 @@ def test_ellipsis_segments_must_be_in_order_and_near():
     far = QuoteIndex(f"{head} {_doc(4_000, seed=21)} {tail}")
     assert quote_verified(f"{head} … {tail}", near) is True, "the next segment starts within 3 000 chars"
     assert quote_verified(f"{head} … {tail}", far) is False, "more than 3 000 chars apart"
+
+
+def test_the_ellipsis_gap_boundary_is_exactly_3000_chars():
+    """A segment's first character may sit at most 3 000 chars (of the normalised
+    token text) after the previous segment's end. (At 1d69139, 3 001 passed.)"""
+    head, tail = "alpha beta gamma", "omega sigma tau"
+    for last, gap, want in (("abc", 3000, True), ("abcd", 3001, False)):
+        idx = QuoteIndex(f"{head} {' '.join(['wxyz'] * 599)} {last} {tail}")
+        end, start = idx.words.index(" gamma ") + len(" gamma"), idx.words.index(" omega ") + 1
+        assert start - end == gap
+        assert quote_verified(f"{head} … {tail}", idx) is want, gap
+
+
+def test_a_quote_of_more_than_8_segments_never_verifies():
+    idx = QuoteIndex(" ".join(f"w{i}" for i in range(20)))
+    assert quote_verified(" … ".join(f"w{i}" for i in range(8)), idx) is True
+    assert quote_verified(" … ".join(f"w{i}" for i in range(9)), idx) is False
+    rep = QuoteIndex("a " * 30_000)                  # the third re-review's degenerate case: 2 s at 1d69139
+    t0 = time.perf_counter()
+    assert quote_verified("…".join(["a"] * 125), rep) is False
+    assert time.perf_counter() - t0 <= 0.050
+
+
+ADVERSARIAL = {
+    "20 000 unclosed [": ("[" * 20_000 + " word" * 8_000)[:60_000],
+    "30 000 unclosed ![": "![" * 30_000,
+    "15 000 links without a closing paren": "[a](" * 15_000,
+    "15 000 footnotes without a closing paren": "[1](" * 15_000,
+}
+
+
+@pytest.mark.parametrize("label", list(ADVERSARIAL))     # ids stay short: the node id lands in an env var
+def test_indexing_stays_linear(label):
+    """The link, image and footnote patterns never rescan the document from every
+    bracket. (At 1d69139, 20 000 unclosed "[" took seconds to index.)"""
+    doc = ADVERSARIAL[label]
+    assert len(doc) == 60_000
+    t0 = time.perf_counter()
+    QuoteIndex(doc)
+    took = time.perf_counter() - t0
+    assert took <= 0.050, f"{label}: indexing took {took:.2f} s"
 
 
 @pytest.mark.parametrize("case", ["exact", "altered", "miss"])

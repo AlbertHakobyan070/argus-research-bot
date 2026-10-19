@@ -17,6 +17,7 @@ import pytest
 
 from argus.engines import fetchers
 from argus.engines.ledger import SpendLedger
+from argus.engines.registry import EngineConfigError
 from argus.graph import research
 from argus.graph.run_config import FetchConfig
 
@@ -766,3 +767,61 @@ def test_a_billed_reply_records_its_cost_even_when_its_results_are_malformed(net
     res = _fetch({"url": "https://walled.example/a"}, ledger=ledger, exa=True)
     assert "malformed reply: results is a JSON int, not a list" in res.error, res.error
     assert ledger.snapshot()["exa_usd"] == pytest.approx(0.001), "Exa billed it, so the spend shows it"
+
+
+# ---------------------------------------------------------------------------
+# WP-B fix round 4
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("coding", ["gzip", "deflate"])
+def test_a_corrupt_compressed_body_is_the_rungs_own_error(net, monkeypatch, coding):
+    """A body labelled gzip / deflate that does not decompress is the rung's own
+    error, with the exception type — native and exa_contents alike; nothing escapes
+    fetch(). (At 1d69139 exa_contents raised httpx.DecodingError out of fetch().)"""
+    monkeypatch.setenv("EXA_API_KEY", "test-key")
+
+    def corrupt(request):
+        return httpx.Response(200, headers={"content-type": "text/html", "content-encoding": coding},
+                              content=iter([b"this is not compressed"]))
+
+    net.routes["https://walled.example/a"] = corrupt
+    net.routes["https://api.exa.ai/contents"] = corrupt
+    res = _fetch({"url": "https://walled.example/a"}, ledger=SpendLedger({"exa_contents_pages": 1}), exa=True)
+    assert not res.ok and _rungs(res) == ["native", "exa_contents"], res.error
+    native, exa = (t["error"] for t in res.rungs_tried)
+    assert native.startswith(f"{coding}: zlib.error: "), native
+    assert exa.startswith("DecodingError: "), exa
+
+
+@pytest.mark.parametrize("total", [b"NaN", b"Infinity", b"-Infinity", b"1e999", b"true", b"1" + b"0" * 400])
+def test_an_exa_total_must_be_a_finite_number(net, monkeypatch, total):
+    """A total that is not a finite number is a malformed reply and never reaches the
+    ledger. (At 1d69139 NaN and ±inf were added to it, and a 400-digit integer
+    raised OverflowError out of fetch().)"""
+    monkeypatch.setenv("EXA_API_KEY", "test-key")
+    net.routes["https://walled.example/a"] = httpx.Response(403)
+    net.routes["https://api.exa.ai/contents"] = httpx.Response(200, content=(
+        b'{"results": [{"text": "%s"}], "costDollars": {"total": %s}}' % (_EXA_TEXT.encode(), total)))
+    ledger = SpendLedger({"exa_contents_pages": 1})
+    res = _fetch({"url": "https://walled.example/a"}, ledger=ledger, exa=True)
+    assert not res.ok and "exa_contents: malformed reply: costDollars.total " in res.error, res.error
+    assert ledger.snapshot()["exa_usd"] == 0
+
+
+@pytest.mark.parametrize("env,url,host", [
+    ("FREELLMAPI_BASE_URL", "http://proxy..example.net:3001/v1", "proxy..example.net"),     # an empty label
+    ("ARGUS_WEBAPP_PUBLIC_URL", f"https://{'a' * 70}.example.net", f"{'a' * 70}.example.net"),  # a 70-char label
+    ("FREELLMAPI_BASE_URL", "http://proxy.example.net:99999/v1", "proxy.example.net"),     # a port out of range
+])
+def test_a_malformed_own_endpoint_is_one_config_error(net, monkeypatch, env, url, host):
+    """An own-endpoint URL the guard cannot read is one EngineConfigError naming the
+    variable and the host — the bot shows it — never a bare UnicodeError / ValueError
+    out of every fetch(). (At 1d69139 every fetch() raised UnicodeError.)"""
+    monkeypatch.setenv(env, url)
+    with pytest.raises(EngineConfigError) as ei:
+        _fetch({"url": "https://docs.example.org/page"})
+    assert env in str(ei.value) and host in str(ei.value), ei.value
+    with pytest.raises(EngineConfigError):             # the node stops on it, not one error line per source
+        research._parallel_fetch([{"url": "https://docs.example.org/a"}, {"url": "https://docs.example.org/b"}],
+                                 cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)
+    assert net.requests == []
