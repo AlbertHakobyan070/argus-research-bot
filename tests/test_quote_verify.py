@@ -1,9 +1,11 @@
-"""Anchored quote verification (v4 spec §2.8, B4): normalised exact
-substring, else word 4-gram anchors → the matched-span SequenceMatcher
-similarity on windows around the top 3 anchors → ``≥ quote_verify_fuzzy``
-**and** every number token and word of the quote a token of that window (the
-WP-B review's token rule). The bound: ≤ 50 ms per 250-char quote on a
-60 000-char document."""
+"""Verbatim quote verification (v4 spec §2.8, B4): the document and the quote
+are normalised alike — case, whitespace, quote marks, dashes, markdown links and
+images (their text), footnote markers, ordered-list markers at line starts — and
+split into ``\\w+`` tokens. A quote verifies when its tokens occur contiguously
+and in order in the document's; an ellipsis splits it into segments that must
+each occur so, in order, each starting within 3 000 chars of the previous one's
+end. Any substituted, added or dropped word or number fails. The bound: ≤ 50 ms
+per 250-char quote on a 60 000-char document."""
 from __future__ import annotations
 
 import json
@@ -12,9 +14,7 @@ import time
 
 import pytest
 
-from argus.graph.research import QuoteIndex, _digest_reply, _norm_quote, quote_verified
-
-FUZZY = 0.9
+from argus.graph.research import QuoteIndex, _digest_reply, quote_verified
 
 
 def _doc(n: int = 60_000, seed: int = 7) -> str:
@@ -35,69 +35,30 @@ DOC = _doc()
 
 
 def _quote_at(start: int, length: int = 250) -> str:
-    """About ``length`` chars of whole words: a word cut in half is no word of the
-    document, and the token rule rejects it."""
+    """About ``length`` chars of whole words from ``DOC``."""
     s = DOC.index(" ", start) + 1
     return DOC[s:s + length + 12].rsplit(" ", 1)[0]
-
-
-def _perturb(q: str) -> str:
-    """What a digest LLM does to a quote: curly quotes, case, spacing, a dropped word."""
-    words = q.split()
-    del words[len(words) // 2]
-    out = " ".join(words).replace(" ", "  ", 2)
-    return "“" + out[:40].upper() + out[40:] + "”"
 
 
 def _miss() -> str:
     return _doc(400, seed=99)[:250]
 
 
-def test_exact_fuzzy_and_miss_cases():
+def test_exact_miss_and_no_quote():
     idx = QuoteIndex(DOC)
     exact = _quote_at(31_000)
-    assert quote_verified(exact, idx, FUZZY) is True
-    assert quote_verified(_perturb(exact), idx, FUZZY) is True, "small LLM edits still verify"
-    short = _quote_at(12_000, 90)
-    assert quote_verified(_perturb(short), idx, FUZZY) is True, "a short paraphrased quote verifies too"
-    assert quote_verified(_miss(), idx, FUZZY) is False
-    assert quote_verified("", idx, FUZZY) is None, "no quote → not checked"
-    assert quote_verified("   ", idx, FUZZY) is None
-
-
-def test_normalisation_of_quotes_case_and_whitespace():
-    idx = QuoteIndex("He said “the interrupt() call pauses the graph” — and resumes later.")
-    assert quote_verified('"The INTERRUPT() call   pauses the graph"', idx, FUZZY) is True
-    assert quote_verified("the graph pauses forever", idx, FUZZY) is False
-
-
-def test_threshold_is_the_knob():
-    """Every word in place (one in three repeated): only the similarity decides."""
-    idx = QuoteIndex(DOC)
-    stuttered = []
-    for i, w in enumerate(_quote_at(5_000).split()):
-        stuttered += [w, w] if i % 3 == 2 else [w]
-    mangled = " ".join(stuttered)
-    assert quote_verified(mangled, idx, FUZZY) is False
-    assert quote_verified(mangled, idx, 0.5) is True
-
-
-@pytest.mark.parametrize("case", ["exact", "fuzzy", "miss"])
-def test_anchored_verification_bound(case):
-    quote = {"exact": _quote_at(31_000), "fuzzy": _perturb(_quote_at(31_000)), "miss": _miss()}[case]
-    assert len(DOC) == 60_000 and len(quote) >= 240
-    best = float("inf")
-    for _ in range(3):                       # best of three: the bound is on the work, not on a noisy timer
-        t0 = time.perf_counter()
-        result = quote_verified(quote, QuoteIndex(DOC), FUZZY)
-        best = min(best, time.perf_counter() - t0)
-    assert result is (case != "miss")
-    assert best <= 0.050, f"{case}: {best * 1000:.1f} ms for one 250-char quote incl. indexing the document"
+    assert quote_verified(exact, idx) is True
+    assert quote_verified(exact.upper(), idx) is True, "case is normalised"
+    words = exact.split()
+    assert quote_verified(" ".join(words[:5] + ["zzz"] + words[5:]), idx) is False, "an added word"
+    assert quote_verified(" ".join(words[:5] + words[6:]), idx) is False, "a dropped word"
+    assert quote_verified(_miss(), idx) is False
+    for none in ("", "   ", "…", "— ..."):
+        assert quote_verified(none, idx) is None, (none, "no words → not checked")
 
 
 # ---------------------------------------------------------------------------
-# the token rule (WP-B review): the span ratio alone verified altered figures,
-# swapped entities and "at most" → "at least" at 0.95–0.99
+# the review rounds' cases: every altered quote fails, every legitimate one passes
 # ---------------------------------------------------------------------------
 
 PROSE = (
@@ -112,6 +73,15 @@ PROSE = (
     "It’s checkpointed — nothing is lost while the graph waits for a human to answer the question. "
     "Presets are the shipped defaults; the bench tunes them, and every knob outside a preset keeps "
     "the value the model declares, so an override is recorded in overrides_applied and survives a rebuild. "
+    "State is _plain_ data: the checkpointer stores every superstep[12] so a crash loses nothing.\n"
+    "To deploy:\n"
+    "1. Install the package.\n"
+    "2) Start the server with the token.\n"
+    "In this release the scheduler does not retry failed jobs automatically after a timeout. "
+    "The model does support streaming responses for every request, but it does not support batching. "
+    "Revenue rose from 5% of sales in 2023 to 12% of sales in 2024 across the whole group. "
+    "In the benchmark the OpenAI model outperformed the Google model on every reasoning task we ran. "
+    "A request is retried at most three times, and at least one attempt is always logged for audit. "
 )
 PROSE_IDX = QuoteIndex(_doc(30_000, seed=3) + " " + PROSE + _doc(30_000, seed=5))
 PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every knob outside a preset keeps "
@@ -119,6 +89,7 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
 
 
 @pytest.mark.parametrize("label,quote", [
+    # WP-B review (round 1, quote_probe.py)
     ("one number changed", "Performance bound (test): ≤ 90 ms per 250-char quote on a 60 000-char document."),
     ("two numbers changed", "Performance bound (test): ≤ 90 ms per 250-char quote on a 80 000-char document."),
     ("at most → at least", "a timeout is retried at least timeout_retry_max times before the attempt fails"),
@@ -131,25 +102,66 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
     ("verbatim head + fabricated tail", PRESETS[:150] + " which cut costs by 40% in 2025"),
     ("several 'the' → 'Google'", PRESETS.replace(" the ", " Google ")),
     ("one word swapped in a long quote", PRESETS.replace("recorded", "ignored")),
+    ("a reordered paraphrase", "an override survives a rebuild and is recorded in overrides_applied"),
+    ("a fabricated claim sharing four words", "the run is checkpointed so the vendor guarantees zero data loss"),
+    # WP-B re-review (round 2, p3_quote_extra.py): the replacement sits nearby
+    ("a dropped 'not'", "In this release the scheduler does retry failed jobs automatically after a timeout."),
+    ("an inserted 'not' that occurs nearby", "The model does not support streaming responses for every request"),
+    ("numbers swapped within the sentence",
+     "Revenue rose from 12% of sales in 2023 to 5% of sales in 2024 across the whole group."),
+    ("entities swapped within the sentence",
+     "In the benchmark the Google model outperformed the OpenAI model on every reasoning task we ran."),
+    ("'at most' → 'at least', 'least' nearby",
+     "A request is retried at least three times, and at least one attempt is always logged for audit."),
+    ("a new number", "Revenue rose from 7% of sales in 2023 to 12% of sales in 2024 across the whole group."),
+    # dropped and added words
+    ("a dropped word", "nothing is lost while the graph waits for a human to answer question"),
+    ("an added word", "nothing is ever lost while the graph waits for a human to answer the question"),
 ])
-def test_a_substituted_word_or_number_never_verifies(label, quote):
-    assert quote_verified(quote, PROSE_IDX, FUZZY) is False, label
+def test_an_altered_quote_never_verifies(label, quote):
+    assert quote_verified(quote, PROSE_IDX) is False, label
 
 
 @pytest.mark.parametrize("label,quote", [
+    ("exact", PRESETS),
     ("markup in the source: a link and bold",
      "The interrupt function pauses the graph at a node and surfaces a value to the caller"),
     ("markup in the source: bold and code",
      "a timeout is retried at most timeout_retry_max times before the attempt fails"),
-    ("punctuation, dash and quote-char differences",
-     "It's checkpointed - nothing is lost, while the graph waits for a human to answer the question"),
-    ("one dropped word", "nothing is lost while the graph waits for a human to answer question"),
-    ("a word elided with an ellipsis", "nothing is lost while the graph … for a human to answer the question"),
-    ("dropped word and curly quotes in a long quote", "“" + PRESETS.replace(" outside a preset", " outside preset")
-     + "”"),
+    ("markup in the source: italics", "State is plain data"),
+    ("quote marks, dashes, punctuation and whitespace",
+     "“It's checkpointed - nothing is lost,  while the graph waits for a human to answer the question”"),
+    ("a footnote marker in the source", "the checkpointer stores every superstep so a crash loses nothing"),
+    ("ordered-list markers in the source", "Install the package. Start the server with the token."),
+    ("ellipsis segments in order", "Presets are the shipped defaults … an override is recorded in overrides_applied"),
+    ("a word elided with an ellipsis", "nothing is lost while the graph ... for a human to answer the question"),
 ])
-def test_legitimate_fuzzy_quotes_still_verify(label, quote):
-    assert quote_verified(quote, PROSE_IDX, FUZZY) is True, label
+def test_a_legitimate_quote_verifies(label, quote):
+    assert quote_verified(quote, PROSE_IDX) is True, label
+
+
+def test_ellipsis_segments_must_be_in_order_and_near():
+    assert quote_verified("an override is recorded in overrides_applied … Presets are the shipped defaults",
+                          PROSE_IDX) is False, "segments out of order"
+    head, tail = "the dispatcher accepts a job", "and the worker acknowledges it"
+    near = QuoteIndex(f"{head} {_doc(2_000, seed=21)} {tail}")
+    far = QuoteIndex(f"{head} {_doc(4_000, seed=21)} {tail}")
+    assert quote_verified(f"{head} … {tail}", near) is True, "the next segment starts within 3 000 chars"
+    assert quote_verified(f"{head} … {tail}", far) is False, "more than 3 000 chars apart"
+
+
+@pytest.mark.parametrize("case", ["exact", "altered", "miss"])
+def test_verification_bound(case):
+    exact = _quote_at(31_000)
+    quote = {"exact": exact, "altered": exact.replace(" ", " zzz ", 1), "miss": _miss()}[case]
+    assert len(DOC) == 60_000 and len(quote) >= 240
+    best = float("inf")
+    for _ in range(3):                       # best of three: the bound is on the work, not on a noisy timer
+        t0 = time.perf_counter()
+        result = quote_verified(quote, QuoteIndex(DOC))
+        best = min(best, time.perf_counter() - t0)
+    assert result is (case == "exact")
+    assert best <= 0.050, f"{case}: {best * 1000:.1f} ms for one 250-char quote incl. indexing the document"
 
 
 # ---------------------------------------------------------------------------
@@ -169,18 +181,16 @@ def _digested_quote(quote: str) -> str:
 
 def test_the_digest_cuts_a_long_quote_at_a_word_boundary():
     """``_digest_reply`` keeps a long quote up to the last whitespace at or before
-    its limit, so a quote it shortened never ends in a fragment the token rule
-    rejects. (At da8762f the hard cut split a word, and an edited quote failed.)"""
+    its limit, so a quote it shortened never ends in a word fragment."""
     idx = QuoteIndex(_doc(20_000, seed=11) + " " + LONG + " " + _doc(20_000, seed=13))
     edited = LONG.replace(",", "").replace(";", " -")              # a digest LLM's punctuation edits
     assert edited[249].isalpha() and edited[250].isalpha(), "a hard cut at 250 would split a word"
     cut = _digested_quote(edited)
     assert edited.startswith(cut) and len(cut) <= 250 and edited[len(cut)].isspace(), cut
-    assert quote_verified(cut, idx, FUZZY) is True
-    assert quote_verified(edited[:250], idx, FUZZY) is False, "the hard cut ends in a fragment"
+    assert quote_verified(cut, idx) is True
+    assert quote_verified(edited[:250], idx) is False, "the hard cut ends in a fragment"
 
     verbatim = _digested_quote(LONG)
     assert LONG.startswith(verbatim) and LONG[len(verbatim)].isspace()
-    assert _norm_quote(verbatim) in idx.text and quote_verified(verbatim, idx, FUZZY) is True, (
-        "a fragment-free cut quote verifies by exact substring, as before")
+    assert quote_verified(verbatim, idx) is True
     assert _digested_quote("x" * 300) == "x" * 250, "a single token longer than the limit keeps the hard cut"

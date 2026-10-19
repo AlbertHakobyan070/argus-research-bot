@@ -66,7 +66,6 @@ class ResearchConfig(BaseModel):
     digest_concurrency: int = 4
     rerank: bool = True
     writer_min_relevance: int = 3
-    quote_verify_fuzzy: float = 0.9
 
 
 class ComposeConfig(BaseModel):
@@ -152,7 +151,7 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "research.gap_fetch_per_wave": (0, 20), "research.per_subq_target": (1, 8),
     "research.coverage_min_strong": (0, 5), "research.gap_waves_max": (0, 3),
     "research.digest_chunks_long_doc": (1, 6), "research.digest_concurrency": (1, 8),
-    "research.writer_min_relevance": (0, 5), "research.quote_verify_fuzzy": (0, 1),
+    "research.writer_min_relevance": (0, 5),
     "compose.concurrency": (1, 6), "compose.section_min_notes": (1, 5),
     "panel.judge_batch_size": (4, 20), "panel.max_compose_revisions": (0, 3),
     "panel.rewrite_flag_ratio": (0, 1),

@@ -326,6 +326,31 @@ async def test_append_queues_urls_and_asset_refs():
     assert ("asset:7", "asset") in kinds
 
 
+async def test_append_again_requeues_a_ref_continue_marked_failed():
+    """WP-B fix round 3 (N1), the bot's flow on the real Library: /append, a
+    /continue that could not ingest the ref (marked ``failed``, the user told to
+    /append it again), then that /append — the ref is pending again and the
+    reply counts it."""
+    from argus.library import Library
+
+    lib = Library(":memory:")
+    await lib.open()
+    try:
+        await lib.create_run(run_id="ab12cd34", thread_id="tg:5:ab12cd34", chat_id=5, topic="topic",
+                             config_json="{}", depth="quick", origin="telegram")
+        ref = "https://walled.example/b"
+        first = _update()
+        await append_cmd(first, _ctx(["ab12cd34", ref], lib))
+        assert "(1 pending total)" in first.message.reply_text.await_args.args[0]
+        await lib.mark_sources("ab12cd34", [ref], "failed")      # what _mark_appended does
+        retry = _update()
+        await append_cmd(retry, _ctx(["ab12cd34", ref], lib))
+        assert "(1 pending total)" in retry.message.reply_text.await_args.args[0]
+        assert [p["ref"] for p in await lib.pending_sources("ab12cd34")] == [ref]
+    finally:
+        await lib.close()
+
+
 class _FakeGraph:
     """Finished-run double: empty snap.next, records update/stream calls."""
 

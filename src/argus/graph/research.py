@@ -3,7 +3,7 @@
 Every fetched document is READ by a cheap LLM (the *digest*,
 ``research.digest``), which extracts atomic claims with quotes, relevance,
 stance and the source type, keyed to the brief's sub-questions; each quote
-is then checked against the document (anchored verification). Writers
+is then checked against the document (verbatim verification). Writers
 downstream work from these EvidenceNotes, never from raw excerpts.
 
 One node run is one *pass*, chosen from the state:
@@ -34,7 +34,7 @@ skipped, and the partial update carries a ``cancelled:`` line.
 """
 from __future__ import annotations
 
-import difflib
+import bisect
 import logging
 import math
 import re
@@ -397,82 +397,57 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
 
 
 # ---------------------------------------------------------------------------
-# Quote verification (spec §2.8, B4) — anchored, bounded.
+# Quote verification (spec §2.8, B4) — verbatim.
 # ---------------------------------------------------------------------------
 
 # quote marks and emphasis asterisks dropped, dashes unified, "_" a space (``_x_`` emphasis, snake_case alike)
 _QUOTE_FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»‹›*"), **dict.fromkeys("–—‐‑−", "-"), "_": " "})
+_FOOTNOTE = re.compile(r"\[\d+\](?:\([^)]*\))?")          # a footnote marker, [3] (or linked: [3](#fn3))
 _MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")         # a markdown link or image → its text
-_NUMBER = re.compile(r"\d[\d.,:]*%?")
+_LIST_MARKER = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)  # an ordered-list marker at a line start
 _WORD = re.compile(r"\w+")
+_ELLIPSIS = re.compile(r"\.\.\.|…")
+_SEGMENT_GAP = 3000          # chars from one ellipsis segment's end to the next one's start
 
 
-def _norm_quote(text: str) -> str:
-    """Case, whitespace, quote marks, dashes and markdown markup normalised."""
-    return " ".join(_MD_LINK.sub(r"\1", text or "").translate(_QUOTE_FOLD).lower().split())
-
-
-def _tokens(text: str) -> tuple[set[str], set[str]]:
-    """A normalised text's number tokens (``\\d[\\d.,:]*%?``, a trailing separator
-    dropped) and its word tokens."""
-    return {n.rstrip(".,:") for n in _NUMBER.findall(text)}, set(_WORD.findall(text))
+def _words(text: str) -> str:
+    """``text`` normalised — case, quote marks, dashes, markdown links and images
+    (their text), footnote markers, ordered-list markers at line starts — as its
+    ``\\w+`` tokens, one space before each and after the last."""
+    text = _LIST_MARKER.sub("", _MD_LINK.sub(r"\1", _FOOTNOTE.sub("", text)))
+    return " " + "".join(w + " " for w in _WORD.findall(text.translate(_QUOTE_FOLD).lower()))
 
 
 class QuoteIndex:
-    """One document, normalised, with a word 4-gram index for anchoring quotes."""
+    """One document's normalised word tokens (``_words``), built once per document."""
 
     def __init__(self, text: str):
-        self.text = _norm_quote(text)
-        spans = [(m.start(), m.group()) for m in re.finditer(r"\S+", self.text)]
-        self.starts = [s for s, _ in spans]
-        words = [w for _, w in spans]
-        self.grams: dict[tuple[str, ...], list[int]] = {}
-        for i in range(len(words) - 3):
-            self.grams.setdefault(tuple(words[i:i + 4]), []).append(i)
+        self.words = _words(text or "")
 
 
-def _span_ratio(quote: str, window: str) -> float:
-    """SequenceMatcher similarity of the quote and the stretch of the window
-    it aligns with (first to last matching block)."""
-    blocks = [b for b in difflib.SequenceMatcher(None, quote, window, autojunk=False).get_matching_blocks()
-              if b.size]
-    if not blocks:
-        return 0.0
-    span = blocks[-1].b + blocks[-1].size - blocks[0].b
-    return 2 * sum(b.size for b in blocks) / (len(quote) + span)
+def quote_verified(quote: str, idx: QuoteIndex) -> bool | None:
+    """Is ``quote`` verbatim in the document (spec §2.8)? ``None``: no quote.
 
-
-def quote_verified(quote: str, idx: QuoteIndex, threshold: float) -> bool | None:
-    """Is ``quote`` in the document? ``None``: no quote to check.
-
-    Normalised exact substring → True. Else the quote's word 4-grams vote
-    for alignments in the document's 4-gram index; the top 3 are compared
-    on windows of ``len(quote) + 40`` chars around them: True when the
-    similarity over the window's matched span (spec §2.8, orchestrator
-    ruling: a whole-window ratio caps at 2L / (2L + 40)) is ``≥ threshold``
-    **and** every number token and every word of the quote occurs as a token
-    in that window — punctuation, spacing, markup and dropped words pass, a
-    substituted word or number never does (WP-B review)."""
-    q = _norm_quote(quote)
-    if not q:
+    The quote's word tokens, normalised as the document's, must occur
+    contiguously and in order; an ellipsis (``...`` / ``…``) splits it into
+    segments that must each occur so, in order, each starting within
+    ``_SEGMENT_GAP`` chars (of the normalised document) of the previous one's
+    end. A substituted, added or dropped word or number fails."""
+    segments = [w for w in (_words(part) for part in _ELLIPSIS.split(quote or "")) if w != " "]
+    if not segments:
         return None
-    if q in idx.text:
-        return True
-    words = q.split()
-    votes: Counter = Counter()
-    for j in range(len(words) - 3):
-        for i in idx.grams.get(tuple(words[j:j + 4]), ()):
-            votes[i - j] += 1
-    numbers, tokens = _tokens(q)
-    for start, _n in votes.most_common(3):
-        at = idx.starts[min(max(start, 0), len(idx.starts) - 1)]
-        lo = max(0, at - 20)
-        window = idx.text[lo:lo + len(q) + 40]
-        if _span_ratio(q, window) >= threshold:
-            w_numbers, w_tokens = _tokens(window)
-            if numbers <= w_numbers and tokens <= w_tokens:
-                return True
-    return False
+    ends: list[int] | None = None
+    for seg in segments:
+        starts, at = [], idx.words.find(seg)
+        while at >= 0:
+            starts.append(at)
+            at = idx.words.find(seg, at + 1)
+        if ends is not None:                      # after a previous end, within the gap
+            starts = [s for s in starts if (i := bisect.bisect_right(ends, s)) and s - ends[i - 1] <= _SEGMENT_GAP]
+        if not starts:
+            return False
+        ends = [s + len(seg) - 1 for s in starts]     # the trailing space, where the next segment may start
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +588,7 @@ def digest_one(item: dict, source_id: int, brief: ResearchBrief, user_request: s
             key = " ".join(c["text"].lower().split())
             if key not in seen:
                 seen.add(key)
-                claims.append({**c, "quote_verified": quote_verified(c["quote"], idx, rc.research.quote_verify_fuzzy)})
+                claims.append({**c, "quote_verified": quote_verified(c["quote"], idx)})
     note = EvidenceNote(
         source_id=source_id, source_url=url, title=item.get("title", ""), sub_qs=tags,
         relevance=best["relevance"], stance=best["stance"], claims=claims, source_type=best["source_type"],
@@ -910,6 +885,8 @@ class _Pass:
 
     def extend_pass(self) -> None:
         self.ledger.grant_extend()
+        if self.draining():                       # before the querygen: a drain costs no LLM call
+            return self.stop_drained()
         everything = list(range(len(self.brief.sub_questions)))
         queries, calls, errs = followup_queries(self.brief, everything, self.queries, rc=self.rc,
                                                 role="research.extend_querygen", rnd=self.rnd)
@@ -932,6 +909,8 @@ class _Pass:
         coverage = compute_coverage(self.brief, self.evidence)
         owned = {i for s in (self.state.get("outline") or {}).get("sections") or [] for i in s.get("sub_qs") or []}
         starved = any(coverage.get(str(i), 0) < r.coverage_min_strong or i not in owned for i in gaps)
+        if self.draining():                       # before the querygen: a drain costs no LLM call
+            return self.stop_drained()
         queries, calls, errs = followup_queries(self.brief, gaps, self.queries, rc=self.rc,
                                                 role="research.followup_querygen", rnd=self.rnd)
         self.note(calls, errs)

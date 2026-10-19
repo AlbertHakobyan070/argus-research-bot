@@ -374,3 +374,24 @@ def test_no_rerank_after_a_drain(fake, tmp_path, pass_):
     assert reranks == (0 if pass_ == "extend opening search" else 1), "no rerank call after the drain"
     assert fake.fetches == fetched_before
     assert any(e.startswith("cancelled: research stopped") for e in out["errors"])
+
+
+@pytest.mark.parametrize("pass_", ["extend", "gap"])
+def test_a_drain_before_the_pass_costs_no_querygen_call(fake, tmp_path, pass_):
+    """Fix round 3: an Extend or a gap pass reads the drain before its querygen, so a
+    cancel already requested costs no LLM call. (At 66c7377 the querygen ran first,
+    and only run_waves' first check stopped the pass.)"""
+    control = RunControl()
+    control.request_drain("user cancel")
+    for role in ("research.extend_querygen", "research.followup_querygen"):
+        fake.answers[role] = lambda human: json.dumps({"queries": [{"sub_q": 1, "q": "y more", "provider": "web"}]})
+    state = (_state(tmp_path, extend_rounds=1) if pass_ == "extend"
+             else _state(tmp_path, coverage_gaps=[1], gap_waves=0, gap_history=[]))
+
+    out = research_mod.research_node(state, Runtime(control=control))
+
+    assert fake.roles == [], "no LLM call"
+    assert fake.waves == [] and fake.fetches == []
+    assert any(e.startswith("cancelled: research stopped") for e in out["errors"])
+    if pass_ == "gap":
+        assert out["gap_waves"] == 0, "no gap wave ran"

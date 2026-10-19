@@ -236,6 +236,32 @@ async def test_add_run_source_dedupes(lib: Library):
     assert len(await lib.pending_sources("ab12cd34")) == 1
 
 
+async def test_a_failed_source_is_queued_again_by_the_next_append():
+    """WP-B fix round 3 (N1): /continue marks an appended ref it could not ingest
+    ``failed`` and tells the user to /append it again — that /append queues it
+    again. A ``pending`` or ``ingested`` row is left as it is. (At 66c7377 the
+    retry left the row ``failed``: INSERT OR IGNORE.)"""
+    lib = Library(":memory:")
+    await lib.open()
+    try:
+        await _seed_run(lib)
+        failed, ingested = "https://walled.example/b", "https://example.com/ok"
+        for ref in (failed, ingested):
+            await lib.add_run_source("ab12cd34", ref)
+        await lib.mark_sources("ab12cd34", [failed], "failed")
+        await lib.mark_sources("ab12cd34", [ingested], "ingested")
+        assert await lib.pending_sources("ab12cd34") == []
+
+        for ref in (failed, ingested, failed):             # the retry, a re-append of an ingested ref, a repeat
+            await lib.add_run_source("ab12cd34", ref)
+        assert [p["ref"] for p in await lib.pending_sources("ab12cd34")] == [failed]
+        async with lib._conn().execute("SELECT ref, status FROM run_sources ORDER BY ref") as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+        assert rows == [(ingested, "ingested"), (failed, "pending")]
+    finally:
+        await lib.close()
+
+
 async def test_mark_sources_rejects_unknown_status(lib: Library):
     await _seed_run(lib)
     await lib.add_run_source("ab12cd34", "https://example.com/a")

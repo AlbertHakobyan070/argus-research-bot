@@ -476,10 +476,15 @@ class Library:
 
     async def add_run_source(self, run_id: str, ref: str,
                              kind: str = "url") -> None:
+        """Queue ``ref`` for the run's next /continue. A ``failed`` ref is
+        queued again (the retry /continue tells the user to make); a
+        ``pending`` or ``ingested`` one is left as it is."""
         db = self._conn()
         await db.execute(
-            "INSERT OR IGNORE INTO run_sources (run_id, ref, kind, status,"
-            " added_at) VALUES (?,?,?,'pending',?)",
+            "INSERT INTO run_sources (run_id, ref, kind, status,"
+            " added_at) VALUES (?,?,?,'pending',?)"
+            " ON CONFLICT(run_id, ref) DO UPDATE SET status='pending'"
+            " WHERE run_sources.status='failed'",
             (run_id, ref, kind, _now()))
         await db.commit()
 

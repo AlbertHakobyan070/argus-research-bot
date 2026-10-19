@@ -62,7 +62,6 @@ BOUNDS = [
     ("research.digest_chunks_long_doc", 1, 6),
     ("research.digest_concurrency", 1, 8),
     ("research.writer_min_relevance", 0, 5),
-    ("research.quote_verify_fuzzy", None, 1),
     ("compose.concurrency", 1, 6),
     ("compose.section_min_notes", 1, 5),
     ("panel.judge_batch_size", 4, 20),
@@ -259,6 +258,19 @@ def test_require_rejects_a_config_whose_length_differs_from_the_state():
     assert require({"run_config": raw, "length": None}).length == "short"  # length not set
     with pytest.raises(ValueError, match=r"run_config.*'short'.*'medium'"):
         require({"run_config": raw, "length": "medium"})
+
+
+def test_a_stored_run_config_with_the_removed_quote_knob_still_loads():
+    """WP-B fix round 3: ``research.quote_verify_fuzzy`` is gone (verbatim quotes).
+    A stored run_config that still carries it loads, the key ignored; an override
+    naming it is an unknown key."""
+    raw = make_run_config("medium")
+    raw["research"]["quote_verify_fuzzy"] = 0.9
+    rc = require({"run_config": raw})
+    assert "quote_verify_fuzzy" not in type(rc.research).model_fields
+    assert not hasattr(rc.research, "quote_verify_fuzzy")
+    with pytest.raises(ValueError, match="quote_verify_fuzzy"):
+        _rc("standard", **{"research.quote_verify_fuzzy": 0.8})
 
 
 def test_require_round_trips_make_run_config():

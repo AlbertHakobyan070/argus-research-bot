@@ -681,3 +681,88 @@ def test_no_proxy_covering_the_host_keeps_the_ip_pin(monkeypatch, tmp_path, fake
     assert connects == [(PUBLIC_IP, 443)], "the pinned connection to the checked address"
     assert seen == [], "the proxy is never asked"
     assert not res.ok and res.error.startswith("native: ConnectError"), res.error
+
+
+# ---------------------------------------------------------------------------
+# WP-B fix round 3
+# ---------------------------------------------------------------------------
+
+def test_a_timed_out_address_falls_through_to_the_next(monkeypatch, tmp_path):
+    """N2: the next checked address is tried when one is refused or times out (a
+    blackholed IPv6 route), as a connect by name did. (At 66c7377 a ConnectTimeout
+    on the first address ended the rung.)"""
+    import socket
+
+    _real_transport_offline(monkeypatch, tmp_path, {"dual.example": ["2606:4700::6810:84e5", PUBLIC_IP]})
+    monkeypatch.setenv("NO_PROXY", "*")              # no proxy from this machine's environment or registry
+    tried: list[str] = []
+
+    def connect(address, *a, **kw):
+        tried.append(address[0])
+        if ":" in address[0]:
+            raise TimeoutError("timed out (a blackholed route, simulated)")
+        raise ConnectionRefusedError("hermetic: refused locally")
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    res = _fetch({"url": "https://dual.example/p"})
+    assert tried == ["2606:4700::6810:84e5", PUBLIC_IP], "the timed-out address falls through"
+    assert not res.ok and res.error.startswith("native: ConnectError"), res.error
+
+
+@pytest.mark.parametrize("dot", ["。", "．", "｡"])
+def test_unicode_dots_never_bypass_the_own_endpoint_check(net, monkeypatch, dot):
+    """N3: U+3002, U+FF0E and U+FF61 are IDNA label separators — the resolver, the
+    ``Host`` header and the SNI all read them as dots — so the guard compares the
+    IDNA-encoded name. (At 66c7377 both endpoints were fetched by these spellings.)"""
+    net.dns.update({"proxy.example.net": [PUBLIC_IP], "console.example.net": ["104.16.0.1"]})
+    monkeypatch.setenv("FREELLMAPI_BASE_URL", "https://proxy.example.net:3001/v1")
+    monkeypatch.setenv("ARGUS_WEBAPP_PUBLIC_URL", "https://console.example.net")
+    for url, own in ((f"https://proxy{dot}example{dot}net:3001/admin", "proxy.example.net:3001"),
+                     (f"https://console{dot}example{dot}net/api/runs", "console.example.net:443"),
+                     (f"https://PROXY{dot}Example{dot}NET{dot}:3001/", "proxy.example.net:3001"),
+                     ("https://ｐｒｏｘｙ.example.net:3001/admin", "proxy.example.net:3001")):   # fullwidth letters
+        res = _fetch({"url": url})
+        assert res.error == f"refused: private address (own endpoint {own})", (url, res.error)
+    assert net.requests == []
+
+
+_EXA_TEXT = "Walled text. " * 80
+
+
+@pytest.mark.parametrize("label,reply", [
+    ("not JSON", httpx.Response(200, text="<html>rate limited</html>")),
+    ("a JSON list", httpx.Response(200, json=[{"text": _EXA_TEXT}])),
+    ("costDollars not an object", httpx.Response(200, json={"results": [{"text": _EXA_TEXT}], "costDollars": 0.001})),
+    ("costDollars missing", httpx.Response(200, json={"results": [{"text": _EXA_TEXT}]})),
+    ("total missing", httpx.Response(200, json={"results": [{"text": _EXA_TEXT}], "costDollars": {}})),
+    ("total not a number", httpx.Response(200, json={"results": [{"text": _EXA_TEXT}],
+                                                     "costDollars": {"total": "0.001"}})),
+    ("total a boolean", httpx.Response(200, json={"results": [{"text": _EXA_TEXT}], "costDollars": {"total": True}})),
+    ("results not a list", httpx.Response(200, json={"results": 5, "costDollars": {"total": 0.001}})),
+    ("results an object", httpx.Response(200, json={"results": {"text": _EXA_TEXT}, "costDollars": {"total": 0.001}})),
+    ("results missing", httpx.Response(200, json={"costDollars": {"total": 0.001}})),
+    ("a result not an object", httpx.Response(200, json={"results": [_EXA_TEXT], "costDollars": {"total": 0.001}})),
+    ("text not a string", httpx.Response(200, json={"results": [{"text": 5}], "costDollars": {"total": 0.001}})),
+    ("title not a string", httpx.Response(200, json={"results": [{"text": _EXA_TEXT, "title": ["W"]}],
+                                                     "costDollars": {"total": 0.001}})),
+])
+def test_a_malformed_exa_reply_is_the_rungs_own_error(net, monkeypatch, label, reply):
+    """N4: a ``/contents`` reply of the wrong shape is the ``exa_contents`` rung's
+    error, never an exception out of ``fetch()``. (At 66c7377 ``results: 5`` raised
+    TypeError and ``costDollars: 0.001`` AttributeError, failing the node.)"""
+    monkeypatch.setenv("EXA_API_KEY", "test-key")
+    net.routes["https://walled.example/a"] = httpx.Response(403)
+    net.routes["https://api.exa.ai/contents"] = reply
+    res = _fetch({"url": "https://walled.example/a"}, ledger=SpendLedger({"exa_contents_pages": 1}), exa=True)
+    assert not res.ok and _rungs(res) == ["native", "exa_contents"]
+    assert "exa_contents: malformed reply: " in res.error, (label, res.error)
+
+
+def test_a_billed_reply_records_its_cost_even_when_its_results_are_malformed(net, monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "test-key")
+    net.routes["https://walled.example/a"] = httpx.Response(403)
+    net.routes["https://api.exa.ai/contents"] = httpx.Response(200, json={"results": 5, "costDollars": {"total": 0.001}})
+    ledger = SpendLedger({"exa_contents_pages": 1})
+    res = _fetch({"url": "https://walled.example/a"}, ledger=ledger, exa=True)
+    assert "malformed reply: results is a JSON int, not a list" in res.error, res.error
+    assert ledger.snapshot()["exa_usd"] == pytest.approx(0.001), "Exa billed it, so the spend shows it"

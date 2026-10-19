@@ -127,7 +127,10 @@ def _whatwg(url: str) -> str:
 
 
 def _norm_host(host: str) -> str:
-    return host.lower().rstrip(".")
+    """The host as the resolver and the request see it: IDNA-encoded (``。``, ``．``
+    and ``｡`` are label separators too), lowercase, no trailing dot. ``UnicodeError``
+    for a name IDNA cannot encode."""
+    return host.encode("idna").decode("ascii").lower().rstrip(".")
 
 
 def _port(parts) -> int:
@@ -135,13 +138,16 @@ def _port(parts) -> int:
 
 
 def _split(url: str) -> tuple[str, int]:
-    """``(host, port)`` of an http(s) URL, the host lowercase without a trailing dot."""
+    """``(host, port)`` of an http(s) URL, the host normalised (``_norm_host``)."""
     try:
         parts = urlsplit(url)
         port = _port(parts)
     except ValueError as e:                       # a bad port, an unclosed bracket
         raise _RungError(f"malformed URL {url!r} ({e})") from e
-    host = _norm_host(parts.hostname or "")
+    try:
+        host = _norm_host(parts.hostname or "")
+    except UnicodeError as e:                     # an empty or overlong label, a name IDNA rejects
+        raise _RungError(f"dns: {parts.hostname} is not a valid host name (UnicodeError: {e})") from e
     if not host or parts.scheme not in ("http", "https"):
         raise _RungError(f"not an http(s) URL: {url!r}")
     return host, port
@@ -161,8 +167,6 @@ def _addresses(host: str) -> list[str]:
         return _resolve(host)
     except socket.gaierror as e:
         raise _RungError(f"dns: {host} did not resolve (gaierror: {e})") from e
-    except UnicodeError as e:                     # not an IDNA-encodable name
-        raise _RungError(f"dns: {host} is not a valid host name (UnicodeError: {e})") from e
 
 
 def _judged(addr: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -227,16 +231,15 @@ def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -
     """A streamed GET of ``url``. When an HTTP(S) proxy from the environment applies
     to it, by name through ``env``: the proxy resolves the name, so the pin cannot
     apply. Otherwise on ``pinned``, to the checked addresses in order (the next one
-    only when a connection fails): ``scheme://<address>[:port]/path?query`` with the
-    original ``Host`` header and ``sni_hostname``, so TLS still verifies the real name."""
+    when a connection fails or times out, as a connect by name would):
+    ``scheme://<address>[:port]/path?query`` with the original ``Host`` header and
+    ``sni_hostname``, so TLS still verifies the real name."""
     # httpx's own trust_env selection (it has no public call for it): the one send() makes
     if env._transport_for_url(httpx.URL(url)) is not env._transport:
         return env.send(env.build_request("GET", url, headers={"Accept-Encoding": _ACCEPT_ENCODING}),
                         stream=True)
     parts = urlsplit(url)
-    name = _norm_host(parts.hostname or "")
-    if ":" not in name:                            # an IPv6 literal is already ASCII
-        name = name.encode("idna").decode("ascii")
+    name = _norm_host(parts.hostname or "")        # the name the guard checked, IDNA-encoded
     host = f"[{name}]" if ":" in name else name
     if parts.port and parts.port != (443 if parts.scheme == "https" else 80):
         host += f":{parts.port}"
@@ -252,7 +255,7 @@ def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -
     for addr in rest:
         try:
             return send(addr)
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.ConnectTimeout):   # a refused or a blackholed address
             continue
     return send(last)
 
@@ -435,20 +438,40 @@ def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned
     try:
         data = r.json()
     except ValueError as e:
-        raise _RungError(f"reply is not JSON ({type(e).__name__}: {e})") from e
-    if not isinstance(data, dict):
-        raise _RungError(f"reply is a JSON {type(data).__name__}, not an object")
-    cost = (data.get("costDollars") or {}).get("total")
-    if cost:
-        ledger.add_usd(float(cost))
-    results = data.get("results") or []
-    first = results[0] if results else {}
-    if not isinstance(first, dict):
-        raise _RungError(f"result is a JSON {type(first).__name__}, not an object")
-    text = first.get("text") or ""
+        raise _RungError(f"malformed reply: not JSON ({type(e).__name__}: {e})") from e
+    text, title = _exa_reply(data, ledger)
     if len(text.strip()) < _MIN_CHARS:
         raise _RungError(f"no text (statuses: {data.get('statuses')})")
-    return text, first.get("title") or ""
+    return text, title
+
+
+def _exa_reply(data, ledger: SpendLedger) -> tuple[str, str]:
+    """The first result's text and title from a ``/contents`` reply, with
+    ``costDollars.total`` added to the ledger first (it was billed). A reply of
+    any other shape is this rung's ``malformed reply: …`` error."""
+    def kind(value) -> str:
+        return "missing" if value is None else f"a JSON {type(value).__name__}"
+
+    if not isinstance(data, dict):
+        raise _RungError(f"malformed reply: {kind(data)}, not an object")
+    cost = data.get("costDollars")
+    if not isinstance(cost, dict):
+        raise _RungError(f"malformed reply: costDollars is {kind(cost)}, not an object")
+    total = cost.get("total")
+    if isinstance(total, bool) or not isinstance(total, int | float):
+        raise _RungError(f"malformed reply: costDollars.total is {kind(total)}, not a number")
+    if total:
+        ledger.add_usd(float(total))
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise _RungError(f"malformed reply: results is {kind(results)}, not a list")
+    first = results[0] if results else {}
+    if not isinstance(first, dict):
+        raise _RungError(f"malformed reply: a result is {kind(first)}, not an object")
+    text, title = first.get("text") or "", first.get("title") or ""
+    if not isinstance(text, str) or not isinstance(title, str):
+        raise _RungError(f"malformed reply: a result's text is {kind(text)}, its title {kind(title)}")
+    return text, title
 
 
 def _intel(rung: str, url: str) -> tuple[str, str]:
