@@ -27,141 +27,15 @@ from .. import llm
 from .assemble import build_sources_block, strip_duplicate_heading, strip_fences
 from .grounding import check_grounding, grounding_warning_prompt
 from .jsonx import parse_json_obj, salvage_objects
-from .state import OutlineSection, ResearchBrief
+from .outline import OUTLINE_SYSTEM, default_outline, outline_node  # noqa: F401  (re-export: moved to outline.py, WP-I)
+from .state import ResearchBrief
 from .synthesis_modes import get_mode, is_valid as is_valid_length
 
 logger = logging.getLogger("argus.compose")
 
 _COMPOSE_CONCURRENCY = int(os.environ.get("ARGUS_COMPOSE_CONCURRENCY", "3"))
 
-# Per-mode structural budgets (sections beyond TL;DR/Sources).
-_MODE_SECTIONS = {"tldr": 0, "short": 0, "medium": 4, "long": 6,
-                  "lecture": 7}
 _MODE_SECTION_TOKENS = {"medium": 1200, "long": 1800, "lecture": 2200}
-
-
-# ---------------------------------------------------------------------------
-# Outline
-# ---------------------------------------------------------------------------
-
-OUTLINE_SYSTEM = """You plan the section structure of a research report.
-
-You get the research brief (sub-questions + success criteria) and a
-summary of the gathered evidence. Produce a section outline:
-
-- Sections must collectively cover the sub-questions that HAVE evidence.
-- Each section gets: a title, a one-line focus, and the sub-question
-  indices it covers.
-- Do NOT create sections for TL;DR or Sources — those are added
-  automatically.
-- Prefer thematic titles over restating sub-questions.
-
-Return ONLY JSON:
-{"sections": [{"title": "...", "focus": "...", "sub_qs": [0, 2]}, ...]}
-"""
-
-LECTURE_HINT = """
-This is a LECTURE-format report: name the sections as parts, in order:
-"Part I — <Background theme>", "Part II — <Current state theme>" (Part II
-may be split into two sections), "Part III — <Open problems theme>",
-"Part IV — Practice and exercises".
-"""
-
-
-def _evidence_summary_lines(brief: ResearchBrief,
-                            evidence: list[dict]) -> str:
-    lines = []
-    for i, sq in enumerate(brief.sub_questions):
-        notes = [n for n in evidence if i in (n.get("sub_qs") or [])]
-        strong = sum(1 for n in notes if int(n.get("relevance") or 0) >= 3)
-        lines.append(f"({i}) {sq.q} — {len(notes)} notes, {strong} strong")
-    return "\n".join(lines)
-
-
-def default_outline(brief: ResearchBrief, length: str) -> list[OutlineSection]:
-    """Deterministic outline: group sub-questions into N sections."""
-    n_target = max(2, min(_MODE_SECTIONS.get(length, 4),
-                          len(brief.sub_questions)))
-    idxs = list(range(len(brief.sub_questions)))
-    chunks: list[list[int]] = [[] for _ in range(n_target)]
-    for pos, i in enumerate(idxs):
-        chunks[pos % n_target].append(i)
-    out = []
-    for c, chunk in enumerate(chunks):
-        if not chunk:
-            continue
-        title = brief.sub_questions[chunk[0]].q.rstrip("?")[:70]
-        if length == "lecture":
-            numeral = ["I", "II", "III", "IV", "V", "VI", "VII"][c]
-            title = f"Part {numeral} — {title}"
-        out.append(OutlineSection(title=title, focus="", sub_qs=chunk))
-    return out
-
-
-def outline_node(state) -> dict:
-    """Plan the report sections (skipped structurally for tldr/short)."""
-    length = state.get("length") or "short"
-    if not is_valid_length(length):
-        length = "short"
-    brief = ResearchBrief.model_validate(state.get("brief") or {})
-    evidence = state.get("evidence") or []
-
-    if _MODE_SECTIONS.get(length, 0) == 0 or len(brief.sub_questions) <= 1:
-        # Flat modes need no outline call.
-        return {"outline": {"sections": []},
-                "messages": [{"role": "assistant",
-                              "content": "🧭 Flat mode — no outline needed."}]}
-
-    human = (
-        f"Topic: {state.get('user_request')}\n"
-        f"Mode: {length} (max {_MODE_SECTIONS[length]} sections)\n\n"
-        f"Sub-questions and evidence strength:\n"
-        f"{_evidence_summary_lines(brief, evidence)}\n\n"
-        f"Success criteria:\n"
-        + "\n".join(f"- {c}" for c in brief.success_criteria)
-        + (LECTURE_HINT if length == "lecture" else "")
-        + "\n\nReturn the outline JSON."
-    )
-    sections: list[OutlineSection] = []
-    calls: list[dict] = []
-    errors: list[str] = []
-    try:
-        chat = llm.chat_for_tier("strong", temperature=0.2, max_tokens=700)
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content=OUTLINE_SYSTEM),
-            HumanMessage(content=human[:8000]),
-        ])
-        calls.append(llm.record_from_response(
-            "strong", llm.resolve_tier("strong"), resp).model_dump())
-        data = parse_json_obj(resp.content, require_any=("sections",))
-        n_subs = len(brief.sub_questions)
-        for s in (data.get("sections") or [])[:_MODE_SECTIONS[length]]:
-            if not isinstance(s, dict) or not (s.get("title") or "").strip():
-                continue
-            subs = [int(i) for i in (s.get("sub_qs") or [])
-                    if isinstance(i, (int, float)) and 0 <= int(i) < n_subs]
-            sections.append(OutlineSection(
-                title=str(s["title"]).strip()[:100],
-                focus=str(s.get("focus") or "")[:200],
-                sub_qs=subs))
-    except Exception as e:
-        logger.warning("outline failed (%s); deterministic fallback", e)
-        errors.append(f"outline: LLM failed ({e}); deterministic fallback")
-    if not sections:
-        sections = default_outline(brief, length)
-    # Every sub-question with evidence must be owned by some section.
-    owned = {i for s in sections for i in s.sub_qs}
-    orphans = [i for i in range(len(brief.sub_questions)) if i not in owned]
-    if orphans and sections:
-        sections[-1].sub_qs = list(sections[-1].sub_qs) + orphans
-
-    return {
-        "outline": {"sections": [s.model_dump() for s in sections]},
-        "model_calls": calls,
-        "errors": errors,
-        "messages": [{"role": "assistant",
-                      "content": (f"🧭 Outline: {len(sections)} sections.")}],
-    }
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ intake → brief → scout ══gate══ research → outline → compose →
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,7 +20,7 @@ from argus.graph import build_graph
 from argus.graph.nodes import _parse_json_obj
 from argus.llm import CallRecord
 
-from helpers import make_run_config
+from helpers import fake_llm, make_run_config
 
 
 def test_parse_json_obj_rejects_empty():
@@ -118,6 +119,10 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
                          "[1].\n\n## Key Findings\n\n1. X is true, with "
                          "the supporting quote attached [1].")
 
+    # brief.draft runs through llm.complete (v4 WP-I): the same scripted
+    # replies behind a fake driver.
+    fake_llm(monkeypatch, lambda system, human: _fake_invoke(
+        None, [SimpleNamespace(content=system), SimpleNamespace(content=human)]).content)
     monkeypatch.setattr(brief_mod.llm, "chat_for_tier",
                         lambda tier, **kw: object())
     monkeypatch.setattr(brief_mod.llm, "invoke_with_retry", _fake_invoke)

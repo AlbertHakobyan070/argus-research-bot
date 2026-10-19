@@ -44,6 +44,29 @@ def as_stream(response):
     return httpx.Response(response.status_code, headers=response.headers, content=iter([response.content]))
 
 
+def fake_llm(monkeypatch, reply):
+    """The real ``llm.complete`` on a fake driver (no network): every attempt
+    answers ``reply(system, human)`` — the text of its first two messages — and
+    the returned list records each attempt's message texts (a validate retry
+    adds the "Reply with only the JSON object." nudge as a third)."""
+    from argus import llm
+    from argus.engines import registry
+    from argus.engines.llm_openai import DriverResponse
+    from argus.engines.schema import ProviderSpec
+    seen: list[list[str]] = []
+
+    class _Driver:
+        def complete(self, engine, provider, messages, **kw):
+            seen.append([m.content for m in messages])
+            return DriverResponse(text=reply(messages[0].content, messages[1].content),
+                                  served_model="fake-model", routed_via="", finish_reason="stop",
+                                  usage={}, headers={}, raw=None)
+
+    monkeypatch.setattr(registry, "provider", lambda name: ProviderSpec(name=name, base_url="http://fake/v1"))
+    monkeypatch.setattr(llm, "_driver", _Driver())
+    return seen
+
+
 def make_run_config(length="short", depth=None, **overrides) -> dict:
     """A ``state["run_config"]`` dict from the presets; overrides are dotted
     keys (``**{"research.waves": 1}``)."""

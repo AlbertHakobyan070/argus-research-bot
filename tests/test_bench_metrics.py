@@ -495,6 +495,18 @@ def test_cross_section_duplicates_need_two_sections():
     assert metrics.compute(_run(state))["cross_section_duplicate_ratio"] == NA
 
 
+def test_cross_section_duplicates_skip_the_analysis_section():
+    """The analyst restates evidence-section findings by design (WP-I): the
+    metric measures duplication between evidence sections only."""
+    restated = _finding("f2", "Analysis", "LangGraph pauses a graph at an interrupt and saves a checkpoint.")
+    state = {"findings": [_finding("f0", "Alpha", "LangGraph pauses a graph at an interrupt and saves a checkpoint."),
+                          _finding("f1", "Beta", "Temporal resumes a workflow without re-running activities."),
+                          restated]}
+    assert metrics.compute(_run(state))["cross_section_duplicate_ratio"] == 0.0
+    state["findings"][1]["section"] = "Alpha"           # one evidence section left: nothing to compare
+    assert metrics.compute(_run(state))["cross_section_duplicate_ratio"] == NA
+
+
 @pytest.mark.parametrize("pv,ratio", [({"judged": 3, "total": 4}, 0.75), ({"judged": 0, "total": 0}, NA),
                                       ({"verdict": "pass"}, NA), (None, NA)])
 def test_judged_ratio(pv, ratio):

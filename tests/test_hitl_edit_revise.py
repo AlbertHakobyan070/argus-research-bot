@@ -37,31 +37,22 @@ from helpers import fake_engines_snapshot, make_run_config
 
 def test_brief_incorporates_plan_feedback(monkeypatch):
     from argus.graph import brief as brief_mod
+    from helpers import fake_llm
     seen = {}
 
-    class _FakeChat:
-        def invoke(self, msgs):
-            seen["prompt"] = "\n".join(getattr(m, "content", "")
-                                       for m in msgs)
-            return SimpleNamespace(
-                content='{"sub_questions": ['
-                        '{"q": "How does the revised security angle work?"},'
-                        '{"q": "What mitigations exist for it?"},'
-                        '{"q": "Which deployments were affected?"}], '
-                        '"must_have_keywords": ["topic"], '
-                        '"summary": "revised plan"}',
-                response_metadata={}, usage_metadata={})
+    def reply(system, human):
+        seen["prompt"] = f"{system}\n{human}"
+        return ('{"sub_questions": ['
+                '{"q": "How does the revised security angle work?"},'
+                '{"q": "What mitigations exist for it?"},'
+                '{"q": "Which deployments were affected?"}], '
+                '"must_have_keywords": ["topic"], '
+                '"summary": "revised plan"}')
 
-    monkeypatch.setattr(brief_mod.llm, "chat_for_tier",
-                        lambda *a, **k: _FakeChat())
-    monkeypatch.setattr(brief_mod.llm, "invoke_with_retry",
-                        lambda chat, msgs, **kw: chat.invoke(msgs))
-    monkeypatch.setattr(brief_mod.llm, "resolve_tier", lambda t: "m")
-    monkeypatch.setattr(brief_mod.llm, "record_from_response", lambda tier, req, resp: brief_mod.llm.CallRecord(
-        role=f"legacy.{tier}", tier=tier, profile="fake", provider="fake",
-        requested_model=req, served_model="m", routed_via=""))
+    fake_llm(monkeypatch, reply)
 
     out = brief_mod.brief_node({
+        "run_config": make_run_config("short"),
         "user_request": "topic",
         "brief": {"summary": "old", "sub_questions": [
             {"q": "old q", "kind": "web"}], "must_have_keywords": ["old"]},

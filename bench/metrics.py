@@ -48,8 +48,8 @@ alike:
                         status ``kept`` / ``unlocated``, or no status (v3, which never cut by id);
                         "n/a" when the grounding judge failed and ``panel_verdict.total`` is
                         absent or 0 (nothing was judged)
-  cross_section_duplicate_ratio  findings (not cut) whose claim is ≥ 0.85 similar to one in
-                        another section / findings; needs two sections
+  cross_section_duplicate_ratio  findings (not cut, not in the "Analysis" section) whose claim is
+                        ≥ 0.85 similar to one in another section / those findings; needs two sections
   judged_ratio          panel_verdict judged / total
   calls_total, calls_by_role, reroute_rate, judge_writer_same_family
                         ``registry.summarize_calls`` (logical calls: ok + exhausted; v3 → legacy.<tier>)
@@ -336,7 +336,9 @@ def _norm(text: str) -> str:
 
 
 def cross_section_duplicate_ratio(run):
-    findings = [f for f in _findings(run) or [] if f.get("status") != "cut"]
+    # The analyst restates evidence-section findings by design (WP-I): duplication is measured
+    # between evidence sections only.
+    findings = [f for f in _findings(run) or [] if f.get("status") != "cut" and f.get("section") != "Analysis"]
     if len({f.get("section") or "" for f in findings}) < 2:
         return NA
     texts = [_norm(f.get("claim") or "") for f in findings]
