@@ -62,12 +62,12 @@ Rules:
 - is_academic_topic: true when peer-reviewed research is the main
   evidence (science, medicine, ML research); false for products, markets,
   news and how-tos.
-- entities: up to 6 exact names of the specific things the request is
-  about — products, models, libraries, organisations, people, places —
-  copied as written in the request, without the generic words around
-  them: "the LangGraph interrupt mechanism" → ["LangGraph"]; "benchmarks
-  of the Orion-7B model by Acme Labs" → ["Orion-7B", "Acme Labs"]; a
-  general topic that names nothing specific ("causes of inflation") → [].
+- entities: up to 6 proper names the request is about — products,
+  models, organisations, people, projects, places — copied as written in
+  the request. Never a date, period, price, metric or generic noun:
+  "Bitcoin price outlook for Q4" → ["Bitcoin"];
+  "LangGraph vs CrewAI" → ["LangGraph", "CrewAI"];
+  a general topic that names nothing specific ("causes of inflation") → [].
 - Do NOT include URLs anywhere. Live search finds the sources.
 
 Return ONLY JSON:
@@ -76,15 +76,19 @@ Return ONLY JSON:
   "must_have_keywords": ["...", "..."],
   "summary": "1-2 sentence brief summary",
   "success_criteria": ["...", "..."],
-  "archetype": "explainer",
-  "time_sensitive": false,
-  "recency_hint": null,
-  "is_academic_topic": false,
-  "entities": ["..."]
+  "archetype": "<one of the archetypes above>",
+  "time_sensitive": <true|false>,
+  "recency_hint": <"d"|"w"|"m"|"y"|null>,
+  "is_academic_topic": <true|false>,
+  "entities": ["<proper name>", ...]
 }
 """
 
 _MAX_ENTITIES = 6
+# A normalised token that names a period or a number, never a thing (spec §3 WP-I).
+_PERIOD_TOKEN = re.compile(r"q[1-4]|h[12]|fy\d{2,4}|\d+(?:\.\d+)*|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?"
+                           r"|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?"
+                           r"|nov(?:ember)?|dec(?:ember)?")
 
 MIN_SUB_QUESTIONS = 3
 VERBATIM_OVERLAP = 0.9
@@ -127,10 +131,12 @@ def _flag(value) -> bool:
 
 def _entities(raw, asked: str) -> list[str]:
     """The entity phrases, lower-cased and whitespace-collapsed, kept only
-    when ``asked`` (the request and any plan feedback) names them — compared
-    the way the grounding check normalises them — so an invented name or
-    abbreviation never becomes something the documents must contain; one
-    per normalised form, at most ``_MAX_ENTITIES``."""
+    when ``asked`` (the request, any plan feedback and the previous brief's
+    entities) names them — compared the way the grounding check normalises
+    them — so an invented name or abbreviation never becomes something the
+    documents must contain; a phrase made only of period/number tokens
+    ("Q4", "FY26", "March 2025") is no entity; one per normalised form, at
+    most ``_MAX_ENTITIES``."""
     hay = f" {normalise(asked)} "
     out: list[str] = []
     keys: set[str] = set()
@@ -139,7 +145,8 @@ def _entities(raw, asked: str) -> list[str]:
             continue
         phrase = " ".join(item.lower().split())
         key = normalise(phrase)
-        if key and key not in keys and f" {key} " in hay:
+        if (key and key not in keys and f" {key} " in hay
+                and not all(_PERIOD_TOKEN.fullmatch(t) for t in key.split())):
             out.append(phrase)
             keys.add(key)
     return out[:_MAX_ENTITIES]
@@ -223,7 +230,8 @@ def brief_node(state) -> dict:
     user_request = state.get("user_request") or ""
     feedback = (state.get("plan_feedback") or "").strip()
     prev = state.get("brief") if feedback else None
-    asked = f"{user_request}\n{feedback}"          # what the entity phrases must come from
+    # what the entity phrases must come from: an entity of an earlier plan edit survives the next one
+    asked = "\n".join([user_request, feedback, *((prev or {}).get("entities") or [])])
     calls: list[dict] = []
 
     def _draft(extra: str = "") -> ResearchBrief:

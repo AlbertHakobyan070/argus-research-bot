@@ -17,7 +17,7 @@ from argus import llm
 from argus.graph.brief import (
     BRIEF_SYSTEM, brief_node, brief_to_plan, check_brief_quality,
 )
-from argus.graph.grounding import check_grounding
+from argus.graph.grounding import check_grounding, grounding_banner
 from argus.graph.state import ResearchBrief, SubQuestion
 
 from helpers import fake_llm, make_run_config
@@ -285,3 +285,67 @@ def test_entities_may_come_from_the_plan_feedback(monkeypatch):
     out = brief_node(_state(Q013, plan_feedback="focus on the QLT-2 release",
                             brief={"sub_questions": [], "summary": "old"}))
     assert out["brief"]["entities"] == ["nebulon ai", "qlt-2"]
+
+
+def test_an_entity_from_an_earlier_plan_edit_survives_the_next_edit(monkeypatch):
+    reply = {**GOOD, "entities": ["Nebulon AI", "QLT-2", "QLT-3"]}
+    fake_llm(monkeypatch, _replies(json.dumps(reply)))
+    previous = {"sub_questions": [], "summary": "old", "entities": ["nebulon ai", "qlt-2"]}
+    out = brief_node(_state(Q013, plan_feedback="make it shorter", brief=previous))
+    assert out["brief"]["entities"] == ["nebulon ai", "qlt-2"], "QLT-3 is named nowhere"
+
+
+def test_the_prompt_defines_entities_as_proper_names_with_counter_examples():
+    assert "proper names" in BRIEF_SYSTEM
+    assert '"Bitcoin price outlook for Q4" → ["Bitcoin"]' in BRIEF_SYSTEM
+    assert '"LangGraph vs CrewAI" → ["LangGraph", "CrewAI"]' in BRIEF_SYSTEM
+    example = BRIEF_SYSTEM[BRIEF_SYSTEM.index("Return ONLY JSON"):]
+    assert '"archetype": "<one of' in example and '"time_sensitive": <true|false>' in example
+    assert '"explainer"' not in example and "false," not in example, "placeholders, not values"
+
+
+def test_period_and_number_only_entities_are_dropped(monkeypatch):
+    request = "GPT 4 vs GLM 5.2 for Bitcoin trading in Q4 2025, H1, FY26, March and Sep 2024"
+    reply = {**GOOD, "entities": ["GPT 4", "Q4", "GLM 5.2", "Q4 2025", "H1", "FY26", "March", "Sep 2024",
+                                  "2025", "Bitcoin"]}
+    fake_llm(monkeypatch, _replies(json.dumps(reply)))
+    assert brief_node(_state(request))["brief"]["entities"] == ["gpt 4", "glm 5.2", "bitcoin"]
+
+
+def _grounding(brief: dict, titles: list[str]):
+    fetched = [{"url": f"https://s{i}.example/p", "title": t, "excerpt": ""} for i, t in enumerate(titles)]
+    evidence = [{"source_id": i + 1, "source_url": f["url"], "relevance": 4, "authority": 1}
+                for i, f in enumerate(fetched)]
+    return check_grounding({"brief": brief, "fetched": fetched, "evidence": evidence})
+
+
+BTC = ["Bitcoin's price could reach new highs by year-end", "Bitcoin outlook for the fourth quarter",
+       "Analysts see BTC rallying into Q4 2026", "Bitcoin ETF flows and the price"]
+
+
+@pytest.mark.parametrize("request_,entities,titles,kept", [
+    # the review's probe rows that raised a false banner
+    ("Bitcoin price outlook for Q4", ["Bitcoin", "Q4"], BTC, ["bitcoin"]),                # Q4: a period
+    ("Bitcoin price outlook for Q4", ["Bitcoin price"],                                   # a possessive 's
+     ["Bitcoin's price could reach new highs by year-end", "Bitcoin’s price and ETF flows"], ["bitcoin price"]),
+    ("LangGraph vs CrewAI", ["LangGraph", "CrewAI"],
+     ["LangGraph vs CrewAI compared", "LangGraph docs", "Crew AI guide"], ["langgraph", "crewai"]),
+    ("LangGraph vs Crew AI", ["LangGraph", "Crew AI"],
+     ["LangGraph vs CrewAI: which agent framework?", "Building agents with LangGraph",
+      "CrewAI multi-agent crews explained"], ["langgraph", "crew ai"]),
+])
+def test_ordinary_requests_raise_no_false_grounding_banner(monkeypatch, request_, entities, titles, kept):
+    fake_llm(monkeypatch, _replies(json.dumps({**GOOD, "entities": entities})))
+    brief = brief_node(_state(request_))["brief"]
+    assert brief["entities"] == kept
+    g = _grounding(brief, titles)
+    assert g.grounded and grounding_banner(g) == "", g
+
+
+def test_a_nonexistent_entity_still_raises_the_banner(monkeypatch):
+    fake_llm(monkeypatch, _replies(json.dumps({**GOOD, "entities": ["Quantum Lattice Transformer",
+                                                                    "Nebulon AI"]})))
+    brief = brief_node(_state(Q013))["brief"]
+    g = _grounding(brief, ["Nebulon AI raises a seed round", "Nebulon AI chatbot", "Transformer lattice models",
+                           "Quantum lattice-based transformers survey"])
+    assert (g.grounded, g.mention_count) == (False, 0) and grounding_banner(g)

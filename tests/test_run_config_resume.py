@@ -23,6 +23,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from argus import llm
 from argus.bot import app as bot_app
 from argus.bot import common as bot_common
 from argus.bot import history as bot_history
@@ -36,7 +37,7 @@ from argus.graph.state import (
     ArgusState, EvidenceClaim, EvidenceNote, FetchedItem, Finding, OutlineSection,
     PanelVerdict, ResearchBrief)
 from argus.library import Library
-from helpers import fake_engines_snapshot, make_run_config
+from helpers import fake_engines_snapshot, fake_llm, make_run_config
 
 LEGACY = "legacy: run_config defaults applied (pre-v4 checkpoint)"
 RUN_ID, CHAT = "ab12cd34", 5
@@ -370,6 +371,22 @@ async def test_research_cmd_records_the_run_config_in_checkpoint_and_library(gra
     assert (row["length"], row["depth"], row["origin"], row["status"]) == (
         "long", "deep", "telegram", "awaiting_plan")
     assert await lib.get_run_config(run_id) == values["run_config"]
+
+
+async def test_research_cmd_tells_the_chat_when_the_brief_is_exhausted(monkeypatch, lib):
+    """``brief.draft`` must raise (spec §2.1): the user is told before the
+    re-raise, the run is marked ``error`` and leaves the in-flight registry."""
+    monkeypatch.setattr(graph_mod, "intake_node", lambda s: {"mode": "deep"})
+    fake_llm(monkeypatch, lambda system, human: "no JSON here")       # the real brief node, unparseable
+    graph = graph_mod.build_graph(checkpointer=MemorySaver())
+    ctx = _ctx(graph, lib, ["some", "topic"])
+    with pytest.raises(llm.EngineError) as raised:
+        await bot_research.research_cmd(_update(), ctx)
+    assert raised.value.role == "brief.draft"
+    assert _sent(ctx)[-1] == f"⚠️ Research failed: {raised.value}"
+    (row,) = await lib.list_runs(chat_id=CHAT)
+    assert row["status"] == "error"
+    assert bot_common._inflight == {}
 
 
 async def test_ask_cmd_records_the_run_config_in_checkpoint_and_library(monkeypatch, lib):

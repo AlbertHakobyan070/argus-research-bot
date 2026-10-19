@@ -11,16 +11,19 @@ findings extractor (compose's, WP-C's to evolve) is faked where it is looked up.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from langgraph.runtime import Runtime
 
+from argus.engines import registry
 from argus.engines.llm_openai import DriverError
-from argus.graph import insight
+from argus.graph import compose, insight
 from argus.graph.insight import (ANALYSIS_LABEL, ANALYST_SYSTEM, analyst_node, confidence_label,
                                  stance_map)
 from argus.graph.state import ResearchBrief, SubQuestion
 
-from helpers import fake_llm, make_run_config
+from helpers import fake_engines_snapshot, fake_llm, make_run_config
 
 FETCHED = [
     {"url": "https://docs.alpha.com/a", "title": "Alpha docs", "published": "2026-09-01"},        # 1
@@ -101,6 +104,9 @@ R13 = [
     # 8. one unverified source of authority 1 → low
     ([3], NOTES, TAKEAWAY, QUIET,
      ("low", ["1 independent source", "no verified quote", "authority 1/3"])),
+    # 9. authority-0 exclusion from V: only the content farm's quote is verified → no V
+    ([1, 4], [_n(1, authority=2, verified=False), *NOTES[1:]], TAKEAWAY, QUIET,
+     ("low", ["1 independent source", "no verified quote", "authority 2/3"])),
 ]
 
 
@@ -254,6 +260,23 @@ def test_findings_are_extracted_over_the_unlabelled_analysis_and_merged(monkeypa
     assert out["findings"][2]["claim"] == "Model X reaches about 90 percent accuracy"
 
 
+def test_the_analysis_findings_come_from_the_real_extractor(monkeypatch):
+    """Pins the call contract of compose's ``_extract_findings`` (WP-C rewrites
+    it): the real extractor, on the legacy ``cheap`` role, over a fake driver."""
+    monkeypatch.setattr(registry._state, "snapshot", fake_engines_snapshot())   # the legacy wrappers read it
+    extract = json.dumps({"findings": [{"claim": "Model X reaches about 90 percent accuracy",
+                                        "source_ids": [1, 3], "confidence": "high"}]})
+    seen = fake_llm(monkeypatch, lambda system, human: REPLY if system == ANALYST_SYSTEM else extract)
+    out = analyst_node(_state())
+    assert [m[0] for m in seen] == [ANALYST_SYSTEM, compose.EXTRACT_SYSTEM]
+    assert seen[1][1].startswith("Section: Analysis\n\n### Key takeaways\n\n- Model X reaches about 90 percent")
+    assert out["findings"][2:] == [{"id": "f2", "claim": "Model X reaches about 90 percent accuracy",
+                                    "citation_urls": [FETCHED[0]["url"], FETCHED[2]["url"]],
+                                    "confidence": "high", "section": "Analysis"}]
+    assert [c["role"] for c in out["model_calls"]] == ["compose.analyst", "legacy.cheap"]
+    assert out["errors"] == []
+
+
 def test_no_extraction_when_the_analysis_cites_nothing(monkeypatch, extracted):
     fake_llm(monkeypatch, lambda system, human: "### Key takeaways\n\n- A guess\n")
     out = analyst_node(_state())
@@ -283,7 +306,8 @@ def _parts(md: str) -> list[str]:
 
 def test_the_short_variant_is_compacted(monkeypatch, extracted):
     seen = fake_llm(monkeypatch, lambda system, human: SHORT_REPLY)
-    analysis = analyst_node(_state("short"))["analysis"]
+    out = analyst_node(_state("short"))
+    analysis = out["analysis"]
     human = seen[0][1]
     assert "### Implications" not in human and "### Where sources agree and disagree" not in human
     assert "at most 4" in human and "at most 3" in human
@@ -291,6 +315,22 @@ def test_the_short_variant_is_compacted(monkeypatch, extracted):
     assert _parts(analysis["md"]) == ["Key takeaways", "Open questions and limits"]
     assert analysis["md"].count("- question") == 3
     assert (analysis["has_disagreement_section"], analysis["has_scenarios"]) == (False, False)
+    assert out["errors"] == ["analysis: short variant kept 4 of 6 takeaways, 3 of 5 open questions"]
+
+
+def test_the_short_cap_counts_relocated_uncited_takeaways_as_open_questions(monkeypatch, extracted):
+    reply = ("### Key takeaways\n\n- One [1]\n- Two [3]\n- Guess a\n- Guess b\n- Guess c\n\n"
+             "### Open questions and limits\n\n- Q1\n- Q2\n")
+    fake_llm(monkeypatch, lambda system, human: reply)
+    out = analyst_node(_state("short"))
+    assert out["analysis"]["md"].endswith("- Q1\n- Q2\n- (uncited) Guess a")
+    assert out["errors"] == ["analysis: short variant kept 2 of 2 takeaways, 3 of 5 open questions"]
+
+
+def test_the_short_variant_records_nothing_when_nothing_is_trimmed(monkeypatch, extracted):
+    reply = "### Key takeaways\n\n- One [1]\n\n### Open questions and limits\n\n- Q1\n"
+    fake_llm(monkeypatch, lambda system, human: reply)
+    assert analyst_node(_state("short"))["errors"] == []
 
 
 def test_the_short_variant_keeps_the_disagreement_when_sources_conflict(monkeypatch, extracted):
@@ -326,11 +366,73 @@ def test_heading_variants_are_recognised(monkeypatch, extracted):
     assert _parts(analysis["md"]) == ["Key takeaways", "Where sources agree and disagree"]
 
 
+@pytest.mark.parametrize("heading", ["### 1. Key takeaways", "## 2) Key takeaways", "**Key takeaways**",
+                                     "**Key takeaways:**", "**Key takeaways**:", "### Takeaways"])
+def test_numbered_bold_and_short_takeaways_headings_are_recognised(monkeypatch, extracted, heading):
+    reply = f"{heading}\n\n- Cited [1]\n\n### Open questions and limits\n\n- Q1\n"
+    fake_llm(monkeypatch, lambda system, human: reply)
+    out = analyst_node(_state())
+    assert [t["text"] for t in out["analysis"]["takeaways"]] == ["Cited [1]"]
+    assert _parts(out["analysis"]["md"]) == ["Key takeaways", "Open questions and limits"]
+    assert out["errors"] == []
+
+
+@pytest.mark.parametrize("before", [
+    "Okay, the user wants an analysis. Let me think…\n\n",
+    "### Thinking\n\nThe sources mostly agree, so lead with accuracy.\n\n",
+    "Okay, the user wants an analysis. Let me think…\n\n### Thinking\n\nLead with accuracy.\n\n",
+])
+def test_text_before_the_first_fixed_heading_is_dropped_and_recorded(monkeypatch, extracted, before):
+    fake_llm(monkeypatch, lambda system, human: before + REPLY)
+    out = analyst_node(_state())
+    md = out["analysis"]["md"]
+    assert md.startswith(ANALYSIS_LABEL + "\n\n### Key takeaways\n\n")
+    assert "Let me think" not in md and "Thinking" not in md and "Lead with accuracy" not in md
+    assert out["errors"] == ["analysis: dropped text before the first heading"]
+    (_, plain), = extracted
+    assert "Let me think" not in plain and "Thinking" not in plain, "nor extracted as findings"
+
+
+def test_other_headings_after_the_first_fixed_one_stay(monkeypatch, extracted):
+    reply = "### Key takeaways\n\n- Cited [1]\n\n### Caveats\n\nSmall samples [3].\n"
+    fake_llm(monkeypatch, lambda system, human: reply)
+    out = analyst_node(_state())
+    assert _parts(out["analysis"]["md"]) == ["Key takeaways", "Caveats"]
+    assert "Small samples [3]." in out["analysis"]["md"] and out["errors"] == []
+
+
+@pytest.mark.parametrize("reply", [
+    "Model X looks accurate [1].",
+    "### Thinking\n\nModel X looks accurate [1].\n\n### Summary\n\n- It is accurate [3]\n",
+    "**Summary**\n\n- It is accurate [3]\n",                       # bold, but not a fixed heading
+])
+def test_a_reply_without_the_fixed_headings_omits_the_analysis_visibly(monkeypatch, extracted, reply):
+    fake_llm(monkeypatch, lambda system, human: reply)
+    events: list = []
+    stale = [*FINDINGS, _finding("f2", "an old analysis claim", "Analysis", [1])]
+    out = analyst_node(_state(findings=stale), Runtime(stream_writer=events.append))
+    assert out["analysis"] is None and out["findings"] == FINDINGS and "draft_md" not in out
+    assert out["errors"] == ["[r1] degrade: compose.analyst → omit_analysis (no analysis headings)"]
+    assert events == [{"kind": "degrade", "node": "analyst",
+                       "data": {"role": "compose.analyst", "degradation": "omit_analysis",
+                                "reason": "no analysis headings"}}]
+    assert extracted == [] and [c["role"] for c in out["model_calls"]] == ["compose.analyst"]
+
+
 def test_a_missing_takeaways_heading_is_recorded_and_the_text_kept(monkeypatch, extracted):
-    fake_llm(monkeypatch, lambda system, human: "Model X looks accurate [1].")
+    reply = "### Where sources agree and disagree\n\nModel X looks accurate [1]."
+    fake_llm(monkeypatch, lambda system, human: reply)
     out = analyst_node(_state())
     assert out["errors"] == ["analysis: takeaways heading missing"]
     assert out["analysis"]["takeaways"] == [] and "Model X looks accurate [1]." in out["analysis"]["md"]
+
+
+@pytest.mark.parametrize("body", ["- A guess\n- Another guess\n", "Prose without bullets [1].\n"])
+def test_a_takeaways_part_without_a_cited_bullet_is_recorded(monkeypatch, extracted, body):
+    fake_llm(monkeypatch, lambda system, human: f"### Key takeaways\n\n{body}")
+    out = analyst_node(_state())
+    assert out["analysis"]["takeaways"] == []
+    assert out["errors"] == ["analysis: no cited takeaways"]
 
 
 def test_an_empty_reply_omits_the_analysis_visibly(monkeypatch, extracted):

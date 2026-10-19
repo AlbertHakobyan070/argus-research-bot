@@ -288,9 +288,10 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             common._inflight.pop(run_id, None)
             await _set_run_status(ctx, run_id, "error")
-    except Exception:
+    except Exception as e:
         common._inflight.pop(run_id, None)
         await _set_run_status(ctx, run_id, "error")
+        await ctx.application.bot.send_message(chat_id=chat_id, text=f"⚠️ Research failed: {e}")
         raise
 
 

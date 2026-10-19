@@ -13,11 +13,13 @@ sub-question whose coverage was below ``coverage_min_strong`` before the wave.
 ``outline["changed_sections"]`` names the sections whose note set changed
 (every section in fresh mode).
 
-The deterministic repair follows either mode and the degradation: unknown
-note ids dropped, a note in at most 2 sections, every usable note allocated
-(to the section sharing most sub-questions with it; ties rotate), and a
-section with fewer than ``section_min_notes`` notes merged into its neighbour
-— the previous section, else the next — never dropped (R11). ``outline.plan``
+A repeated title (case and whitespace aside) merges into its first
+occurrence, in the fresh reply and in an existing outline. The deterministic
+repair follows either mode and the degradation: unknown note ids dropped, a
+note in at most 2 sections, every usable note allocated (to the section
+sharing most sub-questions with it; ties rotate), and a section with fewer
+than ``section_min_notes`` notes merged into its neighbour — the previous
+section, else the next — never dropped (R11). ``outline.plan``
 degrades to ``default_outline`` (fresh) or to the existing sections (extend),
 allocated the same way. Flat lengths and one-sub-question briefs need no
 outline. compose.py re-exports ``outline_node`` (the graph imports it there).
@@ -160,7 +162,8 @@ def _keep_known(sections: list[OutlineSection], known: set[int]) -> None:
 
 def _allocate(sections: list[OutlineSection], notes: list[dict]) -> None:
     """Each note no section holds → the section sharing most sub-questions
-    with it; ties rotate across the tied sections, in order."""
+    with it; ties rotate across the tied sections, in order (a note that is
+    no tie does not advance the rotation)."""
     held = {i for s in sections for i in s.note_ids}
     turn = 0
     for n in notes:
@@ -171,8 +174,25 @@ def _allocate(sections: list[OutlineSection], notes: list[dict]) -> None:
         overlap = [len(subs & set(s.sub_qs)) for s in sections]
         best = [s for s, o in zip(sections, overlap) if o == max(overlap)]
         best[turn % len(best)].note_ids.append(sid)
-        turn += 1
+        if len(best) > 1:
+            turn += 1
         held.add(sid)
+
+
+def _title_key(title: str) -> str:
+    return " ".join(title.split()).casefold()
+
+
+def _merge_repeated(sections: list[OutlineSection]) -> list[OutlineSection]:
+    """A repeated title (case and whitespace aside) merges into its first
+    occurrence: sub-questions and notes unioned in order, the first focus kept."""
+    first: dict[str, OutlineSection] = {}
+    for s in sections:
+        keep = first.setdefault(_title_key(s.title), s)
+        if keep is not s:
+            keep.sub_qs = list(dict.fromkeys([*keep.sub_qs, *s.sub_qs]))
+            keep.note_ids = list(dict.fromkeys([*keep.note_ids, *s.note_ids]))
+    return list(first.values())
 
 
 def _merge_into(dst: OutlineSection, src: OutlineSection) -> None:
@@ -243,13 +263,12 @@ def _parse_sections(text: str, n_subs: int, budget: int) -> list[OutlineSection]
         raise ValueError(f"'sections' is {type(raw).__name__}, not a list")
     out: list[OutlineSection] = []
     for s in raw:
-        if len(out) == budget:
-            break
         if not isinstance(s, dict) or not str(s.get("title") or "").strip():
             continue
         out.append(OutlineSection(title=str(s["title"]).strip()[:100], focus=str(s.get("focus") or "")[:200],
                                   sub_qs=_ints(s.get("sub_qs"), lambda i: 0 <= i < n_subs),
                                   note_ids=_ints(s.get("note_ids"))))
+    out = _merge_repeated(out)[:budget]
     if not out:
         raise ValueError("no usable section in the reply")
     return out
@@ -268,7 +287,7 @@ def _parse_extend(text: str, titles: dict[str, str], new_ids: set[int], n_subs: 
         if not isinstance(a, dict):
             continue
         ids = _ints([a.get("note_id")], lambda i: i in new_ids)
-        title = titles.get(str(a.get("section") or "").strip().casefold())
+        title = titles.get(_title_key(str(a.get("section") or "")))
         if ids and title:
             pairs.append((ids[0], title))
     ns = data.get("new_section")
@@ -335,7 +354,7 @@ def _extend(state, rc: run_config.RunConfig, brief: ResearchBrief, sections: lis
              f"Sub-questions:\n{subs}\n\n"
              f"New evidence notes ([id] domain · relevance · sub-questions — first claim):\n{_note_index(new)}"
              "\n\nReturn the assignment JSON.")
-    titles = {s.title.casefold(): s.title for s in sections}
+    titles = {_title_key(s.title): s.title for s in sections}
     try:
         res = llm.complete("outline.plan", [SystemMessage(content=EXTEND_SYSTEM), HumanMessage(content=human)],
                            engines=rc.engines, temperature=0.2, max_tokens=900,
@@ -347,7 +366,7 @@ def _extend(state, rc: run_config.RunConfig, brief: ResearchBrief, sections: lis
     for i, title in pairs:
         by_title[title].note_ids.append(i)
     accepted = (proposed if proposed is not None and proposed.note_ids
-                and proposed.title.casefold() not in titles and set(proposed.sub_qs) & starved else None)
+                and _title_key(proposed.title) not in titles and set(proposed.sub_qs) & starved else None)
     return accepted, [r.model_dump() for r in res.records], []
 
 
@@ -377,7 +396,10 @@ def outline_node(state, runtime: Runtime | None = None) -> dict:
         if not new:
             return {"outline": {"sections": existing, "changed_sections": []},
                     "messages": [{"role": "assistant", "content": "🧭 Outline unchanged — no new notes."}]}
-        before = {s.title: set(s.note_ids) for s in sections}
+        before: dict[str, set[int]] = {}
+        for s in sections:                      # each title's notes as written (a repeat: its first one's)
+            before.setdefault(s.title, set(s.note_ids))
+        sections = _merge_repeated(sections)    # an outline written before titles were deduplicated
         added, calls, errors = _extend(state, rc, brief, sections, new, runtime)
         if added is not None:
             sections.append(added)

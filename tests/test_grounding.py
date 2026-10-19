@@ -19,6 +19,7 @@ from argus.graph.grounding import (
     check_grounding,
     grounding_banner,
     grounding_warning_prompt,
+    normalise,
 )
 
 
@@ -60,6 +61,28 @@ def test_a_longer_version_does_not_match_a_shorter_entity(tmp_path):
     assert r.mention_count == 0 and not r.grounded
     r = check_grounding(_state(tmp_path, ["GLM 5.2"], ["glm-5.2 is out.", "GLM 5.2."]))
     assert r.mention_count == 2 and r.grounded
+
+
+def test_a_possessive_s_is_dropped_on_both_sides(tmp_path):
+    assert normalise("Bitcoin's price") == normalise("Bitcoin’s price") == "bitcoin price"
+    assert normalise("O'Sullivan's books") == "o sullivan books", "only an 's at a word end"
+    docs = ["Bitcoin's price could reach new highs.", "Bitcoin’s price and ETF flows."]
+    r = check_grounding(_state(tmp_path, ["Bitcoin price"], docs))
+    assert (r.mention_count, r.grounded) == (2, True)
+
+
+def test_a_phrase_spelled_without_its_spaces_matches_whole_tokens(tmp_path):
+    """"CrewAI" ↔ "Crew AI", "Hugging Face" ↔ "HuggingFace": the phrase without its
+    spaces equals a run of whole tokens; never part of a token."""
+    r = check_grounding(_state(tmp_path, ["CrewAI", "Hugging Face"],
+                               ["Crew AI on HuggingFace.", "crew-ai and hugging-face."]))
+    assert (r.mention_count, r.grounded) == (2, True)
+    r = check_grounding(_state(tmp_path, ["Crew AI"], ["CrewAI crews.", "The crewai package."]))
+    assert (r.mention_count, r.grounded) == (2, True)
+    r = check_grounding(_state(tmp_path, ["CrewAI"], ["A screw aims true.", "Crew aims high.", "Crew AIs."]))
+    assert r.mention_count == 0, "a token's part is never a mention"
+    r = check_grounding(_state(tmp_path, ["GLM 5"], ["GLM5.2 is out.", "glm 5.2 again."]))
+    assert r.mention_count == 0, "a longer version still does not match"
 
 
 def test_only_relevant_authoritative_sources_count(tmp_path):

@@ -179,11 +179,31 @@ def test_fresh_degrade_is_the_deterministic_outline_with_its_notes_allocated(mon
     assert [c["ok"] for c in out["model_calls"]] == [False, False]
 
 
-def test_ties_rotate_across_the_tied_sections(monkeypatch):
+@pytest.mark.parametrize("sub_qs,expected", [
+    ([[0, 1]] * 5, [[1, 3, 5], [2, 4]]),                           # every note tied
+    ([[0, 1], [0], [0, 1], [0], [0, 1]], [[1, 2, 4, 5], [3]]),     # ties 1, 3, 5 alternate; 2 and 4 are no tie
+])
+def test_ties_rotate_across_the_tied_sections(monkeypatch, sub_qs, expected):
     fake_llm(monkeypatch, lambda system, human: "no JSON here")
-    evidence = [_note(i, [0, 1]) for i in range(1, 6)]
-    out = outline_node(_state(subs=SUBS[:2], evidence=evidence))
-    assert [s["note_ids"] for s in out["outline"]["sections"]] == [[1, 3, 5], [2, 4]]
+    evidence = [_note(i, s) for i, s in enumerate(sub_qs, 1)]
+    rc = make_run_config("medium", **{"compose.section_min_notes": 1})
+    out = outline_node(_state(subs=SUBS[:2], evidence=evidence, rc=rc))
+    assert [s["note_ids"] for s in out["outline"]["sections"]] == expected
+
+
+def test_a_repeated_title_merges_into_its_first_occurrence(monkeypatch):
+    """Case and whitespace aside; sub-questions and notes unioned in order, the
+    first focus kept, and the duplicate does not count against the budget."""
+    fake_llm(monkeypatch, lambda system, human: _sections(
+        ("How X works", "the mechanism", [0, 1], [1, 2, 3]), ("Uses", "where", [2], [5, 6]),
+        ("how  x   WORKS", "again", [1, 3], [3, 4, 7]), ("Limits", "limits", [3], [7, 8]),
+        ("Outlook", "next", [2], [5, 6])))
+    out = outline_node(_state())
+    _assert_valid(out, range(1, 9))
+    assert _layout(out) == [("How X works", [0, 1, 3], [1, 2, 3, 4, 7]), ("Uses", [2], [5, 6]),
+                            ("Limits", [3], [7, 8]), ("Outlook", [2], [5, 6])]
+    assert out["outline"]["sections"][0]["focus"] == "the mechanism"
+    assert out["outline"]["changed_sections"] == ["How X works", "Uses", "Limits", "Outlook"]
 
 
 def test_the_round_tag_counts_user_rounds(monkeypatch):
@@ -220,6 +240,20 @@ def test_extend_keeps_titles_and_assigns_only_the_new_notes(monkeypatch):
     assert _layout(out) == [("Basics", [0, 1], [1, 2, 3, 4, 9]), ("Uses", [2, 3], [5, 6, 7, 8, 9, 10])]
     assert out["outline"]["changed_sections"] == ["Basics", "Uses"]
     assert [c["role"] for c in out["model_calls"]] == ["outline.plan"]
+
+
+def test_extend_merges_a_repeated_existing_title_and_lists_it_once(monkeypatch):
+    """An outline written before titles were deduplicated: its repeated title
+    merges into the first occurrence, so the assignments land there, not all
+    on the last duplicate, and ``changed_sections`` names the title once."""
+    dup = _existing(("Basics", [0], [1, 2]), ("Uses", [2, 3], [5, 6, 7, 8]), ("Basics", [1], [3, 4]))
+    reply = {"assign": [{"note_id": 9, "section": "  BASICS "}, {"note_id": 10, "section": "Basics"}],
+             "new_section": None}
+    fake_llm(monkeypatch, lambda system, human: json.dumps(reply))
+    out = outline_node(_state(evidence=[*EVIDENCE, _note(9, [1]), _note(10, [0])], outline=dup))
+    assert _layout(out) == [("Basics", [0, 1], [1, 2, 3, 4, 9, 10]), ("Uses", [2, 3], [5, 6, 7, 8])]
+    assert out["outline"]["sections"][0]["focus"] == "Basics focus"
+    assert out["outline"]["changed_sections"] == ["Basics"]
 
 
 def test_extend_with_no_new_note_changes_nothing(monkeypatch):

@@ -6,13 +6,15 @@ the per-section findings (claim, [ids], section), the deterministic
 ``stance_map``, the coverage and an index of the cited sources (title,
 registrable domain, authority, published) — never the section bodies — and
 writes the archetype's analysis headings (``archetypes``). Post-processing is
-deterministic: takeaway bullets without a citation move to the open questions
-as "(uncited)", the ``short`` variant is compacted (at most 4 takeaways and 3
-open questions, no Implications, the agree/disagree section only when the
-stance map shows a conflict), findings are extracted over the analysis
-(section "Analysis"; the labels are not claims) and every takeaway gets its
-``confidence_label`` with the reasons. No TL;DR here: report_builder builds
-it after the cuts (WP-C).
+deterministic: text before the first fixed heading is dropped (recorded), a
+reply with none of them is the ``omit_analysis`` degradation, takeaway bullets
+without a citation move to the open questions as "(uncited)", the ``short``
+variant is compacted (at most 4 takeaways and 3 open questions, no
+Implications, the agree/disagree section only when the stance map shows a
+conflict; what it trims is recorded), findings are extracted over the
+analysis (section "Analysis"; the labels are not claims) and every takeaway
+gets its ``confidence_label`` with the reasons. No TL;DR here: report_builder
+builds it after the cuts (WP-C).
 """
 from __future__ import annotations
 
@@ -118,21 +120,21 @@ def confidence_label(source_ids, sources, notes, takeaway_text, stance_map) -> t
     """The R13 label of a takeaway citing ``source_ids`` (1-based ids into
     ``sources``, the fetched list; ``notes`` are the evidence notes):
     D = distinct registrable domains among the cited sources of authority ≥ 1;
-    V = a cited note holds a ``quote_verified`` claim sharing ≥ 2 non-stop
-    words with the takeaway; A = the highest cited authority. high: D ≥ 2, V
-    and A ≥ 2; medium: D ≥ 2 and (V or A ≥ 2), or A ≥ 2 and V; else low. A note
-    contradicting on the cited notes' sub-questions (``stance_map``) caps the
-    label at medium and adds "contradicted by [n]". An id without a note is
-    not a source."""
+    V = a cited note of authority ≥ 1 holds a ``quote_verified`` claim sharing
+    ≥ 2 non-stop words with the takeaway; A = the highest cited authority.
+    high: D ≥ 2, V and A ≥ 2; medium: D ≥ 2 and (V or A ≥ 2), or A ≥ 2 and V;
+    else low. A note contradicting on the cited notes' sub-questions
+    (``stance_map``) caps the label at medium and adds "contradicted by [n]".
+    An id without a note is not a source."""
     by_id = {int(n["source_id"]): n for n in notes}
     cited = [by_id[i] for i in dict.fromkeys(source_ids) if i in by_id and 0 < i <= len(sources)]
     if not cited:
         return "low", ["no known source cited"]
     words = _words(takeaway_text)
-    d = len({registrable_domain(sources[int(n["source_id"]) - 1].get("url") or "")
-             for n in cited if int(n.get("authority", 1)) >= 1})
+    credible = [n for n in cited if int(n.get("authority", 1)) >= 1]     # authority 0 counts for neither D nor V
+    d = len({registrable_domain(sources[int(n["source_id"]) - 1].get("url") or "") for n in credible})
     v = any(c.get("quote_verified") is True and len(words & _words(c.get("text") or "")) >= 2
-            for n in cited for c in n.get("claims") or [])
+            for n in credible for c in n.get("claims") or [])
     a = max(int(n.get("authority", 1)) for n in cited)
     if d >= 2 and v and a >= 2:
         label = "high"
@@ -230,34 +232,47 @@ def _prompt(state, brief: ResearchBrief, findings: list[dict], smap: dict, evide
 # ---------------------------------------------------------------------------
 
 def _key(title: str) -> str:
+    title = re.sub(r"^\s*\d+[.)]\s*", "", title)                    # "1. Key takeaways", "2) …"
     return " ".join(re.sub(r"[^\w\s]", " ", title.replace("&", " and ")).lower().split())
 
 
-_KNOWN = {_key(h): h for h in (TAKEAWAYS, AGREEMENT, SCENARIOS, IMPLICATIONS, OPEN_QUESTIONS)}
+_FIXED = (TAKEAWAYS, AGREEMENT, SCENARIOS, IMPLICATIONS, OPEN_QUESTIONS)
+_KNOWN = {**{_key(h): h for h in _FIXED}, "takeaways": TAKEAWAYS}
 _HEADING = re.compile(r"^#{2,4}\s+(.+?)\s*#*\s*$")
+_BOLD_LINE = re.compile(r"^\s*(?:\*\*|__)(.+?)(?:\*\*|__)\s*:?\s*$")
 _BULLET = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+(.*\S)\s*$")
 
 
+def _heading(line: str) -> str | None:
+    """The heading a line opens: a fixed heading's canonical name in any
+    variant (level 2-4, numbered, case, "&", a trailing colon, or a line of
+    only bold text), another markdown heading's own title, else None."""
+    m = _HEADING.match(line)
+    if m:
+        title = m.group(1).strip().strip("*_").strip()
+        return _KNOWN.get(_key(title), title)
+    m = _BOLD_LINE.match(line)
+    return _KNOWN.get(_key(m.group(1))) if m else None
+
+
 def _split(md: str) -> tuple[list[str], list[list]]:
-    """(lines before the first heading, [[heading, body lines], …]); a known
-    heading in any variant (level 2-4, case, "&", a trailing colon) gets its
-    canonical name, and a repeated one continues its first part."""
-    intro: list[str] = []
+    """(the lines before the first fixed heading — other headings included —,
+    [[heading, body lines], …] from it on); a repeated fixed heading continues
+    its first part."""
+    before: list[str] = []
     parts: list[list] = []
-    current = intro
+    current = before
     for line in md.splitlines():
-        m = _HEADING.match(line)
-        if not m:
+        head = _heading(line)
+        if head is None or (not parts and head not in _FIXED):
             current.append(line)
             continue
-        title = m.group(1).strip().strip("*_").strip()
-        head = _KNOWN.get(_key(title), title)
-        part = next((p for p in parts if p[0] == head and head in _KNOWN.values()), None)
+        part = next((p for p in parts if p[0] == head and head in _FIXED), None)
         if part is None:
             part = [head, []]
             parts.append(part)
         current = part[1]
-    return intro, parts
+    return before, parts
 
 
 def _bullets(lines: list[str]) -> tuple[list[str], list[str]]:
@@ -284,10 +299,8 @@ def _trim(lines: list[str]) -> list[str]:
     return "\n".join(lines).strip().splitlines()
 
 
-def _render(intro: list[str], parts: list[list], takeaways: list[dict], *, labelled: bool) -> str:
+def _render(parts: list[list], takeaways: list[dict], *, labelled: bool) -> str:
     blocks = [ANALYSIS_LABEL] if labelled else []
-    if "\n".join(intro).strip():
-        blocks.append("\n".join(intro).strip())
     for head, lines in parts:
         body = "\n".join(lines).strip()
         if head == TAKEAWAYS:
@@ -327,6 +340,13 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
             out["findings"] = base
         return out
 
+    def degraded(reason: str, calls: list[dict]) -> dict:      # the declared degradation, visibly
+        degradation = DEGRADABLE_ROLES["compose.analyst"]
+        logger.warning("compose.analyst degraded (%s); analysis omitted", reason)
+        _emit(runtime, "degrade", {"role": "compose.analyst", "degradation": degradation, "reason": reason})
+        return omitted(model_calls=calls,
+                       errors=[f"[r{_round(state)}] degrade: compose.analyst → {degradation} ({reason})"])
+
     if rc.length == "tldr" or not rc.compose.analyst or not base:
         return omitted()
     brief = ResearchBrief.model_validate(state.get("brief") or {})
@@ -341,20 +361,18 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
             HumanMessage(content=_prompt(state, brief, base, smap, evidence, fetched, heads, short))],
             engines=rc.engines, temperature=0.3, max_tokens=900 if short else 1800)
     except llm.EngineDegraded as e:
-        logger.warning("compose.analyst degraded (%s); analysis omitted", e)
-        _emit(runtime, "degrade", {"role": e.role, "degradation": e.degradation, "reason": str(e)})
-        return omitted(model_calls=[a.model_dump() for a in e.attempts],
-                       errors=[f"[r{_round(state)}] degrade: compose.analyst → {e.degradation} ({e})"])
+        return degraded(str(e), [a.model_dump() for a in e.attempts])
     calls = [r.model_dump() for r in res.records]
     text = normalize_cite_markers(strip_fences(res.text))
-    if not text.strip():                        # nothing to analyse: the declared degradation, visibly
-        degradation = DEGRADABLE_ROLES["compose.analyst"]
-        _emit(runtime, "degrade", {"role": "compose.analyst", "degradation": degradation, "reason": "empty reply"})
-        return omitted(model_calls=calls, errors=[
-            f"[r{_round(state)}] degrade: compose.analyst → {degradation} (empty reply)"])
+    if not text.strip():
+        return degraded("empty reply", calls)
+    before, parts = _split(text)
+    if not parts:
+        return degraded("no analysis headings", calls)
 
     errors: list[str] = []
-    intro, parts = _split(text)
+    if "\n".join(before).strip():
+        errors.append("analysis: dropped text before the first heading")
     bullets: list[str] = []
     take = next((p for p in parts if p[0] == TAKEAWAYS), None)
     if take is None:
@@ -363,6 +381,8 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
         bullets, take[1] = _bullets(take[1])
         uncited = [b for b in bullets if not CITE_RE.search(b)]
         bullets = [b for b in bullets if CITE_RE.search(b)]
+        if not bullets:
+            errors.append("analysis: no cited takeaways")
         if uncited:
             questions = next((p for p in parts if p[0] == OPEN_QUESTIONS), None)
             if questions is None:
@@ -370,20 +390,24 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
                 parts.append(questions)
             questions[1] = [*_trim(questions[1]), *(f"- (uncited) {b}" for b in uncited)]
     if short:                                   # the flat short variant (spec §3 WP-I)
-        known = set(_KNOWN.values())
-        parts = [p for p in parts if p[0] in heads or p[0] not in known]
-        bullets = bullets[:_SHORT_TAKEAWAYS]
+        parts = [p for p in parts if p[0] in heads or p[0] not in _FIXED]
+        n_take, bullets = len(bullets), bullets[:_SHORT_TAKEAWAYS]
+        n_open = kept_open = 0
         for p in parts:
             if p[0] == OPEN_QUESTIONS:
                 questions, other = _bullets(p[1])
-                p[1] = [*other, *(f"- {q}" for q in questions[:_SHORT_OPEN_QUESTIONS])]
+                n_open, kept_open = len(questions), min(len(questions), _SHORT_OPEN_QUESTIONS)
+                p[1] = [*other, *(f"- {q}" for q in questions[:kept_open])]
+        if len(bullets) < n_take or kept_open < n_open:
+            errors.append(f"analysis: short variant kept {len(bullets)} of {n_take} takeaways, "
+                          f"{kept_open} of {n_open} open questions")
     takeaways = []
     for b in bullets:
         ids = list(dict.fromkeys(int(m) for m in CITE_RE.findall(b)))
         label, reasons = confidence_label(ids, fetched, evidence, b, smap)
         takeaways.append({"text": b, "source_ids": ids, "confidence": label, "reasons": reasons})
 
-    plain = _render(intro, parts, takeaways, labelled=False)
+    plain = _render(parts, takeaways, labelled=False)
     extracted: list[dict] = []
     if CITE_RE.search(plain):
         extracted, call, err = _extract_findings(ANALYSIS_SECTION, plain, fetched)
@@ -391,7 +415,7 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
             calls.append(call)
         if err:
             errors.append(err)
-    md = _render(intro, parts, takeaways, labelled=True)
+    md = _render(parts, takeaways, labelled=True)
     analysis = {"md": md, "takeaways": takeaways, "stance_map": smap,
                 "has_disagreement_section": _has(parts, AGREEMENT), "has_scenarios": _has(parts, SCENARIOS),
                 "archetype": brief.archetype}

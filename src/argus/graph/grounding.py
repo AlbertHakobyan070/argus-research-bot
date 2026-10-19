@@ -19,9 +19,11 @@ v4 (spec §3 WP-B): the entities are the brief's ``entities`` — full
 phrases, never single query tokens (baseline b5, a nonexistent entity,
 passed v3's gate because any one of six generic request tokens counted;
 only 1 of 28 documents named it). A phrase is matched normalised and
-case-insensitive in the fetched document's full text; a source counts as
-credible when its digest note is relevant (relevance ≥ 3) and not of
-authority 0. No LLM; the only I/O is reading the fetched markdown files.
+case-insensitive (a possessive 's dropped) in the fetched document's full
+text, or spelled without its spaces over a run of whole tokens ("CrewAI" ↔
+"Crew AI"); a source counts as credible when its digest note is relevant
+(relevance ≥ 3) and not of authority 0. No LLM; the only I/O is reading the
+fetched markdown files.
 Until the brief writes ``entities`` (WP-I) there is nothing to check and
 every run is grounded.
 """
@@ -47,10 +49,18 @@ _MIN_RELEVANCE = 3
 # Everything that is not a letter or digit becomes a space — except a dot
 # between two digits, so "5.2" stays one token ("GLM 5" never matches "GLM 5.2").
 _SEPARATORS = re.compile(r"(?!(?<=\d)\.(?=\d))[\W_]")
+_POSSESSIVE = re.compile(r"(?<=\w)['’]s\b")          # "Bitcoin's price" → "bitcoin price"
 
 
 def normalise(text: str) -> str:
-    return " ".join(_SEPARATORS.sub(" ", (text or "").lower()).split())
+    return " ".join(_SEPARATORS.sub(" ", _POSSESSIVE.sub("", (text or "").lower())).split())
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern:
+    """A normalised phrase as a run of whole tokens of a space-padded
+    normalised text, its spaces optional: "crew ai" matches "crew ai" and
+    "crewai", "crewai" matches both too; never part of a token."""
+    return re.compile("(?<= )" + " ?".join(map(re.escape, phrase.replace(" ", ""))) + "(?= )")
 
 
 # compose checks grounding once per section: each document is read and
@@ -113,11 +123,12 @@ def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD):
         if (item is not None and int(note.get("relevance") or 0) >= _MIN_RELEVANCE
                 and int(note.get("authority", 1)) >= 1):
             credible.append(item)
+    patterns = {e: _phrase_pattern(e) for e in entities}       # compiled once, reused per document
     counts = {e: 0 for e in entities}
     samples: list[str] = []
     for item in credible:
         text = _text_of(item)
-        named = [e for e in entities if f" {e} " in text]
+        named = [e for e, pattern in patterns.items() if pattern.search(text)]
         for e in named:
             counts[e] += 1
         if named and len(samples) < 3:
