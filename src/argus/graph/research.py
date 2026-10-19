@@ -406,6 +406,7 @@ _QUOTE_FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»�
 _FOOTNOTE = re.compile(r"\[\d+\](?:\([^)\]]*\))?")        # a footnote marker, [3] (or linked: [3](#fn3))
 _MD_LINK = re.compile(r"!?\[([^\[\]]*)\]\([^)\]]*\)")     # a markdown link or image → its text
 _LIST_MARKER = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)  # an ordered-list marker at a line start
+_BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)    # blockquote markers at a line start: ">", ">>", "> >"
 # whole numbers (a sign only when no word character precedes it, . , : only between digits, a trailing %),
 # the comparison symbols, words: "0.5%" ≠ "5%", "-5%" ≠ "5%", "≤" ≠ "≥"
 _TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?|\d+(?:[.,:]\d+)*%?|[<>≤≥≠±=]|\w+")
@@ -417,13 +418,14 @@ _MAX_SEGMENTS = 8            # a quote with more ellipsis segments never verifie
 
 
 def _words(text: str) -> str:
-    """``text`` normalised — case, quote marks, dashes, markdown links and images
-    (their text), footnote markers, ordered-list markers at line starts, ``<=``
-    ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` — as its tokens (``_TOKEN``), one space before
-    each and after the last."""
-    text = _LIST_MARKER.sub("", _MD_LINK.sub(r"\1", _FOOTNOTE.sub("", text)))
-    text = text.translate(_QUOTE_FOLD).lower().replace("<=", "≤").replace(">=", "≥").replace("!=", "≠")
-    return " " + "".join(t + " " for t in _TOKEN.findall(text))
+    """``text`` normalised — ``<=`` ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` (first, so a
+    ``>=`` opening a line is no blockquote marker), markdown links and images
+    (their text), footnote markers, blockquote and ordered-list markers at line
+    starts, quote marks, dashes, case — as its tokens (``_TOKEN``), one space before
+    each and after the last. A ``>`` anywhere else stays a symbol token."""
+    text = _MD_LINK.sub(r"\1", _FOOTNOTE.sub("", text.replace("<=", "≤").replace(">=", "≥").replace("!=", "≠")))
+    text = _LIST_MARKER.sub("", _BLOCKQUOTE.sub("", text))    # blockquote markers first: "> 1. x" is a list item
+    return " " + "".join(t + " " for t in _TOKEN.findall(text.translate(_QUOTE_FOLD).lower()))
 
 
 class QuoteIndex:

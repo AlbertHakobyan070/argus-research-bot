@@ -1,7 +1,7 @@
 """Verbatim quote verification (v4 spec §2.8, B4): the document and the quote
 are normalised alike — case, whitespace, quote marks, dashes, markdown links and
-images (their text), footnote markers, ordered-list markers at line starts,
-``<=`` ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` — and split into tokens: whole numbers
+images (their text), footnote markers, ordered-list and blockquote markers at
+line starts, ``<=`` ``>=`` ``!=`` as ``≤`` ``≥`` ``≠`` — and split into tokens: whole numbers
 (sign, ``.``/``,``/``:`` between digits, ``%``), the symbols ``< > ≤ ≥ ≠ ± =`` and
 ``\\w+`` words. A quote verifies when its tokens occur contiguously and in order in
 the document's, the first segment not right after a negator; an ellipsis splits it
@@ -93,6 +93,15 @@ PROSE = (
     "The drug is not effective in children. The update ships without breaking changes. "
     "Users don't need an account to read the docs. "
     "Version 2 does not support webhooks; version 3 does support webhooks. "
+    # WP-B fix round 5: blockquote markers at line starts; a mid-line ">" stays a symbol
+    "Throughput must stay >= 300 requests per second at peak. The first arm passes when x > 5 holds for every sample.\n"
+    "> **Note**: Python 3.11 or newer is required for the Functional API, for interrupt(), and for streaming\n"
+    "> from a node running in the Workflow. On older versions the plugin loads but emits a warning,\n"
+    "> and those features will not work.\n"
+    ">> A nested reply: the checkpointer stores every superstep\n"
+    "> > so that a restart loses nothing at all.\n"
+    "> 1. Clone the repository.\n"
+    "> 2. Run the installer.\n"
 )
 PROSE_IDX = QuoteIndex(_doc(30_000, seed=3) + " " + PROSE + _doc(30_000, seed=5))
 PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every knob outside a preset keeps "
@@ -140,6 +149,10 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
     ("starts right after 'without'", "breaking changes"),
     ("starts right after 'don't'", "need an account to read the docs"),
     ("an ellipsis first, then right after 'not'", "… effective in children"),
+    # WP-B fix round 5: stripping blockquote markers loosens nothing else
+    ("a mid-line > → <", "passes when x < 5 holds for every sample"),
+    (">= → <= at the start of a quote", "<= 300 requests per second at peak"),
+    ("a blockquoted figure changed", "Python 3.12 or newer is required for the Functional API"),
 ])
 def test_an_altered_quote_never_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is False, label
@@ -169,6 +182,18 @@ def test_an_altered_quote_never_verifies(label, quote):
     ("<= in the source, ≤ in the quote", "The latency bound is ≤ 20 ms on every route"),
     ("a quote that starts with the negator", "not effective in children"),
     ("another occurrence not after a negator", "support webhooks"),
+    # WP-B fix round 5: blockquote markers at line starts are markup, not ">" tokens
+    ("a sentence the source wraps across two blockquoted lines",
+     "Python 3.11 or newer is required for the Functional API, for interrupt(), and for streaming from a node "
+     "running in the Workflow."),
+    ("... across three blockquoted lines", "streaming from a node running in the Workflow. On older versions the "
+                                           "plugin loads but emits a warning, and those features will not work."),
+    ("nested blockquote markers (>> and > >)",
+     "A nested reply: the checkpointer stores every superstep so that a restart loses nothing at all."),
+    ("a quote that keeps the blockquote marker", "> **Note**: Python 3.11 or newer is required for the Functional API"),
+    ("a blockquoted ordered list", "Clone the repository. Run the installer."),
+    ("a mid-line > in the source", "passes when x > 5 holds for every sample"),
+    (">= at the start of a quote", ">= 300 requests per second at peak"),
 ])
 def test_a_legitimate_quote_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is True, label
