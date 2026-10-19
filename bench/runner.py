@@ -49,8 +49,13 @@ Notes:
       (spec §1.1); nothing here requests a drain.
     - ``report_md`` is compose's ``draft_md`` (pre-report_builder: no
       title block, no citation sanitising). The finished report.md is
-      written under Settings.reports_root — the vault unless
-      ARGUS_REPORTS_ROOT is set.
+      written under Settings.reports_root: the bench sets
+      ARGUS_REPORTS_ROOT to ``<out dir>/reports`` unless it is already set
+      (in the environment or .env), so a bench run never writes into the
+      vault by default.
+    - A query's run first deletes the five layout files its last run left
+      in ``<out dir>/<qid>/``: a failed rerun leaves its own record (and
+      state), never the last run's report beside them.
     - Output is one JSON object per line; downstream scorer.py reads
       this directly.
 """
@@ -96,6 +101,9 @@ async def _engines_snapshot(profile: str | None) -> EnginesSnapshot:
     return await registry.active_snapshot()
 
 
+LAYOUT = ("state.json", "report.md", "metadata.json", "evidence.json", "record.json")
+
+
 def _copy_report_files(paths: dict, qdir: Path) -> None:
     """The run's report.md and metadata.json (report_builder writes both in its
     folder) and its evidence.json when there is one, next to its state.json."""
@@ -116,6 +124,9 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
     RunConfig keys, e.g. ``{"recency": "m"}``."""
     qid = query_obj["id"]
     query = query_obj["query"]
+    qdir = state_dir / qid
+    for name in LAYOUT:                 # the last run's files must not outlive a failed rerun
+        (qdir / name).unlink(missing_ok=True)
     thread_id = f"bench-{qid}-{uuid.uuid4().hex[:8]}"
     user_id = 0  # bench user
     rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, overrides=overrides,
@@ -203,7 +214,7 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
         fetched = final.get("fetched") or []
         findings = final.get("findings") or []
         paths = final.get("report_paths") or {}
-        _copy_report_files(paths, state_dir / qid)
+        _copy_report_files(paths, qdir)
 
         record.update({
             "status": "ok",
@@ -217,14 +228,13 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
             "status": "timeout",
             "error": f"exceeded {timeout_s}s",
         })
-    except Exception as e:  # pragma: no cover — defensive
+    except Exception as e:
         logger.exception("runner: query %s failed", qid)
         # str(), not repr(): an OSError's repr drops the file name
         record.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
     record["duration_s"] = round(time.monotonic() - t0, 2)
     # The full final state — after a timeout or an error, the last checkpoint.
     snap = await graph.aget_state(cfg)
-    qdir = state_dir / qid
     qdir.mkdir(parents=True, exist_ok=True)
     if snap.created_at is not None:
         state_path = qdir / "state.json"
@@ -240,6 +250,8 @@ async def _main_async(args: argparse.Namespace) -> int:
     queries_path = Path(args.queries)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not os.environ.get("ARGUS_REPORTS_ROOT"):            # before anything reads Settings
+        os.environ["ARGUS_REPORTS_ROOT"] = str(out_path.parent / "reports")
 
     with queries_path.open(encoding="utf-8") as f:
         queries = [json.loads(line) for line in f if line.strip()]

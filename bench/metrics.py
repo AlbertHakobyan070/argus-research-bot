@@ -7,17 +7,21 @@ Reads every ``<results>/<qid>/state.json`` (the full final state that
 it, and prints one markdown table: a row per metric, a column per query and
 the mean over the queries that have a number. No LLM is called.
 
-Files per query: ``state.json`` (required), ``report.md``, ``evidence.json``
-(written by WP-C; its findings, degradations and analysis are used when it is
-present), ``metadata.json``, ``record.json`` (the runner's record) and
-``summary.json`` (the v3 baseline capture's record; only ``elapsed_s`` is
-read). A metric that needs a field the run did not have is ``"n/a"`` — never
-0 and never a crash: the v3 baseline (``bench/results/v3-baseline``) has none
-of the v4 fields. A ratio with nothing to divide by is ``"n/a"`` too.
+Files per query: ``state.json``, ``report.md``, ``evidence.json`` (written by
+WP-C; its findings, degradations and analysis are used when it is present),
+``metadata.json``, ``record.json`` (the runner's record) and ``summary.json``
+(the v3 baseline capture's record; only ``status`` and ``elapsed_s`` are
+read). A run that failed before its first checkpoint leaves only
+``record.json``: it is listed, with every metric but ``status`` and
+``wall_clock_s`` "n/a". A metric that needs a field the run did not have is
+``"n/a"`` — never 0 and never a crash: the v3 baseline
+(``bench/results/v3-baseline``) has none of the v4 fields. A ratio with
+nothing to divide by is ``"n/a"`` too.
 
 One rule per metric for every run, so the baseline and a v4 run are measured
 alike:
 
+  status                record.json ``status`` (ok / timeout / error), else the v3 capture's
   unique_sources        distinct canonical URLs (spec §2.8 rules) in ``fetched``
   dupe_ratio            1 − unique_sources / fetched
   fetched_success_ratio fetched / (fetched + "fetch <url> failed" lines in ``errors``)
@@ -27,7 +31,9 @@ alike:
   coverage_min/mean     over ``coverage`` (strong notes per sub-question)
   gap_history, gap_waves  the state's; 0 / [] in a v4 run (``run_config`` set) that had no gap wave
   compose_runs          the state's (compose executions in the current user round)
-  rewrite_rounds        ``revision_rounds`` (v3: revise verdicts; v4: panel rewrites this round)
+  rewrite_rounds        panel rewrites this round: ``revision_rounds``, less one when the state
+                        has no ``compose_runs`` and the final verdict is ``revise`` (the v3 panel
+                        counts revise verdicts, and the last one, at the cap, ships as-is)
   compose_budget_ok     spec §2.4 per round, round = 1 + revise_rounds + extend_rounds:
                         compose_runs == 1 + gap waves of the round + revision_rounds,
                         compose_runs ≤ 1 + gap_waves_max + max_compose_revisions,
@@ -39,7 +45,9 @@ alike:
                         ``[n, m]`` ``[1-3]`` ``[^n]`` ``[Source n]``) plus each ``[n]`` without an entry
   sources_block_present a ``## Sources`` / ``## References`` heading with at least one entry
   flagged_claims_in_body  flagged findings (``panel_verdict.flagged_finding_ids``) not cut:
-                        status ``kept`` / ``unlocated``, or no status (v3, which never cut by id)
+                        status ``kept`` / ``unlocated``, or no status (v3, which never cut by id);
+                        "n/a" when the grounding judge failed and ``panel_verdict.total`` is
+                        absent or 0 (nothing was judged)
   cross_section_duplicate_ratio  findings (not cut) whose claim is ≥ 0.85 similar to one in
                         another section / findings; needs two sections
   judged_ratio          panel_verdict judged / total
@@ -47,7 +55,9 @@ alike:
                         ``registry.summarize_calls`` (logical calls: ok + exhausted; v3 → legacy.<tier>)
   routed_via_captured_ratio  ok call records with a non-empty routed_via / ok records
   degradations_count    evidence.json degradations, else the facade's skip / degrade / legacy
-                        lines in ``errors`` (only when the calls are facade records, with ``role``)
+                        lines in ``errors``; "n/a" without evidence.json and without a call
+                        record of a v4 role (``legacy.*`` wrappers raise, and the v3 nodes'
+                        fallbacks write no such line)
   json_parse_failures   records that failed the validate hook ("unparseable:") + error lines
                         quoting the JSON parser ("no useful JSON object found", not an exhaustion)
   exa_spend             ``search_spend``: searches, text_pages, contents_pages, usd
@@ -95,22 +105,26 @@ def _read_json(path: Path):
 
 
 def load_run(qdir: Path) -> dict:
-    """One query's results folder: its state and the files beside it (None when absent)."""
-    state = _read_json(qdir / "state.json")
-    if state is None:
-        raise FileNotFoundError(f"{qdir}: no state.json")
+    """One query's results folder: its state and the files beside it (None when
+    absent). A run that failed before its first checkpoint has only record.json:
+    its state is ``{}``."""
+    files = {name: _read_json(qdir / f"{name}.json")
+             for name in ("state", "evidence", "metadata", "record", "summary")}
+    if files["state"] is None:
+        if files["record"] is None:
+            raise FileNotFoundError(f"{qdir}: no state.json")
+        files["state"] = {}
     report = qdir / "report.md"
-    return {"qid": qdir.name, "state": state,
-            "report": report.read_text(encoding="utf-8") if report.exists() else None,
-            **{name: _read_json(qdir / f"{name}.json")
-               for name in ("evidence", "metadata", "record", "summary")}}
+    return {"qid": qdir.name, **files,
+            "report": report.read_text(encoding="utf-8") if report.exists() else None}
 
 
 def collect(results: Path) -> dict[str, dict]:
-    """``{qid: metrics}`` for every ``<results>/<qid>/state.json``, in qid order."""
-    qdirs = sorted(p.parent for p in results.glob("*/state.json"))
+    """``{qid: metrics}`` for every ``<results>/<qid>/`` with a state.json or a
+    record.json, in qid order."""
+    qdirs = sorted({p.parent for name in ("state.json", "record.json") for p in results.glob(f"*/{name}")})
     if not qdirs:
-        raise SystemExit(f"no <qid>/state.json under {results}")
+        raise SystemExit(f"no <qid>/state.json or <qid>/record.json under {results}")
     return {q.name: compute(load_run(q)) for q in qdirs}
 
 
@@ -246,7 +260,7 @@ def claims_per_primary_source(run):
 
 
 # ---------------------------------------------------------------------------
-# Compose bookkeeping (spec §2.4, orchestrator ruling 1)
+# Compose bookkeeping (spec §2.4; the orchestrator's compose-budget ruling: §2.4's per-round invariant)
 # ---------------------------------------------------------------------------
 
 def gap_history(run):
@@ -264,7 +278,13 @@ def compose_runs(run):
 
 def rewrite_rounds(run):
     state = run["state"]
-    return state["revision_rounds"] if _has(state, "revision_rounds") else NA
+    if not _has(state, "revision_rounds"):
+        return NA
+    rounds = state["revision_rounds"]
+    # the v3 panel (no compose_runs) counts revise verdicts; the last one, at the cap, ships as-is
+    if not _has(state, "compose_runs") and (state.get("panel_verdict") or {}).get("verdict") == "revise":
+        return rounds - 1
+    return rounds
 
 
 def compose_budget_ok(run):
@@ -326,10 +346,16 @@ def sources_block_present(run):
 # Findings: flags, duplicates, judging
 # ---------------------------------------------------------------------------
 
+_GROUNDING_FAILED = "panel: grounding judge failed"        # graph/panel.py's error line
+
+
 def flagged_claims_in_body(run):
-    pv, findings = run["state"].get("panel_verdict"), _findings(run)
+    state = run["state"]
+    pv, findings = state.get("panel_verdict"), _findings(run)
     if pv is None or findings is None:
         return NA
+    if not pv.get("total") and any(_GROUNDING_FAILED in e for e in state.get("errors") or []):
+        return NA                       # the judge that flags ids never answered: nothing was measured
     flagged = set(pv.get("flagged_finding_ids") or [])
     return sum(1 for f in findings if f.get("id") in flagged and f.get("status") != "cut")
 
@@ -401,12 +427,12 @@ _DEGRADATION_LINE = re.compile(r"^(?:\[r\d+\]\s*)?(?:skip|degrade|legacy):")
 
 
 def degradations_count(run):
-    ev = run["evidence"]
+    ev, state = run["evidence"], run["state"]
     if isinstance(ev, dict) and _has(ev, "degradations"):
         return len(ev["degradations"])
-    state = run["state"]
-    if not any("role" in c for c in state.get("model_calls") or []):
-        return NA                                # no facade records: no structured degradation lines
+    v4_role = any(c.get("role") and not c["role"].startswith("legacy.") for c in state.get("model_calls") or [])
+    if ev is None and not v4_role:
+        return NA                       # nothing writes skip: / degrade: lines yet: unmeasured, not 0
     return sum(1 for e in state.get("errors") or [] if _DEGRADATION_LINE.match(e))
 
 
@@ -428,11 +454,20 @@ def exa_spend(run):
     return {key: spend.get(f"exa_{key}", NA) for key in ("searches", "text_pages", "contents_pages", "usd")}
 
 
-def wall_clock_s(run):
-    for doc, key in ((run["record"], "duration_s"), (run["summary"], "elapsed_s")):
+def _from_record(run, record_key: str, summary_key: str):
+    """The runner's record.json value, else the v3 capture's summary.json one."""
+    for doc, key in ((run["record"], record_key), (run["summary"], summary_key)):
         if doc is not None and doc.get(key) is not None:
             return doc[key]
     return NA
+
+
+def status(run):
+    return _from_record(run, "status", "status")
+
+
+def wall_clock_s(run):
+    return _from_record(run, "duration_s", "elapsed_s")
 
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -479,9 +514,9 @@ def scenarios_present_for_forecast(run):
     return bool(analysis.get("has_scenarios")) if analysis is not None and forecast else NA
 
 
-# spec §3 WP-G order
+# the run's status first, then spec §3 WP-G order
 METRICS = {
-    "unique_sources": unique_sources, "dupe_ratio": dupe_ratio,
+    "status": status, "unique_sources": unique_sources, "dupe_ratio": dupe_ratio,
     "fetched_success_ratio": fetched_success_ratio, "fetchers_used": fetchers_used,
     "pinned_ingested_ratio": pinned_ingested_ratio, "evidence_strong_ratio": evidence_strong_ratio,
     "coverage_min": coverage_min, "coverage_mean": coverage_mean,

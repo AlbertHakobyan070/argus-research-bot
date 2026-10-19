@@ -112,15 +112,21 @@ def check_evidence(run, m):
     return _verdict(n > 0, n)
 
 
+def _kept(run) -> list[dict]:
+    """The findings the report kept: status ``kept``, or none at all (v3).
+    A ``cut`` or ``unlocated`` finding never counts."""
+    return [f for f in run["state"].get("findings") or [] if (f.get("status") or "kept") == "kept"]
+
+
 def check_cited_findings(run, m):
-    findings = run["state"].get("findings") or []
-    n = sum(1 for f in findings if f.get("citation_urls") or f.get("source_ids"))
-    return _verdict(n > 0, f"{n} of {len(findings)}")
+    kept = _kept(run)
+    n = sum(1 for f in kept if f.get("citation_urls") or f.get("source_ids"))
+    return _verdict(n > 0, f"{n} of {len(kept)} kept")
 
 
 def check_few_findings(run, m):
-    n = len(run["state"].get("findings") or [])
-    return _verdict(n <= 3, n)
+    n = len(_kept(run))
+    return _verdict(n <= 3, f"{n} kept")
 
 
 def check_report_size(run, m):

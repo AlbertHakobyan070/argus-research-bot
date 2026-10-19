@@ -8,10 +8,13 @@ state.json with the keys of the orchestrator's baseline
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from langgraph.runtime import RunControl
@@ -133,7 +136,7 @@ def _run(state, *, report=None, evidence=None, record=None, summary=None, metada
 
 
 def _v3_run():
-    return _run(copy.deepcopy(V3_STATE), report=V3_REPORT, summary={"elapsed_s": 258.6})
+    return _run(copy.deepcopy(V3_STATE), report=V3_REPORT, summary={"status": "ok", "elapsed_s": 258.6})
 
 
 def _rec(role, served, *, requested="m", ok=True, routed="groq/x", error=""):   # a v4 CallRecord dict
@@ -219,7 +222,7 @@ Takeaway [1].
 """
 
 V4_VALUES = {
-    "unique_sources": 3, "dupe_ratio": 0.25, "fetched_success_ratio": 0.8,
+    "status": "ok", "unique_sources": 3, "dupe_ratio": 0.25, "fetched_success_ratio": 0.8,
     "fetchers_used": {"(none)": 1, "exa_text": 2, "native": 1}, "pinned_ingested_ratio": NA,
     "evidence_strong_ratio": 0.667, "coverage_min": 0, "coverage_mean": 1.0,
     "gap_history": [{"round": 1, "wave": 1, "sub_qs": [1], "new_strong": 2, "source": "coverage"}],
@@ -248,9 +251,10 @@ def test_a_v3_shaped_run_computes_what_v3_data_supports_and_says_na_for_the_rest
     assert {k for k, v in m.items() if v == NA} == V4_ONLY | {"pinned_ingested_ratio"}
     assert m == {
         **{k: NA for k in V4_ONLY}, "pinned_ingested_ratio": NA,     # nothing was appended
-        "unique_sources": 3, "dupe_ratio": 0.25, "fetched_success_ratio": 0.8,
+        "status": "ok", "unique_sources": 3, "dupe_ratio": 0.25, "fetched_success_ratio": 0.8,
         "evidence_strong_ratio": 0.667, "coverage_min": 0, "coverage_mean": 1.0,
-        "rewrite_rounds": 3, "claims_per_primary_source": 2.0,
+        "rewrite_rounds": 2,                 # 3 revise verdicts; the last shipped the report as-is
+        "claims_per_primary_source": 2.0,
         "cite_markers_unresolved": 3, "sources_block_present": True,
         "flagged_claims_in_body": 2,                    # no status in v3: every flag counts (unlocated)
         "cross_section_duplicate_ratio": 0.5, "calls_total": 6,
@@ -260,9 +264,17 @@ def test_a_v3_shaped_run_computes_what_v3_data_supports_and_says_na_for_the_rest
 
 
 def test_a_v4_run_computes_every_metric():
-    m = metrics.compute(_run(_v4_state(), report=V4_REPORT, record={"duration_s": 301.5}))
+    m = metrics.compute(_run(_v4_state(), report=V4_REPORT, record={"status": "ok", "duration_s": 301.5}))
     assert m == V4_VALUES
     assert list(m) == list(metrics.METRICS)
+
+
+@pytest.mark.parametrize("record,summary,status", [
+    ({"status": "error", "duration_s": 3.0}, {"status": "ok"}, "error"),     # the runner's record wins
+    (None, {"status": "ok", "elapsed_s": 258.6}, "ok"),                      # the v3 capture's
+    (None, None, NA)])
+def test_status_comes_from_the_run_record(record, summary, status):
+    assert metrics.compute(_run({}, record=record, summary=summary))["status"] == status
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +332,7 @@ def test_evidence_and_coverage_metrics_need_their_fields():
 
 
 # ---------------------------------------------------------------------------
-# Compose bookkeeping (orchestrator ruling 1: §2.4's per-round invariant)
+# Compose bookkeeping (the orchestrator's compose-budget ruling: §2.4's per-round invariant)
 # ---------------------------------------------------------------------------
 
 def test_a_v4_run_without_gap_waves_counts_zero_and_without_compose_runs_is_na():
@@ -330,6 +342,20 @@ def test_a_v4_run_without_gap_waves_counts_zero_and_without_compose_runs_is_na()
     m = metrics.compute(_run(state))
     assert (m["gap_waves"], m["gap_history"]) == (0, [])
     assert (m["compose_runs"], m["compose_budget_ok"], m["rewrite_rounds"]) == (NA, NA, 2)
+
+
+@pytest.mark.parametrize("state,rewrites", [
+    # the v3 panel (no compose_runs) counts revise verdicts, and its last revise
+    # verdict ships the report as-is: q010 had 3 verdicts and composed 3 times
+    ({"revision_rounds": 3, "panel_verdict": {"verdict": "revise"}}, 2),
+    ({"revision_rounds": 2, "panel_verdict": {"verdict": "pass"}}, 2),
+    ({"revision_rounds": 0, "panel_verdict": None}, 0),                  # after a user revise reset
+    # v4 (compose_runs recorded): revision_rounds already counts the rewrites
+    ({"revision_rounds": 1, "compose_runs": 2, "panel_verdict": {"verdict": "revise"}}, 1),
+    ({"panel_verdict": {"verdict": "revise"}}, NA),
+])
+def test_rewrite_rounds_counts_the_compose_rewrites_that_ran(state, rewrites):
+    assert metrics.compute(_run(state))["rewrite_rounds"] == rewrites
 
 
 def _budget(**kw):
@@ -433,6 +459,25 @@ def test_flagged_claims_in_body_counts_every_flag_not_cut():
     assert metrics.compute(_run({"findings": []}))["flagged_claims_in_body"] == NA
 
 
+def test_a_failed_grounding_judge_leaves_flagged_claims_unmeasured():
+    """q001's shape: the grounding judge's JSON did not parse and the v3 panel let
+    it vote pass, so flagged_finding_ids is [] although its unparsed output flagged
+    most findings, all still in the body. Nothing was measured: n/a, never 0."""
+    state = copy.deepcopy(V3_STATE)
+    state["panel_verdict"].update(verdict="pass", flagged_finding_ids=[], unsupported_claims=[])
+    state["errors"] = ["panel: grounding judge failed (no useful JSON object found in: '{\"verdict\": "
+                       "\"revise\", \"flagged_finding_ids\": [\"f0\", \"f1\", f2]' (required >= 1 keys, "
+                       "any of ('verdict',)))"]
+    assert metrics.compute(_run(state))["flagged_claims_in_body"] == NA
+    # a panel that recorded its judging shows the failure in judged < total; its flags still count
+    state["panel_verdict"].update(judged=2, total=4, flagged_finding_ids=["f1"])
+    assert metrics.compute(_run(state))["flagged_claims_in_body"] == 1
+    # without the failure line, an empty flag list is a measured 0
+    state["panel_verdict"].update(judged=0, total=0, flagged_finding_ids=[])
+    state["errors"] = ["panel: precision judge failed (no useful JSON object found in: 'x')"]
+    assert metrics.compute(_run(state))["flagged_claims_in_body"] == 0
+
+
 def test_evidence_json_findings_and_degradations_take_precedence():
     findings = [{**f, "status": "cut"} for f in _v4_state()["findings"]]
     evidence = {"findings": findings, "degradations": [{"round": 1, "text": "degrade: x"}],
@@ -468,6 +513,19 @@ def test_degradations_count_reads_the_facade_lines_with_round_tags():
     assert metrics.compute(_run(state))["degradations_count"] == 3
 
 
+def test_degradations_count_is_na_with_only_legacy_role_records():
+    """The post-WP-D shape: every call goes through a legacy.* wrapper (which raises
+    on exhaustion) and the v3 nodes' fallbacks are log-only or free text, so no
+    skip:/degrade: line can exist yet. Nothing is measured: n/a, not 0."""
+    state = {"model_calls": [_rec("legacy.cheap", "m"), _rec("legacy.strong", "m"), _rec("legacy.judge", "m")],
+             "errors": ["brief: unparseable output (no useful JSON object found in: 'x')",
+                        "legacy: run_config defaults applied (pre-v4 checkpoint)"]}
+    assert metrics.compute(_run(state))["degradations_count"] == NA
+    state["model_calls"].append(_rec("research.digest", "m"))      # a v4 role: the facade lines count
+    assert metrics.compute(_run(state))["degradations_count"] == 1
+    assert metrics.compute(_run({"model_calls": []}, evidence={"degradations": []}))["degradations_count"] == 0
+
+
 def test_engine_metrics_are_na_without_model_calls():
     m = metrics.compute(_run({}))
     assert {k: m[k] for k in ("calls_total", "calls_by_role", "reroute_rate", "routed_via_captured_ratio",
@@ -501,6 +559,115 @@ def test_insight_proxies_apply_only_where_they_mean_something():
 
 
 # ---------------------------------------------------------------------------
+# The task review's hand-computed cases (t6_handcheck.py), kept as tests
+# ---------------------------------------------------------------------------
+
+HAND_REPORT = """# t
+
+## A
+
+Raw: 【3†L1-L2】 ［2］ 〔4〕 [1, 2] [3,4] [1-3] [2–4] [^5] [Source 6].
+Plain: [1] ok, [1][2] ok, [9] missing, year [2024] is no marker, spaced [ 1 ] is no form.
+Code `x[7]` and
+
+```
+y[8] 【1】
+```
+
+## Flagged but not located (still in body)
+
+- An appendix claim [10].
+
+## Sources
+
+1. [A](https://a.example)
+2. [B](https://b.example)
+3. [C](https://c.example)
+
+---
+
+## ⚠️ Unverified / flagged claims
+
+- (id=f1) local label [2] [11]
+"""
+
+
+def _hand(fn, state=None, report=None, evidence=None):
+    return fn(_run(state or {}, report=report, evidence=evidence))
+
+
+def test_hand_check_markers_and_the_sources_block():
+    # 9 raw forms, plus [9] and [10] without an entry; code, [2024], [ 1 ] and the v3 appendix excluded
+    assert _hand(metrics.cite_markers_unresolved, report=HAND_REPORT) == 11
+    assert _hand(metrics.sources_block_present, report=HAND_REPORT) is True
+    assert _hand(metrics.cite_markers_unresolved, report="# t\n\nA [1]. B 【2】.\n") == 2
+    assert _hand(metrics.sources_block_present, report="# t\n\nA [1].\n\n## Sources\n\n- [A](https://a)\n") is False
+
+
+def test_hand_check_canonical_dedupe():
+    urls = ["https://www.Example.com/a/?utm_source=x", "http://example.com/a#x", "https://example.com/a?id=1",
+            "https://arxiv.org/abs/2401.00001v3", "https://export.arxiv.org/pdf/2401.00001",
+            "https://huggingface.co/papers/2401.00001", "https://ar5iv.org/html/2401.00002",
+            "https://example.com:443/b", "https://example.com/b?ref=hn&gclid=1"]
+    state = {"fetched": [{"url": u} for u in urls]}
+    assert (_hand(metrics.unique_sources, state), _hand(metrics.dupe_ratio, state)) == (5, round(4 / 9, 3))
+
+
+def _gap(rnd, wave):
+    return {"round": rnd, "wave": wave, "sub_qs": [0], "new_strong": 1, "source": "coverage"}
+
+
+@pytest.mark.parametrize("state,ok", [
+    # a revise round with a panel rewrite: round 1's gap waves do not count
+    ({"revise_rounds": 1, "compose_runs": 2, "revision_rounds": 1, "gap_waves": 2,
+      "gap_history": [_gap(1, 1), _gap(1, 2)]}, True),
+    # the same with the stale Phase D count (1 + gap_waves + rev + revise)
+    ({"revise_rounds": 1, "compose_runs": 5, "revision_rounds": 1, "gap_waves": 2,
+      "gap_history": [_gap(1, 1), _gap(1, 2)]}, False),
+    # round 3 (a revise and an extend) with one gap wave of its own
+    ({"revise_rounds": 1, "extend_rounds": 1, "compose_runs": 2, "revision_rounds": 0, "gap_waves": 2,
+      "gap_history": [_gap(1, 1), _gap(3, 1)]}, True),
+    # this round is consistent but the cumulative gap waves exceed the maximum
+    ({"extend_rounds": 1, "compose_runs": 2, "revision_rounds": 0, "gap_waves": 3,
+      "gap_history": [_gap(1, 1), _gap(1, 2), _gap(2, 1)]}, False),
+    ({"compose_runs": 1, "revision_rounds": 0}, True),           # event-only fields absent: a plain first round
+])
+def test_hand_check_compose_budget(state, ok):
+    assert _hand(metrics.compose_budget_ok, {"run_config": make_run_config(length="medium"), **state}) is ok
+
+
+def test_hand_check_flags_parse_failures_and_source_age():
+    pv = {"flagged_finding_ids": ["f0", "f1", "f2", "f3", "f9"]}
+    findings = [{"id": "f0", "status": "kept"}, {"id": "f1", "status": "unlocated"},
+                {"id": "f2", "status": "cut"}, {"id": "f3"}, {"id": "f4", "status": "kept"}]
+    state = {"panel_verdict": pv, "findings": findings}
+    assert _hand(metrics.flagged_claims_in_body, state) == 3
+    evidence = {"findings": [{"id": "f0", "status": "cut"}, {"id": "f1", "status": "unlocated"},
+                             {"id": "f2", "status": "cut"}, {"id": "f3", "status": "kept"}]}
+    assert _hand(metrics.flagged_claims_in_body, state, evidence=evidence) == 2
+
+    unparseable = "unparseable: ValueError: no useful JSON object found in: '{}'"
+    calls = [{"role": "research.digest", "ok": True, "error": "", "served_model": "m", "requested_model": "m",
+              "extra": {"prior_attempts": [{"role": "research.digest", "ok": False,
+                                            "error": unparseable.format("x")}]}},
+             {"role": "research.digest", "ok": False, "error": unparseable.format("y"), "extra": {}},
+             {"role": "research.digest", "ok": False, "error": "transient: 429", "extra": {}}]
+    errors = ["skip: research.digest u (role research.digest: every engine failed after 2 attempts "
+              f"(last: {unparseable.format('y')}))",
+              "panel: coverage judge failed (no useful JSON object found in: 'z')"]
+    assert _hand(metrics.json_parse_failures, {"model_calls": calls, "errors": errors}) == 3
+
+    state = {"messages": [{"role": "user", "content": "t", "ts": "2026-10-19T10:00:00+04:00"}],
+             "sources": [{"url": "https://a", "published": "2026-10-09T00:00:00Z"}],
+             "fetched": [{"url": "https://a"}, {"url": "https://b", "published": "2026-09-19"},
+                         {"url": "https://c", "published": "not a date"},
+                         {"url": "https://d", "published": "2025-10-19"}]}
+    assert _hand(metrics.median_source_age_days, state) == 30                 # 10, 30, 365
+    state["fetched"].pop()
+    assert _hand(metrics.median_source_age_days, state) == 20.0               # 10, 30
+
+
+# ---------------------------------------------------------------------------
 # Files: load_run, collect, the metrics CLI
 # ---------------------------------------------------------------------------
 
@@ -515,9 +682,9 @@ def _write_run(qdir: Path, state: dict, *, report=None, evidence=None, record=No
 
 
 def test_load_run_reads_the_result_layout(tmp_path):
-    _write_run(tmp_path / "q010", V3_STATE, report=V3_REPORT, summary={"elapsed_s": 258.6})
+    _write_run(tmp_path / "q010", V3_STATE, report=V3_REPORT, summary={"status": "ok", "elapsed_s": 258.6})
     run = metrics.load_run(tmp_path / "q010")
-    assert (run["qid"], run["report"], run["summary"]) == ("q010", V3_REPORT, {"elapsed_s": 258.6})
+    assert (run["qid"], run["report"], run["summary"]) == ("q010", V3_REPORT, {"status": "ok", "elapsed_s": 258.6})
     assert (run["evidence"], run["record"], run["metadata"]) == (None, None, None)
     assert metrics.compute(run) == metrics.compute(_v3_run())
 
@@ -532,14 +699,16 @@ def test_load_run_names_a_broken_file(tmp_path):
 
 
 def test_metrics_cli_prints_one_row_per_metric_and_a_mean(tmp_path, capsys):
-    _write_run(tmp_path / "q010", V3_STATE, report=V3_REPORT, summary={"elapsed_s": 258.6})
-    _write_run(tmp_path / "q001", _v4_state(), report=V4_REPORT, record={"duration_s": 301.5})
-    (tmp_path / "reports").mkdir()                              # not a query: no state.json
+    _write_run(tmp_path / "q010", V3_STATE, report=V3_REPORT, summary={"status": "ok", "elapsed_s": 258.6})
+    _write_run(tmp_path / "q001", _v4_state(), report=V4_REPORT, record={"status": "error", "duration_s": 301.5})
+    (tmp_path / "reports" / "20261019_topic_short").mkdir(parents=True)   # the runner's report folders
+    (tmp_path / "reports" / "20261019_topic_short" / "metadata.json").write_text("{}", encoding="utf-8")
     assert metrics.main(["--results", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "| metric | q001 | q010 | mean |"
     rows = {line.split(" | ")[0].lstrip("| "): line for line in out.splitlines()[2:]}
     assert list(rows) == list(metrics.METRICS)
+    assert rows["status"] == "| status | error | ok | - |"
     assert rows["compose_runs"] == "| compose_runs | 2 | n/a | 2 |"
     assert rows["sources_block_present"] == "| sources_block_present | yes | yes | 1 |"
     assert rows["wall_clock_s"] == "| wall_clock_s | 301.5 | 258.6 | 280.05 |"
@@ -556,14 +725,15 @@ def test_metrics_cli_refuses_a_folder_without_runs(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_compare_renders_a_delta_table_over_the_shared_queries(tmp_path, capsys):
-    _write_run(tmp_path / "a" / "q010", V3_STATE, report=V3_REPORT, summary={"elapsed_s": 258.6})
+    _write_run(tmp_path / "a" / "q010", V3_STATE, report=V3_REPORT, summary={"status": "ok", "elapsed_s": 258.6})
     _write_run(tmp_path / "a" / "q001", V3_STATE, report=V3_REPORT)
-    _write_run(tmp_path / "b" / "q010", _v4_state(), report=V4_REPORT, record={"duration_s": 301.5})
+    _write_run(tmp_path / "b" / "q010", _v4_state(), report=V4_REPORT, record={"status": "error", "duration_s": 301.5})
     _write_run(tmp_path / "b" / "q013", _v4_state())
     assert compare.main(["--a", str(tmp_path / "a"), "--b", str(tmp_path / "b")]) == 0
     out = capsys.readouterr().out
     rows = {line.split(" | ")[0].lstrip("| "): line for line in out.splitlines() if line.startswith("| ")}
     assert rows["metric"] == "| metric | q010 |"
+    assert rows["status"] == "| status | ok -> error |"
     assert rows["flagged_claims_in_body"] == "| flagged_claims_in_body | 2 -> 1 (-1) |"
     assert rows["cite_markers_unresolved"] == "| cite_markers_unresolved | 3 -> 0 (-3) |"
     assert rows["wall_clock_s"] == "| wall_clock_s | 258.6 -> 301.5 (+42.9) |"
@@ -585,13 +755,17 @@ def test_compare_refuses_sets_with_no_shared_query(tmp_path):
 
 class _FakeGraph:
     """Pauses at the plan gate and at the report gate, then ends; keeps every
-    astream call's input and keyword arguments."""
+    astream call's input and keyword arguments. ``fail``: the drive past the
+    plan gate raises. ``created_at`` None: the run left no checkpoint."""
 
-    def __init__(self, values):
+    def __init__(self, values, *, fail=False, created_at="2026-10-19T00:00:00+00:00"):
         self.values, self.calls, self.gates = values, [], 2
+        self.fail, self.created_at = fail, created_at
 
     async def astream(self, inp, **kw):
         self.calls.append((inp, kw))
+        if self.fail and len(self.calls) > 1:
+            raise RuntimeError("compose: every engine failed")
         if self.gates:
             self.gates -= 1
             yield ("updates", {"__interrupt__": ()})
@@ -600,7 +774,7 @@ class _FakeGraph:
         yield ("updates", {"deliver": {"hitl": {"pending": False}}})
 
     async def aget_state(self, cfg):
-        return SimpleNamespace(values=self.values, created_at="2026-10-19T00:00:00+00:00")
+        return SimpleNamespace(values=self.values, created_at=self.created_at)
 
 
 def _report_folder(tmp_path, *, evidence=True) -> dict:
@@ -660,8 +834,59 @@ async def test_runner_records_a_report_folder_without_metadata_as_an_error(monke
     assert json.loads((tmp_path / "res" / "q9" / "record.json").read_text())["status"] == "error"
 
 
+async def test_a_failed_rerun_leaves_none_of_the_last_runs_files(monkeypatch, tmp_path):
+    """The task review's t6_stale.py: run 1 completes, run 2 into the same folder
+    raises mid-drive. Run 2's folder holds no report files, and its metrics show
+    the failure instead of run 1's report."""
+    res, query = tmp_path / "res", {"id": "q010", "query": "topic"}
+    kw = dict(length="short", depth=None, engines=fake_engines_snapshot(), timeout_s=None, state_dir=res)
+    paths = _report_folder(tmp_path)
+    monkeypatch.setattr(runner, "build_graph",
+                        lambda checkpointer: _FakeGraph({"report_paths": paths, "fetched": [{"url": "u"}]}))
+    assert (await runner._run_one(query, **kw))["status"] == "ok"
+    assert sorted(p.name for p in (res / "q010").iterdir()) == [
+        "evidence.json", "metadata.json", "record.json", "report.md", "state.json"]
+
+    monkeypatch.setattr(runner, "build_graph", lambda checkpointer: _FakeGraph({"fetched": []}, fail=True))
+    rec = await runner._run_one(query, **kw)
+    assert (rec["status"], rec["error"]) == ("error", "RuntimeError: compose: every engine failed")
+    assert sorted(p.name for p in (res / "q010").iterdir()) == ["record.json", "state.json"]
+    m = metrics.collect(res)["q010"]
+    assert (m["status"], m["unique_sources"], m["cite_markers_unresolved"], m["sources_block_present"]) == (
+        "error", 0, NA, NA)
+
+    # a run that fails before its first checkpoint leaves only its record, and still shows
+    monkeypatch.setattr(runner, "build_graph",
+                        lambda checkpointer: _FakeGraph({}, fail=True, created_at=None))
+    assert (await runner._run_one(query, **kw))["status"] == "error"
+    assert sorted(p.name for p in (res / "q010").iterdir()) == ["record.json"]
+    m = metrics.collect(res)["q010"]
+    assert m["status"] == "error" and {k for k, v in m.items() if v != NA} == {"status", "wall_clock_s"}
+
+
+@pytest.mark.parametrize("preset", [None, "X:/elsewhere"], ids=["unset", "set"])
+async def test_the_bench_writes_its_reports_into_its_results_folder(monkeypatch, tmp_path, preset):
+    monkeypatch.setenv("ARGUS_REPORTS_ROOT", preset or "x")      # monkeypatch restores it either way
+    if preset is None:
+        monkeypatch.delenv("ARGUS_REPORTS_ROOT")
+    seen = []
+
+    async def fake_run_one(query_obj, **kw):
+        seen.append(os.environ["ARGUS_REPORTS_ROOT"])
+        return {"status": "ok", "duration_s": 1.0, "n_sources": 0, "n_findings": 0}
+
+    monkeypatch.setattr(runner, "_engines_snapshot", AsyncMock(return_value=fake_engines_snapshot()))
+    monkeypatch.setattr(runner, "_run_one", fake_run_one)
+    queries = tmp_path / "queries.jsonl"
+    queries.write_text('{"id": "q1", "query": "t"}\n', encoding="utf-8")
+    out = tmp_path / "res" / "raw.jsonl"
+    args = argparse.Namespace(queries=queries, out=out, length="short", depth=None, profile=None, timeout=60)
+    assert await runner._main_async(args) == 0
+    assert seen == [preset or str(out.parent / "reports")]
+
+
 # ---------------------------------------------------------------------------
-# queries.jsonl (orchestrator ruling 2)
+# queries.jsonl (the orchestrator's exact query texts)
 # ---------------------------------------------------------------------------
 
 def test_queries_q011_to_q016_are_appended_in_the_record_shape():

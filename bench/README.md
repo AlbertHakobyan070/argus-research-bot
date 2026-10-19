@@ -19,7 +19,10 @@ when sources conflict, scenarios for forecasts). The module docstring defines
 each one.
 
 A metric that needs a field the run did not have is `n/a`, never 0: the v3
-baseline in `results/v3-baseline/` predates every v4 field.
+baseline in `results/v3-baseline/` predates every v4 field. The first row is
+the run's `status` (`ok`, `timeout` or `error`, from its record), so a failed
+run shows as one; a run that failed before its first checkpoint is listed
+with only its status and wall clock.
 
 `bench/scorer.py` keeps the original URL metrics (citation integrity, density,
 domain coverage, length) over `raw.jsonl`, for continuity.
@@ -38,6 +41,7 @@ bench/
     ├── v3-baseline/<qid>/ # the "before" of every v4 comparison
     └── <label>/
         ├── raw.jsonl      # runner output, one record per query
+        ├── reports/       # the runs' report folders (unless ARGUS_REPORTS_ROOT is set)
         └── <qid>/         # state.json, report.md, metadata.json,
                            # evidence.json (once WP-C writes it), record.json
 ```
@@ -81,10 +85,9 @@ grounding banner and at most 3 findings.
 ## Queries
 
 Hand-curated technical questions, plus forecasts and time-sensitive topics
-(q011, q012; run with `--recency`), nonexistent entities (q013, q014; run the
-live check with `--expect-banner`), a non-technical explainer (q015) and a
-comparison (q016). Keep ids stable so runs stay comparable; add queries at the
-end.
+(q011, q012), nonexistent entities (q013, q014; run the live check with
+`--expect-banner`), a non-technical explainer (q015) and a comparison (q016).
+Keep ids stable so runs stay comparable; add queries at the end.
 
 ## Constraints
 
@@ -96,10 +99,14 @@ end.
   `argus_engines.json` plus the local file (`--profile` picks a profile); the
   bot's `/engines` changes are not read. The free proxy reroutes every
   request, so runs are comparable only while it serves the same models.
-- The runner's finished `report.md` is written under `Settings.reports_root`
-  (the vault unless `ARGUS_REPORTS_ROOT` is set) and copied into
-  `<label>/<qid>/`; the live check sets `ARGUS_REPORTS_ROOT` under its out
-  folder.
+- The runner sets `ARGUS_REPORTS_ROOT` to `<label>/reports/` unless it is
+  already set (in the environment or `.env`), so the finished reports land
+  beside the results, not in the vault; each query's `report.md`,
+  `metadata.json` and `evidence.json` are copied into `<label>/<qid>/`. The
+  live check always sets it to `<out>/<qid>/reports`.
+- A rerun into the same `<label>/` first deletes each query's last layout
+  files: a failed rerun leaves its own `record.json` (and `state.json` when it
+  checkpointed), never the last run's report beside them.
 
 ## Limitations
 

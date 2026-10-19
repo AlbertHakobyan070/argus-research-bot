@@ -30,6 +30,21 @@ _spec.loader.exec_module(live_check)
 NA, PASS, FAIL = metrics.NA, "PASS", "FAIL"
 
 
+@pytest.fixture(autouse=True)
+def _reports_root_is_restored():
+    """``_main`` sets ARGUS_REPORTS_ROOT in os.environ: no test may leave it changed."""
+    before = os.environ.get("ARGUS_REPORTS_ROOT")
+    yield
+    assert os.environ.get("ARGUS_REPORTS_ROOT") == before
+
+
+def _no_reports_root(monkeypatch):
+    """Unset ARGUS_REPORTS_ROOT for the test. setenv first: deleting an unset
+    variable records nothing, and the value _main sets would leak."""
+    monkeypatch.setenv("ARGUS_REPORTS_ROOT", "x")
+    monkeypatch.delenv("ARGUS_REPORTS_ROOT")
+
+
 def _r(state=None, *, report=None, evidence=None, metadata=None, record=None):
     return {"qid": "q1", "state": state or {}, "report": report, "evidence": evidence,
             "metadata": metadata, "record": record, "summary": None}
@@ -93,8 +108,14 @@ EVIDENCE = {**{k: {} for k in LC.EVIDENCE_KEYS}, "schema": 1, "compose_runs": 1,
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"]}]}), {}, PASS),
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": [], "source_ids": [2]}]}), {}, PASS),
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": []}]}), {}, FAIL),
+    # only kept findings count (no status: v3, kept); cut and unlocated ones never do
+    (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "kept"}]}), {}, PASS),
+    (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "cut"}]}), {}, FAIL),
+    (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "unlocated"}]}), {}, FAIL),
     (LC.check_few_findings, _r({"findings": [{}] * 3}), {}, PASS),
     (LC.check_few_findings, _r({"findings": [{}] * 4}), {}, FAIL),
+    (LC.check_few_findings, _r({"findings": [{"status": "kept"}] * 3 + [{"status": "cut"}] * 5}), {}, PASS),
+    (LC.check_few_findings, _r({"findings": [{"status": "kept"}] * 4 + [{"status": "cut"}]}), {}, FAIL),
     (LC.check_report_size, _r(report="x" * 1001), {}, PASS),
     (LC.check_report_size, _r(report="x" * 1000), {}, FAIL),
     (LC.check_report_size, _r(), {}, FAIL),
@@ -154,6 +175,10 @@ def test_check_details_name_what_was_measured():
                                "run_config": GROUNDING_ON}), {}) == (
         FAIL, "judged 0 of total 0 with 37 findings: the panel recorded no judging")
     assert LC.check_evidence_json(_r(evidence={"schema": 1}), {})[1].startswith("missing run, run_config")
+    findings = [{"citation_urls": ["u"], "status": "kept"}, {"citation_urls": [], "status": "kept"},
+                {"citation_urls": ["u"], "status": "cut"}]
+    assert LC.check_cited_findings(_r({"findings": findings}), {}) == (PASS, "1 of 2 kept")
+    assert LC.check_few_findings(_r({"findings": findings}), {}) == (PASS, "2 kept")
 
 
 def test_the_check_list_follows_expect_banner():
@@ -216,7 +241,7 @@ async def test_main_resolves_the_engines_runs_once_and_exits_by_the_checks(
         monkeypatch, tmp_path, capsys, report, code):
     snapshot = fake_engines_snapshot()
     monkeypatch.setattr(registry, "active_snapshot", AsyncMock(return_value=snapshot))
-    monkeypatch.delenv("ARGUS_REPORTS_ROOT", raising=False)
+    _no_reports_root(monkeypatch)
     seen = {}
 
     async def fake_run_one(query_obj, **kw):
@@ -242,7 +267,7 @@ async def test_main_resolves_the_engines_runs_once_and_exits_by_the_checks(
 
 async def test_main_without_a_checkpoint_reports_the_run_and_fails(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(registry, "active_snapshot", AsyncMock(return_value=fake_engines_snapshot()))
-    monkeypatch.delenv("ARGUS_REPORTS_ROOT", raising=False)
+    _no_reports_root(monkeypatch)
 
     async def fake_run_one(query_obj, **kw):
         return {"status": "error", "error": "EngineError('role legacy.cheap: every engine failed')"}

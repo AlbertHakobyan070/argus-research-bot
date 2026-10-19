@@ -393,15 +393,24 @@ async def test_ask_cmd_records_the_run_config_in_checkpoint_and_library(monkeypa
     assert await lib.get_run_config(row["run_id"]) == values["run_config"]
 
 
-async def test_bench_run_records_its_run_config_and_dumps_the_final_state(graph, tmp_path):
+async def test_bench_run_records_its_run_config_and_dumps_the_final_state(graph, monkeypatch, tmp_path):
     from bench import runner
     (tmp_path / "report.md").write_text("d", encoding="utf-8")      # WP-G: the runner copies the
     (tmp_path / "report").mkdir()                                    # report files report_builder wrote
     (tmp_path / "report" / "metadata.json").write_text("{}", encoding="utf-8")
+    built = []
+
+    def build(checkpointer):
+        built.append(graph_mod.build_graph(checkpointer=checkpointer))
+        return built[-1]
+
+    monkeypatch.setattr(runner, "build_graph", build)
     rec = await runner._run_one({"id": "q900", "query": "topic"}, length="medium", depth="deep",
                                 engines=fake_engines_snapshot(), timeout_s=60,
                                 state_dir=tmp_path / "results")
     assert rec["status"] == "ok", rec
+    snap = await built[0].aget_state({"configurable": {"thread_id": rec["thread_id"]}})
+    assert snap.next == ()                          # past both static interrupts, to END
     assert (rec["depth"], rec["profile"]) == ("deep", "fake")
     state_path = tmp_path / "results" / "q900" / "state.json"
     assert rec["state_path"] == str(state_path)
