@@ -1,4 +1,4 @@
-"""v3 search providers — one interface over Exa / DDGS / arXiv / GitHub.
+"""Search providers — one interface over Exa / DDGS / arXiv / GitHub.
 
 Every provider returns ``SearchHit`` dicts so the scout and research
 nodes can treat sources uniformly. Providers never raise: failures come
@@ -7,22 +7,24 @@ back as an error string so one provider's outage can't poison a wave
 
 Exa (https://exa.ai) is optional: enabled iff ``EXA_API_KEY`` is set.
 Its killer feature for Argus is search + full page text in ONE call —
-hits that carry text skip the fetch stage entirely. The free plan is
-~1000 requests/month, so Exa calls are capped (``ARGUS_EXA_MAX_CALLS``,
-default 6) and DDGS takes the overflow. The cap applies PER QUERY WAVE,
-not per run: every ``run_query_wave`` call starts a fresh budget, and
-scout, each research follow-up wave and each extend_prep wave is one
-call — so one run can spend the cap several times over.
+hits that carry text skip the fetch stage entirely. How many Exa searches
+a run may make is a per-run budget (``run_config.search.exa``, spent
+through the ``SpendLedger``); ``engines/search.run_wave`` plans each wave
+under it and is re-exported here as ``run_query_wave``.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
+
+from ..engines.search import run_wave as run_query_wave
+
+if TYPE_CHECKING:
+    from ..engines.ledger import SpendLedger
 
 logger = logging.getLogger("argus.search")
 
@@ -30,7 +32,8 @@ Provider = Literal["exa", "ddgs", "arxiv", "github"]
 
 # A SearchHit is a plain dict (checkpoint-friendly) with keys:
 #   url, title, snippet, kind, provider, sub_qs (list[int]), text (optional
-#   full page text — Exa only), published (optional ISO date).
+#   full page text — Exa only), published (ISO date, "" when unknown);
+#   run_wave adds canonical_url.
 
 _EXA_ENDPOINT = "https://api.exa.ai/search"
 _EXA_TIMEOUT = 20.0
@@ -40,30 +43,35 @@ def exa_enabled() -> bool:
     return bool(os.environ.get("EXA_API_KEY", "").strip())
 
 
-def exa_max_calls() -> int:
-    return int(os.environ.get("ARGUS_EXA_MAX_CALLS", "6"))
-
-
 def exa_search(query: str, *, category: str | None = None,
                num_results: int = 8, want_text: bool = True,
-               sub_qs: list[int] | None = None) -> tuple[list[dict], str]:
+               sub_qs: list[int] | None = None, text_max_chars: int = 12000,
+               include_domains: list[str] | None = None,
+               start_published_date: str | None = None, search_type: str = "auto",
+               ledger: SpendLedger | None = None) -> tuple[list[dict], str]:
     """One Exa /search call. Returns (hits, error). Never raises.
 
     ``category`` maps research intents onto Exa's index slices
-    (e.g. "research paper", "news", "github").
+    (e.g. "research paper", "news", "github"). With a ``ledger``, the
+    response's ``costDollars.total`` and the hits that came with page text
+    (``exa_text_pages``) are counted there.
     """
     key = os.environ.get("EXA_API_KEY", "").strip()
     if not key:
         return [], "exa: no EXA_API_KEY"
     body: dict[str, Any] = {
         "query": query[:400],
-        "type": "auto",
+        "type": search_type,
         "numResults": max(1, min(int(num_results), 20)),
     }
     if category:
         body["category"] = category
+    if include_domains:
+        body["includeDomains"] = list(include_domains)
+    if start_published_date:
+        body["startPublishedDate"] = start_published_date
     if want_text:
-        body["contents"] = {"text": {"maxCharacters": 8000}}
+        body["contents"] = {"text": {"maxCharacters": int(text_max_chars)}}
     try:
         with httpx.Client(timeout=_EXA_TIMEOUT) as c:
             r = c.post(_EXA_ENDPOINT, json=body,
@@ -75,6 +83,13 @@ def exa_search(query: str, *, category: str | None = None,
         err = f"exa: {type(e).__name__}: {e}"
         logger.warning(err)
         return [], err
+    if ledger is not None:
+        cost = (data.get("costDollars") or {}).get("total")
+        if cost:
+            ledger.add_usd(float(cost))
+        pages = sum(1 for it in data.get("results") or [] if (it.get("text") or "").strip())
+        if want_text and pages:
+            ledger.count("exa_text_pages", pages)
     hits: list[dict] = []
     for it in data.get("results", []) or []:
         url = (it.get("url") or "").strip()
@@ -88,7 +103,7 @@ def exa_search(query: str, *, category: str | None = None,
             "provider": "exa",
             "sub_qs": list(sub_qs or []),
             "text": (it.get("text") or "") if want_text else "",
-            "published": it.get("publishedDate") or "",
+            "published": (it.get("publishedDate") or "")[:10],     # ISO 8601 → the date
             # v2 pipeline compat (merge/dedupe + plan-gate rendering).
             "source": "exa",
             "summary": (it.get("summary") or "")[:400],
@@ -101,12 +116,13 @@ def _kind_from_category(category: str | None) -> str:
             "github": "repo"}.get(category or "", "search_result")
 
 
-def ddgs_hits(query: str, *, max_results: int = 10,
-              sub_qs: list[int] | None = None) -> tuple[list[dict], str]:
-    """DDGS web search (free, keyless). Returns (hits, error)."""
+def ddgs_hits(query: str, *, max_results: int = 10, sub_qs: list[int] | None = None,
+              timelimit: str | None = None) -> tuple[list[dict], str]:
+    """DDGS web search (free, keyless). Returns (hits, error); ``timelimit``
+    is DDGS's recency window (d/w/m/y)."""
     try:
         from ..tools import ddgs_search
-        results = ddgs_search(query, max_results=max_results)
+        results = ddgs_search(query, max_results=max_results, timelimit=timelimit)
     except Exception as e:
         err = f"ddgs: {type(e).__name__}: {e}"
         logger.warning(err)
@@ -131,16 +147,17 @@ def ddgs_hits(query: str, *, max_results: int = 10,
     return hits, ""
 
 
-def arxiv_hits(query: str, *, max_results: int = 10,
-               sub_qs: list[int] | None = None) -> tuple[list[dict], str]:
-    """arXiv Atom API search (free, keyless). Returns (hits, error)."""
+def arxiv_hits(query: str, *, max_results: int = 10, sub_qs: list[int] | None = None,
+               sort_by: str = "relevance") -> tuple[list[dict], str]:
+    """arXiv Atom API search (free, keyless). Returns (hits, error);
+    ``sort_by="submittedDate"`` lists the newest first (recency)."""
     q = (query or "").strip()[:200]
     if not q:
         return [], ""
     params = {
         "search_query": f"all:{q}",
         "start": 0, "max_results": max(1, min(int(max_results), 25)),
-        "sortBy": "relevance", "sortOrder": "descending",
+        "sortBy": sort_by, "sortOrder": "descending",
     }
     try:
         with httpx.Client(timeout=25.0, follow_redirects=True) as c:
@@ -156,6 +173,7 @@ def arxiv_hits(query: str, *, max_results: int = 10,
         title_m = re.search(r"<title>(.*?)</title>", ent, re.DOTALL)
         link_m = re.search(r"<id>(.*?)</id>", ent)
         sum_m = re.search(r"<summary>(.*?)</summary>", ent, re.DOTALL)
+        pub_m = re.search(r"<published>(\d{4}-\d{2}-\d{2})", ent)
         title = (title_m.group(1).strip() if title_m else "")
         link = (link_m.group(1).strip() if link_m else "")
         summary = (sum_m.group(1).strip()[:400] if sum_m else "")
@@ -168,7 +186,7 @@ def arxiv_hits(query: str, *, max_results: int = 10,
                 "provider": "arxiv",
                 "sub_qs": list(sub_qs or []),
                 "text": "",
-                "published": "",
+                "published": pub_m.group(1) if pub_m else "",
                 "source": "arxiv",
                 "summary": summary,
             })
@@ -217,91 +235,7 @@ def github_hits(query: str, *, max_results: int = 8,
     return hits, ""
 
 
-# ---------------------------------------------------------------------------
-# Query wave execution — parallel fan-out over provider calls.
-# ---------------------------------------------------------------------------
-
-# One planned query: {"query": str, "provider": Provider, "sub_qs": [int],
-#                     "category": str|None (exa only)}
-
-
-def run_query_wave(queries: list[dict], *,
-                   exa_budget: int | None = None) -> tuple[list[dict], list[str]]:
-    """Execute a list of planned queries in parallel; merge + dedupe.
-
-    Sync entrypoint (nodes are sync; they run on LangGraph worker
-    threads). Internally fans out with asyncio.to_thread, matching the
-    proven v2 subgraph pattern. Exa queries beyond ``exa_budget`` are
-    transparently downgraded to DDGS. The budget covers THIS call only —
-    no caller passes a running total, so it resets every wave.
-    """
-    budget = exa_max_calls() if exa_budget is None else exa_budget
-    planned: list[dict] = []
-    exa_used = 0
-    for q in queries:
-        q = dict(q)
-        if q.get("provider") == "exa":
-            if not exa_enabled() or exa_used >= budget:
-                q["provider"] = "ddgs"
-            else:
-                exa_used += 1
-        planned.append(q)
-
-    async def _one(q: dict) -> tuple[list[dict], str]:
-        prov = q.get("provider", "ddgs")
-        query = q.get("query", "")
-        sub_qs = q.get("sub_qs") or []
-        if prov == "exa":
-            return await asyncio.to_thread(
-                exa_search, query, category=q.get("category"),
-                sub_qs=sub_qs)
-        if prov == "arxiv":
-            return await asyncio.to_thread(arxiv_hits, query, sub_qs=sub_qs)
-        if prov == "github":
-            return await asyncio.to_thread(github_hits, query, sub_qs=sub_qs)
-        return await asyncio.to_thread(ddgs_hits, query, sub_qs=sub_qs)
-
-    async def _all() -> list[tuple[list[dict], str]]:
-        return await asyncio.gather(*(_one(q) for q in planned))
-
-    def _fresh_loop() -> list[tuple[list[dict], str]]:
-        return asyncio.run(_all())
-
-    try:
-        results = _fresh_loop()
-    except RuntimeError:
-        # Called on a thread that already has a running loop — run the
-        # wave in a fresh loop on a dedicated worker thread.
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            results = ex.submit(_fresh_loop).result()
-
-    merged: list[dict] = []
-    errors: list[str] = []
-    by_url: dict[str, dict] = {}
-    for hits, err in results:
-        if err:
-            errors.append(err)
-        for h in hits:
-            url = h["url"]
-            if url in by_url:
-                # Merge sub-question tags; prefer a hit that has text.
-                prev = by_url[url]
-                tags = list(dict.fromkeys(
-                    list(prev.get("sub_qs") or []) + list(h.get("sub_qs") or [])))
-                if h.get("text") and not prev.get("text"):
-                    h["sub_qs"] = tags
-                    by_url[url] = h
-                    merged[merged.index(prev)] = h
-                else:
-                    prev["sub_qs"] = tags
-                continue
-            by_url[url] = h
-            merged.append(h)
-    return merged, errors
-
-
 __all__ = [
-    "exa_enabled", "exa_max_calls", "exa_search", "ddgs_hits",
+    "exa_enabled", "exa_search", "ddgs_hits",
     "arxiv_hits", "github_hits", "run_query_wave",
 ]

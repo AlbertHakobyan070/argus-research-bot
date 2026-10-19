@@ -266,7 +266,11 @@ class RunConfig(BaseModel):
 
     def exa_cost_estimate_usd(self, prices: ExaPrices | None) -> float | None:
         """Upper-bound Exa spend at ``prices`` (``EnginesConfig.pricing.exa``); display
-        it as "≈". No prices configured → None, shown as "n/a"."""
+        it as "≈". No prices configured → None, shown as "n/a". The page term
+        includes ``max_searches × num_results`` inline-text pages, but a live
+        search with inline text billed only the search price (WP-B measurement,
+        docs/v4-notes/wp-b.md): ``price_per_page_usd`` is what a ``/contents``
+        page costs, so this is a ceiling, not an expected cost."""
         if prices is None:
             return None
         exa = self.search.exa

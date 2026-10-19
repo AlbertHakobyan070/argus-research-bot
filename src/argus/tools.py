@@ -805,8 +805,9 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
 #
 # ``ddgs_search`` — the duckduckgo-search library, free, no key — returns
 # ``list[{url, title, snippet, source}]``. The research engine reaches it
-# through graph/search_providers.py. Fail-soft: any exception (network,
-# parse, library bug) degrades to [] + a warning.
+# through graph/search_providers.py, which turns any exception raised here
+# (package missing, network, parse, library bug) into the wave's errors
+# line — a failed search is never an empty result.
 
 
 def _normalize_web_hit(
@@ -841,8 +842,9 @@ def ddgs_search(query: str, *, max_results: int = 8,
     """Search DuckDuckGo via DDGS — the ``ddgs`` package, with the legacy
     ``duckduckgo_search`` name as fallback (see the import block at top).
 
-    Returns ``[]`` (with a logged warning) if the library is not installed
-    or DDGS raises. The mapping from DDGS's ``{href,title,body}`` to our
+    Raises ``RuntimeError`` if the library is not installed, and lets any
+    DDGS exception propagate (v4: a failed search is reported, never an
+    empty result). The mapping from DDGS's ``{href,title,body}`` to our
     unified ``{url,title,snippet}`` schema lives here so callers never have
     to know the source library's field names.
 
@@ -855,28 +857,23 @@ def ddgs_search(query: str, *, max_results: int = 8,
         return []
     effective_timelimit = _validate_timelimit(timelimit)
     if DDGS is None:  # pragma: no cover - package not installed on this host
-        logger.warning("ddgs_search: duckduckgo_search not installed; returning []")
-        return []
+        raise RuntimeError("ddgs_search: neither the ddgs nor the duckduckgo_search package is installed")
+    # The library's ``text`` is a context-manager-required method on
+    # some versions, and a plain method on others. Use the plain form
+    # (matches duckduckgo_search >= 6.x) and fall back to context
+    # form on AttributeError for robustness.
+    client = DDGS()
+    # Build kwargs. Always include timelimit (with None when unset) so
+    # callers/tests can observe the decision.
+    text_kwargs: dict = {
+        "max_results": max(1, int(max_results)),
+        "timelimit": effective_timelimit,
+    }
     try:
-        # The library's ``text`` is a context-manager-required method on
-        # some versions, and a plain method on others. Use the plain form
-        # (matches duckduckgo_search >= 6.x) and fall back to context
-        # form on AttributeError for robustness.
-        client = DDGS()
-        # Build kwargs. Always include timelimit (with None when unset) so
-        # callers/tests can observe the decision.
-        text_kwargs: dict = {
-            "max_results": max(1, int(max_results)),
-            "timelimit": effective_timelimit,
-        }
-        try:
-            hits = client.text(query, **text_kwargs)
-        except AttributeError:
-            with DDGS() as ctx:
-                hits = ctx.text(query, **text_kwargs)
-    except Exception as e:
-        logger.warning("ddgs_search: failure (%s); returning []", e)
-        return []
+        hits = client.text(query, **text_kwargs)
+    except AttributeError:
+        with DDGS() as ctx:
+            hits = ctx.text(query, **text_kwargs)
 
     out: list[dict[str, str]] = []
     for h in (hits or [])[: max(1, int(max_results))]:

@@ -75,6 +75,12 @@ REMOVED_ENV_KNOBS = {
     "ARGUS_TIMEOUT": "ProviderSpec.timeout_s in argus_engines.json",
     "ARGUS_LLM_RETRIES": "the LLM facade's retry policy",
     "PERPLEXITY_API_KEY": "nothing (Perplexity search was removed)",
+    "ARGUS_RESEARCH_WAVES": "run_config research.waves (the depth preset)",
+    "ARGUS_FETCH_PER_WAVE": "run_config research.fetch_per_wave (the depth preset)",
+    "ARGUS_TOTAL_FETCH_CAP": "run_config research.total_fetch_cap (the depth preset)",
+    "ARGUS_EXA_MAX_CALLS": "run_config search.exa.max_searches (a per-run budget)",
+    "ARGUS_FETCH_CONCURRENCY": "run_config fetch.concurrency",
+    "ARGUS_DIGEST_CONCURRENCY": "run_config research.digest_concurrency",
 }
 
 
@@ -538,7 +544,10 @@ def summarize_calls(model_calls: list[dict], errors: list[str] | None = None, *,
     records are counted apart: ``attempts`` / ``failed_attempts`` over the
     records in ``model_calls`` (with any ``extra["prior_attempts"]`` the
     legacy wrappers attach), and ``exhausted_attempts`` = the <n> of the
-    exhausted calls, whose records the Phase 1–2 call sites do not keep.
+    exhausted ``legacy.*`` calls, whose records the Phase 1–2 call sites do
+    not keep. A real role's call site appends every attempt record
+    (``EngineError.attempts``) to ``model_calls``, so its exhausted attempts
+    are already counted there and never again from the text (0 here).
     ``skipped`` / ``degraded`` come from the ``skip:`` / ``degrade:`` lines.
     v3 records (no role) count as ``legacy.<tier>``."""
     records = [a for c in model_calls or []
@@ -559,7 +568,8 @@ def summarize_calls(model_calls: list[dict], errors: list[str] | None = None, *,
         for m in _EXHAUSTED.finditer(line):
             row = by_role.setdefault(m.group(1), _empty_row())
             row["exhausted"] += 1
-            row["exhausted_attempts"] += int(m.group(2))
+            if m.group(1).startswith("legacy."):
+                row["exhausted_attempts"] += int(m.group(2))
         m = _ITEM_LINE.match(line)
         if m is None:
             continue

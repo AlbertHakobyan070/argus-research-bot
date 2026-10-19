@@ -334,14 +334,17 @@ def test_parse_article_convert_path_returns_none_when_missing() -> None:
 def test_fetch_skips_source_with_empty_url(fake_subprocess, monkeypatch):
     """T6 fix, v3 shape: a source without a URL must be skipped, not
     crash — each skipped source records an error string."""
+    from argus.engines.ledger import SpendLedger
     from argus.graph.research import _parallel_fetch
+    from argus.graph.run_config import FetchConfig
 
     sources = [
         {"kind": "paper", "title": "X", "url": ""},
         {"kind": "paper", "title": "Y"},  # missing 'url'
         {"kind": "search_result", "title": "Z", "url": "site:arxiv.org foo"},
     ]
-    fetched, errors = _parallel_fetch(sources)
+    fetched, errors = _parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}),
+                                      exa_on=False)
     assert fetched == [], (
         f"empty/non-http URLs must not be fetched; got {fetched!r}"
     )
@@ -412,32 +415,43 @@ def test_snatch_url_passes_stealth_and_transcript_flags(monkeypatch):
     assert "--transcript" not in captured["args"]
 
 
-def test_fetch_retries_with_stealth_when_normal_fetch_fails(monkeypatch):
+def test_fetch_retries_with_stealth_when_normal_fetch_fails(monkeypatch, tmp_path):
     """When snatch (plain) + crawl both fail, the research fetch path
     retries once with Scrapling stealth. A success there must land in
-    fetched (bot-walled site recovery)."""
+    fetched (bot-walled site recovery). v4: the intel rungs live in
+    engines/fetchers.py and run only when the intel-stack is available."""
+    from argus.engines import fetchers
+    from argus.engines.ledger import SpendLedger
     from argus.graph import research as research_mod
+    from argus.graph.run_config import FetchConfig
     from argus.tools import SnatchResult, CrawlResult
 
+    ok_md = tmp_path / "ok.md"
+    ok_md.write_text("# Stealth OK\n\nRecovered page text. " * 20, encoding="utf-8")
+    monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", True)
+    monkeypatch.setattr(fetchers, "_resolve", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
     stealth_flags: list[bool] = []
 
     def fake_snatch(url, *a, **kw):
         stealth_flags.append(bool(kw.get("stealth")))
         if kw.get("stealth"):
-            return SnatchResult(ok=True, folder="A:\\f",
-                                markdown_path="A:\\f\\ok.md",
+            return SnatchResult(ok=True, folder=str(tmp_path),
+                                markdown_path=str(ok_md),
                                 title="Stealth OK", url=url)
         return SnatchResult(ok=False, url=url, error="403 bot wall")
 
     def fake_crawl(url, *a, **kw):
         return CrawlResult(ok=False, error="403", duration_s=0.0)
 
-    monkeypatch.setattr(research_mod, "snatch_url", fake_snatch)
-    monkeypatch.setattr(research_mod, "crawl_url", fake_crawl)
+    monkeypatch.setattr(fetchers, "snatch_url", fake_snatch)
+    monkeypatch.setattr(fetchers, "crawl_url", fake_crawl)
 
     fetched, errors = research_mod._parallel_fetch(
         [{"url": "https://walled.example", "kind": "blog",
-          "title": "W", "summary": ""}])
+          "title": "W", "summary": ""}],
+        cfg=FetchConfig(chain=["intel_snatch", "intel_crawl", "intel_stealth"]),
+        ledger=SpendLedger({}), exa_on=False)
     assert True in stealth_flags, (
         f"stealth retry must fire after snatch+crawl fail; calls={stealth_flags!r}"
     )

@@ -17,7 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .. import llm
 from ..tools import markdown_to_pdf
-from .state import ArgusState, ResearchBrief
+from .state import ArgusState
 
 logger = logging.getLogger("argus.nodes")
 
@@ -432,12 +432,13 @@ def revise_prep_node(state: ArgusState) -> dict:
 
 
 def extend_prep_node(state: ArgusState) -> dict:
-    """Broaden the search and gather MORE sources for another deep pass.
-
-    v3: runs one widened query wave (follow-up-style queries over ALL
-    sub-questions) and merges the hits into ``sources``. The run then
-    rejoins at ``research``, which fetches + digests only the NEW
-    sources — the wave never re-triggers the plan gate.
+    """Prepare a user-requested Extend pass (report-preview gate or a
+    plain /continue): clear the flag, bump ``extend_rounds``, reset the
+    panel's revision budget and the stale panel verdict — counters and
+    flags only, like ``revise_prep``. v4: ``research_node`` runs the
+    Extend pass itself (a fresh allowance, ``research.extend_querygen``,
+    the widened search wave), so no search happens here; the run rejoins
+    at ``research`` without re-triggering the plan gate.
 
     ``append_only``: /continue after /append ingests EXACTLY the user's
     appended sources (already merged into ``state["sources"]`` by the
@@ -462,35 +463,11 @@ def extend_prep_node(state: ArgusState) -> dict:
                                       f"only (round {rnd}) — "
                                       f"{len(srcs)} total.")}],
         }
-    from .research import followup_queries
-    from .search_providers import run_query_wave
-
-    brief = ResearchBrief.model_validate(state.get("brief") or {})
-    gaps = list(range(len(brief.sub_questions)))
-    queries, calls = followup_queries(brief, gaps,
-                                      list(state.get("queries") or []))
-    hits, errors = run_query_wave(queries)
-    sources = list(state.get("sources") or [])
-    known = {s.get("url") for s in sources}
-    added = 0
-    for h in hits:
-        if h.get("url") and h["url"] not in known:
-            sources.append(h)
-            known.add(h["url"])
-            added += 1
-    out: dict[str, Any] = {
+    return {
         **base,
-        "sources": sources,
-        "queries": list(state.get("queries") or []) + queries,
-        "model_calls": calls,
         "messages": [{"role": "assistant",
-                      "content": (f"🔎 Extending research (round {rnd}) — "
-                                  f"+{added} new candidate source(s), "
-                                  f"{len(sources)} total.")}],
+                      "content": f"🔎 Extending research (round {rnd})…"}],
     }
-    if errors:
-        out["errors"] = errors
-    return out
 
 
 # ---------------------------------------------------------------------------

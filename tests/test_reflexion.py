@@ -19,6 +19,8 @@ from argus.graph import build_graph
 from argus.graph.nodes import _parse_json_obj
 from argus.llm import CallRecord
 
+from helpers import make_run_config
+
 
 def test_parse_json_obj_rejects_empty():
     """An LLM returning literally `{}` must not satisfy the parser —
@@ -127,19 +129,19 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
 
     # ---- scout: deterministic queries + one wave hit -----------------
     monkeypatch.setattr(scout_mod, "plan_queries",
-                        lambda brief: ([{"query": "evidence for X",
+                        lambda brief, **kw: ([{"query": "evidence for X",
                                          "provider": "ddgs",
                                          "sub_qs": [0]}], [], []))
     monkeypatch.setattr(
         scout_mod, "run_query_wave",
-        lambda queries: ([{"url": "https://example.com/a",
+        lambda queries, **kw: ([{"url": "https://example.com/a",
                            "title": "Source A", "snippet": "evidence",
                            "kind": "blog", "provider": "ddgs",
                            "sub_qs": [0, 1, 2], "text": "", "published": "",
                            "source": "ddgs", "summary": "evidence"}], []))
 
     # ---- research: fake fetch + digest, no follow-up wave ------------
-    def _fake_fetch(src):
+    def _fake_fetch(src, **kw):
         return ({"url": src["url"], "title": src.get("title", ""),
                  "markdown_path": str(md_file), "section": "blog",
                  "excerpt": "X is true because reasons.",
@@ -148,18 +150,18 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
                  "provider": "ddgs"}, [])
     monkeypatch.setattr(research_mod, "fetch_one_source", _fake_fetch)
 
-    def _fake_digest(item, source_id, brief, user_request):
+    def _fake_digest(item, source_id, brief, user_request, **kw):
         note = {"source_id": source_id, "source_url": item["url"],
                 "title": item["title"], "sub_qs": item.get("sub_qs") or [],
                 "relevance": 5, "stance": "supports",
                 "claims": [{"text": "X is true", "quote": "X is true",
                             "confidence": "high"}]}
-        return note, None, ""
+        return note, [], []
     monkeypatch.setattr(research_mod, "digest_one", _fake_digest)
     monkeypatch.setattr(research_mod, "score_fetched",
                         lambda items, user_request: items)
     monkeypatch.setattr(research_mod, "followup_queries",
-                        lambda brief, gaps, prior: ([], []))
+                        lambda brief, gaps, prior, **kw: ([], [], []))
 
     # ---- reports land in tmp -----------------------------------------
     monkeypatch.setenv("ARGUS_REPORTS_ROOT", str(tmp_path))
@@ -172,6 +174,7 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
     g.invoke({
         "thread_id": "test:panel-reflexion", "user_id": 0,
         "user_request": "is X true?",
+        "run_config": make_run_config("short", **{"research.rerank": False}),
         "messages": [], "plan": None, "sources": [], "fetched": [],
         "findings": [], "draft_md": "", "revision_notes": [],
         "revision_rounds": 0, "model_calls": [],

@@ -110,7 +110,7 @@ def main() -> int:
         return hits, []
 
     # Stub the fetch: point each source at its pre-written corpus markdown.
-    def fake_fetch(src):
+    def fake_fetch(src, **kw):
         from argus.graph.state import FetchedItem
         url = src.get("url", "")
         path = corpus_paths.get(url)

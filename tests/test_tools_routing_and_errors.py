@@ -26,9 +26,14 @@ from typing import Any
 
 import pytest
 
+import httpx
+
 from argus import tools
+from argus.engines import fetchers
+from argus.engines.ledger import SpendLedger
 from argus.graph import research as research_mod
 from argus.graph.research import _parallel_fetch
+from argus.graph.run_config import FetchConfig
 from argus.tools import (
     INTEL_PYTHON_BIN, PYTHON_BIN,
     _run_script, crawl_url, normalize_to_markdown, snatch_url,
@@ -146,94 +151,80 @@ def test_all_tools_route_through_intel_python(monkeypatch, tool_name,
 # ---------------------------------------------------------------------------
 
 
-def test_parallel_fetch_propagates_exceptions_to_errors(monkeypatch):
-    """A raising snatch/crawl/normalize MUST surface as error strings.
+@pytest.fixture
+def offline(monkeypatch, tmp_path):
+    """The v4 fetch chain on a fake network: ``routes[url]`` → Response."""
+    routes: dict = {}
+    monkeypatch.setattr(fetchers, "_http_client", lambda cfg: httpx.Client(
+        transport=httpx.MockTransport(lambda r: routes.get(str(r.url), httpx.Response(404)))))
+    monkeypatch.setattr(fetchers, "_resolve", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
+    monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    return routes
+
+
+def _fetch_all(sources):
+    return _parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)
+
+
+def test_parallel_fetch_propagates_exceptions_to_errors(offline, monkeypatch):
+    """A raising fetch rung MUST surface as error strings.
 
     Pre-fix behavior (v2): the ``except Exception: logger.warning(...)``
     branch silently returned ``fetched=[]`` — the writers then produced
     a vacuous "no evidence" report.
     """
-    def boom_normalize(url, *a, **kw):
-        raise RuntimeError("normalize exploded")
-    def boom_snatch(url, *a, **kw):
-        raise RuntimeError("snatch exploded")
-    def boom_crawl(url, *a, **kw):
-        raise RuntimeError("crawl exploded")
+    def boom(*a, **kw):
+        raise RuntimeError("native exploded")
 
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom_normalize)
-    monkeypatch.setattr(research_mod, "snatch_url", boom_snatch)
-    monkeypatch.setattr(research_mod, "crawl_url", boom_crawl)
-
+    monkeypatch.setattr(fetchers, "_native", boom)
     sources = [
-        {"url": "https://a.example", "kind": "official_doc",
-         "title": "A", "summary": ""},
-        {"url": "https://b.example", "kind": "blog",
-         "title": "B", "summary": ""},
+        {"url": "https://a.example", "kind": "official_doc", "title": "A", "summary": ""},
+        {"url": "https://b.example", "kind": "blog", "title": "B", "summary": ""},
     ]
-    fetched, errs = _parallel_fetch(sources)
+    fetched, errs = _fetch_all(sources)
     assert fetched == []
-    assert any("https://a.example" in e for e in errs), errs
-    assert any("https://b.example" in e for e in errs), errs
+    assert any("https://a.example" in e and "native exploded" in e for e in errs), errs
+    assert any("https://b.example" in e and "native exploded" in e for e in errs), errs
 
 
-def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(monkeypatch):
-    """Successful URLs should land in fetched; failed URLs in errors —
-    no silent swallowing."""
-    from argus.tools import CrawlResult, NormalizeResult
-
-    def ok_normalize(url, *a, **kw):
-        return NormalizeResult(
-            ok=True,
-            markdown_path="A:\fake\ok.md",
-            markdown_text="x" * 700,
-            title="OK Title",
-        )
-    def bad_snatch(url, *a, **kw):
-        raise RuntimeError("snatch down")
-    def bad_crawl(url, *a, **kw):
-        return CrawlResult(ok=False, error="down",
-                           duration_s=0.0)
-
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", ok_normalize)
-    monkeypatch.setattr(research_mod, "snatch_url", bad_snatch)
-    monkeypatch.setattr(research_mod, "crawl_url", bad_crawl)
-
-    sources = [
-        {"url": "https://ok.example", "kind": "official_doc",
-         "title": "OK", "summary": ""},
-        {"url": "https://bad.example", "kind": "blog",
-         "title": "BAD", "summary": ""},
-    ]
-    fetched, errs = _parallel_fetch(sources)
+def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(offline):
+    """Successful URLs land in fetched; failed URLs in errors — no silent
+    swallowing."""
+    offline["https://ok.example/a"] = httpx.Response(200, html=(
+        "<html><body><article><h1>OK Title</h1>"
+        + "<p>A long enough paragraph about the topic at hand. </p>" * 20
+        + "</article></body></html>"))
+    offline["https://bad.example/b"] = httpx.Response(500)
+    fetched, errs = _fetch_all([
+        {"url": "https://ok.example/a", "kind": "official_doc", "title": "OK", "summary": ""},
+        {"url": "https://bad.example/b", "kind": "blog", "title": "BAD", "summary": ""},
+    ])
     assert len(fetched) == 1
-    assert fetched[0]["url"] == "https://ok.example"
-    assert any("https://bad.example" in e for e in errs), errs
+    assert fetched[0]["url"] == "https://ok.example/a"
+    assert any("https://bad.example/b" in e for e in errs), errs
 
 
-def test_research_node_emits_all_failed_summary(monkeypatch):
+def test_research_node_emits_all_failed_summary(offline, monkeypatch):
     """When every source fails to fetch, research_node must append the
     'all sources failed' summary error (the v2 T2 contract, kept).
 
     Hermetic: with 0 fetched items the wave loop's coverage check finds
-    a gap and would otherwise launch a REAL follow-up search wave
-    (network) — mock it away so this test only exercises the
-    fetch-failure path it's named for.
+    a gap and would otherwise launch a follow-up search wave — mocked away
+    so this test only exercises the fetch-failure path it's named for.
     """
-    def boom(url, *a, **kw):
-        raise RuntimeError("down")
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom)
-    monkeypatch.setattr(research_mod, "snatch_url", boom)
-    monkeypatch.setattr(research_mod, "crawl_url", boom)
-    monkeypatch.setattr(research_mod, "followup_queries",
-                        lambda brief, gaps, prior: ([], []))
+    from helpers import make_run_config
 
+    offline["https://a.example/x"] = httpx.Response(503)
+    monkeypatch.setattr(research_mod, "followup_queries", lambda *a, **kw: ([], [], []))
     state = {
         "user_request": "attention transformers",
-        "brief": {"sub_questions": [{"q": "What is attention?",
-                                     "kind": "web"}],
+        "run_config": make_run_config("short", **{"research.rerank": False}),
+        "brief": {"sub_questions": [{"q": "What is attention?", "kind": "web"}],
                   "must_have_keywords": ["attention"]},
         "sources": [
-            {"url": "https://a.example", "kind": "blog", "title": "A",
+            {"url": "https://a.example/x", "kind": "blog", "title": "A",
              "snippet": "attention", "sub_qs": [0]},
         ],
         "fetched": [], "evidence": [], "errors": [],
@@ -242,6 +233,7 @@ def test_research_node_emits_all_failed_summary(monkeypatch):
     assert out["fetched"] == []
     errs = out["errors"]
     assert any("all" in e and "failed to fetch" in e for e in errs), errs
+    assert "fetch https://a.example/x failed: native: HTTP 503 (rungs tried: native)" in errs
 
 
 def test_errors_reducer_in_state_accepts_str_list():

@@ -57,67 +57,36 @@ def test_deliver_node_delivers_at_cap_even_if_requested():
 
 # --- extend_prep --------------------------------------------------------------
 
-def test_extend_prep_widens_queries_bumps_round_and_merges(monkeypatch):
-    captured = {}
+def test_extend_prep_only_resets_counters_and_flags(monkeypatch):
+    """v4 (orchestrator ruling, option B): extend_prep keeps only its
+    counters and flags, like revise_prep; research_node runs the Extend
+    wave (tests/test_gap_mode.py::test_plain_continue_extend_pass_runs_a_fresh_search_wave)."""
+    def _boom(*a, **kw):
+        raise AssertionError("extend_prep must not search: research runs the Extend wave")
 
-    def fake_followups(brief, gaps, prior):
-        captured["gaps"] = list(gaps)
-        return ([{"query": "retrieval augmentation grounding",
-                  "provider": "ddgs", "sub_qs": [0]}], [])
-
-    def fake_wave(queries, **kw):
-        captured["queries"] = queries
-        return ([{"url": "https://new.example", "kind": "web",
-                  "title": "n", "snippet": "", "provider": "ddgs",
-                  "sub_qs": [0], "text": "", "published": "",
-                  "source": "ddgs", "summary": ""}], [])
-
-    monkeypatch.setattr(research_mod, "followup_queries", fake_followups)
-    monkeypatch.setattr(sp_mod, "run_query_wave", fake_wave)
-
-    brief = ResearchBrief(
-        sub_questions=[SubQuestion(
-            q="How does retrieval augmentation improve grounding?")],
-        must_have_keywords=["rag"], summary="s")
+    monkeypatch.setattr(research_mod, "followup_queries", _boom)
+    monkeypatch.setattr(sp_mod, "run_query_wave", _boom)
     out = extend_prep_node({
-        "brief": brief.model_dump(),
+        "brief": ResearchBrief(sub_questions=[SubQuestion(q="How does RAG ground answers?")],
+                               must_have_keywords=["rag"], summary="s").model_dump(),
         "extend_requested": True,
         "extend_rounds": 0,
         "revision_rounds": 3,
         "sources": [{"url": "https://old.example", "kind": "web"}],
     })
-
-    # Round bumped, flag cleared, review budget + stale panel reset.
     assert out["extend_rounds"] == 1
     assert out["extend_requested"] is False
     assert out["revision_rounds"] == 0
     assert out["panel_verdict"] is None
-    # Every sub-question is treated as a gap for the widening wave.
-    assert captured["gaps"] == [0]
-    # New hits merge INTO the existing pool (old sources kept).
-    urls = [s["url"] for s in out["sources"]]
-    assert "https://old.example" in urls
-    assert "https://new.example" in urls
-    # The widened queries are recorded on state for later waves.
-    assert any(q["query"] == "retrieval augmentation grounding"
-               for q in out["queries"])
+    assert not {"sources", "queries", "model_calls", "errors"} & set(out), "no wave, nothing merged here"
 
 
-def test_extend_prep_propagates_wave_errors(monkeypatch):
-    monkeypatch.setattr(research_mod, "followup_queries",
-                        lambda brief, gaps, prior: ([{"query": "x",
-                                                      "provider": "ddgs",
-                                                      "sub_qs": [0]}], []))
-    monkeypatch.setattr(sp_mod, "run_query_wave",
-                        lambda queries, **kw: ([], ["ddgs: boom"]))
-    out = extend_prep_node({
-        "brief": ResearchBrief(
-            sub_questions=[SubQuestion(q="x?")],
-            must_have_keywords=["x"]).model_dump(),
-        "extend_rounds": 1,
-    })
+def test_extend_prep_append_only_leaves_the_flag_for_research():
+    srcs = [{"url": "file:///V/t.txt", "local_path": "V/t.txt", "source": "appended-asset"}]
+    out = extend_prep_node({"append_only": True, "extend_rounds": 1, "sources": srcs})
     assert out["extend_rounds"] == 2
-    assert any("boom" in e for e in out.get("errors", []))
+    assert "append_only" not in out, "research_node consumes and clears it"
+    assert out["sources"] == srcs
 
 
 # --- graph wiring -------------------------------------------------------------

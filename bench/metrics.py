@@ -81,9 +81,9 @@ from collections import Counter
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from argus.engines import registry
+from argus.engines.urls import canonical_url
 from argus.graph.assemble import CITE_RE
 
 from .scorer import PRIMARY_DOMAINS
@@ -158,36 +158,6 @@ def _analysis(run: dict):
 # ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
-
-_TRACKING = re.compile(r"utm_.*|ref|fbclid|gclid")
-_ARXIV_PAGE = re.compile(r"/(?:abs|pdf|html)/(\d{4}\.\d{4,5})")
-_HF_PAPER = re.compile(r"/papers/(\d{4}\.\d{4,5})")
-_ARXIV_HOSTS = {"arxiv.org", "export.arxiv.org", "ar5iv.org", "ar5iv.labs.arxiv.org"}
-
-
-def canonical_url(url: str) -> str:
-    """The dedupe key of spec §2.8 ``canonical_url``: lowercase host without
-    ``www.``, no default port, trailing slash, fragment or tracking parameter
-    (``utm_*``, ``ref``, ``fbclid``, ``gclid``), ``http`` → ``https``; arXiv
-    abs/pdf/html pages (any version), ar5iv and Hugging Face paper pages →
-    ``https://arxiv.org/abs/<id>``. Non-http URLs (``file:///`` appends) stay."""
-    # ponytail: mirrors §2.8 until WP-B's engines/urls.canonical_url exists; switching is
-    # safe for comparisons: metrics are recomputed from the raw state, the baseline included.
-    parts = urlsplit(url.strip())
-    if parts.scheme not in ("http", "https"):
-        return url.strip()
-    host = (parts.hostname or "").removeprefix("www.")
-    page = (_HF_PAPER if host == "huggingface.co" else _ARXIV_PAGE if host in _ARXIV_HOSTS else None)
-    m = page.match(parts.path) if page else None
-    if m:
-        return f"https://arxiv.org/abs/{m.group(1)}"
-    if host == "export.arxiv.org":
-        host = "arxiv.org"
-    netloc = host if parts.port in (None, 80, 443) else f"{host}:{parts.port}"
-    query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-                       if not _TRACKING.fullmatch(k)])
-    return urlunsplit(("https", netloc, parts.path.rstrip("/"), query, ""))
-
 
 def unique_sources(run):
     fetched = run["state"].get("fetched")

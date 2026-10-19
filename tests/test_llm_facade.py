@@ -594,30 +594,33 @@ def test_legacy_wrappers_route_through_complete_on_the_cached_snapshot(monkeypat
 DIGEST_OK = '{"relevance": 3, "stance": "supports", "claims": []}'
 
 
-def test_exhausted_legacy_digests_count_as_calls_in_the_report_metadata(monkeypatch, tmp_path, sleeps):
+def test_exhausted_digests_count_as_calls_in_the_report_metadata(monkeypatch, tmp_path, sleeps):
     """Review risk 9: two digests exhaust their engine (429 three times
-    each) and one succeeds after a 429, through the real v3 call site, the
-    legacy wrappers and the facade. The call site keeps only the error text
-    of an exhausted call, so the summary report_builder writes counts it
-    from that text: three logical calls, two of them exhausted."""
+    each) and one succeeds after a 429, through the real call site and the
+    facade. Since WP-B the call site is research.digest on llm.complete: it
+    appends every attempt record and writes the skip line quoting the
+    facade's message, so the summary report_builder writes counts three
+    logical calls, two of them exhausted, and every request exactly once."""
     from argus import config as config_mod
     from argus.graph import nodes as nodes_mod
     from argus.graph import research
+    from argus.graph.run_config import RunConfig
     from argus.graph.state import ResearchBrief, SubQuestion
 
-    registry._state.snapshot = fake_engines_snapshot()
     _drive(monkeypatch, fake=[_status(429)] * 7 + [_resp(DIGEST_OK)])
+    rc = RunConfig.from_preset(length="medium", engines=fake_engines_snapshot(), origin="telegram")
     doc = tmp_path / "doc.md"
     doc.write_text("Retrieval augmented generation. " * 40, encoding="utf-8")
     brief = ResearchBrief(sub_questions=[SubQuestion(q="what is RAG?")], summary="s")
     model_calls, errors = [], []
     for i in range(3):
         item = {"url": f"https://{i}.example", "title": "t", "markdown_path": str(doc), "sub_qs": [0]}
-        _note, call, err = research.digest_one(item, i + 1, brief, "q")
-        model_calls += [call] if call else []
-        errors += [err] if err else []
-    assert len(model_calls) == 1 and len(errors) == 2
-    assert all("role legacy.cheap: every engine failed after 3 attempts" in e for e in errors)
+        _note, calls, errs = research.digest_one(item, i + 1, brief, "q", rc=rc, rnd=1)
+        model_calls += calls
+        errors += errs
+    assert len(model_calls) == 8 and len(errors) == 2, "3 + 3 attempts exhausted, 1 failed + 1 ok"
+    assert all(e.startswith("[r1] skip: research.digest https://") and
+               "role research.digest: every engine failed after 3 attempts" in e for e in errors)
     assert sleeps == [1.0, 2.0, 1.0, 2.0, 1.0]
 
     monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
@@ -626,9 +629,9 @@ def test_exhausted_legacy_digests_count_as_calls_in_the_report_metadata(monkeypa
                                          "draft_md": "# risk nine\n\nBody.\n",
                                          "model_calls": model_calls, "errors": errors})
     meta = json.loads((Path(out["report_paths"]["folder"]) / "metadata.json").read_text(encoding="utf-8"))
-    row = meta["engines"]["by_role"]["legacy.cheap"]
-    assert (row["calls"], row["ok"], row["exhausted"]) == (3, 1, 2)
-    assert (row["attempts"], row["failed_attempts"], row["exhausted_attempts"]) == (2, 1, 6), (
-        "the attempt records apart from the calls; 2 + 6 = every request made")
-    assert row["retries"] == {"transient": 1}
-    assert (meta["engines"]["calls"], meta["engines"]["exhausted"], meta["engines"]["attempts"]) == (3, 2, 2)
+    row = meta["engines"]["by_role"]["research.digest"]
+    assert (row["calls"], row["ok"], row["exhausted"], row["skipped"]) == (3, 1, 2, 2)
+    assert (row["attempts"], row["failed_attempts"], row["exhausted_attempts"]) == (8, 7, 0), (
+        "every request is one attempt record; a real role's exhausted attempts are never re-counted from the text")
+    assert row["retries"] == {"transient": 5}
+    assert (meta["engines"]["calls"], meta["engines"]["exhausted"], meta["engines"]["attempts"]) == (3, 2, 8)

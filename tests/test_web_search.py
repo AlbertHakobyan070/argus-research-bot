@@ -81,8 +81,9 @@ def test_ddgs_returns_mapped_results(monkeypatch) -> None:
     assert out[1]["url"] == "https://example.com/b"
 
 
-def test_ddgs_failure_returns_empty(monkeypatch) -> None:
-    """DDGS exceptions must degrade to [] (logged warning), not crash the graph."""
+def test_ddgs_failure_raises(monkeypatch) -> None:
+    """v4 WP-B: a DDGS failure raises (it was a silent []); the search wave
+    turns it into an errors line (tests/test_search_providers.py)."""
 
     class _BoomDDGS:
         def text(self, *_a: Any, **_kw: Any) -> Any:
@@ -90,8 +91,8 @@ def test_ddgs_failure_returns_empty(monkeypatch) -> None:
 
     monkeypatch.setattr(tools, "DDGS", lambda: _BoomDDGS())
 
-    out = tools.ddgs_search("hi")
-    assert out == []
+    with pytest.raises(RuntimeError, match="duckduckgo blocked us"):
+        tools.ddgs_search("hi")
 
 
 # ---------------------------------------------------------------------------

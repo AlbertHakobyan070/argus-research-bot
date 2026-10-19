@@ -105,7 +105,7 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(scout_mod, "run_query_wave", fake_wave)
     monkeypatch.setattr(research_mod, "run_query_wave", fake_wave)
 
-    def fake_fetch(src):
+    def fake_fetch(src, **kw):
         from argus.graph.state import FetchedItem
         return FetchedItem(
             url=src.get("url", ""), title=src.get("title", ""),
@@ -116,10 +116,13 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
 
     monkeypatch.setattr(research_mod, "fetch_one_source", fake_fetch)
 
+    from argus.graph.run_config import RunConfig
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "test:deep"}}
-    g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),
-             config=cfg)
+    state_in = _make_state_in("test:deep", 1, "LLM agent benchmarks")
+    state_in["run_config"] = RunConfig.from_preset(       # v4: scout/research read it (WP-B)
+        length="short", engines=registry.current_snapshot_cached(), origin="telegram").model_dump()
+    g.invoke(state_in, config=cfg)
     # Grounded plan gate: paused AFTER scout, before research.
     snap = g.get_state(cfg)
     assert snap.next == ("research",), (

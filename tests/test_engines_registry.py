@@ -464,7 +464,8 @@ def test_summarize_calls():
     assert (cheap["calls"], cheap["ok"], cheap["exhausted"], cheap["exhausted_attempts"]) == (3, 2, 1, 3), (
         "an exhausted call quoted by its call site counts as a call")
     digest = s["by_role"]["research.digest"]
-    assert (digest["skipped"], digest["exhausted"], digest["calls"], digest["exhausted_attempts"]) == (1, 1, 1, 1)
+    assert (digest["skipped"], digest["exhausted"], digest["calls"], digest["exhausted_attempts"]) == (1, 1, 1, 0), (
+        "a real role's call site appends EngineError.attempts: they are counted as records, never from the text")
     assert s["by_role"]["scout.querygen"]["degraded"] == 1
     assert s["by_role"]["scout.querygen"]["calls"] == 0, "a degrade line alone is no call"
     assert s["degradations"] == ["degrade: scout.querygen → subquestion_text_queries (unparseable)"]

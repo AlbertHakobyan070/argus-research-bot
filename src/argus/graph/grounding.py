@@ -15,12 +15,23 @@ If NO, the synthesizer gets a strict grounding warning injected into
 its prompt, and the report carries a top-of-page banner so the reader
 is not deceived.
 
-Pure (no I/O, no LLM). Module-level so it is unit-testable.
+v4 (spec §3 WP-B): the entities are the brief's ``entities`` — full
+phrases, never single query tokens (baseline b5, a nonexistent entity,
+passed v3's gate because any one of six generic request tokens counted;
+only 1 of 28 documents named it). A phrase is matched normalised and
+case-insensitive in the fetched document's full text; a source counts as
+credible when its digest note is relevant (relevance ≥ 3) and not of
+authority 0. No LLM; the only I/O is reading the fetched markdown files.
+Until the brief writes ``entities`` (WP-I) there is nothing to check and
+every run is grounded.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 
 
 # Default minimum credible-mention count required for a topic to be
@@ -31,54 +42,42 @@ from dataclasses import dataclass, field
 # produced shallow, hedged reports. 2 still catches genuinely thin /
 # non-existent entities (0-1 credible mentions) — the GLM-5.2 case.
 DEFAULT_GROUNDING_THRESHOLD = 2
+_MIN_RELEVANCE = 3
 
-_GROUNDING_STOPWORDS = frozenset({
-    "the", "and", "for", "with", "from", "into", "this", "that",
-    "are", "was", "were", "how", "why", "what", "when", "where",
-    "model", "system", "approach", "method", "paper", "work",
-    "tldr", "short", "medium", "long", "lecture",
-    "research", "report",
-})
-
-_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+# Everything that is not a letter or digit becomes a space — except a dot
+# between two digits, so "5.2" stays one token ("GLM 5" never matches "GLM 5.2").
+_SEPARATORS = re.compile(r"(?!(?<=\d)\.(?=\d))[\W_]")
 
 
-def _tokens(text: str) -> list[str]:
-    """Tokenise text in source order (preserves first-seen position).
-    Returns a list, not a set, because extract_entity_tokens needs
-    deterministic ordering for "first meaningful word stays first".
-    """
-    return _TOKEN_RE.findall((text or "").lower())
+def normalise(text: str) -> str:
+    return " ".join(_SEPARATORS.sub(" ", (text or "").lower()).split())
 
 
-def extract_entity_tokens(text, stop=None):
-    """Pull meaningful signal tokens from a free-form user request.
-    Returns a deduped list of tokens in first-seen order.
-    """
-    stop = stop or _GROUNDING_STOPWORDS
-    out: list[str] = []
-    seen: set[str] = set()
-    # Iterate the regex-match list directly (preserves source order)
-    # instead of the helper-returned list/dedup on demand.
-    for t in _TOKEN_RE.findall((text or "").lower()):
-        if t in stop or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
+# compose checks grounding once per section: each document is read and
+# normalised once. ponytail: keyed by (path, mtime_ns, size) — a same-size
+# rewrite within one mtime tick would be missed; fetched files are named by
+# URL hash and written once per fetch.
+@lru_cache(maxsize=256)
+def _document(path: str, _mtime_ns: int, _size: int) -> str:
+    return " " + normalise(Path(path).read_text(encoding="utf-8", errors="replace")) + " "
 
 
-def _has_any_token(haystack, tokens):
-    hlow = (haystack or "").lower()
-    return any(t in hlow for t in tokens)
+def _text_of(item: dict) -> str:
+    """The fetched document's full text, normalised and space-padded; the
+    title and excerpt when it has no file on disk."""
+    path = item.get("markdown_path")
+    if path and os.path.isfile(path):
+        st = os.stat(path)
+        return _document(path, st.st_mtime_ns, st.st_size)
+    return " " + normalise(f"{item.get('title') or ''} {item.get('excerpt') or ''}") + " "
 
 
 @dataclass
 class GroundingResult:
     """Outcome of check_grounding."""
     grounded: bool
-    entity_tokens: list
-    mention_count: int
+    entity_tokens: list          # the normalised entity phrases looked for
+    mention_count: int           # credible sources naming the least-supported entity
     n_credible: int
     threshold: int
     sample_evidence_titles: list = field(default_factory=list)
@@ -92,54 +91,41 @@ class GroundingResult:
         )
 
 
-def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD, credibility_floor=0.35):
-    """Compute a grounding verdict for the current pipeline state.
+def check_grounding(state, threshold=DEFAULT_GROUNDING_THRESHOLD):
+    """Grounding verdict for the current pipeline state (``brief``,
+    ``fetched``, ``evidence``).
 
-    state: dict exposing user_request and fetched (FetchedItem list or model_dump() dicts).
-    threshold: minimum credible-mentions required to count as grounded.
-        Default ``DEFAULT_GROUNDING_THRESHOLD``.
-    credibility_floor: items below this score are NOT counted (noise filter).
-        The default mirrors ``credibility.CREDIBILITY_FLOOR`` but is a
-        separate literal — change both together.
-
-    A "mention" is an entity token found in an item's title + ``excerpt``
-    (the document's opening characters), not in its full text.
+    Credible sources are the fetched items whose evidence note has
+    relevance ≥ 3 and authority ≥ 1 (notes without an ``authority`` count
+    as 1). Each entity phrase must occur in at least ``threshold`` of them;
+    ``mention_count`` is the count of the least-supported entity. No
+    entities → nothing to check → grounded.
     """
-    user_request = state.get("user_request") or ""
-    fetched = state.get("fetched") or []
-    tokens = extract_entity_tokens(user_request)
-
-    if not tokens:
-        return GroundingResult(
-            grounded=True, entity_tokens=[], mention_count=0,
-            n_credible=0, threshold=threshold,
-        )
-
-    n_credible = 0
-    mention_count = 0
-    samples = []
-
-    for it in fetched:
-        if isinstance(it, dict):
-            title = it.get("title") or ""
-            excerpt = it.get("excerpt") or ""
-            cred = it.get("credibility_score") or 0.0
-        else:
-            title = getattr(it, "title", "") or ""
-            excerpt = getattr(it, "excerpt", "") or ""
-            cred = getattr(it, "credibility_score", 0.0) or 0.0
-        if cred < credibility_floor:
-            continue
-        n_credible += 1
-        if _has_any_token(title + " " + excerpt, tokens):
-            mention_count += 1
-            if len(samples) < 3:
-                samples.append(title)
-
-    grounded = mention_count >= threshold
+    entities = [p for p in (normalise(e) for e in ((state.get("brief") or {}).get("entities") or [])) if p]
+    entities = list(dict.fromkeys(entities))
+    if not entities:
+        return GroundingResult(grounded=True, entity_tokens=[], mention_count=0,
+                               n_credible=0, threshold=threshold)
+    by_url = {f.get("url"): f for f in state.get("fetched") or []}
+    credible = []
+    for note in state.get("evidence") or []:
+        item = by_url.get(note.get("source_url"))
+        if (item is not None and int(note.get("relevance") or 0) >= _MIN_RELEVANCE
+                and int(note.get("authority", 1)) >= 1):
+            credible.append(item)
+    counts = {e: 0 for e in entities}
+    samples: list[str] = []
+    for item in credible:
+        text = _text_of(item)
+        named = [e for e in entities if f" {e} " in text]
+        for e in named:
+            counts[e] += 1
+        if named and len(samples) < 3:
+            samples.append(item.get("title") or item.get("url") or "")
+    mention_count = min(counts.values())
     return GroundingResult(
-        grounded=grounded, entity_tokens=tokens,
-        mention_count=mention_count, n_credible=n_credible,
+        grounded=mention_count >= threshold, entity_tokens=entities,
+        mention_count=mention_count, n_credible=len(credible),
         threshold=threshold, sample_evidence_titles=samples,
     )
 
@@ -155,7 +141,7 @@ def grounding_warning_prompt(result, user_request):
         "",
         "=== GROUNDING WARNING ===",
         f"The user asked about: {user_request!r}",
-        f"Entity tokens looked for: {result.entity_tokens!r}",
+        f"Entities looked for: {result.entity_tokens!r}",
         (
             f"Only {result.mention_count} of {result.n_credible} credible "
             "fetched sources mention the entity directly (threshold: "
@@ -189,7 +175,7 @@ def grounding_banner(result):
 
 __all__ = [
     "check_grounding",
-    "extract_entity_tokens",
+    "normalise",
     "GroundingResult",
     "grounding_warning_prompt",
     "grounding_banner",

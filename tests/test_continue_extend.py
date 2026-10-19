@@ -29,12 +29,14 @@ from argus.bot import history as bot_history
 from argus.bot.history import append_cmd, continue_cmd
 from argus.config import Settings
 from argus.engines import registry
+from argus.engines.ledger import SpendLedger
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
 from argus.graph import research as research_mod
 from argus.graph import search_providers as sp_mod
+from argus.graph.run_config import FetchConfig
 
-from helpers import fake_engines_snapshot
+from helpers import fake_engines_snapshot, make_run_config
 
 
 # ---------------------------------------------------------------------------
@@ -140,23 +142,19 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
 
 
 def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
+    """A plain /continue (no appends) reaches research as an Extend pass:
+    append_only False, extend_rounds bumped. v4 (option B): research_node
+    runs the fresh search wave itself — asserted where it runs,
+    tests/test_gap_mode.py::test_plain_continue_extend_pass_runs_a_fresh_search_wave."""
     _stub_pipeline(monkeypatch)
-    calls: list = []
+    seen: list[dict] = []
+    stub_research = graph_mod.research_node
 
-    def fake_followups(brief, gaps, prior):
-        calls.append(1)
-        return ([{"query": "widened q", "provider": "ddgs",
-                  "sub_qs": [0]}], [])
+    def research(s):
+        seen.append({"append_only": s.get("append_only"), "extend_rounds": s.get("extend_rounds")})
+        return stub_research(s)
 
-    def fake_wave(queries, **kw):
-        return ([{"kind": "web", "title": "New",
-                  "url": "https://new.example/y", "snippet": "",
-                  "provider": "ddgs", "sub_qs": [0], "text": "",
-                  "published": "", "source": "web-search",
-                  "summary": ""}], [])
-
-    monkeypatch.setattr(research_mod, "followup_queries", fake_followups)
-    monkeypatch.setattr(sp_mod, "run_query_wave", fake_wave)
+    monkeypatch.setattr(graph_mod, "research_node", research)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont2"}}
@@ -171,9 +169,8 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
 
     snap = g.get_state(cfg)
     assert snap.next == ("deliver",)
-    assert calls, "plain /continue must run a fresh search wave"
-    urls = [s.get("url") for s in snap.values.get("sources") or []]
-    assert "https://new.example/y" in urls
+    assert seen[-1] == {"append_only": False, "extend_rounds": 1}, (
+        "plain /continue must reach research as a fresh-search Extend pass")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +179,8 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
 
 
 def _fetch(sources: list[dict]) -> tuple[list[dict], list[str]]:
-    return research_mod._parallel_fetch(sources)
+    return research_mod._parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}),
+                                        exa_on=False)
 
 
 def test_fetch_ingests_local_md(tmp_path):
@@ -488,12 +486,12 @@ def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
     monkeypatch.setattr(research_mod, "run_query_wave", _boom)
 
-    def fake_digest(item, source_id, brief, user_request):
+    def fake_digest(item, source_id, brief, user_request, **kw):
         return ({"source_id": source_id, "source_url": item["url"],
                  "title": item["title"], "sub_qs": [],
                  "relevance": 3, "stance": "background",
                  "claims": [{"text": "c", "quote": "", "confidence":
-                             "medium"}]}, None, "")
+                             "medium"}]}, [], [])
 
     monkeypatch.setattr(research_mod, "digest_one", fake_digest)
     monkeypatch.setattr(research_mod, "score_fetched",
@@ -501,6 +499,7 @@ def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
 
     out = research_mod.research_node({
         "user_request": "topic",
+        "run_config": make_run_config("short"),
         "append_only": True,
         "brief": {"sub_questions": [{"q": "q?", "kind": "web"}],
                   "must_have_keywords": ["topic"]},

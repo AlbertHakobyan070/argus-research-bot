@@ -31,8 +31,6 @@ from argus.config import Settings
 from argus.engines import registry
 from argus.engines.registry import EngineConfigError
 from argus.graph import graph as graph_mod
-from argus.graph import research as research_mod
-from argus.graph import search_providers as sp_mod
 from argus.graph.run_config import ensure_in_checkpoint, require
 from argus.graph.state import (
     ArgusState, EvidenceClaim, EvidenceNote, FetchedItem, Finding, OutlineSection,
@@ -102,10 +100,7 @@ def graph(monkeypatch, tmp_path):
         "panel_verdict": {"verdict": "pass"}, "review_verdict": {"verdict": "pass"}})
     monkeypatch.setattr(graph_mod, "route_after_panel", lambda s: "report_builder")
     monkeypatch.setattr(graph_mod, "report_builder_node", lambda s: {"report_paths": dict(report)})
-    # extend_prep (real) runs one widened search wave
-    monkeypatch.setattr(research_mod, "followup_queries", lambda brief, gaps, prior: (
-        [{"query": "widened q", "provider": "ddgs", "sub_qs": [0]}], []))
-    monkeypatch.setattr(sp_mod, "run_query_wave", lambda queries, **kw: ([], []))
+    # extend_prep (real) only resets counters; the stubbed research runs the Extend wave (v4 WP-B)
     return graph_mod.build_graph(checkpointer=MemorySaver())
 
 
