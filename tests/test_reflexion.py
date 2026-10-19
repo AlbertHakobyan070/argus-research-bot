@@ -1,15 +1,15 @@
-"""Panel reflexion loop test (v3): forced flagged finding → panel returns
-revise → compose gets the judges' notes → next pass cites properly →
-panel passes.
+"""Panel reflexion loop test (v4): forced flagged finding → the panel wants a
+rewrite (the flag ratio) → compose gets the judge's notes → the next pass
+cites properly → the panel passes.
 
-Drives the REAL v3 graph end-to-end with scripted LLMs (no network):
-intake → brief → scout ══gate══ research → outline → compose → panel
-→ (revise → compose → panel) → report_builder ══gate══ deliver.
+Drives the REAL graph end-to-end with scripted LLMs (no network):
+intake → brief → scout ══gate══ research → outline → compose → analyst →
+panel → (compose → analyst → panel) → report_builder ══gate══ deliver.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -18,7 +18,6 @@ from langgraph.types import Command
 from argus.config import get_settings
 from argus.graph import build_graph
 from argus.graph.nodes import _parse_json_obj
-from argus.llm import CallRecord
 
 from helpers import fake_llm, make_run_config
 
@@ -46,25 +45,11 @@ BRIEF_JSON = """{
 }"""
 
 
-class _FakeResp:
-    def __init__(self, content: str):
-        self.content = content
-        self.response_metadata = {"model_name": "fake"}
-        self.usage_metadata = {"input_tokens": 1, "output_tokens": 1}
-
-
-def _fake_record(tier, req, resp):
-    return CallRecord(role=f"legacy.{tier}", tier=tier, profile="fake", provider="fake",
-                      requested_model=req, served_model="fake", routed_via="",
-                      served_provider="fake")
-
-
 def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
     """First compose produces a finding the grounding judge flags →
     verdict revise → recompose with the judges' notes → judge passes.
     Asserts the loop is wired, notes flow, and the report lands on
     disk with the citation intact."""
-    from argus.graph import brief as brief_mod
     from argus.graph import graph as graph_mod
     from argus.graph import research as research_mod
     from argus.graph import scout as scout_mod
@@ -79,58 +64,34 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
                 "model_calls": [], "messages": []}
     monkeypatch.setattr(graph_mod, "intake_node", _fake_intake)
 
-    # ---- ONE scripted LLM for every stage -----------------------------
-    # brief_mod.llm, compose_mod.llm and panel_mod.llm are the SAME
-    # module object (argus.llm), so a single content-dispatching fake
-    # serves all stages.
-    compose_calls = {"write": 0}
+    # ---- ONE scripted LLM for every stage (llm.complete on a fake driver)
+    compose_calls = {"write": 0, "analyst": 0}
     judge_calls = {"grounding": 0}
 
-    def _fake_invoke(chat, msgs, **kw):
-        system = msgs[0].content
+    def _reply(system, human):
         if "research scoper" in system:
-            return _FakeResp(BRIEF_JSON)
+            return BRIEF_JSON
         if "Extract the factual findings" in system:
-            return _FakeResp(
-                '{"findings": [{"claim": "X is true", "source_ids": [1], '
-                '"confidence": "high"}]}')
+            return ('{"findings": [{"claim": "X is true", "sentence": "X is true [1].", '
+                    '"source_ids": [1], "confidence": "high"}]}')
         if "grounding auditor" in system:
             judge_calls["grounding"] += 1
             if judge_calls["grounding"] == 1:
-                return _FakeResp(
-                    '{"verdict": "revise", "flagged_finding_ids": ["f0"], '
-                    '"unsupported_claims": ["X is true"], '
-                    '"notes": ["quote the supporting evidence directly"]}')
-            return _FakeResp('{"verdict": "pass", '
-                             '"flagged_finding_ids": [], '
-                             '"unsupported_claims": [], "notes": []}')
-        if "COVERAGE" in system:
-            return _FakeResp('{"verdict": "pass", "weak_sections": [], '
-                             '"missing": [], "notes": []}')
-        if "fabrication risk" in system:
-            return _FakeResp('{"verdict": "pass", "suspicious": [], '
-                             '"notes": []}')
+                ids = [line.split("]")[0][1:] for line in human.splitlines() if line.startswith("[f")]
+                return json.dumps({"flagged": [{"id": i, "reason": "no quote"} for i in ids],
+                                   "notes": ["quote the supporting evidence directly"]})
+            return '{"flagged": [], "notes": []}'
+        if "ANALYSIS part" in system:
+            compose_calls["analyst"] += 1
+            return "### Key takeaways\n\n- X is true [1]\n"
         # flat report writer (short mode)
         compose_calls["write"] += 1
         if compose_calls["write"] == 1:
-            return _FakeResp("## TL;DR\n\nX is true [1].\n\n"
-                             "## Key Findings\n\n1. X is true [1].")
-        return _FakeResp("## TL;DR\n\nX is true, per the direct quote "
-                         "[1].\n\n## Key Findings\n\n1. X is true, with "
-                         "the supporting quote attached [1].")
+            return "X is true [1]."
+        assert "quote the supporting evidence directly" in human, "the judge's notes reach the rewrite"
+        return "X is true, per the direct quote [1]."
 
-    # brief.draft runs through llm.complete (v4 WP-I): the same scripted
-    # replies behind a fake driver.
-    fake_llm(monkeypatch, lambda system, human: _fake_invoke(
-        None, [SimpleNamespace(content=system), SimpleNamespace(content=human)]).content)
-    monkeypatch.setattr(brief_mod.llm, "chat_for_tier",
-                        lambda tier, **kw: object())
-    monkeypatch.setattr(brief_mod.llm, "invoke_with_retry", _fake_invoke)
-    monkeypatch.setattr(brief_mod.llm, "record_from_response", _fake_record)
-    monkeypatch.setattr(brief_mod.llm, "resolve_tier",
-                        lambda t, force=False: "fake")
-    monkeypatch.setattr(brief_mod.llm, "pick_strong_and_judge",
-                        lambda force=False: ("fake-strong", "fake-judge"))
+    seen = fake_llm(monkeypatch, _reply)
 
     # ---- scout: deterministic queries + one wave hit -----------------
     monkeypatch.setattr(scout_mod, "plan_queries",
@@ -179,7 +140,8 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
     g.invoke({
         "thread_id": "test:panel-reflexion", "user_id": 0,
         "user_request": "is X true?",
-        "run_config": make_run_config("short", **{"research.rerank": False}),
+        "run_config": make_run_config("short", **{"research.rerank": False,
+                                                   "panel.max_compose_revisions": 1}),
         "messages": [], "plan": None, "sources": [], "fetched": [],
         "findings": [], "draft_md": "", "revision_notes": [],
         "revision_rounds": 0, "model_calls": [],
@@ -197,13 +159,14 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
     snap = g.get_state(cfg)
     assert tuple(snap.next) == ("deliver",), snap.next
 
-    # The panel loop ran: revise then pass.
+    # The panel loop ran: a rewrite, then a pass.
     assert judge_calls["grounding"] == 2, judge_calls
-    assert compose_calls["write"] == 2, compose_calls
+    assert compose_calls == {"write": 2, "analyst": 2}, compose_calls
     final = snap.values
     assert (final.get("review_verdict") or {}).get("verdict") == "pass"
-    notes = " | ".join(final.get("revision_notes") or [])
-    assert "quote the supporting evidence directly" in notes, notes
+    assert (final["compose_runs"], final["revision_rounds"]) == (2, 1)
+    rewrite = [m[1] for m in seen if m[0].startswith("You write a complete short")][1]
+    assert "quote the supporting evidence directly" in rewrite
 
     # Finish: deliver.
     g.invoke(Command(resume=True), config=cfg)

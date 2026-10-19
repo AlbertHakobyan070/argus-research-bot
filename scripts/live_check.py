@@ -6,7 +6,7 @@ engines (resolved first with ``registry.active_snapshot()``) and live search,
 ``run_config`` with ``origin="live_check"``, auto-resume through the plan and
 report gates, ``durability="sync"``, ``control=RunControl()``. It writes the
 bench result layout ``<out>/<qid>/{state.json, report.md, metadata.json,
-evidence.json (once WP-C writes it), record.json}``, prints the acceptance
+evidence.json, record.json}``, prints the acceptance
 table and the run's ``bench.metrics``, and exits 1 when any check fails. A
 check whose field the run does not have (``compose_runs`` before WP-C, say)
 is "n/a", not a failure. The report folder goes under ``<out>/<qid>/reports``
@@ -19,7 +19,10 @@ Usage (from the repo root; one live run against the proxy's quota):
 
 ``--query`` takes a bench query id (``bench/queries.jsonl``) or the query
 text; ``--expect-banner`` (nonexistent-entity queries, q013/q014) expects the
-grounding banner and at most 3 findings. Then compare with the v3 baseline:
+grounding banner and at most 3 findings. Every run expects the v4 banners
+("⚠ Not fact-checked", "⚠ Degraded run") absent and report.pdf on disk; the
+evidence.json check validates it with ``graph.evidence_export.Evidence``.
+Then compare with the v3 baseline:
     PYTHONPATH="" ./venv/Scripts/python.exe -m bench.compare --a bench/results/v3-baseline --b <out>
 """
 from __future__ import annotations
@@ -38,18 +41,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
+from argus.graph.evidence_export import Evidence  # noqa: E402
 from argus.graph.run_config import PRESETS  # noqa: E402
 from argus.graph.state import VALID_LENGTHS  # noqa: E402
 from bench import metrics, runner  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 NA = metrics.NA
 QUERIES = ROOT / "bench" / "queries.jsonl"
 BANNER = "Limited direct evidence"                       # graph/grounding.py grounding_banner()
+NOT_FACT_CHECKED = "⚠ Not fact-checked"                   # report_builder's banners (spec §2.8)
+DEGRADED = "⚠ Degraded run"
 FAILURE_TEXTS = ("synthesis_no_evidence", "report suppressed")
-EVIDENCE_KEYS = ("schema", "run", "run_config", "engines", "brief", "coverage", "gap_history",
-                 "compose_runs", "revision_rounds", "gap_waves", "revise_rounds", "extend_rounds",
-                 "degraded", "sources", "notes", "findings", "analysis", "tldr", "panel", "search",
-                 "degradations", "errors")                # spec §2.6, schema 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -114,8 +117,9 @@ def check_evidence(run, m):
 
 def _kept(run) -> list[dict]:
     """The findings the report kept: status ``kept``, or none at all (v3).
-    A ``cut`` or ``unlocated`` finding never counts."""
-    return [f for f in run["state"].get("findings") or [] if (f.get("status") or "kept") == "kept"]
+    A ``cut`` or ``unlocated`` finding never counts. evidence.json first, as
+    the bench metrics read them (``metrics._findings``)."""
+    return [f for f in metrics._findings(run) or [] if (f.get("status") or "kept") == "kept"]
 
 
 def check_cited_findings(run, m):
@@ -168,21 +172,26 @@ def check_compose_budget(run, m):
     return _metric(m, "compose_budget_ok", lambda v: v is True)
 
 
+def check_pdf_exists(run, m):
+    pdf = (run["state"].get("report_paths") or {}).get("pdf")
+    if not pdf:
+        return "FAIL", "no report.pdf (report_paths['pdf'] is empty: see the pdf: line in errors)"
+    return _verdict(Path(pdf).is_file(), pdf if Path(pdf).is_file() else f"{pdf} is missing")
+
+
 def check_evidence_json(run, m):
     ev = run["evidence"]
     if ev is None:
-        return NA, "no evidence.json (WP-C writes it)"
+        return NA, "no evidence.json"
     if not isinstance(ev, dict):
         return "FAIL", "not a JSON object"
-    problems = []
-    if ev.get("schema") != 1:
-        problems.append(f"schema {ev.get('schema')!r}")
-    missing = [k for k in EVIDENCE_KEYS if k not in ev]
-    if missing:
-        problems.append("missing " + ", ".join(missing))
+    try:
+        Evidence.model_validate(ev)
+    except ValidationError as e:
+        return "FAIL", "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors()[:6])
     if '"markdown_path":' in json.dumps(ev):
-        problems.append("carries a markdown_path")
-    return _verdict(not problems, "; ".join(problems) or "schema 1, every §2.6 key")
+        return "FAIL", "carries a markdown_path"
+    return "PASS", "schema 1, valid (graph.evidence_export.Evidence)"
 
 
 def check_metadata_engines(run, m):
@@ -210,6 +219,20 @@ def check_banner_present(run, m):
     return (NA, "no report.md") if md is None else _verdict(BANNER in md, "present" if BANNER in md else "absent")
 
 
+def _absent(text: str):
+    def check(run, m):
+        md = run["report"]
+        if md is None:
+            return NA, "no report.md"
+        line = next((ln.lstrip("> ").strip() for ln in md.splitlines() if text in ln), None)
+        return _verdict(line is None, line or "absent")
+    return check
+
+
+check_not_fact_checked_absent = _absent(NOT_FACT_CHECKED)
+check_degraded_absent = _absent(DEGRADED)
+
+
 def checks(expect_banner: bool) -> list[tuple[str, object]]:
     return [
         ("run completed", check_run_completed),
@@ -218,6 +241,7 @@ def checks(expect_banner: bool) -> list[tuple[str, object]]:
         ("findings <= 3", check_few_findings) if expect_banner
         else ("findings with citations > 0", check_cited_findings),
         ("report.md > 1000 chars", check_report_size),
+        ("report.pdf exists", check_pdf_exists),
         ("sources_block_present", check_sources_block),
         ("cite_markers_unresolved == 0", check_cite_markers),
         ("flagged_claims_in_body == 0", check_flagged_in_body),
@@ -228,6 +252,8 @@ def checks(expect_banner: bool) -> list[tuple[str, object]]:
         ("no synthesis_no_evidence / report suppressed text", check_no_failure_text),
         ("grounding banner present", check_banner_present) if expect_banner
         else ("grounding banner absent", check_banner_absent),
+        ("⚠ Not fact-checked banner absent", check_not_fact_checked_absent),
+        ("⚠ Degraded run banner absent", check_degraded_absent),
     ]
 
 

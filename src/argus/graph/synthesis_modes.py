@@ -58,10 +58,11 @@ class SynthesisMode:
         ``temperature`` for the compose writer calls. Lower for short
         factual modes, slightly higher for lecture (more prose-y).
     template
-        Descriptive only in v3 — no code branches on it; the flat vs
-        sectioned choice comes from ``compose._MODE_SECTIONS``. Values:
-        ``"minimal"``      - single TL;DR paragraph
-        ``"flat"``         - current behaviour: TL;DR + numbered findings
+        Descriptive only — no code branches on it; the flat vs sectioned
+        choice comes from ``outline._MODE_SECTIONS``. Values:
+        ``"minimal"``      - single answer paragraph (under ## Findings)
+        ``"flat"``         - the findings body (## Findings), no headings
+                             of the writer's own
         ``"sectioned"``    - adds ## Background / ## Current state / ##
                              Open problems / ## Sources headings
         ``"lecture"``      - full Parts I-IV + References + Appendix

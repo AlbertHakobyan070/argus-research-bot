@@ -31,10 +31,13 @@ def _live_engines(monkeypatch):
 
 
 def _make_state_in(thread_id: str, user_id: int, text: str) -> dict:
+    from argus.graph.run_config import RunConfig
     return {
         "thread_id": thread_id,
         "user_id": user_id,
         "user_request": text,
+        "run_config": RunConfig.from_preset(       # v4: every node reads it (WP-C: intake, quick_answer)
+            length="short", engines=registry.current_snapshot_cached(), origin="telegram").model_dump(),
         "messages": [], "plan": None,
         "sources": [], "fetched": [], "findings": [],
         "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -116,12 +119,9 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
 
     monkeypatch.setattr(research_mod, "fetch_one_source", fake_fetch)
 
-    from argus.graph.run_config import RunConfig
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "test:deep"}}
     state_in = _make_state_in("test:deep", 1, "LLM agent benchmarks")
-    state_in["run_config"] = RunConfig.from_preset(       # v4: scout/research read it (WP-B)
-        length="short", engines=registry.current_snapshot_cached(), origin="telegram").model_dump()
     g.invoke(state_in, config=cfg)
     # Grounded plan gate: paused AFTER scout, before research.
     snap = g.get_state(cfg)

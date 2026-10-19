@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from argus.tools import _register_report_fonts, _strip_emoji, markdown_to_pdf
+from helpers import make_run_config
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +65,8 @@ def test_strip_emoji_leaves_markdown_structure_untouched():
 # ---------------------------------------------------------------------------
 
 def test_report_fonts_register_to_bundled_files_not_base14():
-    """A missing/broken font file must not silently fall back without
-    trace — this asserts the REAL bundled fonts are what's active in
-    this environment (base14 fallback is a separate degrade path, not
-    the expected state of a checked-out repo)."""
+    """The REAL bundled fonts are what's active in this environment (a
+    missing or broken font file raises — there is no base14 fallback)."""
     fonts = _register_report_fonts()
     assert fonts["display"] == "Cardo-Regular"
     assert fonts["body"] == "CrimsonText-Regular"
@@ -150,20 +149,22 @@ def test_markdown_to_pdf_handles_title_page_and_body_h1_without_raising(tmp_path
     assert out.stat().st_size > 5_000
 
 
-def test_markdown_to_pdf_survives_missing_font_dir(tmp_path, monkeypatch):
-    """The bundled-font lookup must degrade to base14, never crash a
-    report delivery, if the assets directory is unavailable.
+def test_a_missing_font_dir_raises(tmp_path, monkeypatch):
+    """No hidden base14 fallback (v4 WP-C): a missing bundled font raises, so
+    report_builder records the PDF failure (``[r<k>] pdf: …`` in errors and
+    the degradation notes) while report.md still ships.
 
     monkeypatch reverts both attributes (including the font-role cache)
-    to their pre-test values on teardown, so this cannot leak a base14
-    fallback into later tests.
+    to their pre-test values on teardown.
     """
+    from reportlab.pdfbase.ttfonts import TTFError
+
     import argus.tools as tools_mod
     monkeypatch.setattr(tools_mod, "_REPORT_FONT_ROLES", None)
     monkeypatch.setattr(tools_mod, "FONTS_DIR", tmp_path / "does-not-exist")
-    fonts = tools_mod._register_report_fonts()
-    assert fonts["display"] == "Times-Bold"
-    assert fonts["body"] == "Times-Roman"
+    with pytest.raises(TTFError, match="does-not-exist"):
+        tools_mod._register_report_fonts()
+    assert tools_mod._REPORT_FONT_ROLES is None, "nothing half-registered is cached"
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +215,14 @@ def test_report_builder_records_pdf_failure(tmp_path, monkeypatch):
 
     out = nodes_mod.report_builder_node({
         "user_request": "pdf failure probe", "length": "short",
+        "run_config": make_run_config("short"),
         "draft_md": "# probe\n\nBody text.\n",
     })
 
     assert out["report_paths"]["pdf"] is None
     assert out["hitl"]["ctx"]["paths"]["pdf"] is None
     errors = out.get("errors") or []
-    assert len(errors) == 1 and errors[0].startswith("pdf: "), errors
+    assert len(errors) == 1 and errors[0].startswith("[r1] pdf: RuntimeError: "), errors
     assert "reportlab exploded" in errors[0]
     assert Path(out["report_paths"]["md"]).exists()
 
@@ -238,6 +240,7 @@ def test_report_builder_returns_pdf_path_on_success(tmp_path, monkeypatch):
 
     out = nodes_mod.report_builder_node({
         "user_request": "pdf success probe", "length": "short",
+        "run_config": make_run_config("short"),
         "draft_md": "# probe\n\nBody text.\n",
     })
 

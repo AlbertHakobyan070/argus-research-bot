@@ -1,45 +1,62 @@
-"""v3 compose stage — outline → parallel section writers → assembly.
+"""v4 compose (spec §3 WP-C, §2.8): section writers on their allocated notes,
+the reuse rule, the R11 merge of a skipped first write, the dedupe pass and
+the findings extractor.
 
-STORM-style: an outline is planned first, then each section is written
-by its own strong-tier call that sees ONLY that section's evidence
-notes. Writers emit PLAIN MARKDOWN — never markdown-inside-JSON (the v2
-fragility that produced the 2026-07-12 empty-report bug is structurally
-gone). Findings for the citation/quarantine machinery are extracted per
-section afterwards in small JSON passes, with claims citing source ids
-(short ints — far more weak-model-robust than long URLs).
+Sectioned lengths: one ``compose.section`` call per section, which sees only
+the notes the outline allocated to it (``note_ids``) plus the pinned ones,
+filtered by ``writer_min_relevance`` and ``quote_verified is not False``
+(``outline.usable_notes``) — never the whole evidence. Compose writes
+``panel_verdict.revise_sections`` on a panel rewrite (``next == "compose"``),
+else ``outline.changed_sections`` (fresh, gap wave, extend, user revise), and
+always a section not written before; every other section is reused as it was
+(md, ``note_ids``, findings, re-ided in outline order). A skipped first write
+merges its notes into its neighbour (the previous section, else the next),
+which is written once more with them; when that re-write is skipped too, the
+neighbour keeps its version and the notes are reported as unwritten. A
+skipped re-write keeps the previous version; every section skipped raises.
+Flat lengths: one ``compose.flat`` call (``raise``) writes the body that
+``assemble_draft`` puts under ``## Findings``.
 
-Revision modes:
-- panel revise  → rewrite only ``panel_verdict.revise_sections`` with
-  the judges' notes;
-- user revise   → rewrite every section with the user's notes
-  (``revision_notes``).
+Every writer reply goes through ``normalize_cite_markers`` before the
+``compose.findings_extract`` pass (one call per written section; each finding
+carries its verbatim ``sentence``) and the assembly. The dedupe pass cuts a
+later near-duplicate of an earlier section's finding from a section written
+in this run. No TL;DR here: report_builder builds it after the cuts.
+User revision notes reach the writers newest first, then the panel's notes
+on a panel rewrite (8 at most).
 """
 from __future__ import annotations
 
 import logging
-import os
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from difflib import SequenceMatcher
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.runtime import Runtime
 
-from .. import llm
-from .assemble import build_sources_block, strip_duplicate_heading, strip_fences
+from .. import llm, quarantine
+from . import run_config
+from .assemble import CITE_RE, assemble_draft, normalize_cite_markers, strip_duplicate_heading, strip_fences
 from .grounding import check_grounding, grounding_warning_prompt
-from .jsonx import parse_json_obj, salvage_objects
-from .outline import OUTLINE_SYSTEM, default_outline, outline_node  # noqa: F401  (re-export: moved to outline.py, WP-I)
-from .state import ResearchBrief
-from .synthesis_modes import get_mode, is_valid as is_valid_length
+from .jsonx import parse_json_obj
+from .outline import OUTLINE_SYSTEM, _ints, default_outline, outline_node, usable_notes  # noqa: F401  (re-export: moved to outline.py, WP-I)
+from .research import _round
+from .state import OutlineSection, ResearchBrief
+from .synthesis_modes import get_mode
 
 logger = logging.getLogger("argus.compose")
 
-_COMPOSE_CONCURRENCY = int(os.environ.get("ARGUS_COMPOSE_CONCURRENCY", "3"))
-
 _MODE_SECTION_TOKENS = {"medium": 1200, "long": 1800, "lecture": 2200}
+_MIN_CHARS = 40                 # a shorter section reply is an empty write (a skip)
+_MAX_REVISION_NOTES = 8
+_DUP_RATIO = 0.85               # = bench.metrics.cross_section_duplicate_ratio's threshold
+_ANALYSIS = "Analysis"          # = insight.ANALYSIS_SECTION (insight imports this module)
 
 
 # ---------------------------------------------------------------------------
-# Section writers
+# Prompts
 # ---------------------------------------------------------------------------
 
 SECTION_SYSTEM = """You write ONE section of a grounded research report.
@@ -68,9 +85,9 @@ Rules:
    knowledge. If evidence is thin, say so.
 2. Cite with [n] after each factual claim, n = the source id on the
    evidence note. Every number/date/name must come from the evidence.
-3. Structure: ## TL;DR (short paragraph), ## Key Findings (numbered,
-   each 1-2 sentences with citations). Do NOT write a Sources section —
-   it is added automatically.
+3. Write the findings as short paragraphs or a numbered list, each point
+   1-2 sentences with its citations. No headings (added automatically), no
+   summary paragraph, no Sources section (added automatically).
 4. Output RAW MARKDOWN only — no JSON, no code fences.
 """
 
@@ -79,38 +96,53 @@ the user's question from the evidence notes only. Cite with [n] inline
 (n = source id). If the evidence can't answer, say so plainly. Output
 raw text only."""
 
+EXTRACT_SYSTEM = """Extract the factual findings from ONE section of a
+research report. A finding = one claim with the source ids it cites.
+
+Return ONLY JSON:
+{"findings": [{"claim": "...", "sentence": "...", "source_ids": [2, 5],
+               "confidence": "high|medium|low"}]}
+
+Rules:
+- claim: the fact, condensed from the section — never invented.
+- sentence: the section's own sentence (or adjacent sentences) stating
+  it, copied VERBATIM with its [n] markers: character for character, no
+  rewording, no shortening.
+- source_ids: the [n] numbers cited by that sentence.
+- Skip sentences with no citation.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Notes
+# ---------------------------------------------------------------------------
 
 def _is_local_note(n: dict) -> bool:
     """User-appended vault material (file:///) — pinned, never crowded out."""
     return str(n.get("source_url") or "").startswith("file:///")
 
 
-def render_notes(evidence: list[dict], sub_qs: list[int] | None,
-                 *, max_chars: int = 7000) -> str:
-    """Render evidence notes (optionally filtered by sub-question) as
-    [n]-labelled blocks for a writer prompt. Pinned (user-appended
-    local) notes first, then strong notes."""
-    picked: list[dict] = []
-    for n in evidence:
-        if sub_qs is not None and not _is_local_note(n) \
-                and not (set(n.get("sub_qs") or []) & set(sub_qs)):
-            continue
-        picked.append(n)
-    if not picked and sub_qs is not None:
-        picked = list(evidence)  # graceful: don't starve a section
-    picked.sort(key=lambda n: (_is_local_note(n),
-                               int(n.get("relevance") or 0)), reverse=True)
+def render_notes(evidence: list[dict], note_ids, *, max_chars: int = 7000,
+                 pinned: frozenset[int] = frozenset()) -> str:
+    """The notes with a source id in ``note_ids`` (None: every note), plus
+    the local and ``pinned`` ones, as ``[n]``-labelled blocks for a writer
+    prompt: pinned first, then by relevance; a claim whose quote failed
+    verification is left out. Stops at ``max_chars``."""
+    def is_pinned(n: dict) -> bool:
+        return _is_local_note(n) or int(n.get("source_id") or 0) in pinned
+
+    wanted = None if note_ids is None else set(note_ids)
+    picked = [n for n in evidence if wanted is None or int(n.get("source_id") or 0) in wanted or is_pinned(n)]
+    picked.sort(key=lambda n: (is_pinned(n), int(n.get("relevance") or 0)), reverse=True)
     blocks: list[str] = []
     total = 0
     for n in picked:
         claims = "\n".join(
-            f"   • {c.get('text')} (conf: {c.get('confidence','medium')})"
+            f"   • {c.get('text')} (conf: {c.get('confidence', 'medium')})"
             + (f'\n     quote: "{c.get("quote")}"' if c.get("quote") else "")
-            for c in (n.get("claims") or []))
-        block = (f"[{n.get('source_id')}] {n.get('title') or '(untitled)'} "
-                 f"— {n.get('source_url')}\n"
-                 f"   relevance {n.get('relevance')}/5, "
-                 f"stance: {n.get('stance')}\n{claims}")
+            for c in n.get("claims") or [] if c.get("quote_verified") is not False)
+        block = (f"[{n.get('source_id')}] {n.get('title') or '(untitled)'} — {n.get('source_url')}\n"
+                 f"   relevance {n.get('relevance')}/5, stance: {n.get('stance')}\n{claims}")
         if total + len(block) > max_chars:
             break
         blocks.append(block)
@@ -118,178 +150,65 @@ def render_notes(evidence: list[dict], sub_qs: list[int] | None,
     return "\n\n".join(blocks) or "(no evidence notes)"
 
 
-def _write_section(section: dict, brief: ResearchBrief, state: dict,
-                   notes_block: str, *, length: str,
-                   extra_notes: list[str]) -> tuple[str, dict | None, str]:
-    """Write one section body. Returns (markdown, model_call, error)."""
-    mode = get_mode(length)
-    grounding_warn = grounding_warning_prompt(
-        check_grounding(state), state.get("user_request") or "")
-    # Only the FIRST 8 notes reach the prompt. revision_notes grows by the
-    # panel's notes every revise round and bot.py appends the user's
-    # revise request LAST, so after a panel revise round the user's
-    # request can fall outside this slice and silently never reach the
-    # writer (probe-verified; _write_flat has the same cap).
-    notes_extra = ""
-    if extra_notes:
-        notes_extra = ("\n\nREVISION NOTES (must address):\n"
-                       + "\n".join(f"- {n}" for n in extra_notes[:8]))
-    covered = "\n".join(
-        f"- {brief.sub_questions[i].q}"
-        for i in (section.get("sub_qs") or [])
-        if i < len(brief.sub_questions))
-    human = (
-        f"Report topic: {state.get('user_request')}\n"
-        f"Section: {section.get('title')}\n"
-        f"Focus: {section.get('focus') or '(general)'}\n"
-        f"Sub-questions to answer here:\n{covered or '- (general coverage)'}\n"
-        f"Target: ~{max(400, mode.target_chars_max // max(1, len((state.get('outline') or {}).get('sections') or [1])))} chars."
-        f"{notes_extra}\n\n"
-        f"EVIDENCE NOTES:\n{notes_block}\n\n"
-        "Write the section body markdown now."
-    )
-    try:
-        chat = llm.chat_for_tier(
-            "strong", temperature=mode.temperature,
-            max_tokens=_MODE_SECTION_TOKENS.get(length, 1200))
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content=SECTION_SYSTEM + grounding_warn),
-            HumanMessage(content=human[:13000]),
-        ])
-        call = llm.record_from_response(
-            "strong", llm.resolve_tier("strong"), resp).model_dump()
-        md = strip_fences(resp.content)
-        md = strip_duplicate_heading(md, section.get("title", ""))
-        if len(md.strip()) < 40:
-            return "", call, (f"compose: section '{section.get('title')}' "
-                              "came back empty")
-        return md.strip(), call, ""
-    except Exception as e:
-        return "", None, (f"compose: section '{section.get('title')}' "
-                          f"failed ({e})")
+def _pinned_ids(notes: list[dict], fetched: list[dict]) -> frozenset[int]:
+    out = set()
+    for n in notes:
+        i = int(n["source_id"])
+        if _is_local_note(n) or (0 < i <= len(fetched) and fetched[i - 1].get("pinned")):
+            out.add(i)
+    return frozenset(out)
 
 
-def _write_flat(state: dict, brief: ResearchBrief, *, length: str,
-                extra_notes: list[str]) -> tuple[str, list[dict], list[str]]:
-    """tldr/short path: one writer call for the whole body."""
-    mode = get_mode(length)
-    evidence = state.get("evidence") or []
-    notes_block = render_notes(evidence, None, max_chars=8000)
-    grounding_warn = grounding_warning_prompt(
-        check_grounding(state), state.get("user_request") or "")
-    system = TLDR_SYSTEM if length == "tldr" else FLAT_SYSTEM
-    # Same 8-note cap as _write_section (see the note there).
-    notes_extra = ""
-    if extra_notes:
-        notes_extra = ("\n\nREVISION NOTES (must address):\n"
-                       + "\n".join(f"- {n}" for n in extra_notes[:8]))
-    human = (
-        f"Question: {state.get('user_request')}\n"
-        f"Target length: {mode.target_chars_min}-{mode.target_chars_max} "
-        f"chars.{notes_extra}\n\n"
-        f"EVIDENCE NOTES:\n{notes_block}\n\nWrite the markdown now."
-    )
-    try:
-        chat = llm.chat_for_tier("strong", temperature=mode.temperature,
-                                 max_tokens=mode.max_tokens)
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content=system + grounding_warn),
-            HumanMessage(content=human[:13000]),
-        ])
-        call = llm.record_from_response(
-            "strong", llm.resolve_tier("strong"), resp).model_dump()
-        return strip_fences(resp.content), [call], []
-    except Exception as e:
-        return "", [], [f"compose: flat write failed ({e})"]
+def _revision_block(notes: list[str]) -> str:
+    if not notes:
+        return ""
+    return "\n\nREVISION NOTES (must address):\n" + "\n".join(f"- {n}" for n in notes)
 
 
 # ---------------------------------------------------------------------------
-# TL;DR + assembly
+# The findings extractor
 # ---------------------------------------------------------------------------
 
-def _write_tldr(state: dict, body: str) -> tuple[str, list[dict], list[str]]:
-    human = (f"Question: {state.get('user_request')}\n\n"
-             f"REPORT BODY:\n{body[:9000]}\n\n"
-             "Write a 2-4 sentence TL;DR of this report. Keep the [n] "
-             "citations of the claims you compress. Raw text only.")
+def _parse_findings(text: str) -> list[dict]:
+    data = parse_json_obj(text, require_any=("findings",))
+    raw = data.get("findings")
+    if not isinstance(raw, list):
+        raise ValueError(f"'findings' is {type(raw).__name__}, not a list")
+    return [f for f in raw if isinstance(f, dict)]
+
+
+def extract_findings(title: str, md: str, fetched: list[dict], *, engines, rnd: int
+                     ) -> tuple[list[dict], list[dict], list[str]]:
+    """The findings of one section (or of the analysis): ``(findings, model
+    call records, errors)``. One ``compose.findings_extract`` call; each
+    finding keeps the verbatim ``sentence`` (markers normalised) and cites
+    the ids in it — the model's ``source_ids`` only when the sentence has
+    none. A finding citing nothing is left out; one citing only unknown ids
+    is kept (report_builder cuts it). A skipped call is the declared
+    ``[r<k>] skip: compose.findings_extract <title> (…)`` line."""
+    by_id = {i + 1: f.get("url") or "" for i, f in enumerate(fetched)}
     try:
-        chat = llm.chat_for_tier("cheap", temperature=0.2, max_tokens=350)
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content="You summarize research reports faithfully."),
-            HumanMessage(content=human),
-        ])
-        call = llm.record_from_response(
-            "cheap", llm.resolve_tier("cheap"), resp).model_dump()
-        return strip_fences(resp.content), [call], []
-    except Exception as e:
-        return "", [], [f"compose: tldr write failed ({e})"]
-
-
-# ---------------------------------------------------------------------------
-# Findings extraction (feeds citation verification + quarantine)
-# ---------------------------------------------------------------------------
-
-EXTRACT_SYSTEM = """Extract the factual findings from ONE section of a
-research report. A finding = one claim with the source ids it cites.
-
-Return ONLY JSON:
-{"findings": [{"claim": "...", "source_ids": [2, 5],
-               "confidence": "high|medium|low"}]}
-
-Rules: claims must be copied/condensed from the section (not invented);
-source_ids are the [n] citation numbers attached to the claim; skip
-sentences with no citation.
-"""
-
-
-def _extract_findings(section_title: str, section_md: str,
-                      fetched: list[dict]
-                      ) -> tuple[list[dict], dict | None, str]:
-    by_id = {i + 1: f.get("url", "") for i, f in enumerate(fetched)}
-    try:
-        chat = llm.chat_for_tier("cheap", temperature=0.1, max_tokens=900)
-        resp = llm.invoke_with_retry(chat, [
+        res = llm.complete("compose.findings_extract", [
             SystemMessage(content=EXTRACT_SYSTEM),
-            HumanMessage(content=(f"Section: {section_title}\n\n"
-                                  f"{section_md[:8000]}\n\n"
-                                  "Return the findings JSON.")),
-        ])
-        call = llm.record_from_response(
-            "cheap", llm.resolve_tier("cheap"), resp).model_dump()
-    except Exception as e:
-        return [], None, f"findings: '{section_title}' failed ({e})"
-    raw_findings: list[dict] = []
-    try:
-        data = parse_json_obj(resp.content, require_any=("findings",))
-        raw_findings = list(data.get("findings") or [])
-    except Exception:
-        raw_findings = salvage_objects(resp.content,
-                                       required_keys=("claim",))
+            HumanMessage(content=f"Section: {title}\n\n{md}\n\nReturn the findings JSON.")],
+            engines=engines, temperature=0.1, max_tokens=2000, validate=_parse_findings, item=title)
+    except llm.EngineSkipped as e:
+        logger.warning("compose.findings_extract skipped for %r (%s)", title, e)
+        return [], [a.model_dump() for a in e.attempts], [f"[r{rnd}] skip: compose.findings_extract {title} ({e})"]
     out: list[dict] = []
-    for fd in raw_findings:
-        if not isinstance(fd, dict) or not (fd.get("claim") or "").strip():
+    for fd in res.parsed:
+        claim = str(fd.get("claim") or "").strip()
+        if not claim:
             continue
-        urls = []
-        for sid in fd.get("source_ids") or []:
-            try:
-                u = by_id.get(int(sid), "")
-            except (TypeError, ValueError):
-                continue
-            if u:
-                urls.append(u)
-        # Legacy shape tolerance: citation_urls straight from the model.
-        for u in fd.get("citation_urls") or []:
-            if isinstance(u, str) and u.startswith("http"):
-                urls.append(u)
-        if not urls:
+        sentence = normalize_cite_markers(str(fd.get("sentence") or "")).strip()
+        ids = list(dict.fromkeys(int(i) for i in CITE_RE.findall(sentence))) or _ints(fd.get("source_ids"))
+        if not ids:
             continue
-        conf = fd.get("confidence", "medium")
-        if conf not in ("high", "medium", "low"):
-            conf = "medium"
-        out.append({"claim": str(fd["claim"])[:600],
-                    "citation_urls": list(dict.fromkeys(urls)),
-                    "confidence": conf, "section": section_title})
-    return out, call, ""
+        confidence = fd.get("confidence") if fd.get("confidence") in ("high", "medium", "low") else "medium"
+        out.append({"claim": claim[:600], "citation_urls": [by_id[i] for i in ids if by_id.get(i)],
+                    "confidence": confidence, "section": title, "source_ids": ids, "sentence": sentence,
+                    "status": "kept"})
+    return out, [r.model_dump() for r in res.records], []
 
 
 # ---------------------------------------------------------------------------
@@ -358,197 +277,309 @@ def _no_evidence_md(topic: str, *, length: str, fetched_count: int,
 
 
 # ---------------------------------------------------------------------------
-# The compose node
+# Writers
 # ---------------------------------------------------------------------------
 
-def compose_node(state) -> dict:
-    """Write (or revise) the report from the evidence notes."""
-    length = state.get("length") or "short"
-    if not is_valid_length(length):
-        length = "short"
-    brief = ResearchBrief.model_validate(state.get("brief") or {})
-    evidence = state.get("evidence") or []
+def _emit(runtime: Runtime | None, kind: str, data: dict) -> None:
+    if runtime is not None:
+        runtime.stream_writer({"kind": kind, "node": "compose", "data": data})
+
+
+class _Ctx:
+    """What every writer of one compose run shares."""
+
+    def __init__(self, state, rc: run_config.RunConfig, brief: ResearchBrief, notes: list[dict],
+                 revision_notes: list[str], n_sections: int):
+        self.state, self.rc, self.brief, self.notes = state, rc, brief, notes
+        self.fetched = state.get("fetched") or []
+        self.pinned = _pinned_ids(notes, self.fetched)
+        self.revision_notes = revision_notes
+        self.n_sections = n_sections
+        self.rnd = _round(state)
+        self.grounding_warn = grounding_warning_prompt(check_grounding(state), state.get("user_request") or "")
+
+
+def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
+                   ) -> tuple[str | None, list[dict], str | None]:
+    """One ``compose.section`` write: ``(md | None, records, skip line | None)``."""
+    mode = get_mode(ctx.rc.length)
+    title = section.title
+    covered = "\n".join(f"- {ctx.brief.sub_questions[i].q}" for i in section.sub_qs
+                        if i < len(ctx.brief.sub_questions))
+    human = (
+        f"Report topic: {ctx.state.get('user_request')}\n"
+        f"Section: {title}\n"
+        f"Focus: {section.focus or '(general)'}\n"
+        f"Sub-questions to answer here:\n{covered or '- (general coverage)'}\n"
+        f"Target: ~{max(400, mode.target_chars_max // max(1, ctx.n_sections))} chars."
+        f"{_revision_block(ctx.revision_notes)}\n\n"
+        f"EVIDENCE NOTES:\n{render_notes(ctx.notes, note_ids, pinned=ctx.pinned)}\n\n"
+        "Write the section body markdown now."
+    )
+    try:
+        res = llm.complete("compose.section", [SystemMessage(content=SECTION_SYSTEM + ctx.grounding_warn),
+                                               HumanMessage(content=human)],
+                           engines=ctx.rc.engines, temperature=mode.temperature,
+                           max_tokens=_MODE_SECTION_TOKENS.get(ctx.rc.length, 1200), item=title)
+    except llm.EngineSkipped as e:
+        logger.warning("compose.section skipped for %r (%s)", title, e)
+        return None, [a.model_dump() for a in e.attempts], f"[r{ctx.rnd}] skip: compose.section {title} ({e})"
+    records = [r.model_dump() for r in res.records]
+    md = normalize_cite_markers(strip_duplicate_heading(strip_fences(res.text), title)).strip()
+    if len(md) < _MIN_CHARS:
+        records[-1].update(ok=False, error="empty reply")
+        return None, records, f"[r{ctx.rnd}] skip: compose.section {title} (empty reply)"
+    return md, records, None
+
+
+# ---------------------------------------------------------------------------
+# The dedupe pass
+# ---------------------------------------------------------------------------
+
+def _norm(text: str) -> str:
+    """= bench.metrics._norm: NFKC, casefold, [n] markers out, word tokens."""
+    text = CITE_RE.sub(" ", unicodedata.normalize("NFKC", text).casefold())
+    return " ".join(re.findall(r"\w+", text))
+
+
+def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]], written: set[str]) -> None:
+    """In place: a finding of a section written in this run whose claim
+    nearly repeats (ratio ≥ 0.85) a finding of an earlier section is cut from
+    that section's md (its whole sentences) and dropped — unless its
+    sentences also state another finding of that section, or cannot be
+    located. The first occurrence wins; a reused section is never touched."""
+    seen: list[str] = []
+    for title in order:
+        mine = found.get(title) or []
+        if title in written:
+            # ponytail: every claim against every earlier one through difflib, O(n²) over one
+            # report's findings (tens to a few hundred); an index if reports grow far past that.
+            dup = [any(SequenceMatcher(None, _norm(f["claim"]), s, autojunk=False).ratio() >= _DUP_RATIO
+                       for s in seen) for f in mine]
+            where = [quarantine.locate(f.get("sentence") or f["claim"], mds[title]) or [] for f in mine]
+            keep_at = {i for k, idx in enumerate(where) if not dup[k] for i in idx}
+            gone = {k for k, idx in enumerate(where) if dup[k] and idx and not set(idx) & keep_at}
+            if gone:
+                mds[title] = quarantine.cut(mds[title], {i for k in gone for i in where[k]})
+                found[title] = [f for k, f in enumerate(mine) if k not in gone]
+        seen.extend(_norm(f["claim"]) for f in found.get(title) or [])
+
+
+# ---------------------------------------------------------------------------
+# The node
+# ---------------------------------------------------------------------------
+
+def _extras(state, brief: ResearchBrief, rc: run_config.RunConfig, sections: list[dict], findings: list[dict],
+            draft: str) -> dict:
+    """The v3 title-page assessment and the lecture appendix (mode-dependent)."""
+    mode = get_mode(rc.length)
     fetched = state.get("fetched") or []
-    outline = (state.get("outline") or {}).get("sections") or []
-    prior_sections = {s.get("title"): s for s in (state.get("sections") or [])}
-    panel = state.get("panel_verdict") or {}
-    revise_sections = set(panel.get("revise_sections") or [])
-    user_notes = list(state.get("revision_notes") or [])
-
-    calls: list[dict] = []
-    errors: list[str] = []
-
-    usable = [n for n in evidence if (n.get("claims") or [])
-              and (int(n.get("relevance") or 0) >= 2 or _is_local_note(n))]
-    if not usable:
-        reason = ("No digested evidence note reached relevance >= 2 with "
-                  "at least one claim.")
-        # NB: synthesis_outcome / synthesis_no_evidence_reason /
-        # synthesis_error (here and below) are not ArgusState keys, so
-        # LangGraph drops them from the update. Downstream only sees
-        # findings == [] — which is what panel_node's skip really keys off.
-        return {
-            "draft_md": _no_evidence_md(
-                state.get("user_request") or "", length=length,
-                fetched_count=len(fetched), reason=reason),
-            "findings": [],
-            "sections": [],
-            "synthesis_outcome": "no_evidence",
-            "synthesis_no_evidence_reason": reason,
-            "messages": [{"role": "assistant",
-                          "content": "⚠️ Compose: no usable evidence."}],
-        }
-
-    # ---- flat modes: one writer call --------------------------------
-    if not outline:
-        body, wcalls, werrs = _write_flat(state, brief, length=length,
-                                          extra_notes=user_notes)
-        calls.extend(wcalls)
-        errors.extend(werrs)
-        if not body.strip():
-            errors.append("compose: flat writer returned nothing")
-            body = "_(writer failed — see errors)_"
-        sections = [{"title": "Report", "md": body}]
-        findings, fcall, ferr = _extract_findings("Report", body, fetched)
-        if fcall:
-            calls.append(fcall)
-        if ferr:
-            errors.append(ferr)
-        for i, f in enumerate(findings):
-            f["id"] = f"f{i}"
-        draft = body + "\n" + build_sources_block(body, fetched)
-        out: dict[str, Any] = {
-            "draft_md": draft,
-            "sections": sections,
-            "findings": findings,
-            "synthesis_outcome": "ok",
-            "model_calls": calls,
-            "messages": [{"role": "assistant",
-                          "content": (f"🧠 Composed flat report, "
-                                      f"{len(findings)} findings.")}],
-        }
-        if errors:
-            out["errors"] = errors
-        return out
-
-    # ---- sectioned modes: parallel section writers ------------------
-    is_panel_revision = bool(revise_sections) and bool(prior_sections)
-    is_user_revision = bool(state.get("revise_rounds")) and bool(
-        prior_sections) and not revise_sections
-
-    def _work(section: dict) -> tuple[str, str, dict | None, str]:
-        title = section.get("title", "")
-        if is_panel_revision and title not in revise_sections:
-            prior = prior_sections.get(title)
-            if prior and prior.get("md"):
-                return title, prior["md"], None, ""   # keep untouched
-        extra = list(user_notes) if (is_user_revision or not
-                                     is_panel_revision) else []
-        if is_panel_revision and title in revise_sections:
-            extra = [n for n in (panel.get("notes") or [])][:8]
-        notes_block = render_notes(evidence, section.get("sub_qs"))
-        md, call, err = _write_section(section, brief, state, notes_block,
-                                       length=length, extra_notes=extra)
-        return title, md, call, err
-
-    sections_out: list[dict] = []
-    workers = max(1, min(_COMPOSE_CONCURRENCY, len(outline)))
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="argus-compose") as ex:
-        for title, md, call, err in ex.map(_work, outline):
-            if call:
-                calls.append(call)
-            if err:
-                errors.append(err)
-            if md:
-                sections_out.append({"title": title, "md": md})
-
-    if not sections_out:
-        reason = "Every section writer failed."
-        return {
-            "draft_md": _no_evidence_md(
-                state.get("user_request") or "", length=length,
-                fetched_count=len(fetched), reason=reason),
-            "findings": [],
-            "sections": [],
-            "synthesis_outcome": "synthesis_error",
-            "synthesis_error": reason,
-            "model_calls": calls,
-            "errors": errors,
-            "messages": [{"role": "assistant",
-                          "content": "⚠️ Compose: all section writers "
-                                     "failed."}],
-        }
-
-    body = "\n\n".join(f"## {s['title']}\n\n{s['md']}"
-                       for s in sections_out)
-
-    tldr, tcalls, terrs = _write_tldr(state, body)
-    calls.extend(tcalls)
-    errors.extend(terrs)
-    tldr_head = "## Executive TL;DR" if length == "lecture" else "## TL;DR"
-    if tldr.strip():
-        body = f"{tldr_head}\n\n{tldr.strip()}\n\n{body}"
-
-    # Findings per section (parallel, cheap).
-    findings: list[dict] = []
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="argus-extract") as ex:
-        futs = [ex.submit(_extract_findings, s["title"], s["md"], fetched)
-                for s in sections_out]
-        for f in futs:
-            sec_findings, call, err = f.result()
-            if call:
-                calls.append(call)
-            if err:
-                errors.append(err)
-            findings.extend(sec_findings)
-    for i, f in enumerate(findings):
-        f["id"] = f"f{i}"
-
-    draft = body + "\n" + build_sources_block(body, fetched)
-    mode = get_mode(length)
-    out = {
-        "draft_md": draft,
-        "sections": sections_out,
-        "findings": findings,
-        "synthesis_outcome": "ok",
-        "model_calls": calls,
-        "messages": [{"role": "assistant",
-                      "content": (f"🧠 Composed {len(sections_out)} sections, "
-                                  f"{len(findings)} findings "
-                                  f"({mode.label}).")}],
-    }
+    out: dict = {}
     if mode.include_validated_assessment:
-        out["validated_assessment"] = build_assessment(
-            sections_out, findings, state.get("coverage") or {}, brief)
+        out["validated_assessment"] = build_assessment(sections, findings, state.get("coverage") or {}, brief)
     if mode.include_appendix:
+        cites = sum(len(f.get("citation_urls") or []) for f in findings)
         out["lecture_appendix"] = {
             "methodology": (
                 f"{len(state.get('queries') or [])} live queries across "
                 f"Exa/DDGS/arXiv/GitHub; {len(fetched)} sources fetched; "
-                f"{len(evidence)} digested into evidence notes over "
+                f"{len(state.get('evidence') or [])} digested into evidence notes over "
                 f"{state.get('research_rounds') or 1} wave(s)."),
-            "tool_calls": [f"{q.get('provider')}: {q.get('query')}"
-                           for q in (state.get("queries") or [])][:30],
+            "tool_calls": [f"{q.get('provider')}: {q.get('query')}" for q in (state.get("queries") or [])][:30],
             "density_metrics": {
-                "total_chars": len(draft),
-                "total_findings": len(findings),
-                "total_citations": sum(len(f.get("citation_urls") or [])
-                                       for f in findings),
+                "total_chars": len(draft), "total_findings": len(findings), "total_citations": cites,
                 "unique_sources": len(fetched),
-                "avg_citations_per_finding": round(
-                    sum(len(f.get("citation_urls") or [])
-                        for f in findings) / len(findings), 2)
-                if findings else 0.0,
+                "avg_citations_per_finding": round(cites / len(findings), 2) if findings else 0.0,
             },
         }
-    if errors:
-        out["errors"] = errors
     return out
 
 
-__all__ = ["outline_node", "compose_node", "render_notes",
-           "build_assessment", "default_outline",
-           "SECTION_SYSTEM", "FLAT_SYSTEM", "OUTLINE_SYSTEM",
-           "EXTRACT_SYSTEM"]
+def _records(calls: list[dict]) -> list[llm.CallRecord]:
+    """The attempt records an all-skipped EngineError carries (as research's does)."""
+    return [llm.CallRecord(**c) for c in calls]
+
+
+def _extract_all(ctx: _Ctx, written: dict[str, str], pool_size: int
+                 ) -> tuple[dict[str, list[dict]], list[dict], list[str], bool]:
+    """Extraction over every written section, on the pool: (findings by
+    section, records, errors, every attempted extraction skipped)."""
+    found: dict[str, list[dict]] = {}
+    calls: list[dict] = []
+    errors: list[str] = []
+    skipped = 0
+    with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="argus-extract") as ex:
+        futs = {t: ex.submit(extract_findings, t, md, ctx.fetched, engines=ctx.rc.engines, rnd=ctx.rnd)
+                for t, md in written.items()}
+        for title, fut in futs.items():
+            fs, recs, errs = fut.result()
+            found[title] = fs
+            calls.extend(recs)
+            errors.extend(errs)
+            skipped += bool(errs)
+    return found, calls, errors, bool(written) and skipped == len(written)
+
+
+def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
+    rc = ctx.rc
+    prior = [s for s in state.get("sections") or [] if s.get("title") == "Report"]
+    if pv.get("next") == "compose" and "Report" not in (pv.get("revise_sections") or []) and prior:
+        section = prior[0]                       # a panel rewrite of other sections only (the analysis)
+        findings = [{**f, "status": "kept"} for f in state.get("findings") or [] if f.get("section") == "Report"]
+        calls, errors = [], []
+        _emit(runtime, "section", {"title": "Report", "ok": True, "chars": len(section["md"]), "reused": True})
+    else:
+        mode = get_mode(rc.length)
+        system = (TLDR_SYSTEM if rc.length == "tldr" else FLAT_SYSTEM) + ctx.grounding_warn
+        human = (f"Question: {state.get('user_request')}\n"
+                 f"Target length: {mode.target_chars_min}-{mode.target_chars_max} chars."
+                 f"{_revision_block(ctx.revision_notes)}\n\n"
+                 f"EVIDENCE NOTES:\n{render_notes(ctx.notes, None, max_chars=8000, pinned=ctx.pinned)}\n\n"
+                 "Write the markdown now.")
+        res = llm.complete("compose.flat", [SystemMessage(content=system), HumanMessage(content=human)],
+                           engines=rc.engines, temperature=mode.temperature, max_tokens=mode.max_tokens)
+        calls = [r.model_dump() for r in res.records]
+        md = normalize_cite_markers(strip_fences(res.text)).strip()
+        if not md:
+            raise llm.EngineError("role compose.flat: empty reply", role="compose.flat", attempts=res.records)
+        section = {"title": "Report", "md": md, "note_ids": [int(n["source_id"]) for n in ctx.notes]}
+        found, ecalls, errors, all_skipped = _extract_all(ctx, {"Report": md}, 1)
+        calls.extend(ecalls)
+        findings = found["Report"]
+        if all_skipped:
+            raise llm.EngineError(f"compose: the findings extraction was skipped ({errors[0]})",
+                                  role="compose.findings_extract", attempts=_records(ecalls))
+        _emit(runtime, "section", {"title": "Report", "ok": True, "chars": len(md), "reused": False})
+    findings = [{**f, "id": f"f{i}"} for i, f in enumerate(findings)]
+    draft = assemble_draft(tldr=None, sections=[section], analysis_md=None, fetched=ctx.fetched, flat=True)
+    return {
+        "draft_md": draft, "sections": [section], "findings": findings,
+        "compose_runs": int(state.get("compose_runs") or 0) + 1,
+        "model_calls": calls, "errors": errors,
+        "messages": [{"role": "assistant", "content": f"🧠 Composed flat report, {len(findings)} findings."}],
+        **_extras(state, ctx.brief, rc, [section], findings, draft),
+    }
+
+
+def compose_node(state, runtime: Runtime | None = None) -> dict:
+    """Write (or rewrite) the report sections from their allocated notes."""
+    rc = run_config.require(state)
+    brief = ResearchBrief.model_validate(state.get("brief") or {})
+    fetched = state.get("fetched") or []
+    runs = int(state.get("compose_runs") or 0) + 1
+    notes = usable_notes(state.get("evidence") or [], fetched, rc.research.writer_min_relevance)
+    if not notes:
+        reason = (f"No digested evidence note reached relevance >= {rc.research.writer_min_relevance} "
+                  "with at least one verified claim.")
+        return {"draft_md": _no_evidence_md(state.get("user_request") or "", length=rc.length,
+                                            fetched_count=len(fetched), reason=reason),
+                "findings": [], "sections": [], "compose_runs": runs,
+                "messages": [{"role": "assistant", "content": "⚠️ Compose: no usable evidence."}]}
+
+    pv = state.get("panel_verdict") or {}
+    panel_rewrite = pv.get("next") == "compose"
+    revision_notes = [*reversed(state.get("revision_notes") or []),
+                      *((pv.get("notes") or []) if panel_rewrite else [])][:_MAX_REVISION_NOTES]
+    outline = [OutlineSection.model_validate(s) for s in (state.get("outline") or {}).get("sections") or []]
+    ctx = _Ctx(state, rc, brief, notes, revision_notes, len(outline))
+    if not outline:
+        return _flat(state, ctx, pv, runtime)
+
+    prior = {s["title"]: s for s in state.get("sections") or []}
+    if panel_rewrite:
+        targets = set(pv.get("revise_sections") or [])
+    else:
+        changed = (state.get("outline") or {}).get("changed_sections")
+        targets = {s.title for s in outline} if changed is None else set(changed)
+    order = [s.title for s in outline]
+    by_title = {s.title: s for s in outline}
+    to_write = [s for s in outline if s.title in targets or s.title not in prior]
+    pool_size = max(1, min(rc.compose.concurrency, len(outline)))
+
+    calls: list[dict] = []
+    errors: list[str] = []
+    note_ids = {s.title: list(s.note_ids) for s in outline}
+    mds: dict[str, str] = {}
+    written: set[str] = set()
+    failed: set[str] = set()                                     # a write of this run that was skipped
+
+    def run(batch: list[tuple[OutlineSection, list[int]]]) -> dict[str, str | None]:
+        out: dict[str, str | None] = {}
+        with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="argus-compose") as ex:
+            for (section, _), (md, recs, err) in zip(batch, ex.map(lambda b: _write_section(ctx, *b), batch)):
+                calls.extend(recs)
+                if err:
+                    errors.append(err)
+                out[section.title] = md
+        return out
+
+    for title, md in run([(s, note_ids[s.title]) for s in to_write]).items():
+        if md is not None:
+            mds[title] = md
+            written.add(title)
+        elif title in prior:                                     # a skipped re-write keeps the previous version
+            failed.add(title)
+    for title in order:
+        if title in prior and title not in mds:
+            mds[title] = prior[title]["md"]
+            note_ids[title] = list(prior[title].get("note_ids") or [])
+    # R11: a skipped first write merges into its neighbour (previous, else next), written once more.
+    lost = [s.title for s in to_write if s.title not in mds]
+    if lost and not mds:
+        raise llm.EngineError("compose: every section was skipped", role="compose.section", attempts=_records(calls))
+    merged: dict[str, list[str]] = {}
+    for title in lost:
+        k = order.index(title)
+        alive = [t for t in order if t in mds]
+        before = [t for t in alive if order.index(t) < k]
+        merged.setdefault(before[-1] if before else alive[0], []).append(title)
+    if merged:
+        batch = [(by_title[t], list(dict.fromkeys([*note_ids[t], *(i for s in src for i in note_ids[s])])))
+                 for t, src in merged.items()]
+        for (section, ids), md in zip(batch, run(batch).values()):
+            title = section.title
+            if md is not None:
+                mds[title], note_ids[title] = md, ids
+                written.add(title)
+                failed.discard(title)
+            else:
+                for src in merged[title]:
+                    errors.append(f'[r{ctx.rnd}] compose: section "{src}" dropped — notes '
+                                  f'{", ".join(map(str, note_ids[src])) or "none"} not written '
+                                  f'(its merge into "{title}" was skipped)')
+    order = [t for t in order if t in mds]
+
+    found, ecalls, eerrors, all_skipped = _extract_all(ctx, {t: mds[t] for t in order if t in written}, pool_size)
+    calls.extend(ecalls)
+    errors.extend(eerrors)
+    for title in order:
+        if title not in written:
+            found[title] = [{**f, "status": "kept"} for f in state.get("findings") or [] if f.get("section") == title]
+    if all_skipped and not any(found.values()):
+        raise llm.EngineError(f"compose: every findings extraction was skipped ({eerrors[0]})",
+                              role="compose.findings_extract", attempts=_records(ecalls))
+    if rc.compose.dedupe_pass:
+        _dedupe(order, mds, found, written)
+
+    sections = [{"title": t, "md": mds[t], "note_ids": note_ids[t]} for t in order]
+    findings = [{**f, "id": f"f{i}"} for i, f in enumerate(f for t in order for f in found[t])]
+    for title in [s.title for s in outline]:
+        if title in mds:
+            _emit(runtime, "section", {"title": title, "ok": title not in failed, "chars": len(mds[title]),
+                                       "reused": title not in written})
+        else:
+            _emit(runtime, "section", {"title": title, "ok": False, "chars": 0, "reused": False})
+    draft = assemble_draft(tldr=None, sections=sections, analysis_md=None, fetched=fetched, flat=False)
+    mode = get_mode(rc.length)
+    return {
+        "draft_md": draft, "sections": sections, "findings": findings, "compose_runs": runs,
+        "model_calls": calls, "errors": errors,
+        "messages": [{"role": "assistant",
+                      "content": (f"🧠 Composed {len(sections)} sections ({len(written)} written), "
+                                  f"{len(findings)} findings ({mode.label}).")}],
+        **_extras(state, brief, rc, sections, findings, draft),
+    }
+
+
+__all__ = ["outline_node", "compose_node", "render_notes", "extract_findings", "build_assessment",
+           "default_outline", "SECTION_SYSTEM", "FLAT_SYSTEM", "TLDR_SYSTEM", "OUTLINE_SYSTEM", "EXTRACT_SYSTEM"]

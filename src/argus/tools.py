@@ -354,9 +354,11 @@ def _register_report_fonts() -> dict[str, str]:
     """Register the bundled report fonts once per process.
 
     Returns a role -> registered-font-name map so callers never need to
-    know the underlying file names. Falls back to ReportLab's built-in
-    base14 fonts (with a logged warning) if a font file is missing —
-    a font problem must never stop a report from being delivered.
+    know the underlying file names. A missing or broken font file raises
+    (ReportLab's ``TTFError``) and nothing is cached: there is no hidden
+    base14 fallback (v4 WP-C) — report_builder records the PDF failure as
+    an ``[r<k>] pdf:`` line and a degradation note, and report.md still
+    ships.
     """
     global _REPORT_FONT_ROLES
     if _REPORT_FONT_ROLES is not None:
@@ -373,28 +375,16 @@ def _register_report_fonts() -> dict[str, str]:
         "body_bold_italic": "CrimsonText-BoldItalic",
         "caps": "CormorantSC-SemiBold",
     }
-    try:
-        for name in dict.fromkeys(custom.values()):
-            pdfmetrics.registerFont(TTFont(name, str(FONTS_DIR / f"{name}.ttf")))
-        pdfmetrics.registerFontFamily(
-            "Cardo", normal="Cardo-Regular", bold="Cardo-Bold",
-            italic="Cardo-Italic", boldItalic="Cardo-Bold")
-        pdfmetrics.registerFontFamily(
-            "CrimsonText", normal="CrimsonText-Regular",
-            bold="CrimsonText-Bold", italic="CrimsonText-Italic",
-            boldItalic="CrimsonText-BoldItalic")
-        _REPORT_FONT_ROLES = custom
-    except Exception as e:
-        logger.warning("bundled report fonts unavailable (%s); "
-                       "falling back to base14", e)
-        _REPORT_FONT_ROLES = {
-            "display": "Times-Bold", "display_bold": "Times-Bold",
-            "display_italic": "Times-Italic",
-            "body": "Times-Roman", "body_italic": "Times-Italic",
-            "body_semibold": "Times-Bold",
-            "body_bold": "Times-Bold", "body_bold_italic": "Times-BoldItalic",
-            "caps": "Times-Bold",
-        }
+    for name in dict.fromkeys(custom.values()):
+        pdfmetrics.registerFont(TTFont(name, str(FONTS_DIR / f"{name}.ttf")))
+    pdfmetrics.registerFontFamily(
+        "Cardo", normal="Cardo-Regular", bold="Cardo-Bold",
+        italic="Cardo-Italic", boldItalic="Cardo-Bold")
+    pdfmetrics.registerFontFamily(
+        "CrimsonText", normal="CrimsonText-Regular",
+        bold="CrimsonText-Bold", italic="CrimsonText-Italic",
+        boldItalic="CrimsonText-BoldItalic")
+    _REPORT_FONT_ROLES = custom
     return _REPORT_FONT_ROLES
 
 

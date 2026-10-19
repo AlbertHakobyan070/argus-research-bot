@@ -1,8 +1,8 @@
 """Argus LangGraph node implementations — shared nodes.
 
-v3: the research pipeline lives in dedicated modules (brief.py,
-scout.py, research.py, compose.py, panel.py). This module keeps the
-nodes that frame the pipeline: intake, report_builder, deliver + the
+The research pipeline lives in dedicated modules (brief.py, scout.py,
+research.py, outline.py, compose.py, insight.py, panel.py). This module
+keeps the nodes that frame it: intake, report_builder, deliver + the
 extend/revise preps, and the quick-answer path. Each node is a function
 (state) -> partial state update; no black-box prebuilt agents.
 """
@@ -14,12 +14,23 @@ from datetime import datetime
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.runtime import Runtime
 
-from .. import llm
+from .. import llm, quarantine
+from ..citations import SourceRegistry, sanitize_report, verify_citations
+from ..engines.registry import summarize_calls
+from ..sources_block import sanitize_sources_block
 from ..tools import markdown_to_pdf
+from . import precision, run_config
+from .assemble import assemble_draft
+from .evidence_export import DEGRADATION_LINE, write_evidence
+from .grounding import check_grounding, grounding_banner
+from .research import _round
 from .state import ArgusState
 
 logger = logging.getLogger("argus.nodes")
+
+_ANALYSIS = "Analysis"        # = insight.ANALYSIS_SECTION
 
 
 # ---------------------------------------------------------------------------
@@ -38,316 +49,200 @@ Return ONLY valid JSON matching the schema:
 """
 
 
-def intake_node(state: ArgusState) -> dict:
-    """Classify request as quick vs deep and clean it up."""
+def _parse_intake(text: str) -> tuple[str, str]:
+    data = _parse_json_obj(text, require_any=("mode",))
+    if data.get("mode") not in ("quick", "deep"):
+        raise ValueError(f"mode {data.get('mode')!r} is neither 'quick' nor 'deep'")
+    return data["mode"], str(data.get("refined_query") or "").strip()
+
+
+def intake_node(state: ArgusState, runtime: Runtime | None = None) -> dict:
+    """Classify the request as quick vs deep and clean it up
+    (``intake.classify``; degrade → ``default_classification``: deep, the raw
+    request)."""
+    rc = run_config.require(state)
     raw = state.get("user_request") or ""
-    chat = llm.chat_for_tier("cheap", temperature=0.0, max_tokens=200)
-    resp = llm.invoke_with_retry(chat, [
-        SystemMessage(content=INTAKE_SYSTEM),
-        HumanMessage(content=raw[:4000]),
-    ])
-    rec = llm.record_from_response("cheap", "cheap", resp)
+    message = {"role": "user", "content": raw, "ts": _ts()}
     try:
-        parsed = _parse_json_obj(resp.content)
-    except Exception:
-        parsed = {"mode": "deep" if len(raw) > 80 else "quick",
-                  "refined_query": raw.strip()}
-    mode = parsed.get("mode", "deep")
-    if mode not in ("quick", "deep"):
-        mode = "deep"
-    return {
-        "mode": mode,
-        "user_request": parsed.get("refined_query", raw).strip() or raw,
-        "model_calls": [rec.model_dump()],
-        "messages": [{"role": "user", "content": raw, "ts": _ts()}],
-    }
+        res = llm.complete("intake.classify", [SystemMessage(content=INTAKE_SYSTEM),
+                                               HumanMessage(content=raw[:4000])],
+                           engines=rc.engines, temperature=0.0, max_tokens=200, validate=_parse_intake)
+    except llm.EngineDegraded as e:
+        logger.warning("intake.classify degraded (%s)", e)
+        if runtime is not None:
+            runtime.stream_writer({"kind": "degrade", "node": "intake",
+                                   "data": {"role": e.role, "degradation": e.degradation, "reason": str(e)}})
+        return {"mode": "deep", "user_request": raw, "model_calls": [a.model_dump() for a in e.attempts],
+                "errors": [f"[r{_round(state)}] degrade: intake.classify → {e.degradation} ({e})"],
+                "messages": [message]}
+    mode, refined = res.parsed
+    return {"mode": mode, "user_request": refined or raw, "model_calls": [r.model_dump() for r in res.records],
+            "messages": [message]}
 
 
 # ---------------------------------------------------------------------------
 # report_builder
 # ---------------------------------------------------------------------------
 
-def report_builder_node(state: ArgusState) -> dict:
-    """T7 — mode-aware report builder.
+def _integrity(md: str, fetched: list[dict]) -> str:
+    """The v3 citation-integrity passes: URLs that resolve to no fetched
+    source are stripped (``citations``), dangling ``[N]`` Sources slots
+    dropped (``sources_block``). They raise on failure — never skipped."""
+    registry = SourceRegistry()
+    registry.add_from_fetched(fetched)
+    verified = verify_citations(md, registry)
+    sanitized = sanitize_report(verified.verified_report)
+    if verified.removed_citations or sanitized.removed:
+        logger.info("citation integrity: stripped %d unregistered URL(s), %d sanitized URL(s)",
+                    len(verified.removed_citations), len(sanitized.removed))
+    block = sanitize_sources_block(sanitized.cleaned_text)
+    if block.dropped_count:
+        logger.info("sources block: dropped %d dangling slot(s)", block.dropped_count)
+        return block.cleaned_text
+    return sanitized.cleaned_text
 
-    Responsibilities:
-    1. Use compose's ``draft_md`` as the body (``# (empty draft)`` when
-       missing); ``state["length"]`` selects the mode label, the title
-       block and whether the lecture appendix is added.
-    2. Prepend a T7 title-page block (mode, date, quality summary,
-       per-section confidence) so the user can see what they're getting
-       before scrolling.
-    3. Append a lecture appendix (methodology + tool calls + density)
-       when ``state["length"] == "lecture"``.
-    4. Merge reviewer-flagged unsupported_claims / fabrication_flags
-       into the validated_assessment so the title page reflects the
-       adversarial pass.
-    5. Write ``metadata.json`` sidecar with the same fields + the full
-       validated_assessment + lecture_appendix blobs.
-    6. Render markdown -> PDF via ``tools.markdown_to_pdf`` (ReportLab
-       only, no fallback). A render failure sets ``report_paths["pdf"]``
-       to None and appends ``"pdf: <exc>"`` to ``errors``.
-    7. Trigger the report-preview HITL gate.
+
+def report_builder_node(state: ArgusState) -> dict:
+    """The deliverable (v4 spec §3 WP-C).
+
+    1. Cut-not-flag: the panel's flagged findings and every finding citing
+       only unknown source ids are cut from their section or the analysis
+       (``quarantine.apply_cuts``: whole sentences; a section left empty is
+       dropped); a flag that cannot be located stays in the body and is
+       listed as such. Findings come back with their status.
+    2. The deterministic TL;DR over what was kept (``tldr_md``), then
+       ``assemble_draft``: TL;DR → sections → Analysis → appendices (cut,
+       unlocated, uncited specifics) → Sources over all of them. Without
+       sections (no usable evidence) the draft is the body.
+    3. Title block with the engines / recency / research lines; the
+       grounding banner and the "⚠ Not fact-checked" / "⚠ Degraded run"
+       banners above the body; the degradation notes by round after
+       Sources; the citation-integrity passes.
+    4. report.md, report.pdf (ReportLab; a failure is an ``[r<k>] pdf:``
+       line and a degradation note, and report.md is written again with
+       it), evidence.json and metadata.json; then the report-preview gate.
     """
     from ..config import get_settings
-    from .synthesis_modes import get_mode
     from .report_builder_helpers import (
-        build_sidecar_metadata, merge_reviewer_into_assessment,
-        now_iso, render_lecture_appendix, render_title_block,
-        sidecar_to_json,
-    )
-    s = get_settings()
+        TLDR_LABEL, build_sidecar_metadata, build_tldr, degraded_run, info_lines, merge_reviewer_into_assessment,
+        not_fact_checked, now_iso, render_degradation_notes, render_lecture_appendix, render_title_block,
+        sidecar_to_json)
+    from .synthesis_modes import get_mode
+
+    rc = run_config.require(state)
+    mode = get_mode(rc.length)
+    rnd = _round(state)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    length = state.get("length") or "short"
-    mode = get_mode(length)
     topic = re.sub(r"[^A-Za-z0-9_-]+", "_", state["user_request"])[:50] or "report"
-    folder = s.reports_root / f"{stamp}_{topic}_{length}"
+    folder = get_settings().reports_root / f"{stamp}_{topic}_{rc.length}"
     folder.mkdir(parents=True, exist_ok=True)
-    md_path = folder / "report.md"
-    pdf_path = folder / "report.pdf"
+    md_path, pdf_path, evidence_path = folder / "report.md", folder / "report.pdf", folder / "evidence.json"
+    fetched = state.get("fetched") or []
+    pv = state.get("panel_verdict") or {}
+    model_calls = state.get("model_calls") or []
+    new_errors: list[str] = []
 
-    # Merge reviewer verdict into the validated_assessment so the
-    # title-page summary is honest about adversarial findings.
-    validated = state.get("validated_assessment") or {}
-    validated = merge_reviewer_into_assessment(
-        validated, state.get("review_verdict"),
-    )
+    # 1. the cuts
+    sections = state.get("sections") or []
+    analysis = state.get("analysis")
+    mds = {s["title"]: s["md"] for s in sections}
+    if analysis:
+        mds[_ANALYSIS] = analysis["md"]
+    reasons = (pv.get("judge_verdicts") or {}).get("flag_reasons") or {}
+    flagged = {i: reasons.get(i) or "not supported by its sources" for i in pv.get("flagged_finding_ids") or []}
+    findings, cut_mds, cut_rows, unlocated = quarantine.apply_cuts(state.get("findings") or [], mds, flagged,
+                                                                   len(fetched))
+    appendices = [quarantine.render_cut_appendix(cut_rows), quarantine.render_unlocated_appendix(unlocated)]
 
-    # Compose the final markdown: title block + body + (optional) appendix.
-    n_findings = len(state.get("findings") or [])
-    n_sources = len(state.get("fetched") or [])
-    revision_rounds = int(state.get("revision_rounds") or 0)
+    # 2. the TL;DR and the body
+    tldr_md = None
+    tldr = {"source": "omitted", "items": []}
+    if sections:
+        kept_sections = [{**s, "md": cut_mds[s["title"]]} for s in sections if cut_mds[s["title"]].strip()]
+        analysis_md = cut_mds.get(_ANALYSIS) or ""
+        items, source = build_tldr(analysis=analysis, analysis_md=analysis_md, sections=kept_sections,
+                                   findings=findings)
+        tldr = {"source": source, "items": items}
+        if items:
+            tldr_md = TLDR_LABEL + "\n\n" + "\n".join(f"- {i}" for i in items)
+        else:
+            new_errors.append(f"[r{rnd}] tldr: omitted — no kept takeaway or finding")
+        if rc.panel.precision_mode == "deterministic":
+            appendices.append(precision.render_appendix(precision.scan(
+                "\n\n".join([*(s["md"] for s in kept_sections), analysis_md]))))
+        body = assemble_draft(tldr=tldr_md, sections=kept_sections, analysis_md=analysis_md or None,
+                              appendices=appendices, fetched=fetched,
+                              flat=not (state.get("outline") or {}).get("sections"),
+                              tldr_heading="Executive TL;DR" if rc.length == "lecture" else "TL;DR")
+    else:
+        body = "\n\n".join(x for x in [(state.get("draft_md") or "# (empty draft)").rstrip(), *appendices] if x)
 
-    # P4 - quarantine reviewer-flagged fabrication claims BEFORE we
-    # compose the body so the title-block flags report honest numbers.
-    #
-    # Two paths:
-    #   (a) Structured (default, 2026-07-09): route findings by
-    #       ``finding_id`` through ``post_synthesis.quarantine_by_id``.
-    #       This is the structural fix for the §4.1 fragmentation
-    #       bug - when the same flagged claim appears in multiple
-    #       sections, the structured path routes it exactly once
-    #       instead of partially matching substrings and producing
-    #       orphaned prose fragments.
-    #   (b) Legacy string-quarantine fallback: when findings lack
-    #       ids (legacy checkpoint replay) or the structured path
-    #       raises, fall back to the substring-matching legacy
-    #       ``quarantine_flagged_claims``. Removed when the legacy
-    #       module is retired (post 5.4 of the argus-async handoff).
-    review_verdict = state.get("review_verdict") or {}
-    body = state.get("draft_md") or "# (empty draft)"
-    used_structured_quarantine = False
-    if review_verdict:
-        # The reviewer may flag findings by id (new structured
-        # contract) OR by claim text (legacy substring contract). We
-        # support both - preferring id-based when available.
-        flagged_ids = review_verdict.get("flagged_finding_ids") or []
-        flagged_claim_text = (
-            list(review_verdict.get("unsupported_claims") or [])
-            + list(review_verdict.get("fabrication_flags") or [])
-        )
-        try:
-            from ..post_synthesis import (
-                assign_finding_ids,
-                quarantine_by_id as _quarantine_by_id,
-                render_quarantine_appendix as _render_quarantine_appendix,
-            )
-            findings_records = assign_finding_ids(state.get("findings") or [])
-            if findings_records and flagged_ids:
-                kept, q, d, unmatched = _quarantine_by_id(
-                    findings_records, flagged_ids, mode="move",
-                )
-                n_quarantined = len(q)
-                n_still_unmatched = len(unmatched)
-                # Append the structured appendix; the body is left
-                # intact. In v3 that means the flagged claims are STILL
-                # in the body — compose extracts findings FROM prose it
-                # already wrote — while the appendix text says they
-                # "were removed from the body" (probe-verified). Only
-                # the legacy string path below actually cuts sentences.
-                if q:
-                    body = body + _render_quarantine_appendix(q)
-                used_structured_quarantine = True
-                logger.info(
-                    "quarantine(structured): moved %d finding(s) to "
-                    "appendix (%d unmatched); kept %d",
-                    n_quarantined, n_still_unmatched, len(kept),
-                )
-        except Exception as _e:
-            logger.warning(
-                "structured quarantine skipped (%s); falling back to "
-                "legacy string-quarantine", _e,
-            )
-
-        if not used_structured_quarantine and flagged_claim_text:
-            try:
-                from ..quarantine import quarantine_flagged_claims as                     _quarantine_flagged_claims
-                _qres = _quarantine_flagged_claims(
-                    body,
-                    review_verdict.get("unsupported_claims") or [],
-                    review_verdict.get("fabrication_flags") or [],
-                    mode="move",
-                )
-                n_quarantined = len(_qres.quarantined)
-                n_still_unmatched = len(_qres.still_unmatched)
-                body = _qres.cleaned_text
-                if n_quarantined:
-                    logger.info(
-                        "quarantine(legacy): moved %d flagged "
-                        "sentence(s) to appendix (%d unmatched)",
-                        n_quarantined, n_still_unmatched,
-                    )
-            except Exception as _e:
-                logger.warning(
-                    "quarantine pass skipped (%s); body unchanged", _e,
-                )
-
-
+    # 3. the title block, the banners, the integrity passes
+    kept = [f for f in findings if f.get("status") == "kept"]
+    validated = merge_reviewer_into_assessment(state.get("validated_assessment") or {}, state.get("review_verdict"))
     title_block = render_title_block(
-        topic=state["user_request"],
-        length=length,
-        length_label=mode.label,
-        stamp=now_iso(),
-        n_findings=n_findings,
-        n_sources=n_sources,
-        revision_rounds=revision_rounds,
+        topic=state["user_request"], length=rc.length, length_label=mode.label, stamp=now_iso(),
+        n_findings=len(kept), n_sources=len(fetched), revision_rounds=int(state.get("revision_rounds") or 0),
         validated_assessment=validated,
-    )
-    appendix = ""
-    if mode.include_appendix:
-        appendix = render_lecture_appendix(
-            state.get("lecture_appendix") or {},
-            density_metrics={},
-            total_chars=len(body),
-        )
+        info_lines=info_lines(state=state, rc=rc, panel=pv,
+                              reroute_rate=summarize_calls(model_calls)["reroute_rate"]))
+    unchecked = not_fact_checked(rc, pv, findings)
+    degraded_items = degraded_run(model_calls, [*(state.get("errors") or []), *new_errors])
+    banners = "".join(f"> ⚠ {b}\n\n" for b in (
+        f"Not fact-checked — {unchecked}" if unchecked else None,
+        f"Degraded run — {degraded_items}" if degraded_items else None) if b)
+    content = _integrity(title_block + grounding_banner(check_grounding(state)) + banners + body, fetched)
+    footer = f"\n\n---\n\n_Generated by Argus • {now_iso()} • mode: {mode.label}_\n"
+    appendix = render_lecture_appendix(state.get("lecture_appendix") or {}, density_metrics={},
+                                       total_chars=len(body)) if mode.include_appendix else ""
 
-    # P5 — grounding banner prepended ABOVE the body so the reader sees
-    # the warning BEFORE the asserted content. Empty string when
-    # grounded - the helper handles that.
-    try:
-        from .grounding import (
-            check_grounding as _check_grounding,
-            grounding_banner as _grounding_banner,
-        )
-        _grounding_banner = _grounding_banner(_check_grounding(state))
-    except Exception as _e:
-        logger.warning("grounding banner skipped (%s); report unchanged", _e)
-        _grounding_banner = ""
+    def render() -> str:
+        notes = render_degradation_notes([*(state.get("errors") or []), *new_errors], rnd)
+        return content.rstrip() + ("\n\n" + notes if notes else "") + footer + appendix
 
-    md_text = (
-        title_block
-        + _grounding_banner
-        + body
-        + "\n\n---\n\n_Generated by Argus • "
-        + now_iso()
-        + f" • mode: {mode.label}_\n"
-        + appendix
-    )
-
-    # Citation integrity pass (lifted from NVIDIA AI-Q Blueprint).
-    # Every URL in the final report must resolve to a URL that was
-    # actually fetched by a researcher tool. Anything else is stripped,
-    # along with its inline citation, and recorded in the audit trail.
-    # This is the structural fix for the 2026-07-08 hallucinated-URL bug.
-    try:
-        from ..citations import (
-            SourceRegistry as _CitationRegistry,
-            verify_citations as _verify_citations,
-            sanitize_report as _sanitize_report,
-        )
-        from ..sources_block import (
-            sanitize_sources_block as _sanitize_sources_block,
-        )
-        _reg = _CitationRegistry()
-        _reg.add_from_fetched(state.get("fetched") or [])
-        _verified = _verify_citations(md_text, _reg)
-        _sanitized = _sanitize_report(_verified.verified_report)
-        md_text = _sanitized.cleaned_text
-        # P3 — drop dangling [N] source slots left behind by
-        # verify_citations (which only strips the URL, not the label).
-        # Also renumbers body refs so nothing points at an empty slot.
-        try:
-            _src_block = _sanitize_sources_block(md_text)
-            if _src_block.dropped_count:
-                md_text = _src_block.cleaned_text
-                logger.info(
-                    "sources block: dropped %d dangling slot(s), "
-                    "renumbered %d ref(s)",
-                    _src_block.dropped_count,
-                    len(_src_block.renumbered),
-                )
-        except Exception as _e:
-            logger.warning(
-                "sources-block post-pass skipped (%s); report unchanged",
-                _e,
-            )
-        if _verified.removed_citations or _sanitized.removed:
-            logger.info(
-                "citation integrity: stripped %d unregistered URL(s), %d sanitized URL(s)",
-                len(_verified.removed_citations),
-                len(_sanitized.removed),
-            )
-    except Exception as _e:
-        # Citation module failure must NOT block report delivery; degrade
-        # gracefully and log. The user's bot should always produce a report.
-        logger.warning("citation integrity pass skipped (%s); report unchanged", _e)
-
+    # 4. the files
+    md_text = render()
     md_path.write_text(md_text, encoding="utf-8")
-
-    # ReportLab is the only renderer and there is no fallback: a failure is
-    # logged, the PDF is reported as missing (report_paths["pdf"] is None) and
-    # the exception goes into the run's errors, so it is visible downstream.
-    pdf_error: str | None = None
     try:
-        # NB: pass the raw human-readable topic (not the filesystem
-        # slug) — the renderer uses this only for PDF metadata /
-        # title-page treatment, never as a second literal heading
-        # (the body's own "# {topic}" line, written by
-        # render_title_block, is the single source of the visible
-        # title — see the 2026-07-16 double-title bug fix).
-        markdown_to_pdf(md_text, str(pdf_path),
-                        title=state["user_request"])
-    except Exception as e:
+        # the human-readable topic (not the slug): PDF metadata only — the
+        # body's own "# {topic}" line is the one visible title.
+        markdown_to_pdf(md_text, str(pdf_path), title=state["user_request"])
+        pdf = str(pdf_path)
+    except Exception as e:      # ReportLab has no fallback: recorded, and report.md still ships
         logger.warning("PDF render failed: %s", e)
-        pdf_error = f"pdf: {type(e).__name__}: {e}"
-    pdf_ok = pdf_error is None
+        new_errors.append(f"[r{rnd}] pdf: {type(e).__name__}: {e}")
+        md_path.write_text(render(), encoding="utf-8")
+        pdf = None
 
+    errors = [*(state.get("errors") or []), *new_errors]
+    spend = state.get("search_spend") or {}
+    engines = summarize_calls(model_calls, errors, exa_usd=spend.get("exa_usd"))
+    degraded = bool(degraded_items) or int(pv.get("judged") or 0) < int(pv.get("total") or 0)
+    write_evidence(evidence_path, state, findings=findings, errors=errors, degraded=degraded, tldr=tldr,
+                   engines=engines, generated_at=now_iso())
+    rc_dump = rc.model_dump(mode="json")
+    rc_dump["engines"].pop("roles", None)
     meta = build_sidecar_metadata(
-        topic=state["user_request"],
-        thread_id=state.get("thread_id"),
-        user_id=state.get("user_id"),
-        length=length,
-        length_label=mode.label,
-        stamp=stamp,
-        n_findings=n_findings,
-        n_sources=n_sources,
-        revision_rounds=revision_rounds,
-        validated_assessment=validated,
-        lecture_appendix=state.get("lecture_appendix"),
-        model_calls=state.get("model_calls") or [],
-        errors=state.get("errors") or [],
-    )
-    (folder / "metadata.json").write_text(
-        sidecar_to_json(meta), encoding="utf-8",
-    )
+        topic=state["user_request"], thread_id=state.get("thread_id"), user_id=state.get("user_id"),
+        length=rc.length, length_label=mode.label, stamp=stamp, n_findings=len(kept), n_sources=len(fetched),
+        revision_rounds=int(state.get("revision_rounds") or 0), validated_assessment=validated,
+        lecture_appendix=state.get("lecture_appendix"), model_calls=model_calls, engines=engines,
+        run_config=rc_dump, evidence_path=str(evidence_path),
+        degradations=[e for e in errors if DEGRADATION_LINE.match(e)], degraded=degraded,
+        exa_usd=spend.get("exa_usd"))
+    (folder / "metadata.json").write_text(sidecar_to_json(meta), encoding="utf-8")
+
+    paths = {"folder": str(folder), "md": str(md_path), "pdf": pdf, "evidence": str(evidence_path)}
     result: dict[str, Any] = {
-        "report_paths": {
-            "folder": str(folder),
-            "md": str(md_path),
-            "pdf": str(pdf_path) if pdf_ok else None,
-        },
-        "hitl": {"pending": True, "kind": "report_preview",
-                 "ctx": {"paths": {
-                     "folder": str(folder),
-                     "md": str(md_path),
-                     "pdf": str(pdf_path) if pdf_ok else None,
-                 }}},
+        "report_paths": paths,
+        "findings": findings,
+        "tldr_md": tldr_md,
+        "hitl": {"pending": True, "kind": "report_preview", "ctx": {"paths": dict(paths)}},
         "messages": [{"role": "assistant",
-                      "content": f"📝 Report ready ({mode.label}). "
-                                 "Awaiting your sign-off."}],
+                      "content": f"📝 Report ready ({mode.label}). Awaiting your sign-off."}],
     }
-    if pdf_error:
-        result["errors"] = [pdf_error]
+    if new_errors:
+        result["errors"] = new_errors
     return result
 
 
@@ -413,32 +308,36 @@ def revise_prep_node(state: ArgusState) -> dict:
     """Prepare a user-requested revision pass (report-preview gate).
 
     Clears the request flag, bumps the user-revise counter, resets the
-    panel's revision budget, and clears any stale panel verdict so
-    ``compose`` runs in user-revision mode (rewrite every section with
-    the user's notes) rather than a leftover targeted panel revision.
-    The user's feedback is already in ``revision_notes`` (the bot
-    appended it before resuming) — LAST, after any panel notes, which
-    matters because the writers read only the first 8 notes.
+    round's counters (``revision_rounds``, ``compose_runs``) and the stale
+    panel verdict, and marks every outline section changed, so ``compose``
+    rewrites every section with the user's notes (``revision_notes``, which
+    the bot appended before resuming; the writers read them newest first).
     """
     rnd = int(state.get("revise_rounds") or 0) + 1
-    return {
+    out = {
         "revision_requested": False,
         "revise_rounds": rnd,
-        "revision_rounds": 0,   # fresh panel budget for the revision
-        "panel_verdict": None,  # v3: drop stale targeted-revision state
+        "revision_rounds": 0,   # a fresh panel budget for the revision round
+        "compose_runs": 0,      # per-round counter (spec §2.4)
+        "panel_verdict": None,  # no stale targeted rewrite
         "messages": [{"role": "assistant",
                       "content": f"🔁 Applying your revision (round {rnd})…"}],
     }
+    outline = state.get("outline") or {}
+    if outline.get("sections"):
+        out["outline"] = {**outline, "changed_sections": [s["title"] for s in outline["sections"]]}
+    return out
 
 
 def extend_prep_node(state: ArgusState) -> dict:
     """Prepare a user-requested Extend pass (report-preview gate or a
     plain /continue): clear the flag, bump ``extend_rounds``, reset the
-    panel's revision budget and the stale panel verdict — counters and
-    flags only, like ``revise_prep``. v4: ``research_node`` runs the
-    Extend pass itself (a fresh allowance, ``research.extend_querygen``,
-    the widened search wave), so no search happens here; the run rejoins
-    at ``research`` without re-triggering the plan gate.
+    round's counters (``revision_rounds``, ``compose_runs``) and the stale
+    panel verdict — counters and flags only, like ``revise_prep``. v4:
+    ``research_node`` runs the Extend pass itself (a fresh allowance,
+    ``research.extend_querygen``, the widened search wave), so no search
+    happens here; the run rejoins at ``research`` without re-triggering the
+    plan gate.
 
     ``append_only``: /continue after /append ingests EXACTLY the user's
     appended sources (already merged into ``state["sources"]`` by the
@@ -449,6 +348,7 @@ def extend_prep_node(state: ArgusState) -> dict:
         "extend_requested": False,
         "extend_rounds": rnd,
         "revision_rounds": 0,
+        "compose_runs": 0,
         "panel_verdict": None,
     }
     if state.get("append_only"):
@@ -474,22 +374,21 @@ def extend_prep_node(state: ArgusState) -> dict:
 # quick_answer
 # ---------------------------------------------------------------------------
 
+QUICK_SYSTEM = ("You are Argus, a research assistant. Answer the user's question "
+                "concisely and accurately. If you don't know, say so. No fake citations.")
+
+
 def quick_answer_node(state: ArgusState) -> dict:
-    """Cheap single-shot answer. Still routes through FreeLLMAPI, so it
-    is grounded in the model's training (no fabrication guarantees)."""
-    chat = llm.chat_for_tier("cheap", temperature=0.3, max_tokens=600)
-    resp = llm.invoke_with_retry(chat, [
-        SystemMessage(content=(
-            "You are Argus, a research assistant. Answer the user's question "
-            "concisely and accurately. If you don't know, say so. No fake citations."
-        )),
-        HumanMessage(content=state["user_request"][:4000]),
-    ])
-    rec = llm.record_from_response("cheap", llm.resolve_tier("cheap"), resp)
+    """Cheap single-shot answer (``quick.answer``, ``raise``): grounded in the
+    model's training only (no fabrication guarantees)."""
+    rc = run_config.require(state)
+    res = llm.complete("quick.answer", [SystemMessage(content=QUICK_SYSTEM),
+                                        HumanMessage(content=state["user_request"][:4000])],
+                       engines=rc.engines, temperature=0.3, max_tokens=600)
     return {
-        "quick_answer": resp.content,
-        "model_calls": [rec.model_dump()],
-        "messages": [{"role": "assistant", "content": resp.content}],
+        "quick_answer": res.text,
+        "model_calls": [r.model_dump() for r in res.records],
+        "messages": [{"role": "assistant", "content": res.text}],
     }
 
 

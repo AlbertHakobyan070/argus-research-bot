@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from argus.engines import registry
+from argus.graph.evidence_export import Evidence
 from bench import metrics, runner
 from helpers import fake_engines_snapshot, make_run_config
 
@@ -92,9 +93,15 @@ def test_resolve_query_by_id_by_text_or_ad_hoc():
 LC = live_check
 GROUNDING_ON = make_run_config(length="medium")
 GROUNDING_OFF = make_run_config(length="medium", **{"panel.grounding": False})
-EVIDENCE = {**{k: {} for k in LC.EVIDENCE_KEYS}, "schema": 1, "compose_runs": 1, "revision_rounds": 0,
-            "gap_waves": 0, "revise_rounds": 0, "extend_rounds": 0, "degraded": False,
-            **{k: [] for k in ("gap_history", "sources", "notes", "findings", "degradations", "errors")}}
+EVIDENCE = Evidence.model_validate({
+    "schema": 1, "run": {"run_id": "abcd1234", "thread_id": "bench:q1:abcd1234", "topic": "t",
+                         "generated_at": "2026-10-20T00:00:00+00:00", "length": "medium", "depth": "standard",
+                         "recency": None, "archetype": "explainer", "origin": "live_check"},
+    "run_config": {}, "engines": {}, "brief": {}, "coverage": {}, "gap_history": [], "compose_runs": 1,
+    "revision_rounds": 0, "gap_waves": 0, "revise_rounds": 0, "extend_rounds": 0, "degraded": False,
+    "sources": [], "notes": [], "findings": [], "analysis": None, "tldr": {"source": "omitted", "items": []},
+    "panel": {}, "search": {"queries": [], "spend": {}}, "degradations": [], "errors": []},
+).model_dump(mode="json", by_alias=True)
 
 
 @pytest.mark.parametrize("check,run,m,status", [
@@ -119,6 +126,10 @@ EVIDENCE = {**{k: {} for k in LC.EVIDENCE_KEYS}, "schema": 1, "compose_runs": 1,
     (LC.check_report_size, _r(report="x" * 1001), {}, PASS),
     (LC.check_report_size, _r(report="x" * 1000), {}, FAIL),
     (LC.check_report_size, _r(), {}, FAIL),
+    (LC.check_pdf_exists, _r({"report_paths": {"pdf": __file__}}), {}, PASS),
+    (LC.check_pdf_exists, _r({"report_paths": {"pdf": None}}), {}, FAIL),
+    (LC.check_pdf_exists, _r({"report_paths": {"pdf": "Z:/nowhere/report.pdf"}}), {}, FAIL),
+    (LC.check_pdf_exists, _r({}), {}, FAIL),
     (LC.check_sources_block, _r(), {"sources_block_present": True}, PASS),
     (LC.check_sources_block, _r(), {"sources_block_present": False}, FAIL),
     (LC.check_sources_block, _r(), {"sources_block_present": NA}, NA),
@@ -144,6 +155,7 @@ EVIDENCE = {**{k: {} for k in LC.EVIDENCE_KEYS}, "schema": 1, "compose_runs": 1,
     (LC.check_evidence_json, _r(evidence=EVIDENCE), {}, PASS),
     (LC.check_evidence_json, _r(evidence={**EVIDENCE, "schema": 2}), {}, FAIL),
     (LC.check_evidence_json, _r(evidence={k: v for k, v in EVIDENCE.items() if k != "panel"}), {}, FAIL),
+    (LC.check_evidence_json, _r(evidence={**EVIDENCE, "tldr": {"source": "llm", "items": []}}), {}, FAIL),
     (LC.check_evidence_json, _r(evidence={**EVIDENCE, "sources": [{"markdown_path": "A:/x.md"}]}), {}, FAIL),
     (LC.check_evidence_json, _r(evidence={**EVIDENCE, "errors": ["markdown_path missing"]}), {}, PASS),
     (LC.check_evidence_json, _r(evidence=[1]), {}, FAIL),
@@ -161,6 +173,14 @@ EVIDENCE = {**{k: {} for k in LC.EVIDENCE_KEYS}, "schema": 1, "compose_runs": 1,
     (LC.check_banner_present, _r(report="> WARNING: **Limited direct evidence:** only\n"), {}, PASS),
     (LC.check_banner_present, _r(report="# t\n\nbody\n"), {}, FAIL),
     (LC.check_banner_present, _r(), {}, NA),
+    (LC.check_not_fact_checked_absent, _r(report="# t\n\nbody\n"), {}, PASS),
+    (LC.check_not_fact_checked_absent,
+     _r(report="> ⚠ Not fact-checked — the grounding judge failed (429)\n"), {}, FAIL),
+    (LC.check_not_fact_checked_absent, _r(), {}, NA),
+    (LC.check_degraded_absent, _r(report="# t\n\nbody\n"), {}, PASS),
+    (LC.check_degraded_absent,
+     _r(report="> ⚠ Degraded run — 14 of 28 sources could not be digested (429)\n"), {}, FAIL),
+    (LC.check_degraded_absent, _r(), {}, NA),
 ])
 def test_each_check(check, run, m, status):
     got, detail = check(run, m)
@@ -174,7 +194,14 @@ def test_check_details_name_what_was_measured():
     assert LC.check_judged(_r({"panel_verdict": {"judged": 0, "total": 0}, "findings": [{}] * 37,
                                "run_config": GROUNDING_ON}), {}) == (
         FAIL, "judged 0 of total 0 with 37 findings: the panel recorded no judging")
-    assert LC.check_evidence_json(_r(evidence={"schema": 1}), {})[1].startswith("missing run, run_config")
+    assert LC.check_evidence_json(_r(evidence={"schema": 1}), {})[1].startswith(
+        "run: Field required; run_config: Field required")
+    assert LC.check_degraded_absent(_r(report="x\n> ⚠ Degraded run — 2 of 3 sections could not be written (429)\n"),
+                                    {}) == (FAIL, "⚠ Degraded run — 2 of 3 sections could not be written (429)")
+    # the kept findings come from evidence.json when it has them (as in the bench metrics)
+    ev = {**EVIDENCE, "findings": [{"id": "f0", "claim": "c", "sentence": "c [1].", "source_ids": [1],
+                                    "section": "A", "status": "cut"}]}
+    assert LC.check_few_findings(_r({"findings": [{"status": "kept"}] * 4}, evidence=ev), {}) == (PASS, "0 kept")
     findings = [{"citation_urls": ["u"], "status": "kept"}, {"citation_urls": [], "status": "kept"},
                 {"citation_urls": ["u"], "status": "cut"}]
     assert LC.check_cited_findings(_r({"findings": findings}), {}) == (PASS, "1 of 2 kept")
@@ -184,10 +211,11 @@ def test_check_details_name_what_was_measured():
 def test_the_check_list_follows_expect_banner():
     names = [n for n, _ in LC.checks(expect_banner=False)]
     assert names == ["run completed", "fetched > 0", "evidence > 0", "findings with citations > 0",
-                     "report.md > 1000 chars", "sources_block_present", "cite_markers_unresolved == 0",
-                     "flagged_claims_in_body == 0", "judged == total", "compose_budget_ok",
-                     "evidence.json valid", "metadata.json has engines",
-                     "no synthesis_no_evidence / report suppressed text", "grounding banner absent"]
+                     "report.md > 1000 chars", "report.pdf exists", "sources_block_present",
+                     "cite_markers_unresolved == 0", "flagged_claims_in_body == 0", "judged == total",
+                     "compose_budget_ok", "evidence.json valid", "metadata.json has engines",
+                     "no synthesis_no_evidence / report suppressed text", "grounding banner absent",
+                     "⚠ Not fact-checked banner absent", "⚠ Degraded run banner absent"]
     banner = dict(LC.checks(expect_banner=True))
     assert banner["findings <= 3"] is LC.check_few_findings
     assert banner["grounding banner present"] is LC.check_banner_present
@@ -228,7 +256,11 @@ PASSING_REPORT = ("# topic\n\n## A\n\n" + "LangGraph pauses a run at an interrup
 
 def _write(qdir: Path, *, report: str) -> None:
     qdir.mkdir(parents=True)
-    for name, obj in (("state", _passing_state()), ("evidence", EVIDENCE), ("metadata", {"engines": {}}),
+    (qdir / "report.pdf").write_bytes(b"%PDF-1.4 stub")
+    state = {**_passing_state(), "report_paths": {"md": str(qdir / "report.md"), "pdf": str(qdir / "report.pdf")}}
+    evidence = {**EVIDENCE, "findings": [{k: f[k] for k in ("id", "claim", "sentence", "source_ids", "section",
+                                                            "status")} for f in state["findings"]]}
+    for name, obj in (("state", state), ("evidence", evidence), ("metadata", {"engines": {}}),
                       ("record", {"status": "ok", "duration_s": 245.0, "error": None})):
         (qdir / f"{name}.json").write_text(json.dumps(obj), encoding="utf-8")
     (qdir / "report.md").write_text(report, encoding="utf-8")

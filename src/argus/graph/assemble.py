@@ -1,13 +1,13 @@
 """Report assembly (v4 spec §2.8): TL;DR → sections → Analysis → appendices → Sources.
 
-The helpers moved here unchanged from compose.py. ``assemble_draft``
-reproduces compose's sectioned assembly (lecture passes
-``tldr_heading="Executive TL;DR"``), but not its flat path (``tldr``/``short``,
-or a brief with one sub-question): ``flat=True`` adds ``## Findings``, and the
-flat writer emits its own ``## TL;DR`` and ``## Key Findings``. So the flat
-path must not move onto ``assemble_draft`` before WP-C removes the flat
-writer's own headings, or those reports get ``## Findings`` above the model's
-headings. WP-C implements ``normalize_cite_markers`` (identity until then).
+``assemble_draft`` lays the report out (lecture passes
+``tldr_heading="Executive TL;DR"``); the flat lengths (``tldr``/``short``, or a
+brief with one sub-question) put their single body under ``## Findings`` — the
+flat writer emits no headings of its own (WP-C). The TL;DR is never written by
+an LLM: report_builder builds it after the cuts and passes it in.
+``normalize_cite_markers`` rewrites the citation forms models emit (CJK
+brackets, lists, ranges, footnotes, ``[Source n]``) to ``[n][m]…``; compose
+applies it to every writer reply before extraction and assembly.
 """
 from __future__ import annotations
 
@@ -78,9 +78,45 @@ def build_sources_block(body: str, fetched: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+_ID_LIST = r"\d{1,3}(?!\d)(?:\s*[,，;；、]\s*\d{1,3}(?!\d))*"
+_CJK = re.compile(r"[【［〔]\s*(" + _ID_LIST + r")[^】］〕\n]*[】］〕]")   # 【4】 ［3］ 〔5〕 【2†L1-L4】 【1, 2】
+_FOOTNOTE = re.compile(r"\[\^(\d{1,3})\]")                                  # [^2]
+_SOURCE = re.compile(r"\[\s*sources?\s+(" + _ID_LIST + r")\s*\]", re.I)     # [Source 3] [Sources 3, 4]
+_RANGE = re.compile(r"\[\s*(\d{1,3})\s*[-–—]\s*(\d{1,3})\s*\]")           # [1-3] [4–6]
+_LIST = re.compile(r"\[\s*(\d{1,3}(?:\s*[,;]\s*\d{1,3})+)\s*\]")          # [1, 2] [1; 2; 7]
+_RANGE_MAX = 20     # a wider "range" is not a citation (a span of years, a version range)
+
+
+def _ids(group: str) -> str:
+    return "".join(f"[{n}]" for n in re.findall(r"\d{1,3}", group))
+
+
+def _expand(m: re.Match) -> str:
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if 0 < lo <= hi <= lo + _RANGE_MAX:
+        return "".join(f"[{n}]" for n in range(lo, hi + 1))
+    return m.group(0)
+
+
+def _normalize_prose(text: str) -> str:
+    text = _FOOTNOTE.sub(r"[\1]", text)
+    text = _SOURCE.sub(lambda m: _ids(m.group(1)), text)
+    text = _CJK.sub(lambda m: _ids(m.group(1)), text)
+    text = _RANGE.sub(_expand, text)
+    return _LIST.sub(lambda m: _ids(m.group(1)), text)
+
+
 def normalize_cite_markers(md: str) -> str:
-    """Identity until WP-C (``【n】``, ``［n］``, ``〔n〕``, ``【n†…】``, ``[n, m]`` → ``[n][m]``)."""
-    return md
+    """``【n】``, ``［n］``, ``〔n〕``, ``【n†…】``, ``[n, m]`` / ``[n; m]``, ranges
+    ``[1-3]`` / ``[1–3]`` (at most 20 wide), ``[^n]`` and ``[Source n]`` →
+    ``[n][m]…`` (spec §2.8). Code spans and fences are left alone; ``[n]``
+    already is the form."""
+    out, last = [], 0
+    for m in _CODE.finditer(md):
+        out += [_normalize_prose(md[last:m.start()]), m.group(0)]
+        last = m.end()
+    return "".join(out) + _normalize_prose(md[last:])
 
 
 def assemble_draft(*, tldr: str | None, sections: list[dict], analysis_md: str | None,

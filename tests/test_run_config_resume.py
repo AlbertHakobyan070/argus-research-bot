@@ -97,6 +97,7 @@ def graph(monkeypatch, tmp_path):
     monkeypatch.setattr(graph_mod, "outline_node", lambda s: {"outline": {"sections": []}})
     monkeypatch.setattr(graph_mod, "compose_node",
                         lambda s: {"draft_md": "d", "findings": [], "sections": []})
+    monkeypatch.setattr(graph_mod, "analyst_node", lambda s: {"analysis": None})
     monkeypatch.setattr(graph_mod, "panel_node", lambda s: {
         "panel_verdict": {"verdict": "pass"}, "review_verdict": {"verdict": "pass"}})
     monkeypatch.setattr(graph_mod, "route_after_panel", lambda s: "report_builder")

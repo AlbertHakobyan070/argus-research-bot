@@ -1,4 +1,4 @@
-"""v4 WP-0 — graph/assemble.py (spec §2.8).
+"""v4 WP-0 / WP-C — graph/assemble.py (spec §2.8).
 
 The two EXPECTED strings were captured from compose_node's inline
 assembly at commit 012a756 (before the helpers moved), by driving the
@@ -105,6 +105,28 @@ def test_strip_fences(raw, clean):
     assert strip_fences(raw) == clean
 
 
-def test_normalize_cite_markers_is_identity_until_wp_c():
-    md = "a 【4】 b ［3］ c [1, 2]"
+@pytest.mark.parametrize("raw,clean", [
+    ("Rates rose 【4】.", "Rates rose [4]."),
+    ("Rates rose【2†L1-L4】.", "Rates rose[2]."),
+    ("Rates rose ［3］ and 〔5〕.", "Rates rose [3] and [5]."),
+    ("Rates rose 【1, 2】.", "Rates rose [1][2]."),
+    ("Rates rose [1, 2].", "Rates rose [1][2]."),
+    ("Rates rose [1; 2; 7].", "Rates rose [1][2][7]."),
+    ("Rates rose [1-3].", "Rates rose [1][2][3]."),
+    ("Rates rose [4–6].", "Rates rose [4][5][6]."),
+    ("Rates rose [^2].", "Rates rose [2]."),
+    ("Rates rose [Source 3].", "Rates rose [3]."),
+    ("Rates rose [sources 3, 4].", "Rates rose [3][4]."),
+])
+def test_normalize_cite_markers_table(raw, clean):
+    assert normalize_cite_markers(raw) == clean
+
+
+@pytest.mark.parametrize("md", [
+    "Rates rose [2][5] and [12].",
+    "An array `[1, 2]` and a fence:\n```\nx = 【4】\n```\n",
+    "A wide span [1-40] is not a citation range.",
+    "Years [2019, 2020] are not source ids.",
+])
+def test_normalize_cite_markers_leaves_the_rest(md):
     assert normalize_cite_markers(md) == md

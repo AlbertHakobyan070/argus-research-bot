@@ -626,6 +626,9 @@ def test_exhausted_digests_count_as_calls_in_the_report_metadata(monkeypatch, tm
     monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
     monkeypatch.setattr(nodes_mod, "markdown_to_pdf", lambda *a, **k: None)
     out = nodes_mod.report_builder_node({"user_request": "risk nine", "length": "short",
+                                         "run_config": RunConfig.from_preset(
+                                             length="short", engines=fake_engines_snapshot(),
+                                             origin="telegram").model_dump(),
                                          "draft_md": "# risk nine\n\nBody.\n",
                                          "model_calls": model_calls, "errors": errors})
     meta = json.loads((Path(out["report_paths"]["folder"]) / "metadata.json").read_text(encoding="utf-8"))

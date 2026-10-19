@@ -652,6 +652,8 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
 
         snap = await graph.aget_state(cfg)
         cur = snap.values if snap else {}
+        if (lib := _get_library(ctx)) is not None:      # v4: runs.exa_usd, the run's Exa spend so far (§2.4)
+            await lib.update_run(run_id, exa_usd=(cur.get("search_spend") or {}).get("exa_usd"))
         paths = cur.get("report_paths") or info.get("report_paths") or {}
         info["awaiting"] = "report_preview"
         info["paths"] = paths

@@ -7,12 +7,14 @@ the per-section findings (claim, [ids], section), the deterministic
 registrable domain, authority, published) — never the section bodies — and
 writes the archetype's analysis headings (``archetypes``). Post-processing is
 deterministic: text before the first fixed heading is dropped (recorded), a
-reply with none of them is the ``omit_analysis`` degradation, takeaway bullets
+reply with none of them — or with nothing under them — is the
+``omit_analysis`` degradation, takeaway bullets
 without a citation move to the open questions as "(uncited)", the ``short``
 variant is compacted (at most 4 takeaways and 3 open questions, no
 Implications, the agree/disagree section only when the stance map shows a
 conflict; what it trims is recorded), findings are extracted over the
-analysis (section "Analysis"; the labels are not claims) and every takeaway
+analysis by compose's ``extract_findings`` (section "Analysis"; the labels are
+not claims; a skipped extraction is a declared ``skip:`` line) and every takeaway
 gets its ``confidence_label`` with the reasons. No TL;DR here: report_builder
 builds it after the cuts (WP-C).
 """
@@ -30,7 +32,7 @@ from ..engines.urls import registrable_domain
 from . import run_config
 from .archetypes import AGREEMENT, IMPLICATIONS, OPEN_QUESTIONS, SCENARIOS, TAKEAWAYS, TEMPLATES
 from .assemble import CITE_RE, assemble_draft, normalize_cite_markers, strip_fences
-from .compose import _extract_findings
+from .compose import extract_findings
 from .research import _round
 from .state import ResearchBrief
 
@@ -408,13 +410,14 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
         takeaways.append({"text": b, "source_ids": ids, "confidence": label, "reasons": reasons})
 
     plain = _render(parts, takeaways, labelled=False)
+    if not plain.strip():                       # fixed headings, empty bodies: a label-only analysis
+        return degraded("no analysis content", calls)
     extracted: list[dict] = []
     if CITE_RE.search(plain):
-        extracted, call, err = _extract_findings(ANALYSIS_SECTION, plain, fetched)
-        if call:
-            calls.append(call)
-        if err:
-            errors.append(err)
+        extracted, ecalls, eerrors = extract_findings(ANALYSIS_SECTION, plain, fetched, engines=rc.engines,
+                                                      rnd=_round(state))
+        calls.extend(ecalls)
+        errors.extend(eerrors)
     md = _render(parts, takeaways, labelled=True)
     analysis = {"md": md, "takeaways": takeaways, "stance_map": smap,
                 "has_disagreement_section": _has(parts, AGREEMENT), "has_scenarios": _has(parts, SCENARIOS),

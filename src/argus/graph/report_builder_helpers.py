@@ -1,4 +1,7 @@
-"""T7 — report_builder helpers (title page, validated assessment, appendix).
+"""report_builder helpers: title page, validated assessment, appendix (T7)
+and the v4 trust surface (WP-C): the title-block info lines, the "⚠ Not
+fact-checked" / "⚠ Degraded run" banners, the deterministic TL;DR, the
+degradation notes by round and the metadata.json sidecar.
 
 These functions are pure (no I/O, no LLM calls) so they can be unit
 tested without spinning up the full graph. ``report_builder_node``
@@ -11,7 +14,7 @@ The title-page + validated-assessment block is content that
 state). It has to render cleanly in:
 
 - the markdown itself (read back by Telegram via ``report:send``),
-- the PDF (via the intel-stack Chromium renderer), and
+- the PDF (via ReportLab, ``tools.markdown_to_pdf``), and
 - the ``metadata.json`` sidecar (so a future audit can reconstruct
   what the user was promised vs what was delivered).
 
@@ -25,10 +28,28 @@ Keeping the formatter here lets us:
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
-from ..engines.registry import summarize_calls
+from .. import quarantine
+from .panel import failure_reason
+
+TLDR_LABEL = "_TL;DR — compiled from the report's own cited, judged findings_"
+_TLDR_ITEMS = 4
+# The per-item roles (spec §2.3 skip_item) and what a skipped item is, for the degraded-run banner.
+_ITEM_ROLES = {
+    "research.digest": "sources could not be digested",
+    "compose.section": "sections could not be written",
+    "compose.findings_extract": "finding extractions failed",
+    "panel.grounding": "grounding batches could not be judged",
+    "panel.coverage": "coverage reviews failed",
+}
+_SKIP_LINE = re.compile(r"^(?:\[r\d+\]\s*)?skip:\s*([a-z0-9_.]+)\s")
+# The degradation notes: the bench's skip / degrade / legacy lines, plus the other visible losses.
+_NOTE_LINE = re.compile(r"^(?:\[r(\d+)\]\s*)?(?:skip|degrade|legacy|pdf|tldr|cancelled|compose):")
+_RECENCY = {"d": "past day", "w": "past week", "m": "past month", "y": "past year"}
 
 
 def _section_label(name: str) -> str:
@@ -53,7 +74,8 @@ def _confidence_emoji(level: str) -> str:
 def render_title_block(*, topic: str, length: str, length_label: str,
                         stamp: str, n_findings: int, n_sources: int,
                         revision_rounds: int,
-                        validated_assessment: dict | None) -> str:
+                        validated_assessment: dict | None,
+                        info_lines: list[str] = ()) -> str:
     """Render the markdown title-page / metadata block.
 
     The block is prepended to ``draft_md`` so a reader opening the
@@ -80,6 +102,9 @@ def render_title_block(*, topic: str, length: str, length_label: str,
     validated_assessment
         Optional dict from the synthesizer; we surface only the
         overall_relevancy + a one-line per-section confidence summary.
+    info_lines
+        v4 lines under the mode line (``info_lines()``: engines, recency,
+        research counters).
     """
     parts: list[str] = []
     parts.append(f"# {topic}")
@@ -89,6 +114,9 @@ def render_title_block(*, topic: str, length: str, length_label: str,
         f"findings: {n_findings} • sources: {n_sources} • "
         f"revisions: {revision_rounds}_"
     )
+    for line in info_lines:
+        parts.append("")
+        parts.append(line)
     parts.append("")
     parts.append("> **Quality summary**")
     parts.append(">")
@@ -206,7 +234,12 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
                             validated_assessment: dict | None,
                             lecture_appendix: dict | None,
                             model_calls: list[dict],
-                            errors: list[str] | None = None) -> dict[str, Any]:
+                            engines: dict,
+                            run_config: dict | None = None,
+                            evidence_path: str | None = None,
+                            degradations: list[str] = (),
+                            degraded: bool = False,
+                            exa_usd: float | None = None) -> dict[str, Any]:
     """Build the ``metadata.json`` sidecar dict.
 
     Two consumers:
@@ -216,6 +249,9 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
 
     Includes the full validated_assessment + lecture_appendix blocks
     so an offline reviewer can reconstruct everything without the MD.
+    v4: ``engines`` is ``registry.summarize_calls()``; ``run_config`` the
+    RunConfig without ``engines.roles``; ``degradations`` the skip /
+    degrade / legacy lines; ``degraded`` whether a banner marks the run.
     """
     return {
         "topic": topic,
@@ -230,8 +266,107 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
         "validated_assessment": validated_assessment or {},
         "lecture_appendix": lecture_appendix or {},
         "model_calls": model_calls,
-        "engines": summarize_calls(model_calls, errors),   # v4 provenance summary (spec §2.3)
+        "engines": engines,
+        "run_config": run_config,
+        "evidence_path": evidence_path,
+        "degradations": list(degradations),
+        "degraded": degraded,
+        "exa_usd": exa_usd,
     }
+
+
+def info_lines(*, state, rc, panel: dict, reroute_rate: float | None) -> list[str]:
+    """The title block's v4 lines: engines, recency (when applied), research counters."""
+    reroute = "n/a" if reroute_rate is None else f"{reroute_rate * 100:.0f} %"
+    lines = [f"_Engines: {rc.engines.profile} · reroute {reroute} · judge diversity "
+             f"{'⚠' if panel.get('judge_not_diverse') else 'ok'} · judged {int(panel.get('judged') or 0)}/"
+             f"{int(panel.get('total') or 0)} · warnings {len(rc.engines.warnings)}_"]
+    recency = (state.get("search_spend") or {}).get("recency")
+    if recency:
+        since = f" (sources published since {recency['start_date']})" if recency.get("start_date") else ""
+        lines.append(f"_Recency: {_RECENCY.get(recency.get('window'), recency.get('window'))}{since}_")
+    coverage = [int(v) for v in (state.get("coverage") or {}).values()]
+    cov = (f"coverage min {min(coverage)} / mean {round(sum(coverage) / len(coverage), 1):g}"
+           if coverage else "coverage n/a")
+    lines.append(f"_Research: {len(state.get('fetched') or [])} sources · {cov} · gap waves "
+                 f"{int(state.get('gap_waves') or 0)} · compose runs {int(state.get('compose_runs') or 0)}_")
+    return lines
+
+
+def not_fact_checked(rc, panel: dict, findings: list[dict]) -> str | None:
+    """The "⚠ Not fact-checked" banner text, or None: the grounding judge is
+    off, failed outright, or left some findings unjudged (spec §2.8 R1)."""
+    if not findings:
+        return None
+    if not (rc.panel.enabled and rc.panel.grounding):
+        return "the grounding judge is off"
+    judged, total = int(panel.get("judged") or 0), int(panel.get("total") or 0)
+    if judged >= total:
+        return None
+    reasons = ", ".join(dict.fromkeys(e.split(": ", 1)[1] for e in panel.get("skipped_judges") or []
+                                      if e.startswith("grounding") and ": " in e)) or "unknown"
+    if judged == 0:
+        return f"the grounding judge failed ({reasons})"
+    return f"{total - judged} of {total} findings were not judged ({reasons})"
+
+
+def degraded_run(model_calls: list[dict], errors: list[str]) -> str | None:
+    """The "⚠ Degraded run" banner text, or None: every per-item role that
+    skipped half or more of its items (spec §2.3), e.g. "14 of 28 sources
+    could not be digested (429)". Items = its ok calls plus its skip lines."""
+    ok = Counter(c.get("role") for c in model_calls
+                 if c.get("ok", True) and c.get("retry_reason") != "diversity_rerun")
+    skips: dict[str, list[str]] = {}
+    for line in errors:
+        m = _SKIP_LINE.match(line)
+        if m and m.group(1) in _ITEM_ROLES:
+            skips.setdefault(m.group(1), []).append(failure_reason(line))
+    parts = []
+    for role, what in _ITEM_ROLES.items():
+        k = len(skips.get(role) or [])
+        if k and 2 * k >= k + ok[role]:
+            parts.append(f"{k} of {k + ok[role]} {what} ({', '.join(dict.fromkeys(skips[role]))})")
+    return "; ".join(parts) or None
+
+
+def build_tldr(*, analysis: dict | None, analysis_md: str, sections: list[dict], findings: list[dict]
+               ) -> tuple[list[str], str]:
+    """R2, after the cuts: ``(items, source)``. With an analysis, its first
+    ≤ 4 takeaways still in the (cut) analysis, with their labels; without
+    one, the first kept finding sentence still in each section (≤ 4); else
+    none ("omitted")."""
+    if analysis:
+        items = [f"{t['text']} — confidence **{t['confidence']}**" for t in analysis.get("takeaways") or []
+                 if t["text"] in analysis_md][:_TLDR_ITEMS]
+        return items, "takeaways" if items else "omitted"
+    items = []
+    for s in sections:
+        first = next((f.get("sentence") or f.get("claim") for f in findings
+                      if f.get("section") == s["title"] and f.get("status") == "kept"
+                      and quarantine.locate(f.get("sentence") or f.get("claim") or "", s["md"]) is not None), None)
+        if first:
+            items.append(" ".join(first.split()))
+    items = items[:_TLDR_ITEMS]
+    return items, "sections" if items else "omitted"
+
+
+def render_degradation_notes(errors: list[str], rnd: int) -> str:
+    """"## Degradation notes": this round's lines in full (an untagged line
+    takes this round's tag), earlier rounds collapsed to a count; "" when
+    there are none."""
+    rows = []
+    for line in errors:
+        m = _NOTE_LINE.match(line)
+        if m:
+            rows.append((int(m.group(1) or rnd), line if m.group(1) else f"[r{rnd}] {line}"))
+    if not rows:
+        return ""
+    lines = ["## Degradation notes", ""] + [f"- {text}" for r, text in rows if r == rnd]
+    earlier = Counter(r for r, _ in rows if r != rnd)
+    if earlier:
+        lines.append("- earlier rounds: " + ", ".join(
+            f"r{r} — {n} note{'' if n == 1 else 's'}" for r, n in sorted(earlier.items())))
+    return "\n".join(lines)
 
 
 def sidecar_to_json(meta: dict[str, Any]) -> str:
@@ -243,6 +378,12 @@ def now_iso() -> str:
 
 
 __all__ = [
+    "TLDR_LABEL",
+    "info_lines",
+    "not_fact_checked",
+    "degraded_run",
+    "build_tldr",
+    "render_degradation_notes",
     "render_title_block",
     "render_lecture_appendix",
     "merge_reviewer_into_assessment",

@@ -7,7 +7,8 @@ fixed headings. Post-processing is deterministic and tested here: uncited
 takeaways move to the open questions, the short variant is compacted, each
 takeaway gets its confidence label, findings are extracted over the analysis
 (section "Analysis"). The real ``llm.complete`` runs on a fake driver; the
-findings extractor (compose's, WP-C's to evolve) is faked where it is looked up.
+findings extractor (compose's ``extract_findings``, WP-C) is faked where it is
+looked up, and run for real once (``compose.findings_extract``).
 """
 from __future__ import annotations
 
@@ -16,14 +17,13 @@ import json
 import pytest
 from langgraph.runtime import Runtime
 
-from argus.engines import registry
 from argus.engines.llm_openai import DriverError
 from argus.graph import compose, insight
 from argus.graph.insight import (ANALYSIS_LABEL, ANALYST_SYSTEM, analyst_node, confidence_label,
                                  stance_map)
 from argus.graph.state import ResearchBrief, SubQuestion
 
-from helpers import fake_engines_snapshot, fake_llm, make_run_config
+from helpers import fake_llm, make_run_config
 
 FETCHED = [
     {"url": "https://docs.alpha.com/a", "title": "Alpha docs", "published": "2026-09-01"},        # 1
@@ -179,11 +179,13 @@ def extracted(monkeypatch):
     """compose's findings extractor, faked where insight looks it up."""
     calls: list[tuple[str, str]] = []
 
-    def fake(title, md, fetched):
+    def fake(title, md, fetched, *, engines, rnd):
         calls.append((title, md))
         return [{"claim": "Model X reaches about 90 percent accuracy", "citation_urls": [FETCHED[0]["url"]],
-                 "confidence": "high", "section": title}], None, ""
-    monkeypatch.setattr(insight, "_extract_findings", fake)
+                 "confidence": "high", "section": title, "source_ids": [1],
+                 "sentence": "Model X reaches about 90 percent accuracy on reasoning tasks [1][3]",
+                 "status": "kept"}], [], []
+    monkeypatch.setattr(insight, "extract_findings", fake)
     return calls
 
 
@@ -261,10 +263,12 @@ def test_findings_are_extracted_over_the_unlabelled_analysis_and_merged(monkeypa
 
 
 def test_the_analysis_findings_come_from_the_real_extractor(monkeypatch):
-    """Pins the call contract of compose's ``_extract_findings`` (WP-C rewrites
-    it): the real extractor, on the legacy ``cheap`` role, over a fake driver."""
-    monkeypatch.setattr(registry._state, "snapshot", fake_engines_snapshot())   # the legacy wrappers read it
+    """Pins the call contract of compose's ``extract_findings`` (WP-C): the real
+    extractor on ``compose.findings_extract`` over a fake driver, with the
+    verbatim sentence, its source ids and the kept status."""
     extract = json.dumps({"findings": [{"claim": "Model X reaches about 90 percent accuracy",
+                                        "sentence": "Model X reaches about 90 percent accuracy on reasoning "
+                                                    "tasks [1][3]",
                                         "source_ids": [1, 3], "confidence": "high"}]})
     seen = fake_llm(monkeypatch, lambda system, human: REPLY if system == ANALYST_SYSTEM else extract)
     out = analyst_node(_state())
@@ -272,9 +276,37 @@ def test_the_analysis_findings_come_from_the_real_extractor(monkeypatch):
     assert seen[1][1].startswith("Section: Analysis\n\n### Key takeaways\n\n- Model X reaches about 90 percent")
     assert out["findings"][2:] == [{"id": "f2", "claim": "Model X reaches about 90 percent accuracy",
                                     "citation_urls": [FETCHED[0]["url"], FETCHED[2]["url"]],
-                                    "confidence": "high", "section": "Analysis"}]
-    assert [c["role"] for c in out["model_calls"]] == ["compose.analyst", "legacy.cheap"]
+                                    "confidence": "high", "section": "Analysis", "source_ids": [1, 3],
+                                    "sentence": "Model X reaches about 90 percent accuracy on reasoning tasks [1][3]",
+                                    "status": "kept"}]
+    assert [c["role"] for c in out["model_calls"]] == ["compose.analyst", "compose.findings_extract"]
     assert out["errors"] == []
+
+
+def test_a_skipped_analysis_extraction_is_a_declared_skip(monkeypatch):
+    def reply(system, human):
+        if system == ANALYST_SYSTEM:
+            return REPLY
+        raise DriverError("provider fake: boom")
+    fake_llm(monkeypatch, reply)
+    out = analyst_node(_state(revise_rounds=1))
+    assert out["analysis"] is not None and [f["section"] for f in out["findings"]] == ["Accuracy", "Cost"]
+    assert out["errors"] == ["[r2] skip: compose.findings_extract Analysis (role compose.findings_extract: every "
+                             "engine failed after 1 attempt (last: DriverError: provider fake: boom))"]
+
+
+def test_list_markers_are_normalised_before_the_takeaways_are_parsed(monkeypatch, extracted):
+    fake_llm(monkeypatch, lambda system, human: "### Key takeaways\n\n- Model X is accurate [1, 3]\n")
+    takeaways = analyst_node(_state())["analysis"]["takeaways"]
+    assert [(t["text"], t["source_ids"]) for t in takeaways] == [("Model X is accurate [1][3]", [1, 3])], (
+        "a [1, 2] takeaway is cited, not relocated as uncited")
+
+
+def test_a_label_only_analysis_takes_omit_analysis(monkeypatch, extracted):
+    fake_llm(monkeypatch, lambda system, human: "### Key takeaways\n\n### Open questions and limits\n")
+    out = analyst_node(_state())
+    assert out["analysis"] is None and "draft_md" not in out and extracted == []
+    assert out["errors"] == ["[r1] degrade: compose.analyst → omit_analysis (no analysis content)"]
 
 
 def test_no_extraction_when_the_analysis_cites_nothing(monkeypatch, extracted):

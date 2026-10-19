@@ -81,6 +81,8 @@ REMOVED_ENV_KNOBS = {
     "ARGUS_EXA_MAX_CALLS": "run_config search.exa.max_searches (a per-run budget)",
     "ARGUS_FETCH_CONCURRENCY": "run_config fetch.concurrency",
     "ARGUS_DIGEST_CONCURRENCY": "run_config research.digest_concurrency",
+    "ARGUS_MAX_REVISIONS": "run_config panel.max_compose_revisions",
+    "ARGUS_COMPOSE_CONCURRENCY": "run_config compose.concurrency",
 }
 
 
