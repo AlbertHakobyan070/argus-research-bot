@@ -6,6 +6,8 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 
 - `src/argus/engines/registry.py` (new), the async registry:
   - `load_config(paths=None, library=None)` merges the layers, lowest first: the defaults file (`ARGUS_ENGINES_FILE`, default `argus_engines.json`), the optional local file (`ARGUS_ENGINES_LOCAL_FILE`, default `argus_engines.local.json`), and the library settings keys `engines.active_profile`, `engines.overrides` and `engines.transcriber` (JSON, through `Library.get_setting`/`set_setting`). Dicts merge key by key. An engine spec (a dict with `provider`), a list or a scalar replaces. The file read runs in a worker thread.
+    - Files are read as `utf-8-sig`, so a UTF-8 file with a BOM (Notepad) loads.
+    - A file that can't be read or decoded (a Windows ANSI file with non-ASCII text, a UTF-16 file from PowerShell 5.1 `>`) raises `EngineConfigError` naming the file and the problem. At startup that is one more logged and DM'd problem, never a crash.
   - Startup checks, with no I/O:
     - `validate_schema(cfg)`: the pydantic validators, names that match their keys, and every `model_from_preferences` pointing at a preference list its provider has.
     - `static_problems(cfg)`: covers the active profile's primaries only. It reports a missing `api_key_env` (one line per provider) and a fixed id outside a `known_models` provider's list.
@@ -22,11 +24,17 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
     - `set_overrides(profile, overrides)`: a full check for the active profile, the schema check for any other.
     - `set_transcriber(t)`.
   - `base_url(prov)` (env override first) and `api_key(prov)`. A keyless provider gets `"none"`, never `None`. A missing key raises.
-  - `live_models(name)`: the live list, cached for `MODELS_TTL_S`, or `known_models` when the provider has no endpoint. An error names the URL and never the key.
+  - `live_models(name)`: the live list, cached for `MODELS_TTL_S`, or `known_models` when the provider has no endpoint. An error names the URL and never the key: a key quoted by the underlying error is replaced by `***`, and that error is not chained.
   - `family(model_id)`: the prefix table of the original WP-A text.
   - `summarize_calls(model_calls, errors=None, *, exa_usd=None)`:
-    - `by_role`, keyed by role. v3 records, which have no role, count as `legacy.<tier>`. Each row has `calls`, `ok`, `served_models`, `fallbacks`, `skipped`, `degraded`, `errors`, `retries` and `avg_latency_ms`.
-    - Top level: `calls`, `reroute_rate`, `judge_families`, `writer_families`, `judge_writer_same_family` (`None` when unknown), `warnings`, `degradations`, and `exa_usd` when it is given.
+    - `by_role`, keyed by role. v3 records, which have no role, count as `legacy.<tier>`.
+    - Each row counts **logical calls** in `calls`: `ok` successful calls plus `exhausted` calls. An exhausted call is each "role <id>: every engine failed after <n> attempts" that `errors` quotes, wherever in the line.
+    - **Attempt records** are counted apart and are never labelled calls:
+      - `attempts` and `failed_attempts` cover the records in `model_calls`, including the `prior_attempts` the wrappers attach;
+      - `exhausted_attempts` is the sum of those `<n>`.
+    - The row also has `skipped` and `degraded` (from the `skip:` and `degrade:` lines), `served_models`, `fallbacks`, `retries` and `avg_latency_ms`.
+    - Top level: `calls` (logical), `exhausted`, `attempts`, `reroute_rate`, `judge_families`, `writer_families`, `judge_writer_same_family` (`None` when unknown), `warnings`, `degradations`, and `exa_usd` when it is given.
+    - **During Phases 1–2, the per-attempt records of an exhausted legacy call are absent from `model_calls`.** The v3 call sites are outside WP-A: they catch the `EngineError` and keep only its text, and some (scout and follow-up query generation) only log it. So an exhausted call is visible only where its call site quotes the facade's message in `errors`. The node migrations append `EngineError.attempts` to `model_calls` later.
 - `src/argus/engines/llm_openai.py` (new), the driver. It calls the openai SDK directly:
   - One client per (provider, model), built with `max_retries=0`, `api_key=registry.api_key(...)`, the provider's `timeout_s` and the provider's `headers`.
   - `with_raw_response`, so response headers are read.
@@ -35,17 +43,19 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
   - `response_format={"type": "json_object"}` when `json_mode` is set.
   - `extra_body` is the provider's, merged with the engine's.
   - `routed_via` comes from the header `x-routed-via`, else the body's `_routed_via`, else `x_groq`.
+  - An unusable response raises `DriverError` and is never an empty success. That covers an `error` object in the body (FreeLLMAPI and upstreams send these with HTTP 200), no choices, a body that isn't JSON, and a body the SDK can't parse as a chat completion. `DriverError.code` carries the error object's numeric code.
 - `src/argus/llm.py`, rewritten as the facade:
   - `complete(role, messages, *, engines, temperature, max_tokens, json_mode, expect_json, validate, item) -> LLMResult`, plus `NOT_VALIDATED`, `CallRecord`, `LLMResult` and `strip_reasoning`.
   - The exceptions `EngineError`, `EngineSkipped` and `EngineDegraded` (which carries `degradation`). `EngineConfigError` is re-exported from the registry.
   - Each engine is tried in turn: the primary, then the fallbacks.
-    - Transient errors (connection, 5xx, 429) get up to three tries, with a 1 s then 2 s backoff, or the `Retry-After` value up to `retry_after_cap_s`.
+    - Transient errors (connection, 5xx, 429, and a `DriverError` whose code is 429 or 5xx) get up to three tries, with a 1 s then 2 s backoff, or the `Retry-After` value up to `retry_after_cap_s`.
     - A timeout is retried at most `timeout_retry_max` times.
-    - Any other error fails that engine.
+    - Any other error fails that engine, a `DriverError` without such a code included.
+    - Every failed attempt is a `CallRecord` with `ok=False` and the provider's message. The provider's key is replaced by `***` in the record and in the log line.
     - Tagged reasoning blocks are then stripped.
-    - A JSON role cut off at its limit (`finish_reason == "length"`) gets one retry at twice the budget, capped at 4096.
+    - A JSON role cut off at its limit (`finish_reason == "length"`) gets one retry at twice the budget, capped at 4096. With no budget, the retry uses 4096.
     - A reply the `validate` hook rejects gets one retry with "Reply with only the JSON object."
-  - When every engine has failed, the binding's `on_exhausted` applies: `raise` raises `EngineError`, `skip_item` raises `EngineSkipped`, and `degrade` raises `EngineDegraded`.
+  - When every engine has failed, the binding's `on_exhausted` applies: `raise` raises `EngineError`, `skip_item` raises `EngineSkipped`, and `degrade` raises `EngineDegraded`. The message is "role <id>: every engine failed after <n> attempts (last: …)", so the role id and the attempt count can be parsed back out of `errors`.
   - A per-provider `rpm_limit` sliding window applies across threads.
   - The Phase 1–2 wrappers `chat_for_tier`, `invoke_with_retry`, `record_from_response`, `resolve_tier` and `pick_strong_and_judge` keep their call sites. They route through `complete("legacy.<tier>", …, engines=registry.current_snapshot_cached())`. `record_from_response` returns the successful attempt, with the earlier attempts in `extra["prior_attempts"]`.
 - `argus_engines.json` (new):
@@ -69,14 +79,15 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
   - Usage: `[--provider NAME | --all] [--model ID]`.
   - For each provider whose key is set, it lists the models and then makes single direct calls through the driver: `plain` at 20 tokens, `json_mode`, `temperature=0.2`, the `cap16` check, and a 200-token JSON call that must return content. It also reports whether `routed_via` was captured.
   - It prints a Markdown table and suggested flag changes. It never prints keys; a key echoed in an error is redacted.
-  - It exits 1 when a call failed or a check did not hold. `--all` skips keyless local servers; pass them by name.
+  - It exits 1 when a call failed or a check did not hold. `--all` skips keyless local servers; pass them by name. When nothing can be probed (no key set), it says so and exits 1, with no empty table.
 - Shared-file edits:
   - `src/argus/bot/app.py`:
     - `HANDLER_MODULES.append(engines_cmd)`.
     - A `_post_init` block: `load_config(library=lib)`, `validate_schema` and `static_problems`, with no network. Each problem is logged at WARNING, and one DM to `TELEGRAM_ALLOWED_USER_ID` lists them all. An `EngineConfigError` while loading counts as a problem, so startup continues.
     - A WARNING for each removed env knob that is still set.
   - `src/argus/bot/research.py` and `src/argus/bot/history.py`: one `await registry.active_snapshot()` at the start of each drive entry, after the existing guards and before any graph call. The entries are `research_cmd`, `ask_cmd`, `_replan_after_edit`, `_revise_after_feedback`, `_resume_after_plan`, `_resume_after_report` and `continue_cmd`.
-  - `src/argus/graph/report_builder_helpers.py`: `build_sidecar_metadata(..., errors=None)` adds `metadata["engines"] = summarize_calls(model_calls, errors)`. `nodes.py` does not pass `errors` yet; that is WP-C's.
+  - `src/argus/graph/report_builder_helpers.py`: `build_sidecar_metadata(..., errors=None)` adds `metadata["engines"] = summarize_calls(model_calls, errors)`.
+  - `src/argus/graph/nodes.py` (WP-C's file): one line in the fix round, approved by the orchestrator. The `report_builder_node` call to `build_sidecar_metadata` passes `errors=state.get("errors") or []`, so the summary sees the exhausted, skip and degrade lines.
   - `src/argus/config.py` (WP-D's file, two edits the WP-A text requires):
     - `Settings.request_timeout_seconds` (`ARGUS_TIMEOUT`) is deleted with the wrappers, its last reader.
     - The `FREELLMAPI_API_KEY` missing/malformed `RuntimeError` is removed, because the acceptance needs the bot to start without the key. The registry reports the missing key instead. The `freellmapi_*` fields stay, because `manual_e2e`, `demo_run` and `test_config_tools` read them.
@@ -107,6 +118,9 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - The `/models` fetch is not retried; v3 retried it. A failed listing fails the resolution, with the URL in the text.
 - `/engines` is new. `HELP_TEXT` and `docs/help.md` don't list it yet; they belong to other WPs.
 - Until their WPs add `await registry.active_snapshot()`, `scripts/demo_run.py` (WP-D) and `bench/runner.py` (WP-G) raise "no engines snapshot resolved".
+- A response with an error object in its body is a failed attempt, as in v3, never an empty success. So is a response with no choices or one that isn't a chat completion. An error object with code 429 or 5xx is retried like a 429 or 5xx status.
+- An exhausted call's error text reads "role <id>: every engine failed after <n> attempts (last: …)". `metadata.json["engines"]` counts such calls in `calls` and `exhausted`, and keeps attempt counts apart (`attempts`, `failed_attempts`, `exhausted_attempts`). The earlier per-row `errors` field is gone.
+- `argus_engines.json` and the local file must be UTF-8; a BOM is fine. Anything else is a startup problem (logged and DM'd) that names the file, and runs are refused until it is fixed.
 
 ### New env vars
 
@@ -130,6 +144,10 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
   - `tests/test_plan_hitl_gating.py`, `tests/test_delete_browser.py`, `tests/test_media_bot.py`: no `request_timeout_seconds`.
   - `tests/test_graph.py`: an autouse fixture that resolves the shipped config against the live proxy.
   - `tests/manual_e2e.py`: resolves before driving.
+- Fix round 1: new cases in the three new files.
+  - `test_llm_facade.py`: error bodies, no choices, non-JSON and non-completion bodies through the real driver and SDK; key redaction; exhaustion by policy; the truncation retry without a budget; the `ALL_SKIPPED_RAISES` case reworked to check the facade's `EngineSkipped`; and the risk-9 scenario through `report_builder_node`.
+  - `test_engines_registry.py`: the decoding cases, a `/models` error that quotes the key, the new `summarize_calls` fields, and the probe's `--all` with no key.
+  - `test_engines_cmd.py`: startup with a cp1252 or UTF-16 local file.
 
 ### Verification evidence (2026-10-19)
 
@@ -186,3 +204,24 @@ Not run here, per the brief's single live call (orchestrator checks):
 - The bot started with `FREELLMAPI_API_KEY` unset, checking for the DM.
 
 The unit tests drive the same `_post_init`, drive entries and error handler.
+
+### Fix round 1 — verification evidence (2026-10-19)
+
+The fix round made no live calls. Logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t4fix\`. The review's repro scripts are in `scratchpad\t4-review\`.
+
+- **RED** (`red_fix.log`): the new and changed test cases of the three new test files, run against `097c99d` (extracted with `git archive`, so `src/` is the pre-fix code) → `18 failed, 58 passed`. The failures:
+  - an error body gave `''` instead of the fallback's text, and the call did not raise;
+  - `[None] == [None, 4096]` for the truncation retry;
+  - no "after N attempts" in the exhaustion text;
+  - `KeyError: 'exhausted'`;
+  - the BOM file rejected as invalid JSON;
+  - the `/models` error printed `Bearer sk-proxy-secret`;
+  - the probe's `--all` exited 0;
+  - startup raised `UnicodeDecodeError` for the cp1252 and UTF-16 local files.
+- **GREEN, focused** (`green_fix.log`): `test_llm_facade.py`, `test_engines_registry.py`, `test_engines_cmd.py` and `test_llm_retry.py` with `FREELLMAPI_BASE_URL=http://127.0.0.1:9/v1` → `84 passed`.
+- **Full suite, proxy URL on a closed port** (`suite_fix.log`): `2 failed, 646 passed, 1 skipped, 1 warning, 2 errors`. Only the live tests failed, as by design with no proxy: `test_llm.py` ×2, and the `test_graph.py` fixture ×2.
+- **Review repros after the fix** (`review_repros_after.log`):
+  - `errbody_check.py`: the legacy call now raises `EngineError: role legacy.cheap: every engine failed after 3 attempts (last: DriverError: provider fake: error in the response body: All models exhausted)`.
+  - `startup_check.py`: cp1252 and UTF-16 give `EngineConfigError (caught by _post_init)`, and the BOM file loads.
+  - `risk9_check.py`: the digests' error lines now carry "after 3 attempts". Its last line still reads the removed per-row `errors` field, so it stops with `KeyError`. `test_exhausted_legacy_digests_count_as_calls_in_the_report_metadata` checks the new fields instead.
+- **Static scan:** clean apart from the known `__file__` false positive. **Model-id check:** none outside the spec list.

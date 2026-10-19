@@ -244,11 +244,14 @@ def test_engines_cmd_is_registered_via_handler_modules():
     fake.add_error_handler.assert_called_once_with(engines_cmd.on_error)
 
 
-async def _post_init(monkeypatch, tmp_path, engines_text: str) -> MagicMock:
+async def _post_init(monkeypatch, tmp_path, engines_text: str, local: bytes | None = None) -> MagicMock:
     f = tmp_path / "engines.json"
     f.write_text(engines_text, encoding="utf-8")
+    local_file = tmp_path / "engines.local.json"
+    if local is not None:
+        local_file.write_bytes(local)
     monkeypatch.setenv("ARGUS_ENGINES_FILE", str(f))
-    monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(tmp_path / "absent.local.json"))
+    monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(local_file))
     monkeypatch.setattr(bot_app, "get_settings", lambda: _settings(tmp_path))
     app = MagicMock()
     app.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
@@ -268,6 +271,20 @@ async def test_post_init_survives_a_broken_engines_file(monkeypatch, tmp_path, n
     kw = app.bot.send_message.await_args.kwargs
     assert kw["chat_id"] == 42 and "invalid JSON" in kw["text"]
     assert any("engines:" in r.getMessage() and "invalid JSON" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("encoding", ["cp1252", "utf-16"])
+async def test_post_init_survives_a_local_engines_file_that_is_not_utf8(
+        monkeypatch, tmp_path, no_network, caplog, encoding):
+    caplog.set_level(logging.WARNING, logger="argus.bot")
+    local = json.dumps({"profiles": {"main": {"description": "proxy — local"}}}, ensure_ascii=False)
+    app = await _post_init(monkeypatch, tmp_path, json.dumps(CFG), local=local.encode(encoding))
+    assert "graph" in app.bot_data, "startup completed"
+    app.bot.send_message.assert_awaited_once()
+    text = app.bot.send_message.await_args.kwargs["text"]
+    assert "engines.local.json" in text and "save it as UTF-8" in text
+    assert any("engines:" in r.getMessage() and "engines.local.json" in r.getMessage()
+               for r in caplog.records)
 
 
 async def test_post_init_dms_static_problems_once_and_warns_on_removed_knobs(

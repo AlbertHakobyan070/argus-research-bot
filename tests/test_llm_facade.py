@@ -4,6 +4,8 @@ Phase 1–2 legacy wrappers. Hermetic: no network."""
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -167,30 +169,42 @@ def test_policy_classes_map_to_exception_classes(monkeypatch, role, exc_type, de
 
 
 def test_all_skipped_raises_rule_at_a_fake_per_item_call_site(monkeypatch):
-    """The §2.3 rule as a per-item node applies it: EngineSkipped per item
-    (role and item recorded), and the node raises EngineError when every
-    item of an ALL_SKIPPED_RAISES role was skipped."""
+    """The §2.3 rule as a per-item node applies it. The facade's own raise
+    path hands the node one EngineSkipped per item (role, item and attempts
+    recorded); the node raises EngineError, carrying those attempts, only
+    when every item of an ALL_SKIPPED_RAISES role was skipped."""
+    skipped: list[llm.EngineError] = []
+
     def section_node(titles, snap):
         bodies, errors = [], []
         for t in titles:
             try:
                 bodies.append(llm.complete("compose.section", MSGS, engines=snap, item=t).text)
             except llm.EngineSkipped as e:
-                assert e.role == "compose.section" and e.attempts[-1].item == t
+                skipped.append(e)
                 errors.append(f"skip: compose.section {t} ({e.attempts[-1].error})")
         if "compose.section" in ALL_SKIPPED_RAISES and not bodies:
             raise llm.EngineError("compose: every section was skipped", role="compose.section",
-                                  attempts=[])
+                                  attempts=[a for e in skipped for a in e.attempts])
         return bodies, errors
 
     _drive(monkeypatch, p1=[_status(400)] * 2, p2=[_status(400)] * 2)
     with pytest.raises(llm.EngineError) as ei:
         section_node(["A", "B"], _snap("compose.section"))
-    assert type(ei.value) is llm.EngineError
+    assert [type(e) for e in skipped] == [llm.EngineSkipped, llm.EngineSkipped], (
+        "the facade raised EngineSkipped for each item, not a bare EngineError")
+    assert all(e.role == "compose.section" and
+               str(e).startswith("role compose.section: every engine failed after 2 attempts")
+               for e in skipped)
+    assert str(ei.value) == "compose: every section was skipped"
+    assert [(a.item, a.provider, a.ok) for a in ei.value.attempts] == [
+        ("A", "p1", False), ("A", "p2", False), ("B", "p1", False), ("B", "p2", False)]
 
+    skipped.clear()
     _drive(monkeypatch, p1=[_status(400), _resp("body B")], p2=[_status(400)])
     bodies, errors = section_node(["A", "B"], _snap("compose.section"))
     assert bodies == ["body B"] and errors and errors[0].startswith("skip: compose.section A (")
+    assert [type(e) for e in skipped] == [llm.EngineSkipped]
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +230,10 @@ def test_truncation_retry_doubles_the_budget_once_with_a_cap(monkeypatch):
     out = llm.complete("intake.classify", MSGS, engines=_snap("intake.classify"), max_tokens=3000)
     assert [c.max_tokens for c in d.calls] == [3000, 4096]
     assert out.records[1].retry_reason == "truncated" and out.text == '{"mode": "deep"}'
+
+    d = _drive(monkeypatch, p1=[_resp('{"mode": "de', finish="length"), _resp('{"mode": "deep"}')])
+    llm.complete("intake.classify", MSGS, engines=_snap("intake.classify"))      # no budget given
+    assert [c.max_tokens for c in d.calls] == [None, 4096], "the retry uses the cap"
 
     d = _drive(monkeypatch, p1=[_resp("cut", finish="length")])        # not a JSON role
     llm.complete("legacy.cheap", MSGS, engines=_snap("legacy.cheap"), max_tokens=100)
@@ -384,6 +402,88 @@ def test_driver_routed_via_from_headers_and_body(monkeypatch, headers, extra, ro
 
 
 # ---------------------------------------------------------------------------
+# unusable response bodies are engine failures, never empty successes
+# (the real driver and SDK on a mock transport, through the facade)
+# ---------------------------------------------------------------------------
+
+def _hosts(monkeypatch, **answers) -> list[str]:
+    """Each request to http://<host>/v1 pops that host's next httpx.Response;
+    returns the hosts asked, in order."""
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.host)
+        return answers[request.url.host].pop(0)
+    monkeypatch.setattr(llm_openai, "OpenAI", lambda **kw: openai.OpenAI(
+        **kw, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+    monkeypatch.setattr(llm, "_driver", OpenAICompatDriver())
+    return sent
+
+
+def _ok() -> httpx.Response:
+    return httpx.Response(200, json=BODY)
+
+
+def _error_body(message: str, code) -> httpx.Response:
+    return httpx.Response(200, json={"error": {"message": message, "code": code}})
+
+
+def test_a_429_error_body_is_transient_retried_then_falls_back(monkeypatch, sleeps):
+    sent = _hosts(monkeypatch, p1=[_error_body("All models exhausted", 429)] * 3, p2=[_ok()])
+    out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft"))
+    assert out.text == "PONG" and out.record.provider == "p2"
+    assert sent == ["p1", "p1", "p1", "p2"] and sleeps == [1.0, 2.0]
+    failed = out.records[:3]
+    assert [r.retry_reason for r in failed] == ["", "transient", "transient"]
+    assert all(not r.ok and r.error.startswith("DriverError") and "All models exhausted" in r.error
+               for r in failed)
+
+
+@pytest.mark.parametrize("answer, reason", [
+    (_error_body("model not found", 404), "model not found"),
+    (_error_body("slow down", "rate_limit_exceeded"), "slow down"),     # a symbolic code is no status
+    (httpx.Response(200, json={**BODY, "choices": []}), "no choices"),
+    (httpx.Response(200, json={k: v for k, v in BODY.items() if k != "choices"}), "no choices"),
+    (httpx.Response(200, text="<html>bad gateway</html>", headers={"content-type": "text/html"}),
+     "not a chat completion"),
+    (httpx.Response(200, content=b"{not json", headers={"content-type": "application/json"}), "not JSON"),
+])
+def test_an_unusable_body_fails_the_engine_and_goes_to_the_fallback(monkeypatch, sleeps, answer, reason):
+    sent = _hosts(monkeypatch, p1=[answer], p2=[_ok()])
+    out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft"))
+    assert sent == ["p1", "p2"] and sleeps == [], "not transient: straight to the fallback"
+    first = out.records[0]
+    assert first.ok is False and first.error.startswith("DriverError") and reason in first.error
+    assert out.text == "PONG" and out.record.ok
+
+
+def test_error_bodies_everywhere_raise_by_policy_never_an_empty_success(monkeypatch, sleeps):
+    registry._state.snapshot = fake_engines_snapshot()
+    _hosts(monkeypatch, fake=[_error_body("All models exhausted", 429)] * 6)
+    with pytest.raises(llm.EngineError) as ei:
+        llm.invoke_with_retry(llm.chat_for_tier("cheap"), MSGS)
+    assert type(ei.value) is llm.EngineError and len(ei.value.attempts) == 3
+    assert str(ei.value).startswith("role legacy.cheap: every engine failed after 3 attempts")
+    with pytest.raises(llm.EngineDegraded) as ei:
+        llm.complete("scout.querygen", MSGS, engines=registry._state.snapshot, validate=json.loads)
+    assert all(not a.ok and "All models exhausted" in a.error for a in ei.value.attempts)
+
+
+def test_a_key_in_a_provider_error_is_never_recorded_or_logged(monkeypatch, sleeps, caplog):
+    caplog.set_level(logging.WARNING, logger="argus.llm")
+    monkeypatch.setenv("T_PK_KEY", "sk-leaky-123")
+    keyed = ProviderSpec(name="pk", base_url="http://pk/v1", api_key_env="T_PK_KEY")
+    monkeypatch.setattr(registry, "provider", {**PROVIDERS, "pk": keyed}.__getitem__)
+    _hosts(monkeypatch, pk=[_error_body("invalid key sk-leaky-123", 401),
+                            httpx.Response(401, json={"error": {"message": "bad key sk-leaky-123"}})],
+           p2=[_ok(), _ok()])
+    for _ in range(2):                    # the 200 error body, then a real 401 status
+        out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft", "pk"))
+        assert "sk-leaky-123" not in out.records[0].error and "***" in out.records[0].error
+    assert caplog.records and not any("sk-leaky-123" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # the Phase 1–2 legacy wrappers
 # ---------------------------------------------------------------------------
 
@@ -411,3 +511,46 @@ def test_legacy_wrappers_route_through_complete_on_the_cached_snapshot(monkeypat
     _drive(monkeypatch, fake=[_resp("judged")])
     ok = llm.invoke_with_retry(llm.chat_for_tier("judge", model_override="fake-model"), MSGS)
     assert ok.content == "judged"
+
+
+DIGEST_OK = '{"relevance": 3, "stance": "supports", "claims": []}'
+
+
+def test_exhausted_legacy_digests_count_as_calls_in_the_report_metadata(monkeypatch, tmp_path, sleeps):
+    """Review risk 9: two digests exhaust their engine (429 three times
+    each) and one succeeds after a 429, through the real v3 call site, the
+    legacy wrappers and the facade. The call site keeps only the error text
+    of an exhausted call, so the summary report_builder writes counts it
+    from that text: three logical calls, two of them exhausted."""
+    from argus import config as config_mod
+    from argus.graph import nodes as nodes_mod
+    from argus.graph import research
+    from argus.graph.state import ResearchBrief, SubQuestion
+
+    registry._state.snapshot = fake_engines_snapshot()
+    _drive(monkeypatch, fake=[_status(429)] * 7 + [_resp(DIGEST_OK)])
+    doc = tmp_path / "doc.md"
+    doc.write_text("Retrieval augmented generation. " * 40, encoding="utf-8")
+    brief = ResearchBrief(sub_questions=[SubQuestion(q="what is RAG?")], summary="s")
+    model_calls, errors = [], []
+    for i in range(3):
+        item = {"url": f"https://{i}.example", "title": "t", "markdown_path": str(doc), "sub_qs": [0]}
+        _note, call, err = research.digest_one(item, i + 1, brief, "q")
+        model_calls += [call] if call else []
+        errors += [err] if err else []
+    assert len(model_calls) == 1 and len(errors) == 2
+    assert all("role legacy.cheap: every engine failed after 3 attempts" in e for e in errors)
+    assert sleeps == [1.0, 2.0, 1.0, 2.0, 1.0]
+
+    monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
+    monkeypatch.setattr(nodes_mod, "markdown_to_pdf", lambda *a, **k: None)
+    out = nodes_mod.report_builder_node({"user_request": "risk nine", "length": "short",
+                                         "draft_md": "# risk nine\n\nBody.\n",
+                                         "model_calls": model_calls, "errors": errors})
+    meta = json.loads((Path(out["report_paths"]["folder"]) / "metadata.json").read_text(encoding="utf-8"))
+    row = meta["engines"]["by_role"]["legacy.cheap"]
+    assert (row["calls"], row["ok"], row["exhausted"]) == (3, 1, 2)
+    assert (row["attempts"], row["failed_attempts"], row["exhausted_attempts"]) == (2, 1, 6), (
+        "the attempt records apart from the calls; 2 + 6 = every request made")
+    assert row["retries"] == {"transient": 1}
+    assert (meta["engines"]["calls"], meta["engines"]["exhausted"], meta["engines"]["attempts"]) == (3, 2, 2)

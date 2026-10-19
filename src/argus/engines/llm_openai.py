@@ -8,6 +8,9 @@ only in JSON mode, and merges the engine's ``extra_body`` over the
 provider's. From the raw response it keeps the served model, ``routed_via``
 (header ``x-routed-via``, else body ``_routed_via`` / ``x_groq``), the finish
 reason, token usage including reasoning tokens, and the rate-limit headers.
+A response that is not a usable completion — an error object in the body
+(often with HTTP 200), no choices, or a body that is not a chat completion —
+raises ``DriverError``; the facade treats it as a failed attempt.
 
 ``Driver`` is the interface a native driver (``ProviderSpec.kind``) would
 implement later."""
@@ -19,6 +22,7 @@ from typing import Any, Protocol
 
 from langchain_core.messages import BaseMessage
 from openai import OpenAI
+from openai.types.chat import ChatCompletion
 
 from . import registry
 from .registry import EngineConfigError
@@ -26,6 +30,27 @@ from .schema import EngineSpec, ProviderSpec
 
 _ROLE_OF = {"system": "system", "human": "user", "ai": "assistant"}
 _KEPT_HEADERS = frozenset({"retry-after", "x-fallback-attempts"})
+
+
+class DriverError(RuntimeError):
+    """The provider answered, but not with a usable chat completion.
+    ``code`` is the error object's numeric code (429 or 5xx → transient),
+    else None; ``headers`` are the response headers (``Retry-After``)."""
+
+    def __init__(self, message: str, *, code: int | None = None, headers: Any = None):
+        super().__init__(message)
+        self.code = code
+        self.headers = headers if headers is not None else {}
+
+
+def _body_error(provider: ProviderSpec, error: Any, headers: Any) -> DriverError:
+    message, code = (error.get("message") or error, error.get("code")) if isinstance(error, dict) else (error, None)
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):     # a symbolic code ("rate_limit_exceeded") is not a status
+        code = None
+    return DriverError(f"provider {provider.name}: error in the response body: {message}", code=code,
+                       headers=headers)
 
 
 @dataclass
@@ -101,15 +126,27 @@ class OpenAICompatDriver:
         if extra:
             kwargs["extra_body"] = extra
         raw = self._client(engine, provider).chat.completions.with_raw_response.create(**kwargs)
-        completion = raw.parse()
+        try:
+            completion = raw.parse()
+        except ValueError as e:           # a JSON content type whose body is not JSON
+            raise DriverError(f"provider {provider.name}: the response body is not JSON ({e})",
+                              headers=raw.headers) from e
+        if not isinstance(completion, ChatCompletion):    # the SDK hands back a non-JSON body as text
+            raise DriverError(f"provider {provider.name}: the response is not a chat completion: "
+                              f"{str(completion)[:200]!r}", headers=raw.headers)
+        error = (completion.model_extra or {}).get("error")
+        if error:
+            raise _body_error(provider, error, raw.headers)
         choice = completion.choices[0] if completion.choices else None
+        if choice is None or choice.message is None:
+            raise DriverError(f"provider {provider.name}: the response has no choices", headers=raw.headers)
         usage = completion.usage
         details = usage.completion_tokens_details if usage else None
         return DriverResponse(
-            text=(choice.message.content or "") if choice else "",
+            text=choice.message.content or "",
             served_model=completion.model or "",
             routed_via=_routed_via(raw.headers, completion.model_extra or {}),
-            finish_reason=(choice.finish_reason or "") if choice else "",
+            finish_reason=choice.finish_reason or "",
             usage={"prompt_tokens": (usage.prompt_tokens or 0) if usage else 0,
                    "completion_tokens": (usage.completion_tokens or 0) if usage else 0,
                    "reasoning_tokens": (details.reasoning_tokens or 0) if details else 0},

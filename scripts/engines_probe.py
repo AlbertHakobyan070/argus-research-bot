@@ -13,7 +13,8 @@ retries or fallbacks, so each check is exactly one request:
   routed_via  captured from any of the answers?
 
 Prints a Markdown table and suggested flag changes for argus_engines.json.
-Never prints keys. Exits 1 when a call failed or a check did not hold.
+Never prints keys. Exits 1 when a call failed, a check did not hold, or
+nothing could be probed (no key set).
 
   PYTHONPATH="" PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe scripts/engines_probe.py --provider freellmapi
 """
@@ -233,6 +234,13 @@ def main() -> int:
             continue
         probes.append(probe_provider(cfg, prov, args.model))
 
+    if not probes:
+        for s in skipped:
+            print(f"skipped — {s}")
+        print("Nothing was probed: no provider has its key set. Set a key in .env, "
+              "or probe a local server with --provider NAME.")
+        return 1
+
     print("| provider | model | check | status | finish | tokens (completion/reasoning) | ms | detail |")
     print("|---|---|---|---|---|---|---|---|")
     for pr in probes:
@@ -244,8 +252,7 @@ def main() -> int:
     print("\nSuggested flag changes:" if suggestions else "\nSuggested flag changes: none")
     for s in suggestions:
         print(f"- {s}")
-    explicit_missing = bool(args.provider and skipped)
-    return 1 if explicit_missing or any(pr.failed for pr in probes) else 0
+    return 1 if any(pr.failed for pr in probes) else 0
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ and every test starts from an empty registry state."""
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
+import sys
 
 import httpx
 import pytest
@@ -245,6 +247,23 @@ async def test_load_config_reports_bad_files(tmp_path):
         await registry.load_config([_write(tmp_path, "x.json", data)])
 
 
+async def test_load_config_reads_a_bom_and_names_a_file_that_is_not_utf8(tmp_path, fetches):
+    defaults = _write(tmp_path, "d.json", BASE)
+    local = tmp_path / "local.json"
+    text = json.dumps({"profiles": {"other": {"description": "fixed — local"}}}, ensure_ascii=False)
+
+    local.write_bytes(text.encode("utf-8-sig"))                # Notepad's UTF-8 with a BOM
+    cfg = await registry.load_config([defaults, str(local)])
+    assert cfg.profiles["other"].description == "fixed — local"
+
+    for encoding in ("cp1252", "utf-16"):                     # a Windows ANSI file, PowerShell 5.1 `>`
+        local.write_bytes(text.encode(encoding))
+        with pytest.raises(EngineConfigError) as ei:
+            await registry.load_config([defaults, str(local)])
+        assert str(local) in str(ei.value) and "UnicodeDecodeError" in str(ei.value), encoding
+        assert "save it as UTF-8" in str(ei.value)
+
+
 # ---------------------------------------------------------------------------
 # active snapshot cache and persistence of /engines changes
 # ---------------------------------------------------------------------------
@@ -297,13 +316,16 @@ async def test_live_models_ttl_cache_known_models_and_no_key_in_errors(tmp_path,
     assert fetches == ["http://proxy/v1/models"], "TTL cache"
     assert registry.live_models("fixed") == ["k1", "k2"], "known_models, no network"
 
-    def refused(url, headers):
-        raise httpx.ConnectError("connection refused")
-    monkeypatch.setattr(registry, "_get_json", refused)
+    def leaky(url, headers):           # an error whose text quotes the request's credentials
+        raise httpx.HTTPError(f"401 Unauthorized, sent {headers['Authorization']}")
+    monkeypatch.setattr(registry, "_get_json", leaky)
     monkeypatch.setattr(registry, "_models_cache", {})
     with pytest.raises(EngineConfigError) as ei:
         registry.live_models("proxy")
-    assert "cannot list models" in str(ei.value) and "sk-proxy-secret" not in str(ei.value)
+    assert "cannot list models" in str(ei.value) and "Bearer ***" in str(ei.value)
+    assert "sk-proxy-secret" not in str(ei.value)
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__, (
+        "the original error, which holds the key, is neither chained nor shown")
 
 
 # ---------------------------------------------------------------------------
@@ -400,29 +422,62 @@ def test_summarize_calls():
         {"tier": "cheap", "requested_model": "cheap", "served_model": "llama-x",   # a v3 record
          "served_provider": "", "prompt_tokens": 3, "completion_tokens": 4, "extra": {}},
     ]
-    errors = ["skip: research.digest https://a.example (429)",
+    errors = ["skip: research.digest https://a.example (role research.digest: every engine failed "
+              "after 1 attempt (last: RateLimitError: 429))",
               "degrade: scout.querygen → subquestion_text_queries (unparseable)",
+              "digest: https://b.example failed (role legacy.cheap: every engine failed after 3 attempts "
+              "(last: RateLimitError: 429))",
               "compose: section 'x' failed (boom)"]
     s = registry.summarize_calls(calls, errors, exa_usd=0.12)
 
     strong = s["by_role"]["legacy.strong"]
-    assert (strong["calls"], strong["ok"], strong["errors"]) == (2, 1, 1)
+    assert (strong["calls"], strong["ok"], strong["exhausted"]) == (1, 1, 0), "one logical call"
+    assert (strong["attempts"], strong["failed_attempts"]) == (2, 1), "its two attempt records"
+    assert "errors" not in strong
     assert strong["retries"] == {"transient": 1}
     assert strong["served_models"] == {"openai/gpt-oss-120b": 1}
     assert strong["avg_latency_ms"] == 52.5
     assert s["by_role"]["legacy.judge"]["fallbacks"] == 1
-    assert s["by_role"]["legacy.cheap"]["served_models"] == {"req": 1, "llama-x": 1}, (
-        "a v3 record (no role) counts as legacy.<tier>")
-    assert s["by_role"]["research.digest"]["skipped"] == 1
+    cheap = s["by_role"]["legacy.cheap"]
+    assert cheap["served_models"] == {"req": 1, "llama-x": 1}, "a v3 record (no role) counts as legacy.<tier>"
+    assert (cheap["calls"], cheap["ok"], cheap["exhausted"], cheap["exhausted_attempts"]) == (3, 2, 1, 3), (
+        "an exhausted call quoted by its call site counts as a call")
+    digest = s["by_role"]["research.digest"]
+    assert (digest["skipped"], digest["exhausted"], digest["calls"], digest["exhausted_attempts"]) == (1, 1, 1, 1)
     assert s["by_role"]["scout.querygen"]["degraded"] == 1
+    assert s["by_role"]["scout.querygen"]["calls"] == 0, "a degrade line alone is no call"
     assert s["degradations"] == ["degrade: scout.querygen → subquestion_text_queries (unparseable)"]
     assert s["reroute_rate"] == round(3 / 4, 3)
     assert s["judge_families"] == ["openai"] and s["writer_families"] == ["openai"]
     assert s["judge_writer_same_family"] is True
     assert s["warnings"] and "openai" in s["warnings"][0]
     assert s["exa_usd"] == 0.12
-    assert s["calls"] == 5
+    assert (s["calls"], s["exhausted"], s["attempts"]) == (6, 2, 5)
 
     empty = registry.summarize_calls([])
     assert empty["reroute_rate"] is None and empty["judge_writer_same_family"] is None
     assert "exa_usd" not in empty
+
+
+# ---------------------------------------------------------------------------
+# scripts/engines_probe.py
+# ---------------------------------------------------------------------------
+
+def test_probe_all_with_no_key_set_says_why_and_exits_non_zero(monkeypatch, tmp_path, capsys, no_network):
+    monkeypatch.setattr(sys, "path", list(sys.path))          # the script prepends src/ on import
+    monkeypatch.delenv("PYTHONPATH", raising=False)            # and pops PYTHONPATH
+    spec = importlib.util.spec_from_file_location("engines_probe", registry._ROOT / "scripts" / "engines_probe.py")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(tmp_path / "absent.json"))
+    shipped = json.loads((registry._ROOT / "argus_engines.json").read_text(encoding="utf-8"))
+    for p in shipped["providers"].values():
+        if p.get("api_key_env"):
+            monkeypatch.delenv(p["api_key_env"], raising=False)
+    monkeypatch.setattr(sys, "argv", ["engines_probe.py", "--all"])
+
+    assert probe.main() == 1
+    out = capsys.readouterr().out
+    assert "Nothing was probed: no provider has its key set" in out
+    assert "FREELLMAPI_API_KEY is not set" in out and "keyless local server" in out
+    assert "| provider |" not in out, "no empty table"

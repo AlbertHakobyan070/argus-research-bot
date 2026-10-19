@@ -129,7 +129,10 @@ def _read_files(files: list[Path]) -> dict:
                 raise EngineConfigError(f"engines file not found: {path}")
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))     # a BOM (Notepad) is fine
+        except (OSError, UnicodeDecodeError) as e:
+            raise EngineConfigError(f"{path}: cannot be read as UTF-8 ({type(e).__name__}: {e}); "
+                                    "save it as UTF-8") from e
         except json.JSONDecodeError as e:
             raise EngineConfigError(f"{path}: invalid JSON ({e})") from e
         if not isinstance(data, dict):
@@ -452,14 +455,18 @@ def _models_for(prov: ProviderSpec) -> list[str]:
     if hit and time.monotonic() - hit[0] < MODELS_TTL_S:
         return list(hit[1])
     headers = dict(prov.headers)
-    if prov.api_key_env:
-        headers["Authorization"] = f"Bearer {api_key(prov)}"
+    secret = api_key(prov) if prov.api_key_env else None
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
     try:
         data = _get_json(url, headers)
         ids = sorted({m["id"] for m in data["data"] if isinstance(m, dict) and "id" in m})
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+        detail = f"{type(e).__name__}: {e}"
+        leaked = bool(secret) and secret in detail
         raise EngineConfigError(f"provider {prov.name}: cannot list models at {url} "
-                                f"({type(e).__name__}: {e})") from e
+                                f"({detail.replace(secret, '***') if leaked else detail})"
+                                ) from (None if leaked else e)   # never chain an error that holds the key
     with _models_lock:
         _models_cache[key] = (time.monotonic(), ids)
     return ids
@@ -504,6 +511,8 @@ def family(model_id: str) -> str:
 _WRITER_ROLES = frozenset({"compose.section", "compose.flat", "compose.analyst", "legacy.strong"})
 _JUDGE_ROLES = frozenset({"panel.grounding", "legacy.judge"})
 _ITEM_LINE = re.compile(r"^(?:\[r\d+\]\s*)?(skip|degrade):\s*(?:\[r\d+\]\s*)?(\S+)")
+# the facade's exhaustion message (llm.complete), wherever a call site quotes it
+_EXHAUSTED = re.compile(r"\brole ([a-z0-9_.]+): every engine failed after (\d+) attempts?")
 
 
 def _role_of(call: dict) -> str:
@@ -511,31 +520,43 @@ def _role_of(call: dict) -> str:
 
 
 def _empty_row() -> dict:
-    return {"calls": 0, "ok": 0, "served_models": {}, "fallbacks": 0, "skipped": 0, "degraded": 0,
-            "errors": 0, "retries": {}, "avg_latency_ms": 0.0}
+    return {"calls": 0, "ok": 0, "exhausted": 0, "attempts": 0, "failed_attempts": 0,
+            "exhausted_attempts": 0, "served_models": {}, "fallbacks": 0, "skipped": 0, "degraded": 0,
+            "retries": {}, "avg_latency_ms": 0.0}
 
 
 def summarize_calls(model_calls: list[dict], errors: list[str] | None = None, *,
                     exa_usd: float | None = None) -> dict:
-    """The provenance summary for ``metadata.json["engines"]``. Reads
-    CallRecord dicts (with any ``extra["prior_attempts"]`` the legacy
-    wrappers attach), v3 records (no role: ``legacy.<tier>``), and the
-    ``skip:`` / ``degrade:`` lines of ``errors``."""
-    calls = [a for c in model_calls or []
-             for a in [*((c.get("extra") or {}).get("prior_attempts") or []), c]]
+    """The provenance summary for ``metadata.json["engines"]``.
+
+    Per role, ``calls`` counts logical calls: the successful ones (an ok
+    record) plus the exhausted ones (``exhausted``: each "role <id>: every
+    engine failed after <n> attempts" quoted in ``errors``). The attempt
+    records are counted apart: ``attempts`` / ``failed_attempts`` over the
+    records in ``model_calls`` (with any ``extra["prior_attempts"]`` the
+    legacy wrappers attach), and ``exhausted_attempts`` = the <n> of the
+    exhausted calls, whose records the Phase 1–2 call sites do not keep.
+    ``skipped`` / ``degraded`` come from the ``skip:`` / ``degrade:`` lines.
+    v3 records (no role) count as ``legacy.<tier>``."""
+    records = [a for c in model_calls or []
+               for a in [*((c.get("extra") or {}).get("prior_attempts") or []), c]]
     groups: dict[str, list[dict]] = {}
-    for c in calls:
+    for c in records:
         groups.setdefault(_role_of(c), []).append(c)
     by_role: dict[str, dict] = {}
     for role, cs in groups.items():
         oks = [c for c in cs if c.get("ok", True)]
-        by_role[role] = {**_empty_row(), "calls": len(cs), "ok": len(oks), "errors": len(cs) - len(oks),
+        by_role[role] = {**_empty_row(), "ok": len(oks), "attempts": len(cs), "failed_attempts": len(cs) - len(oks),
                          "served_models": dict(Counter(c["served_model"] for c in oks if c.get("served_model"))),
                          "fallbacks": sum(1 for c in oks if c.get("fallback_rank")),
                          "retries": dict(Counter(c["retry_reason"] for c in cs if c.get("retry_reason"))),
                          "avg_latency_ms": round(sum(int(c.get("latency_ms") or 0) for c in cs) / len(cs), 1)}
     degradations = []
     for line in errors or []:
+        for m in _EXHAUSTED.finditer(line):
+            row = by_role.setdefault(m.group(1), _empty_row())
+            row["exhausted"] += 1
+            row["exhausted_attempts"] += int(m.group(2))
         m = _ITEM_LINE.match(line)
         if m is None:
             continue
@@ -543,14 +564,18 @@ def summarize_calls(model_calls: list[dict], errors: list[str] | None = None, *,
         by_role.setdefault(role, _empty_row())["skipped" if kind == "skip" else "degraded"] += 1
         if kind == "degrade":
             degradations.append(line)
-    served = [c for c in calls if c.get("ok", True) and c.get("served_model")]
+    for row in by_role.values():
+        row["calls"] = row["ok"] + row["exhausted"]
+    served = [c for c in records if c.get("ok", True) and c.get("served_model")]
     rerouted = sum(1 for c in served if c["served_model"] != c.get("requested_model"))
 
     def families(roles: frozenset) -> list[str]:
         return sorted({family(c["served_model"]) for c in served if _role_of(c) in roles})
     judge_f, writer_f = families(_JUDGE_ROLES), families(_WRITER_ROLES)
     shared = sorted(set(judge_f) & set(writer_f))
-    out = {"calls": len(calls), "by_role": by_role,
+    out = {"calls": sum(r["calls"] for r in by_role.values()),
+           "exhausted": sum(r["exhausted"] for r in by_role.values()),
+           "attempts": len(records), "by_role": by_role,
            "reroute_rate": round(rerouted / len(served), 3) if served else None,
            "judge_families": judge_f, "writer_families": writer_f,
            "judge_writer_same_family": bool(shared) if judge_f and writer_f else None,

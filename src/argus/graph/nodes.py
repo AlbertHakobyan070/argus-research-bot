@@ -325,6 +325,7 @@ def report_builder_node(state: ArgusState) -> dict:
         validated_assessment=validated,
         lecture_appendix=state.get("lecture_appendix"),
         model_calls=state.get("model_calls") or [],
+        errors=state.get("errors") or [],
     )
     (folder / "metadata.json").write_text(
         sidecar_to_json(meta), encoding="utf-8",

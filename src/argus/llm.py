@@ -2,15 +2,18 @@
 
 Every call names a role; its binding (primary, fallbacks, failure policy)
 comes from an ``EnginesSnapshot``. On each engine: connection errors, 5xx
-and 429 get up to three tries with backoff, honouring ``Retry-After`` up to
-the provider's ``retry_after_cap_s``; a timeout is retried at most
-``timeout_retry_max`` times; any other error fails that engine (the SDK
-itself never retries). Then tagged reasoning blocks are stripped; a JSON
-role cut off at the token limit gets one retry with double the budget; a
+and 429 (also as the code of an error object in a 200 body) get up to three
+tries with backoff, honouring ``Retry-After`` up to the provider's
+``retry_after_cap_s``; a timeout is retried at most ``timeout_retry_max``
+times; any other error fails that engine (the SDK itself never retries).
+Then tagged reasoning blocks are stripped; a JSON role cut off at the token
+limit gets one retry with double the budget (4096 when it had none); a
 reply the ``validate`` hook rejects gets one retry with "Reply with only the
 JSON object.". Then the next fallback, then the binding's ``on_exhausted``:
 ``raise`` → ``EngineError``, ``skip_item`` → ``EngineSkipped``, ``degrade`` →
-``EngineDegraded``. Every attempt is a ``CallRecord``.
+``EngineDegraded``, each with the message "role <id>: every engine failed
+after <n> attempts (last: …)". Every attempt is a ``CallRecord``; recorded
+and logged errors never contain the provider's key.
 
 The wrappers at the bottom keep the Phase 1 nodes unchanged: they route
 through ``complete`` with role ``legacy.<tier>`` on the registry's cached
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import re
 import threading
 import time
@@ -34,7 +38,7 @@ import openai
 from langchain_core.messages import BaseMessage, HumanMessage
 
 from .engines import registry
-from .engines.llm_openai import OpenAICompatDriver
+from .engines.llm_openai import DriverError, OpenAICompatDriver
 from .engines.registry import EngineConfigError  # noqa: F401  (re-export: llm.EngineConfigError)
 from .engines.roles import DEGRADABLE_ROLES, JSON_ROLES, LEGACY_ROLES, ROLES
 from .engines.schema import EngineSpec, EnginesSnapshot, ProviderSpec, ResolvedBinding
@@ -167,7 +171,8 @@ def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot
                             expect_json=expect_json, validate=validate, item=item)
         if result is not None:
             return result
-    msg = f"role {role}: every engine failed (last: {records[-1].error})"
+    n = len(records)
+    msg = f"role {role}: every engine failed after {n} attempt{'s' if n != 1 else ''} (last: {records[-1].error})"
     logger.warning("llm %s", msg)
     if binding.on_exhausted == "skip_item":
         raise EngineSkipped(msg, role=role, attempts=records)
@@ -210,11 +215,12 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
         try:
             resp = _driver.complete(engine, provider, msgs, temperature=temperature,
                                     max_tokens=budget, json_mode=json_mode)
-        except (openai.APIError, EngineConfigError) as e:
-            record(attempt=attempt, ok=False, error=f"{type(e).__name__}: {e}"[:300],
+        except (openai.APIError, DriverError, EngineConfigError) as e:
+            error = _redact(f"{type(e).__name__}: {e}", provider)
+            record(attempt=attempt, ok=False, error=error[:300],
                    latency_ms=_ms(t0), json_mode=json_mode, retry_reason=reason)
-            logger.warning("llm %s %s/%s attempt %d failed: %s: %s", role, engine.provider,
-                           engine.model, attempt, type(e).__name__, e)
+            logger.warning("llm %s %s/%s attempt %d failed: %s", role, engine.provider,
+                           engine.model, attempt, error)
             if isinstance(e, openai.APITimeoutError):
                 if timeouts < provider.timeout_retry_max:
                     timeouts += 1
@@ -238,9 +244,10 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
                      extra={"headers": dict(resp.headers)} if resp.headers else {})
         text = strip_reasoning(resp.text)
         if (expect_json and resp.finish_reason == "length" and binding.retry_on_truncation
-                and not truncated and budget and budget < _TRUNCATION_CAP):
+                and not truncated and (budget is None or budget < _TRUNCATION_CAP)):
             rec.ok, rec.error = False, "truncated (finish_reason=length)"
-            truncated, budget, reason = True, min(budget * 2, _TRUNCATION_CAP), "truncated"
+            truncated, reason = True, "truncated"
+            budget = _TRUNCATION_CAP if budget is None else min(budget * 2, _TRUNCATION_CAP)
             continue
         if validate is None:
             return LLMResult(text=text, parsed=NOT_VALIDATED, record=rec, records=list(records))
@@ -259,12 +266,22 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
 def _is_transient(e: Exception) -> bool:
     if isinstance(e, openai.APIConnectionError):
         return True
-    return isinstance(e, openai.APIStatusError) and (e.status_code == 429 or e.status_code >= 500)
+    code = e.code if isinstance(e, DriverError) else getattr(e, "status_code", None)
+    return isinstance(code, int) and (code == 429 or code >= 500)
+
+
+def _redact(text: str, provider: ProviderSpec) -> str:
+    key = os.environ.get(provider.api_key_env) if provider.api_key_env else None
+    return text.replace(key, "***") if key else text
 
 
 def _retry_after(e: Exception, provider: ProviderSpec) -> float | None:
-    response = getattr(e, "response", None)
-    value = response.headers.get("retry-after") if response is not None else None
+    if isinstance(e, DriverError):
+        headers = e.headers
+    else:
+        response = getattr(e, "response", None)
+        headers = response.headers if response is not None else {}
+    value = headers.get("retry-after")
     if not value:
         return None
     try:
