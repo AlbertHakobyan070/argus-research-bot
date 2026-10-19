@@ -105,11 +105,14 @@ def test_budget_helpers_first_pass_is_total_minus_reserve(depth):
 
 
 def test_exa_cost_estimate_uses_the_given_prices():
-    # standard: 16 searches · $0.007 + (16 · 8 results + 40 pages) · $0.001
-    assert _rc("standard").exa_cost_estimate_usd(_PRICES) == pytest.approx(0.28)
+    # searches · search price + /contents pages · page price (inline search text is not billed)
+    exa = _rc("standard").search.exa
+    expected = exa.max_searches * _PRICES.price_per_search_usd + exa.max_contents_pages * _PRICES.price_per_page_usd
+    assert _rc("standard").exa_cost_estimate_usd(_PRICES) == pytest.approx(expected)
+    assert _rc("standard").exa_cost_estimate_usd(_PRICES) == pytest.approx(0.152)   # 16 · 0.007 + 40 · 0.001
     doubled = ExaPrices(price_per_search_usd=0.014, price_per_page_usd=0.002,
                         prices_as_of="2026-10-18")
-    assert _rc("standard").exa_cost_estimate_usd(doubled) == pytest.approx(0.56)
+    assert _rc("standard").exa_cost_estimate_usd(doubled) == pytest.approx(2 * expected)
 
 
 def test_exa_cost_estimate_without_prices_is_none():

@@ -11,6 +11,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
 from ..engines import registry
+from ..engines.urls import canonical_url
+from ..graph.research import _source_key
 from ..graph.run_config import ensure_in_checkpoint
 from ..graph.state import DEFAULT_LENGTH
 from ..library import Library
@@ -155,7 +157,8 @@ async def _sources_from_refs(lib: Library,
 
     URLs become search_result sources the research node fetches; asset refs
     (``asset:<id>``, e.g. vault transcripts) become local_path sources
-    the research node ingests from disk (file:/// citations).
+    the research node ingests from disk (file:/// citations). Each carries
+    its ``ref``, so ``_mark_appended`` can tell which ones were ingested.
     """
     out: list[dict] = []
     for row in pending:
@@ -175,14 +178,46 @@ async def _sources_from_refs(lib: Library,
                 "title": a.get("title") or Path(a["path"]).name,
                 "url": "file:///" + str(a["path"]).replace("\\", "/"),
                 "local_path": a["path"],
-                "summary": "", "source": "appended-asset",
+                "summary": "", "source": "appended-asset", "ref": ref,
             })
         else:
             out.append({
                 "kind": "search_result", "title": ref, "url": ref,
-                "summary": "", "source": "appended-url",
+                "summary": "", "source": "appended-url", "ref": ref,
             })
     return out
+
+
+async def _mark_appended(lib: Library, graph, cfg: dict, run_id: str,
+                         pending: list[dict], appended: list[dict]) -> list[str]:
+    """After the append pass: a pending ref is ``ingested`` only when research
+    fetched its source; every other one is ``failed``. Returns one line per
+    failed ref, naming it with research's error line for it (the fetch error
+    and the rungs tried)."""
+    snap = await graph.aget_state(cfg)
+    values = (snap.values if snap else None) or {}
+    fetched = {canonical_url(f.get("url") or "") for f in values.get("fetched") or []}
+    errors = list(values.get("errors") or [])
+    ingested, failed, lines = [], [], []
+    by_ref = {s["ref"]: s for s in appended}
+    for ref in (p["ref"] for p in pending):
+        src = by_ref.get(ref)
+        try:
+            got = src is not None and _source_key(src) in fetched
+        except ValueError:                       # research dropped it: a malformed URL
+            got = False
+        if got:
+            ingested.append(ref)
+            continue
+        failed.append(ref)
+        needle = (src or {}).get("local_path") or ref
+        why = (next((e for e in reversed(errors) if needle in e), "not fetched") if src is not None
+               else "the asset no longer exists")
+        lines.append(f"• {ref}: {why}")
+    for refs, status in ((ingested, "ingested"), (failed, "failed")):
+        if refs:
+            await lib.mark_sources(run_id, refs, status)
+    return lines
 
 
 async def append_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -334,10 +369,14 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _resume_after_plan(ctx, info, resume_input=None)
     if pending and info.get("awaiting") == "report_preview":
         try:
-            await lib.mark_sources(run_id, [p["ref"] for p in pending],
-                                   "ingested")
+            lines = await _mark_appended(lib, graph, cfg, run_id, pending, appended)
         except Exception:
             logger.exception("mark_sources failed for %s", run_id)
+            return
+        if lines:
+            await update.message.reply_text(
+                f"⚠️ {len(lines)} appended source(s) could not be ingested "
+                "(marked failed — /append them again to retry):\n" + "\n".join(lines))
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

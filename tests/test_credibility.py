@@ -15,6 +15,8 @@ dropped; the research triage demotes them softly instead.
 """
 from __future__ import annotations
 
+import pytest
+
 from argus.graph.credibility import (
     CREDIBILITY_FLOOR,
     DomainTrust,
@@ -466,16 +468,41 @@ def test_official_docs_get_a_credibility_prior():
 
 
 def test_authority_prior_scale():
-    """0 = low-credibility, 1 = unknown, 2 = trusted, 3 = primary / official docs."""
+    """0 = low-credibility, 1 = unknown, 2 = trusted / official docs by URL heuristics,
+    3 = the curated primary tier (WP-B review: a heuristic is not a curated list)."""
     from argus.graph.credibility import authority_prior
     assert authority_prior("https://thetechbriefs.com/best-rag-models-2025") == 0
     assert authority_prior("https://someblog.example/post") == 1
     assert authority_prior("https://github.com/langchain-ai/langgraph") == 2
     assert authority_prior("https://arxiv.org/abs/2406.12793") == 3
-    assert authority_prior("https://docs.langchain.com/oss/python/langgraph/interrupts") == 3
+    assert authority_prior("https://docs.langchain.com/oss/python/langgraph/interrupts") == 2
+    assert authority_prior("https://example.com/docs/guide") == 2
+    assert authority_prior("https://example.com/post", kind="official_doc") == 2
     assert authority_prior("https://arxiv.org/abs/2603.01234") == 3, (
         "a fetched page is real: the year heuristic's known false positive must not zero it")
     assert authority_prior("file:///V/transcripts/clip.txt") == 2, "the user's own material"
+
+
+@pytest.mark.parametrize("url", [
+    "https://docs.google.com/document/d/abc/edit", "https://sites.google.com/view/x/docs",
+    "https://acme.notion.site/docs/setup", "https://www.notion.so/docs/setup",
+    "https://someone.substack.com/p/docs", "https://medium.com/docs/how-to",
+])
+def test_user_content_hosts_are_never_official_docs(url):
+    from argus.graph.credibility import authority_prior, is_official_doc
+    assert not is_official_doc(url), "anyone can publish a 'docs' page there"
+    assert authority_prior(url) <= 2
+
+
+def test_official_docs_still_reach_authority_two():
+    """The WP-B acceptance rule 'official docs authority >= 2' on the q010 sources:
+    the docs host by its prior, the project's GitHub Pages site by the digest's
+    official_doc label."""
+    from argus.graph.credibility import authority_prior, note_authority
+    docs = authority_prior("https://docs.langchain.com/oss/python/langgraph/interrupts")
+    pages = authority_prior("https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/")
+    assert note_authority(docs, "official_doc") >= 2 and note_authority(docs, "other") >= 2
+    assert note_authority(pages, "official_doc") >= 2
 
 
 def test_note_authority_trusts_an_official_doc_label_only_above_zero():

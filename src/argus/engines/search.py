@@ -20,7 +20,8 @@ Recency (only when the caller passes one — ``resolve_recency``): Exa
 ``startPublishedDate``, DDGS ``timelimit``, arXiv ``sortBy=submittedDate``;
 undated Exa hits are dropped and counted (``dropped_undated``). Provider
 failures come back as their own error strings; one provider's outage never
-empties a wave.
+empties a wave, and a hit whose URL ``canonical_url`` rejects is dropped with
+an errors line naming it.
 """
 from __future__ import annotations
 
@@ -192,7 +193,11 @@ def run_wave(queries: list[dict], *, cfg: SearchConfig, ledger: SpendLedger, rec
             if recency and prov == "exa" and not h.get("published"):
                 dropped += 1                    # an undated hit can't show it is recent
                 continue
-            key = canonical_url(h["url"])
+            try:
+                key = canonical_url(h["url"])
+            except ValueError as e:             # one malformed hit never fails the wave
+                errors.append(f"search: {prov} hit dropped, malformed URL {h['url']!r} ({e})")
+                continue
             h = {**h, "canonical_url": key}
             if key not in by_key:
                 by_key[key] = len(merged)

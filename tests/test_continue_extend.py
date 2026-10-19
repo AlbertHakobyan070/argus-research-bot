@@ -353,6 +353,8 @@ async def test_continue_finished_run_forks_with_full_sources():
         assert resume_input is None, (
             "a fork (no pending interrupt) must resume with None, not "
             "Command(resume=True)")
+        from argus.graph.research import _local_url
+        graph.values["fetched"] = [{"url": _local_url(r"V:\t.txt"), "title": "T"}]   # research ingested it
         info["awaiting"] = "report_preview"
 
     with patch.object(bot_history, "_resume_after_plan",
@@ -370,7 +372,35 @@ async def test_continue_finished_run_forks_with_full_sources():
         "merged list, never a delta")
     assert any(u.startswith("file:///") for u in urls)
     # Ingested bookkeeping happened after the successful resume.
-    assert lib.marked and lib.marked[0][2] == "ingested"
+    assert lib.marked == [("ab12cd34", ("asset:7",), "ingested")]
+
+
+async def test_continue_marks_only_fetched_appends_ingested_and_names_the_failures():
+    """Spec §2.4 Trust fix (WP-B review): a pinned ref is ``ingested`` only when
+    research fetched it; a failed one is marked ``failed`` and the user sees a line
+    naming the URL and the rungs tried (v3/v4-first marked every pending ref)."""
+    lib = _FakeLib(run=dict(_RUN))
+    lib.pending = [{"ref": "https://ok.example/a", "kind": "url", "status": "pending"},
+                   {"ref": "https://walled.example/b", "kind": "url", "status": "pending"}]
+    graph = _FakeGraph(values={"sources": [], "length": "short"})
+    line = ("fetch https://walled.example/b failed: native: HTTP 403; exa_contents: no EXA_API_KEY "
+            "(rungs tried: native, exa_contents)")
+
+    async def fake_resume(ctx, info, resume_input=...):
+        graph.values.update(fetched=[{"url": "https://ok.example/a", "title": "A"}],
+                            errors=["an earlier, unrelated line", line])
+        info["awaiting"] = "report_preview"
+
+    update = _update()
+    with patch.object(bot_history, "_resume_after_plan", side_effect=fake_resume):
+        await continue_cmd(update, _ctx(["ab12"], lib, graph))
+
+    assert lib.marked == [("ab12cd34", ("https://ok.example/a",), "ingested"),
+                          ("ab12cd34", ("https://walled.example/b",), "failed")]
+    text = update.message.reply_text.await_args_list[-1].args[0]
+    assert "1 appended source(s) could not be ingested" in text
+    assert f"• https://walled.example/b: {line}" in text, "the URL and the rungs tried are visible"
+    assert "ok.example" not in text
 
 
 async def test_continue_reattaches_plan_gate_paused_run():

@@ -155,8 +155,9 @@ def test_all_tools_route_through_intel_python(monkeypatch, tool_name,
 def offline(monkeypatch, tmp_path):
     """The v4 fetch chain on a fake network: ``routes[url]`` → Response."""
     routes: dict = {}
+    from helpers import as_stream, request_url
     monkeypatch.setattr(fetchers, "_http_client", lambda cfg: httpx.Client(
-        transport=httpx.MockTransport(lambda r: routes.get(str(r.url), httpx.Response(404)))))
+        transport=httpx.MockTransport(lambda r: as_stream(routes.get(request_url(r), httpx.Response(404))))))
     monkeypatch.setattr(fetchers, "_resolve", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
     monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
@@ -168,25 +169,21 @@ def _fetch_all(sources):
     return _parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)
 
 
-def test_parallel_fetch_propagates_exceptions_to_errors(offline, monkeypatch):
-    """A raising fetch rung MUST surface as error strings.
+def test_parallel_fetch_lets_an_unexpected_rung_exception_propagate(offline, monkeypatch):
+    """A fetch rung's expected failures (HTTP status, network, size, a parser's
+    exception) are error lines (next test); anything else is a bug and MUST
+    propagate (v4 spec §2.8, WP-B review), never become a string.
 
-    Pre-fix behavior (v2): the ``except Exception: logger.warning(...)``
-    branch silently returned ``fetched=[]`` — the writers then produced
-    a vacuous "no evidence" report.
+    v2 swallowed it (``fetched=[]``, then a vacuous "no evidence" report);
+    v4's first cut turned it into an error line.
     """
     def boom(*a, **kw):
         raise RuntimeError("native exploded")
 
     monkeypatch.setattr(fetchers, "_native", boom)
-    sources = [
-        {"url": "https://a.example", "kind": "official_doc", "title": "A", "summary": ""},
-        {"url": "https://b.example", "kind": "blog", "title": "B", "summary": ""},
-    ]
-    fetched, errs = _fetch_all(sources)
-    assert fetched == []
-    assert any("https://a.example" in e and "native exploded" in e for e in errs), errs
-    assert any("https://b.example" in e and "native exploded" in e for e in errs), errs
+    sources = [{"url": "https://a.example", "kind": "official_doc", "title": "A", "summary": ""}]
+    with pytest.raises(RuntimeError, match="native exploded"):
+        _fetch_all(sources)
 
 
 def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(offline):

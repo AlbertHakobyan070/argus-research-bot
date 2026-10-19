@@ -104,5 +104,18 @@ def test_unknown_kinds_raise():
     ledger = SpendLedger({"fetch_first": 1})
     with pytest.raises(ValueError, match="fetch_bogus"):
         ledger.take("fetch_bogus")
-    with pytest.raises(ValueError, match="fetch_first"):
-        ledger.count("fetch_first")        # a capped kind is spent through take(), never count()
+    with pytest.raises(ValueError, match="fetch_bogus"):
+        ledger.count("fetch_bogus")
+    with pytest.raises(ValueError, match="exa_text_pages"):
+        ledger.take("exa_text_pages")      # an uncapped counter has no cap to take from
+
+
+def test_count_on_a_capped_kind_is_never_refused_and_shares_the_counter():
+    """Pinned sources count what they use (spec §2.8): an exa_contents page past the
+    cap is counted, and it reduces what take() has left for unpinned pages."""
+    ledger = SpendLedger({"exa_contents_pages": 2})
+    ledger.count("exa_contents_pages")
+    assert ledger.remaining("exa_contents_pages") == 1
+    ledger.count("exa_contents_pages", 2)                  # past the cap: still counted
+    assert ledger.snapshot()["exa_contents_pages"] == 3
+    assert ledger.take("exa_contents_pages") is False, "the shared counter left nothing for unpinned pages"

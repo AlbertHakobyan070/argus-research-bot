@@ -249,6 +249,19 @@ def test_wave_prefers_hit_with_text_on_dupe(monkeypatch):
     assert sorted(hits[0]["sub_qs"]) == [0, 1]
 
 
+def test_wave_drops_a_malformed_hit_with_an_errors_line(monkeypatch):
+    """WP-B review: canonical_url raises on a malformed URL; one bad hit never fails the wave."""
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.setattr(sp, "ddgs_hits", lambda query, **kw: (
+        [_hit("http://bad.example:99999/x", kw.get("sub_qs")), _hit("https://ok.example/a", kw.get("sub_qs"))], ""))
+    rc = _rc()
+    hits, errors = search.run_wave([{"query": "a", "provider": "ddgs", "sub_qs": [0]}],
+                                   cfg=rc.search, ledger=SpendLedger.for_run(rc, None), recency=None, mode="first")
+    assert [h["url"] for h in hits] == ["https://ok.example/a"]
+    (line,) = errors
+    assert line.startswith("search: ddgs hit dropped, malformed URL 'http://bad.example:99999/x'"), line
+
+
 def test_wave_error_isolation(monkeypatch):
     """One provider's failure surfaces as an error string while the other
     providers' hits ship — the v2 failure-isolation property."""
@@ -364,6 +377,22 @@ def test_scout_node_merges_preseeded_first_and_writes_spend(monkeypatch):
     assert out["plan"]["planned_sources"], "plan gets executed queries"
     assert seen["mode"] == "first" and seen["recency"] is None
     assert out["search_spend"]["ddgs_queries"] == 1
+
+
+def test_scout_node_drops_a_malformed_source_and_keeps_the_pinned_copy(monkeypatch):
+    """WP-B review: a malformed URL is dropped with an errors line (the node never
+    fails on it), and a pinned (appended) copy wins the dedupe over an unpinned one."""
+    monkeypatch.setattr(scout_mod, "plan_queries",
+                        lambda brief, **kw: ([{"query": "q", "provider": "ddgs", "sub_qs": [0]}], [], []))
+    monkeypatch.setattr(scout_mod, "run_query_wave", lambda queries, **kw: ([_hit("https://new.example")], []))
+    out = scout_mod.scout_node({
+        "brief": _brief().model_dump(), "run_config": make_run_config("medium"),
+        "sources": [{"url": "https://www.blog.example/post/", "title": "scout copy"},
+                    {"url": "http://[::1/broken", "title": "broken"},
+                    {"url": "https://blog.example/post", "title": "mine", "source": "appended-url"}],
+    })
+    assert [s["title"] for s in out["sources"]] == ["mine", "t"]
+    assert any(e.startswith("scout: dropped source with a malformed URL 'http://[::1/broken'") for e in out["errors"])
 
 
 def test_scout_node_caps_sources(monkeypatch):

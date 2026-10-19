@@ -207,6 +207,57 @@ def test_rerank_degrade_falls_back_to_keyword_triage_and_is_recorded(facade):
                            "every engine failed after 2 attempts (last: unparseable: ValueError: ")
 
 
+# research.per_subq_target — the per-wave, per-sub-question selection quota (WP-B review)
+
+def _dominated():
+    """Sub-question 0 dominates the scores: six candidates at 5; sub-question 1
+    three at 2; one untagged candidate at 4."""
+    cands = ([{"url": f"https://a{i}.example/p", "title": "a", "snippet": "s", "sub_qs": [0]} for i in range(6)]
+             + [{"url": f"https://b{i}.example/p", "title": "b", "snippet": "s", "sub_qs": [1]} for i in range(3)]
+             + [{"url": "https://u.example/p", "title": "u", "snippet": "s", "sub_qs": []}])
+    scores = [5] * 6 + [2] * 3 + [4]
+    return cands, json.dumps({"scores": [{"id": i + 1, "score": s} for i, s in enumerate(scores)]})
+
+
+def _quota_rc(per_subq: int) -> RunConfig:
+    return RunConfig.model_validate(make_run_config("medium", **{"research.per_subq_target": per_subq}))
+
+
+def test_rerank_quota_holds_when_one_sub_question_dominates_the_scores(facade):
+    by_system, _ = facade
+    cands, reply = _dominated()
+    by_system[research_mod.RERANK_SYSTEM] = lambda human: reply
+    out = research_mod.rerank(cands, BRIEF, "q", rc=_quota_rc(2), wave=1, rnd=1, cap=4)
+    assert [c["url"] for c in out.picked] == ["https://a0.example/p", "https://a1.example/p",
+                                               "https://b0.example/p", "https://b1.example/p"], (
+        "score order alone would take a0..a3")
+    assert out.event["kept"] == 4
+
+
+def test_rerank_quota_leftovers_fill_by_rank(facade):
+    by_system, _ = facade
+    cands, reply = _dominated()
+    by_system[research_mod.RERANK_SYSTEM] = lambda human: reply
+    out = research_mod.rerank(cands, BRIEF, "q", rc=_quota_rc(2), wave=1, rnd=1, cap=9)
+    assert [c["url"] for c in out.picked] == [
+        "https://a0.example/p", "https://a1.example/p", "https://b0.example/p", "https://b1.example/p",   # quota
+        "https://a2.example/p", "https://a3.example/p", "https://a4.example/p", "https://a5.example/p",   # leftovers
+        "https://u.example/p"], "leftovers by rank: an untagged source only here, b2 (score 2) left out"
+
+
+def test_the_quota_holds_on_the_degrade_path(facade):
+    by_system, _ = facade
+    by_system[research_mod.RERANK_SYSTEM] = lambda human: "I would rank them by relevance, roughly..."
+    hot = [{"url": f"https://hot{i}.example/p", "title": "langgraph interrupt resume", "snippet": "langgraph interrupt",
+            "sub_qs": [0]} for i in range(6)]
+    cold = [{"url": f"https://cold{i}.example/p", "title": "unrelated", "snippet": "nothing", "sub_qs": [1]}
+            for i in range(3)]
+    out = research_mod.rerank(hot + cold, BRIEF, "q", rc=_quota_rc(2), wave=1, rnd=1, cap=4)
+    assert out.degraded is True
+    assert [c["sub_qs"][0] for c in out.picked].count(1) == 2, "keyword_triage applies the same quota"
+    assert len(out.picked) == 4
+
+
 def _long_doc(tmp_path):
     head = "LangGraph interrupt() pauses the run at a node. " * 160            # ~7 700 chars
     tail = "Resuming passes Command(resume=value) back into the node. " * 400   # ~23 000 chars

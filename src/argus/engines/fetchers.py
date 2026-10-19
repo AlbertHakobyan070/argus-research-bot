@@ -4,21 +4,36 @@ Rungs, in ``FetchConfig.chain`` order, first success wins:
 
 - ``exa_text``     the search hit already carries Exa's page text — no request;
 - ``native``       httpx + trafilatura / pypdf, by URL class: arXiv → ar5iv HTML,
-                   else the PDF; a GitHub repo → its raw README; ``.pdf`` → pypdf;
+                   else the PDF; a GitHub repo → its raw README; a PDF → pypdf;
                    anything else → ``trafilatura.extract(html, include_links=False,
                    favor_recall=True)``;
-- ``exa_contents`` ``POST https://api.exa.ai/contents`` (pages counted in the
-                   ledger, ``costDollars`` added to it);
+- ``exa_contents`` ``POST https://api.exa.ai/contents`` (the page taken from the
+                   ledger's cap — or only counted, for a pinned source — and
+                   ``costDollars`` added to it);
 - ``intel_*``      the intel-stack scripts (snatch / crawl / stealth) — in the
                    chain only when both ``INTEL_*`` paths exist (checked at import).
 
-Guards: before every network rung, and on every redirect hop of ``native``,
-a URL whose host resolves to a non-global address (loopback, RFC 1918,
-link-local, …) or is this server's own endpoint (the proxy, the console's
-public URL) is refused — ``error = "refused: private address (…)"`` and the
-chain stops. Every download stops at ``FetchConfig.max_bytes``; text on disk
-is capped at ``max_chars_on_disk``. A source no rung can fetch comes back
-with ``ok=False``, every rung's error and ``rungs_tried``.
+Guards (spec §2.8, WP-B review):
+
+- the URL is read the WHATWG way first (``\\`` is ``/`` in an http(s) URL), for
+  every rung, so the host the guard checks is the host any rung reaches;
+- before every network rung, and on every redirect hop of ``native``, every
+  address the host resolves to must be global — an IPv6 address carrying an
+  IPv4 one (mapped, compatible, NAT64) is judged by that IPv4 — and must not be
+  this server's own endpoint (the proxy, the console's public URL; compared by
+  name and by resolved address and port); else ``error = "refused: private
+  address (…)"`` and the chain stops;
+- ``native`` sends each hop to the address the guard checked — never a second
+  DNS lookup — with the original ``Host`` header and TLS ``sni_hostname``;
+- every download stops at ``FetchConfig.max_bytes`` decoded bytes: requests send
+  ``Accept-Encoding: gzip, deflate``, bodies go through a bounded decompressor,
+  any other ``Content-Encoding`` is refused. Text on disk is capped at
+  ``max_chars_on_disk``.
+
+A rung's expected failures — HTTP status, network and timeout errors, size, a
+third-party parser's exception — are its own error type, recorded with the
+exception type; anything else propagates. ``rungs_tried`` lists every rung tried
+with its error (``""`` for the one that succeeded), on success too.
 """
 from __future__ import annotations
 
@@ -29,11 +44,12 @@ import re
 import socket
 import tempfile
 import time
+import zlib
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import pypdf
@@ -54,6 +70,10 @@ _MAX_REDIRECTS = 5
 _EXA_CONTENTS = "https://api.exa.ai/contents"
 _UA = "Mozilla/5.0 (compatible; Argus research)"
 _REDIRECTS = (301, 302, 303, 307, 308)
+_ACCEPT_ENCODING = "gzip, deflate"          # decoded here, under the byte cap
+_WBITS = {"gzip": 16 + zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS}
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_HTTP_SCHEME = re.compile(r"\s*https?:", re.IGNORECASE)
 
 
 def intel_available(stack_dir: Path, python_bin: Path) -> bool:
@@ -77,7 +97,7 @@ class FetchResult:
     fetcher: str = ""
     ms: int = 0
     error: str = ""
-    rungs_tried: list[str] = field(default_factory=list)
+    rungs_tried: list[dict] = field(default_factory=list)   # [{"rung", "error"}]; "" for the winner
 
 
 class _Refused(Exception):
@@ -85,116 +105,253 @@ class _Refused(Exception):
 
 
 class _RungError(Exception):
-    """This rung failed; the chain moves on."""
+    """An expected failure of this rung (HTTP status, network / timeout, size, a
+    third-party parser's exception, with its type); the chain moves on."""
 
 
 # ---------------------------------------------------------------------------
 # the SSRF guard
 # ---------------------------------------------------------------------------
 
-def _resolve(host: str) -> list[str]:
-    return sorted({info[4][0] for info in socket.getaddrinfo(host, None)})
+def _whatwg(url: str) -> str:
+    """An http(s) URL with ``\\`` read as ``/`` before its query or fragment, as
+    browsers read it (WHATWG): ``http://127.0.0.1\\@evil.example/`` goes to
+    127.0.0.1, whatever ``urlsplit`` makes of it."""
+    if not _HTTP_SCHEME.match(url):
+        return url
+    cut = min([i for i in (url.find("?"), url.find("#")) if i >= 0] or [len(url)])
+    return url[:cut].replace("\\", "/") + url[cut:]
+
+
+def _norm_host(host: str) -> str:
+    return host.lower().rstrip(".")
 
 
 def _port(parts) -> int:
     return parts.port or (443 if parts.scheme == "https" else 80)
 
 
-def _own_endpoints() -> set[tuple[str, int]]:
-    """This server's own endpoints outside loopback: the proxy (``FREELLMAPI_BASE_URL``)
-    and the console's public URL. Their loopback defaults are refused as private anyway."""
-    out = set()
-    for env in ("FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
-        parts = urlsplit(os.environ.get(env, "").strip())
-        if parts.hostname:
-            out.add((parts.hostname.lower(), _port(parts)))
-    return out
-
-
-def check_target(url: str) -> None:
-    """Raise ``_Refused`` when the URL's host resolves to a non-global address
-    or is one of this server's own endpoints."""
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
+def _split(url: str) -> tuple[str, int]:
+    """``(host, port)`` of an http(s) URL, the host lowercase without a trailing dot."""
+    try:
+        parts = urlsplit(url)
+        port = _port(parts)
+    except ValueError as e:                       # a bad port, an unclosed bracket
+        raise _RungError(f"malformed URL {url!r} ({e})") from e
+    host = _norm_host(parts.hostname or "")
     if not host or parts.scheme not in ("http", "https"):
         raise _RungError(f"not an http(s) URL: {url!r}")
-    if (host, _port(parts)) in _own_endpoints():
-        raise _Refused(f"refused: private address (own endpoint {host}:{_port(parts)})")
+    return host, port
+
+
+def _resolve(host: str) -> list[str]:
+    """Every address ``host`` resolves to, in the resolver's order."""
+    return list(dict.fromkeys(info[4][0] for info in socket.getaddrinfo(host, None)))
+
+
+def _addresses(host: str) -> list[str]:
     try:
-        addrs = [str(ipaddress.ip_address(host))]
+        return [str(ipaddress.ip_address(host))]
     except ValueError:
+        pass
+    try:
+        return _resolve(host)
+    except socket.gaierror as e:
+        raise _RungError(f"dns: {host} did not resolve (gaierror: {e})") from e
+    except UnicodeError as e:                     # not an IDNA-encodable name
+        raise _RungError(f"dns: {host} is not a valid host name (UnicodeError: {e})") from e
+
+
+def _judged(addr: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """The address the guard judges: an IPv6 address carrying an IPv4 one — mapped
+    (``::ffff:a.b.c.d``), compatible (``::a.b.c.d``, not ``::`` or ``::1``) or NAT64
+    (``64:ff9b::/96``) — by that IPv4 address."""
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return ip.ipv4_mapped
+        if (int(ip) >> 32 == 0 and int(ip) > 1) or ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFF_FFFF)
+    return ip
+
+
+def _own_endpoints() -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    """This server's own endpoints — the proxy (``FREELLMAPI_BASE_URL``) and the
+    console's public URL — as ``(host, port)`` and ``(address, port)`` pairs.
+    Their loopback defaults are refused as private anyway."""
+    names: set[tuple[str, int]] = set()
+    addrs: set[tuple[str, int]] = set()
+    for env in ("FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
+        parts = urlsplit(os.environ.get(env, "").strip())
+        host = _norm_host(parts.hostname or "")
+        if not host:
+            continue
+        port = _port(parts)
+        names.add((host, port))
         try:
-            addrs = _resolve(host)
-        except socket.gaierror as e:
-            raise _RungError(f"dns: {host} did not resolve ({e})") from e
+            found = _addresses(host)
+        except _RungError:
+            continue        # an endpoint name that does not resolve has no address to compare; its name still counts
+        addrs |= {(str(_judged(a)), port) for a in found}
+    return names, addrs
+
+
+def check_target(url: str) -> list[str]:
+    """The addresses ``url``'s host resolves to, each one checked: ``_Refused`` for a
+    non-global address or this server's own endpoint, ``_RungError`` for a malformed
+    URL or a name that does not resolve."""
+    host, port = _split(url)
+    names, own = _own_endpoints()
+    if (host, port) in names:
+        raise _Refused(f"refused: private address (own endpoint {host}:{port})")
+    addrs = _addresses(host)
     for a in addrs:
-        ip = ipaddress.ip_address(a.split("%", 1)[0])
-        if ip.version == 6 and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
+        ip = _judged(a)
         if not ip.is_global:
             raise _Refused(f"refused: private address ({host} → {ip})")
-    # ponytail: resolve-then-connect leaves a DNS-rebinding window (TOCTOU); pin the
-    # connection to the checked address if a hostile resolver ever matters here.
+        if (str(ip), port) in own:
+            raise _Refused(f"refused: private address (own endpoint {host} → {ip}:{port})")
+    return addrs
 
 
 # ---------------------------------------------------------------------------
-# HTTP with the guard on every hop and the byte cap
+# HTTP: every hop through the guard and to the address it checked, the byte cap
 # ---------------------------------------------------------------------------
 
 def _http_client(cfg: FetchConfig) -> httpx.Client:
-    return httpx.Client(timeout=cfg.timeout_s, follow_redirects=False, headers={"User-Agent": _UA})
+    """No keep-alive: the pool keys connections by address, so a later hop to another
+    name on the same address would reuse a TLS session verified for the first name."""
+    return httpx.Client(timeout=cfg.timeout_s, follow_redirects=False,
+                        headers={"User-Agent": _UA, "Accept-Encoding": _ACCEPT_ENCODING},
+                        limits=httpx.Limits(max_keepalive_connections=0))
+
+
+def _open(client: httpx.Client, url: str, addrs: list[str]) -> httpx.Response:
+    """A streamed GET of ``url`` sent to the checked addresses in order (the next one
+    only when a connection fails): ``scheme://<address>[:port]/path?query`` with the
+    original ``Host`` header and ``sni_hostname``, so TLS still verifies the real name."""
+    parts = urlsplit(url)
+    name = _norm_host(parts.hostname or "")
+    if ":" not in name:                            # an IPv6 literal is already ASCII
+        name = name.encode("idna").decode("ascii")
+    host = f"[{name}]" if ":" in name else name
+    if parts.port and parts.port != (443 if parts.scheme == "https" else 80):
+        host += f":{parts.port}"
+
+    def send(addr: str) -> httpx.Response:
+        netloc = (f"[{addr}]" if ":" in addr else addr) + (f":{parts.port}" if parts.port else "")
+        request = client.build_request(
+            "GET", urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, "")),
+            headers={"Host": host, "Accept-Encoding": _ACCEPT_ENCODING}, extensions={"sni_hostname": name})
+        return client.send(request, stream=True)
+
+    *rest, last = addrs
+    for addr in rest:
+        try:
+            return send(addr)
+        except httpx.ConnectError:
+            continue
+    return send(last)
+
+
+def _too_large(cfg: FetchConfig) -> _RungError:
+    return _RungError(f"too large (> {cfg.max_bytes} bytes)")
+
+
+def _read_body(r: httpx.Response, cfg: FetchConfig) -> bytes:
+    """The body, decoded as it streams in and never more than ``cfg.max_bytes``
+    decoded bytes (+ one chunk): gzip / deflate through a bounded ``zlib``
+    decompressor; any other ``Content-Encoding`` is refused before a byte is decoded."""
+    declared = int(r.headers.get("content-length") or 0)
+    if declared > cfg.max_bytes:
+        raise _RungError(f"too large ({declared} > {cfg.max_bytes} bytes)")
+    encoding = r.headers.get("content-encoding", "")
+    codings = [c for c in (t.strip().lower() for t in encoding.split(",")) if c and c != "identity"]
+    if len(codings) > 1 or (codings and codings[0] not in _WBITS):
+        raise _RungError(f"Content-Encoding {encoding!r} refused (only gzip or deflate is decoded)")
+    inflate = zlib.decompressobj(_WBITS[codings[0]]) if codings else None
+    body, raw = bytearray(), 0
+    for chunk in r.iter_raw():
+        raw += len(chunk)
+        if raw > cfg.max_bytes:
+            raise _too_large(cfg)
+        if inflate is None:
+            body += chunk
+        while inflate is not None and chunk and not inflate.eof:
+            try:
+                body += inflate.decompress(chunk, cfg.max_bytes - len(body) + 1)
+            except zlib.error as e:
+                raise _RungError(f"{codings[0]}: zlib.error: {e}") from e
+            if len(body) > cfg.max_bytes:
+                raise _too_large(cfg)
+            chunk = inflate.unconsumed_tail
+        if len(body) > cfg.max_bytes:
+            raise _too_large(cfg)
+        if inflate is not None and inflate.eof:
+            break                                  # past the end of the compressed stream: nothing to keep
+    return bytes(body)
 
 
 def _get(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, bytes, str]:
-    """(final URL, body, content-type) of a GET: ≤ 5 redirects, each hop through
-    the guard; the body stops at ``cfg.max_bytes``."""
-    for _ in range(_MAX_REDIRECTS + 1):
-        check_target(url)
-        with client.stream("GET", url) as r:
-            if r.status_code in _REDIRECTS:
-                location = r.headers.get("location")
-                if not location:
-                    raise _RungError(f"HTTP {r.status_code} without a Location")
-                url = urljoin(url, location)
-                continue
-            if r.status_code >= 400:
-                raise _RungError(f"HTTP {r.status_code}")
-            declared = int(r.headers.get("content-length") or 0)
-            if declared > cfg.max_bytes:
-                raise _RungError(f"too large ({declared} > {cfg.max_bytes} bytes)")
-            body = bytearray()
-            for chunk in r.iter_bytes():
-                body += chunk
-                if len(body) > cfg.max_bytes:
-                    raise _RungError(f"too large (> {cfg.max_bytes} bytes)")
-            return url, bytes(body), r.headers.get("content-type", "")
+    """(final URL, decoded body, content-type) of a GET: at most ``_MAX_REDIRECTS``
+    redirects, every hop read the WHATWG way, through the guard and sent to the
+    address it checked; the body under the byte cap."""
+    try:
+        for _ in range(_MAX_REDIRECTS + 1):
+            url = _whatwg(url)
+            r = _open(client, url, check_target(url))
+            try:
+                if r.status_code in _REDIRECTS:
+                    location = r.headers.get("location")
+                    if not location:
+                        raise _RungError(f"HTTP {r.status_code} without a Location")
+                    try:
+                        url = urljoin(url, location)
+                    except ValueError as e:
+                        raise _RungError(f"HTTP {r.status_code} to a malformed Location {location!r} ({e})") from e
+                    continue
+                if r.status_code >= 400:
+                    raise _RungError(f"HTTP {r.status_code}")
+                return url, _read_body(r, cfg), r.headers.get("content-type", "")
+            finally:
+                r.close()
+    except (httpx.TransportError, httpx.InvalidURL) as e:     # network, timeout, protocol; a URL httpx rejects
+        raise _RungError(f"{type(e).__name__}: {e}") from e
     raise _RungError(f"more than {_MAX_REDIRECTS} redirects")
 
 
 def _is_pdf(url: str, ctype: str, body: bytes) -> bool:
-    return "pdf" in ctype.lower() or urlsplit(url).path.lower().endswith(".pdf") or body[:5] == b"%PDF-"
+    """A PDF by content type, ``.pdf`` path or ``%PDF-`` bytes — but an HTML
+    response is HTML whatever its path says."""
+    mtype = ctype.split(";", 1)[0].strip().lower()
+    if mtype in ("text/html", "application/xhtml+xml"):
+        return False
+    return "pdf" in mtype or urlsplit(url).path.lower().endswith(".pdf") or body[:5] == b"%PDF-"
 
 
 def _pdf_text(body: bytes, limit: int) -> str:
     """The PDF's text, page by page, until ``limit`` chars (all that is kept on disk)."""
+    pages, total = [], 0
     try:
-        pages, total = [], 0
         for page in pypdf.PdfReader(BytesIO(body)).pages:
             pages.append((page.extract_text() or "").strip())
             total += len(pages[-1]) + 2
             if total >= limit:
                 break
-        return "\n\n".join(pages).strip()
-    except pypdf.errors.PyPdfError as e:
+    except Exception as e:      # a third-party parser on untrusted bytes: what it raises is this rung's failure
         raise _RungError(f"pdf: {type(e).__name__}: {e}") from e
+    return "\n\n".join(pages).strip()
 
 
 def _html_text(html: bytes, url: str) -> tuple[str, str]:
     """trafilatura on the raw bytes (it detects the encoding itself)."""
-    text = trafilatura.extract(html, url=url, include_links=False, favor_recall=True) or ""
+    try:
+        text = trafilatura.extract(html, url=url, include_links=False, favor_recall=True) or ""
+        meta = trafilatura.extract_metadata(html, default_url=url) if len(text.strip()) >= _MIN_CHARS else None
+    except Exception as e:      # a third-party parser on untrusted bytes: what it raises is this rung's failure
+        raise _RungError(f"trafilatura: {type(e).__name__}: {e}") from e
     if len(text.strip()) < _MIN_CHARS:
         raise _RungError(f"no article text extracted ({len(text.strip())} chars)")
-    meta = trafilatura.extract_metadata(html, default_url=url)
     return text, (meta.title if meta is not None and meta.title else "")
 
 
@@ -247,26 +404,43 @@ def _native(url: str, source: dict, cfg: FetchConfig) -> tuple[str, str]:
         return _page(client, url, cfg)
 
 
-def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None) -> tuple[str, str]:
+def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned: bool) -> tuple[str, str]:
+    """``pinned``: the page is counted, never taken from the cap (spec §2.8) — the
+    counter is shared, so it does reduce what remains for unpinned pages."""
     key = os.environ.get("EXA_API_KEY", "").strip()
     if not key:
         raise _RungError("no EXA_API_KEY")
-    if ledger is None or not ledger.take("exa_contents_pages"):
+    if ledger is None:
         raise _RungError("page budget spent")
-    with _http_client(cfg) as client:
-        r = client.post(_EXA_CONTENTS, json={"urls": [url], "text": {"maxCharacters": cfg.max_chars_on_disk}},
-                        headers={"x-api-key": key})
+    if pinned:
+        ledger.count("exa_contents_pages")
+    elif not ledger.take("exa_contents_pages"):
+        raise _RungError("page budget spent")
+    try:
+        with _http_client(cfg) as client:
+            r = client.post(_EXA_CONTENTS, json={"urls": [url], "text": {"maxCharacters": cfg.max_chars_on_disk}},
+                            headers={"x-api-key": key})
+    except httpx.TransportError as e:
+        raise _RungError(f"{type(e).__name__}: {e}") from e
     if r.status_code >= 400:
         raise _RungError(f"HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise _RungError(f"reply is not JSON ({type(e).__name__}: {e})") from e
+    if not isinstance(data, dict):
+        raise _RungError(f"reply is a JSON {type(data).__name__}, not an object")
     cost = (data.get("costDollars") or {}).get("total")
     if cost:
         ledger.add_usd(float(cost))
     results = data.get("results") or []
-    text = (results[0].get("text") if results else "") or ""
+    first = results[0] if results else {}
+    if not isinstance(first, dict):
+        raise _RungError(f"result is a JSON {type(first).__name__}, not an object")
+    text = first.get("text") or ""
     if len(text.strip()) < _MIN_CHARS:
         raise _RungError(f"no text (statuses: {data.get('statuses')})")
-    return text, results[0].get("title") or ""
+    return text, first.get("title") or ""
 
 
 def _intel(rung: str, url: str) -> tuple[str, str]:
@@ -299,12 +473,13 @@ def _store(rung: str, url: str, text: str, cfg: FetchConfig) -> tuple[str, str]:
     return str(path), text
 
 
-def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_enabled: bool) -> FetchResult:
-    """Fetch one search hit through the available chain (see the module doc)."""
-    url = source.get("url") or ""
+def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_enabled: bool,
+          pinned: bool = False) -> FetchResult:
+    """Fetch one search hit through the available chain (see the module doc).
+    ``pinned``: a user-appended source, which never calls ``take``."""
+    url = _whatwg(source.get("url") or "")
     t0 = time.monotonic()
-    tried: list[str] = []
-    errors: list[str] = []
+    tried: list[dict] = []
 
     def ms() -> int:
         return int((time.monotonic() - t0) * 1000)
@@ -318,29 +493,25 @@ def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_ena
         elif rung == "exa_contents" and not exa_enabled:
             continue
         else:
-            tried.append(rung)
             try:
                 check_target(url)
                 text, title = (_native(url, source, cfg) if rung == "native" else
-                               _exa_contents(url, cfg, ledger) if rung == "exa_contents" else
+                               _exa_contents(url, cfg, ledger, pinned) if rung == "exa_contents" else
                                _intel(rung, url))
                 if len(text.strip()) < _MIN_CHARS:
                     raise _RungError(f"only {len(text.strip())} chars of text")
             except _Refused as e:
+                tried.append({"rung": rung, "error": str(e)})
                 return FetchResult(ok=False, error=str(e), rungs_tried=tried, ms=ms())
             except _RungError as e:
-                errors.append(f"{rung}: {e}")
+                tried.append({"rung": rung, "error": str(e)})
                 continue
-            except Exception as e:             # one broken rung must not lose the source: recorded, next rung
-                errors.append(f"{rung}: {type(e).__name__}: {e}")
-                continue
-        if rung == "exa_text":
-            tried.append(rung)
+        tried.append({"rung": rung, "error": ""})
         path, text = _store(rung, url, text, cfg)
         return FetchResult(ok=True, markdown_path=path, title=title or source.get("title") or "",
                            chars=len(text), fetcher=rung, ms=ms(), rungs_tried=tried)
-    return FetchResult(ok=False, error="; ".join(errors) or f"no fetch rung applies (chain: {cfg.chain})",
-                       rungs_tried=tried, ms=ms())
+    return FetchResult(ok=False, error="; ".join(f"{t['rung']}: {t['error']}" for t in tried)
+                       or f"no fetch rung applies (chain: {cfg.chain})", rungs_tried=tried, ms=ms())
 
 
 __all__ = ["FetchResult", "fetch", "available_chain", "intel_available", "check_target", "INTEL_AVAILABLE"]

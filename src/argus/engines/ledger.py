@@ -1,11 +1,12 @@
 """SpendLedger (v4 spec §2.4, §2.8): every research budget through one lock.
 
 ``take(kind, n)`` is an atomic check-and-count against the cap of a capped
-kind; ``count(kind, n)`` bumps an uncapped counter; ``add_usd`` sums the Exa
-cost. Pool threads only call these; the node thread writes ``snapshot()`` to
+kind; ``count(kind, n)`` bumps a counter with no cap check; ``add_usd`` sums the
+Exa cost. Pool threads only call these; the node thread writes ``snapshot()`` to
 ``state["search_spend"]`` and every node rebuilds its ledger from it with
 ``for_run`` — the snapshot carries the per-kind counters, so it round-trips.
-Pinned sources (``/append``) never call ``take``.
+Pinned sources (``/append``) never call ``take``: they ``count`` what they use
+(an ``exa_contents`` page), so their spend stays visible and no cap refuses them.
 """
 from __future__ import annotations
 
@@ -67,8 +68,11 @@ class SpendLedger:
             return True
 
     def count(self, kind: str, n: int = 1) -> None:
-        if kind not in COUNTERS:
-            raise ValueError(f"count(): {kind!r} is not an uncapped counter {COUNTERS}")
+        """Bump ``kind`` with no cap check: an uncapped counter, or a capped kind's
+        spend that no cap may refuse (a pinned source's ``exa_contents`` page —
+        the counter is shared, so it reduces what ``take`` has left)."""
+        if kind not in COUNTERS and kind not in CAPPED:
+            raise ValueError(f"count(): {kind!r} is not a known kind {CAPPED + COUNTERS}")
         with self._lock:
             self._spent[kind] += n
 

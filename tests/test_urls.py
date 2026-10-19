@@ -37,6 +37,26 @@ def test_canonical_url_table(url, canonical):
     assert canonical_url(url) == canonical
 
 
+@pytest.mark.parametrize("url,canonical", [
+    ("http://[::1]:8080/x/", "https://[::1]:8080/x"),
+    ("https://[2001:DB8::1]/a/?utm_source=x", "https://[2001:db8::1]/a"),
+    ("https://[2001:db8::1]:443/a", "https://[2001:db8::1]/a"),
+])
+def test_canonical_url_keeps_ipv6_brackets(url, canonical):
+    assert canonical_url(url) == canonical
+
+
+@pytest.mark.parametrize("url", [
+    "http://example.com:99999/x",          # port out of range
+    "http://example.com:abc/x",            # not a port
+    "http://[::1/x",                       # unclosed bracket
+    "https://arxiv.org:99999/abs/2401.12345",
+])
+def test_canonical_url_raises_on_a_malformed_url(url):
+    with pytest.raises(ValueError):
+        canonical_url(url)
+
+
 def test_canonical_url_merges_the_v3_duplicates():
     dupes = ["https://www.Example.com/a/?utm_source=x", "http://example.com/a#x",
              "https://arxiv.org/abs/2401.00001v3", "https://export.arxiv.org/pdf/2401.00001",

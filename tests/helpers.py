@@ -26,6 +26,24 @@ def fake_engines_snapshot() -> EnginesSnapshot:
                            roles=roles)
 
 
+def request_url(request) -> str:
+    """The URL an httpx request is FOR. The fetch chain sends every hop to the
+    address its SSRF guard checked, with the original ``Host`` header (spec
+    §2.8), so ``request.url`` carries that address, not the name."""
+    return f"{request.url.scheme}://{request.headers['host']}{request.url.raw_path.decode('ascii')}"
+
+
+def as_stream(response):
+    """``response`` as a real transport hands it over: unread. httpx pre-reads
+    (and decodes) a Response built from bytes, while the fetch chain reads the
+    raw stream itself — so build an encoded body with ``content=iter([...])``."""
+    import httpx
+    if not response.is_stream_consumed:
+        return response
+    assert "content-encoding" not in response.headers, "build an encoded body with content=iter([...])"
+    return httpx.Response(response.status_code, headers=response.headers, content=iter([response.content]))
+
+
 def make_run_config(length="short", depth=None, **overrides) -> dict:
     """A ``state["run_config"]`` dict from the presets; overrides are dotted
     keys (``**{"research.waves": 1}``)."""

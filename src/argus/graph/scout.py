@@ -177,10 +177,18 @@ def scout_node(state, runtime: Runtime | None = None) -> dict:
     # slots (and their sub_qs tags, which index the old brief). When that
     # wave already filled SCOUT_SOURCE_CAP, no new-wave hit survives the
     # cap below.
+    # A pinned (appended) copy wins the dedupe over an unpinned one (spec §2.8);
+    # a source whose URL canonical_url rejects is dropped with an errors line.
+    from .research import _is_pinned          # lazy: research imports this module
+    seeded = sorted(state.get("sources") or [], key=lambda s: not _is_pinned(s))
     seen: set[str] = set()
     final: list[dict] = []
-    for s in [*(state.get("sources") or []), *hits]:
-        key = canonical_url(s.get("url") or "") or str(s.get("local_path") or "")
+    for s in [*seeded, *hits]:
+        try:
+            key = canonical_url(s.get("url") or "") or str(s.get("local_path") or "")
+        except ValueError as e:
+            errors.append(f"scout: dropped source with a malformed URL {s.get('url')!r} ({e})")
+            continue
         if key and key not in seen:
             final.append(dict(s))
             seen.add(key)

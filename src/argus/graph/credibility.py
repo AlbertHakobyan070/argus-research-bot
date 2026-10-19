@@ -48,9 +48,10 @@ CREDIBILITY_FLOOR = 0.35
 # year < 2015 is impossible, the format was introduced 2015-01).
 #
 # We surface those URLs with ``credibility_flag = "fabricated_path"``
-# AND drag the score below CREDIBILITY_FLOOR (v3 has no filter_node to
-# drop them; the effect is that grounding.check_grounding stops counting
-# the source).
+# AND drag the score below CREDIBILITY_FLOOR. Nothing drops them: triage
+# demotes a candidate below the floor, and the flag is recorded on the
+# fetched item. (v4 grounding no longer reads the score — it counts a
+# source by its evidence note's relevance and authority.)
 #
 # KNOWN FALSE POSITIVE (probe-verified): every new-format id since 2015
 # has a 5-digit sequence, so the "current year, MM <= 6, 5 digits" rule
@@ -326,19 +327,27 @@ def _host(url: str) -> str:
 
 _DOCS_HOST_RE = re.compile(r"^(?:www\.)?(?:docs|developers?)\.|\.readthedocs\.(?:io|org)$")
 _DOCS_PATH_SEGMENTS = frozenset({"docs", "documentation"})
+# Hosts where anyone publishes: a "docs." name or a /docs path there is not a
+# vendor's documentation (WP-B review). A host matches itself and its subdomains.
+_USER_CONTENT_HOSTS = ("docs.google.com", "sites.google.com", "notion.site", "notion.so",
+                       "substack.com", "medium.com")
 
 
 def is_official_doc(url: str, kind: str = "") -> bool:
     """A vendor's or project's own documentation: a ``docs.`` /
     ``developer(s).`` host, ``*.readthedocs.io|org``, a ``/docs`` or
-    ``/documentation`` first path segment — or a search hit labelled
-    ``official_doc``. ponytail: URL heuristics, not a curated list; a docs
-    page on a content farm still loses its prior to the "low" tier
-    (``authority_prior`` checks that first)."""
+    ``/documentation`` first path segment — never on a user-content host
+    (``_USER_CONTENT_HOSTS``) — or a search hit labelled ``official_doc``.
+    ponytail: URL heuristics, not a curated list; a docs page on a content
+    farm still loses its prior to the "low" tier (``authority_prior`` checks
+    that first)."""
     if kind == "official_doc":
         return True
     parsed = urlparse(url or "")
-    if _DOCS_HOST_RE.search((parsed.hostname or "").lower()):
+    host = (parsed.hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _USER_CONTENT_HOSTS):
+        return False
+    if _DOCS_HOST_RE.search(host):
         return True
     first = next((seg for seg in (parsed.path or "").lower().split("/") if seg), "")
     return first in _DOCS_PATH_SEGMENTS
@@ -346,17 +355,18 @@ def is_official_doc(url: str, kind: str = "") -> bool:
 
 def authority_prior(url: str, kind: str = "") -> int:
     """The fetched source's prior on the 0–3 authority scale: 0 = the
-    low-credibility tier (content farms), 1 = unknown, 2 = trusted (and the
-    user's own ``file:///`` material), 3 = primary or official
-    documentation. No arXiv year heuristic here: a fetched page exists."""
+    low-credibility tier (content farms), 1 = unknown, 2 = trusted, official
+    documentation by ``is_official_doc``'s heuristics and the user's own
+    ``file:///`` material, 3 = the curated primary tier. No arXiv year
+    heuristic here: a fetched page exists."""
     if (url or "").startswith("file:///"):
         return 2
     tier = DomainTrust.tier_for(url or "")
     if tier == "low":
         return 0
-    if tier == "primary" or is_official_doc(url, kind):
+    if tier == "primary":
         return 3
-    return 2 if tier == "trusted" else 1
+    return 2 if tier == "trusted" or is_official_doc(url, kind) else 1
 
 
 def note_authority(prior: int, source_type: str) -> int:

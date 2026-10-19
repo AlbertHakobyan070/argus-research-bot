@@ -57,6 +57,7 @@ class FetchedItem(BaseModel):
     chars: int = 0
     authority_prior: int = 1
     pinned: bool = False       # a user-appended source (/append): bypasses every cap
+    rungs_tried: list[dict] = Field(default_factory=list)   # [{"rung", "error"}] of the fetch (spec §2.8, WP-B review)
 
 
 # ---------------------------------------------------------------------------

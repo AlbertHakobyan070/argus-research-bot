@@ -51,7 +51,9 @@ def fake(monkeypatch, tmp_path):
         waves: list[dict] = []
         wave_hits: list[dict] = []
         fetches: list[str] = []
+        srcs: list[dict] = []
         on_fetch = None
+        on_wave = None
 
     def complete(role, messages, *, engines, validate=None, item="", **kw):
         F.roles.append((role, item))
@@ -64,10 +66,13 @@ def fake(monkeypatch, tmp_path):
 
     def wave(queries, **kw):
         F.waves.append({"queries": queries, **kw})
+        if F.on_wave:
+            F.on_wave()
         return list(F.wave_hits), []
 
     def fetch(src, **kw):
         F.fetches.append(src["url"])
+        F.srcs.append(src)
         if F.on_fetch:
             F.on_fetch(src)
         md = tmp_path / f"doc{len(F.fetches)}.md"
@@ -261,3 +266,111 @@ def test_append_only_pass_ingests_pinned_sources_without_searching(fake, tmp_pat
     assert [f["url"] for f in out["fetched"][2:]] == ["file:///" + str(md).replace("\\", "/")]
     assert out["fetched"][2]["pinned"] is True
     assert "https://web.example/z" not in fake.fetches, "exactly the appended sources"
+
+
+# ---------------------------------------------------------------------------
+# WP-B review, fix round 1
+# ---------------------------------------------------------------------------
+
+def _appended(url):
+    return {"kind": "search_result", "title": url, "url": url, "summary": "", "source": "appended-url"}
+
+
+def test_a_pinned_copy_wins_the_dedupe_in_an_append_only_pass(fake, tmp_path):
+    """C1 (the reviewer's pinned probe): the appended URL duplicates a scout source
+    the first pass left unfetched. At 98ebc5b the unpinned copy won the dedupe and
+    the append pass fetched nothing, silently."""
+    state = _state(tmp_path, append_only=True, extend_rounds=1, search_spend={"fetch_first": 32})
+    state["sources"] += [_src("https://www.blog.example/post/", 0), _appended("https://blog.example/post")]
+    out = research_mod.research_node(state)
+    assert fake.fetches == ["https://blog.example/post"]
+    assert fake.srcs[0]["source"] == "appended-url", "fetched as the pinned copy"
+    assert not [e for e in out.get("errors", []) if "blog.example" in e]
+    assert len(out["fetched"]) == 3
+
+
+def test_in_an_extend_pass_the_pinned_copy_is_neither_reranked_nor_capped(fake, tmp_path):
+    prompts: list[str] = []
+
+    def rerank(human):
+        prompts.append(human)
+        return json.dumps({"scores": [{"id": 1, "score": 5}, {"id": 2, "score": 4}]})
+
+    fake.answers["research.extend_querygen"] = lambda human: json.dumps({"queries": []})
+    fake.answers["research.rerank"] = rerank
+    state = _state(tmp_path, extend_rounds=1,
+                   overrides={"research.rerank": True, "research.fetch_per_wave": 1})
+    state["sources"] += [_src("https://www.blog.example/post/", 1), _appended("https://blog.example/post"),
+                         _src("https://other.example/1", 1), _src("https://other.example/2", 1)]
+
+    out = research_mod.research_node(state)
+
+    assert prompts and not any("blog.example" in p for p in prompts), "the pinned URL is never reranked"
+    assert fake.fetches == ["https://blog.example/post", "https://other.example/1"]
+    assert fake.srcs[0]["source"] == "appended-url"
+    assert out["search_spend"]["fetch_extend"] == 1, "the cap (fetch_per_wave 1) counts only the reranked pick"
+
+
+def test_a_malformed_url_never_fails_the_node(fake, tmp_path):
+    """D1: canonical_url raises on a malformed URL; research drops the source (from
+    the state or a search hit) with an errors line naming it and carries on."""
+    fake.answers["research.extend_querygen"] = lambda human: json.dumps(
+        {"queries": [{"sub_q": 1, "q": "y more", "provider": "web"}]})
+    fake.answers["research.followup_querygen"] = lambda human: json.dumps({"queries": []})
+    fake.wave_hits = [{"url": "http://bad.example:99999/x", "title": "bad", "sub_qs": [1]},
+                      _src("https://good.example/1", 1)]
+    state = _state(tmp_path, extend_rounds=1)
+    state["sources"] += [{"url": "http://[::1/broken", "title": "broken", "sub_qs": [1]}]
+
+    out = research_mod.research_node(state)
+
+    assert "https://good.example/1" in fake.fetches
+    assert "research: dropped source with a malformed URL 'http://[::1/broken' (Invalid IPv6 URL)" in out["errors"]
+    assert any(e.startswith("research: dropped source with a malformed URL 'http://bad.example:99999/x'")
+               for e in out["errors"])
+    assert {s["url"] for s in out["sources"]}.isdisjoint({"http://[::1/broken", "http://bad.example:99999/x"})
+
+
+def test_no_follow_up_once_the_fetch_budget_is_spent(fake, tmp_path):
+    """D2: wave 1 spends the first pass's last fetches; coverage gaps remain, but no
+    follow-up querygen and no search run (at 98ebc5b both did, then fetched nothing)."""
+    fake.answers["research.followup_querygen"] = lambda human: json.dumps(
+        {"queries": [{"sub_q": 1, "q": "y more", "provider": "web"}]})
+    state = _state(tmp_path, research_rounds=0, fetched=[], evidence=[], coverage={},
+                   search_spend={"fetch_first": 30})                        # standard: first-pass cap 32
+    state["sources"] = [_src(f"https://s{i}.example/p", i % 2) for i in range(6)]
+
+    out = research_mod.research_node(state)
+
+    assert len(fake.fetches) == 2 and out["search_spend"]["fetch_first"] == 32
+    assert "research.followup_querygen" not in [r for r, _ in fake.roles]
+    assert fake.waves == []
+
+
+@pytest.mark.parametrize("pass_", ["extend opening search", "first-pass follow-up search"])
+def test_no_rerank_after_a_drain(fake, tmp_path, pass_):
+    """D3 (extends the drain test): a drain requested during a search — the next
+    step is a rerank call, and none runs; no fetch starts."""
+    control = RunControl()
+    fake.answers["research.rerank"] = lambda human: json.dumps({"scores": [{"id": 1, "score": 5}]})
+    fake.answers["research.extend_querygen"] = lambda human: json.dumps(
+        {"queries": [{"sub_q": 1, "q": "y more", "provider": "web"}]})
+    fake.answers["research.followup_querygen"] = fake.answers["research.extend_querygen"]
+    fake.wave_hits = [_src("https://new.example/1", 1)]
+    fake.on_wave = lambda: control.request_drain("user cancel")
+    if pass_ == "extend opening search":
+        state = _state(tmp_path, extend_rounds=1, overrides={"research.rerank": True})
+        fetched_before = []
+    else:
+        state = _state(tmp_path, research_rounds=0, fetched=[], evidence=[], coverage={},
+                       overrides={"research.rerank": True})
+        state["sources"] = [_src("https://s0.example/p", 0), _src("https://s1.example/p", 1)]
+        fetched_before = ["https://s0.example/p", "https://s1.example/p"]           # wave 1, before the drain
+
+    out = research_mod.research_node(state, Runtime(control=control))
+
+    assert len(fake.waves) == 1
+    reranks = [r for r, _ in fake.roles].count("research.rerank")
+    assert reranks == (0 if pass_ == "extend opening search" else 1), "no rerank call after the drain"
+    assert fake.fetches == fetched_before
+    assert any(e.startswith("cancelled: research stopped") for e in out["errors"])

@@ -24,9 +24,10 @@ One node run is one *pass*, chosen from the state:
           appended sources, no search.
 
 A wave is: pick (``research.rerank`` scores the candidates, or keyword
-``triage``) → fetch (``engines/fetchers``) → digest → coverage. Every
-budget goes through one ``SpendLedger`` (spec §2.4); pinned ``/append``
-sources bypass every cap. Between items the node reads
+``triage``; at most ``per_subq_target`` per sub-question before the
+leftover slots go by rank) → fetch (``engines/fetchers``) → digest →
+coverage. Every budget goes through one ``SpendLedger`` (spec §2.4); pinned
+``/append`` sources bypass every cap and win the dedupe. Between items the node reads
 ``runtime.drain_requested`` (spec §2.5): once it is set no new fetch
 starts, what was fetched is still digested, the remaining waves are
 skipped, and the partial update carries a ``cancelled:`` line.
@@ -93,8 +94,23 @@ def _local_url(local_path: str) -> str:
 
 
 def _source_key(src: dict) -> str:
-    """The dedupe key: the canonical URL; ``file:///…`` for local appends."""
+    """The dedupe key: the canonical URL; ``file:///…`` for local appends.
+    ``ValueError`` for a malformed URL (``_keep_valid`` drops those first)."""
     return _local_url(src["local_path"]) if src.get("local_path") else canonical_url(src.get("url") or "")
+
+
+def _keep_valid(sources: list[dict], errors: list[str]) -> list[dict]:
+    """``sources`` without those whose URL ``canonical_url`` rejects — one errors
+    line each, so one bad hit never fails the node (spec §2.8)."""
+    out = []
+    for s in sources:
+        try:
+            _source_key(s)
+        except ValueError as e:
+            errors.append(f"research: dropped source with a malformed URL {s.get('url')!r} ({e})")
+            continue
+        out.append(s)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +183,23 @@ def triage(sources: list[dict], fetched_urls: set[str],
     return picked[:max(cap, len(locals_))]
 
 
+def _quota_pick(ranked: list[dict], cap: int, per_subq: int) -> list[dict]:
+    """A wave's ``cap`` picks from ``ranked`` (best first) under the
+    ``research.per_subq_target`` quota: each sub-question — a source's first
+    ``sub_qs`` tag, triage's bucket — first takes up to ``per_subq`` of its best,
+    in rank order; the leftover slots then go by rank, and only they take
+    untagged sources. Quota picks come first, then the leftovers."""
+    quota, per = [], Counter()
+    for i, s in enumerate(ranked):
+        tags = s.get("sub_qs") or []
+        if len(quota) < cap and tags and per[tags[0]] < per_subq:
+            per[tags[0]] += 1
+            quota.append(i)
+    taken = set(quota)
+    leftovers = [i for i in range(len(ranked)) if i not in taken][:max(0, cap - len(quota))]
+    return [ranked[i] for i in quota + leftovers]
+
+
 # ---------------------------------------------------------------------------
 # Rerank — research.rerank scores the candidates before anything is fetched.
 # ---------------------------------------------------------------------------
@@ -203,9 +236,10 @@ def _sub_question_lines(brief: ResearchBrief, idxs=None) -> str:
 def rerank(candidates: list[dict], brief: ResearchBrief, user_request: str, *,
            rc: run_config.RunConfig, wave: int, rnd: int, cap: int) -> RerankResult:
     """``research.rerank``: one call scores every candidate; the wave takes
-    the top ``cap`` by score (ties keep candidate order, score 0 is
-    dropped, a candidate the reply leaves out ranks after every scored
-    one). Degrade → ``keyword_triage``: ``triage`` picks the wave and the
+    ``cap`` of them by score under the ``per_subq_target`` quota
+    (``_quota_pick``; ties keep candidate order, score 0 is dropped, a
+    candidate the reply leaves out ranks after every scored one). Degrade →
+    ``keyword_triage``: the same quota over ``triage``'s order, and the
     ``degrade:`` line says so."""
     n = len(candidates)
     lines = []
@@ -232,17 +266,18 @@ def rerank(candidates: list[dict], brief: ResearchBrief, user_request: str, *,
             raise ValueError("no candidate scores in the reply")
         return scores
 
+    per_subq = rc.research.per_subq_target
     try:
         res = llm.complete("research.rerank", [SystemMessage(content=RERANK_SYSTEM), HumanMessage(content=human)],
                            engines=rc.engines, temperature=0.0, max_tokens=200 + 16 * n, validate=validate)
     except llm.EngineDegraded as e:
-        picked = triage(candidates, set(), brief, cap=cap)
+        picked = _quota_pick(triage(candidates, set(), brief, cap=n), cap, per_subq)
         return RerankResult(picked, [a.model_dump() for a in e.attempts],
                             [f"[r{rnd}] degrade: research.rerank → {e.degradation} ({e})"], True,
                             {"wave": wave, "candidates": n, "kept": len(picked)})
     scores = res.parsed
     keep = sorted((i for i in range(1, n + 1) if scores.get(i, 0.5) > 0), key=lambda i: -scores.get(i, 0.5))
-    picked = [candidates[i - 1] for i in keep[:cap]]
+    picked = _quota_pick([candidates[i - 1] for i in keep], cap, per_subq)
     return RerankResult(picked, [r.model_dump() for r in res.records], [], False,
                         {"wave": wave, "candidates": n, "kept": len(picked)})
 
@@ -301,9 +336,10 @@ def fetch_one_source(src: dict, *, cfg, ledger: SpendLedger | None,
         msg = f"research skipping source with no/empty/non-http URL: {src!r}"
         logger.info(msg)
         return None, [msg]
-    res = fetchers.fetch(src, cfg=cfg, ledger=ledger, exa_enabled=exa_enabled)
+    res = fetchers.fetch(src, cfg=cfg, ledger=ledger, exa_enabled=exa_enabled, pinned=_is_pinned(src))
     if not res.ok:
-        msg = f"fetch {url} failed: {res.error} (rungs tried: {', '.join(res.rungs_tried) or 'none'})"
+        msg = (f"fetch {url} failed: {res.error} "
+               f"(rungs tried: {', '.join(t['rung'] for t in res.rungs_tried) or 'none'})")
         logger.warning(msg)
         return None, [msg]
     kind = src.get("kind") or "search_result"
@@ -313,7 +349,7 @@ def fetch_one_source(src: dict, *, cfg, ledger: SpendLedger | None,
         section=kind, excerpt=excerpt, sub_qs=sub_qs, provider=src.get("provider") or src.get("source") or "",
         canonical_url=canonical_url(url), domain=domain(url), published=src.get("published") or "",
         fetcher=res.fetcher, fetch_ms=res.ms, chars=res.chars,
-        authority_prior=authority_prior(url, kind), pinned=_is_pinned(src),
+        authority_prior=authority_prior(url, kind), pinned=_is_pinned(src), rungs_tried=res.rungs_tried,
     ).model_dump(), []
 
 
@@ -364,13 +400,22 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
 # Quote verification (spec §2.8, B4) — anchored, bounded.
 # ---------------------------------------------------------------------------
 
-_QUOTE_MARKS = re.compile(r"[\"'`“”„‟‘’‚‛«»‹›]")
-_DASHES = str.maketrans({"–": "-", "—": "-", "‐": "-", "‑": "-", "−": "-"})
+# quote marks and emphasis asterisks dropped, dashes unified, "_" a space (``_x_`` emphasis, snake_case alike)
+_QUOTE_FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»‹›*"), **dict.fromkeys("–—‐‑−", "-"), "_": " "})
+_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")         # a markdown link or image → its text
+_NUMBER = re.compile(r"\d[\d.,:]*%?")
+_WORD = re.compile(r"\w+")
 
 
 def _norm_quote(text: str) -> str:
-    """Case, whitespace, quote marks and dashes normalised."""
-    return " ".join(_QUOTE_MARKS.sub("", (text or "").translate(_DASHES).lower()).split())
+    """Case, whitespace, quote marks, dashes and markdown markup normalised."""
+    return " ".join(_MD_LINK.sub(r"\1", text or "").translate(_QUOTE_FOLD).lower().split())
+
+
+def _tokens(text: str) -> tuple[set[str], set[str]]:
+    """A normalised text's number tokens (``\\d[\\d.,:]*%?``, a trailing separator
+    dropped) and its word tokens."""
+    return {n.rstrip(".,:") for n in _NUMBER.findall(text)}, set(_WORD.findall(text))
 
 
 class QuoteIndex:
@@ -402,12 +447,12 @@ def quote_verified(quote: str, idx: QuoteIndex, threshold: float) -> bool | None
 
     Normalised exact substring → True. Else the quote's word 4-grams vote
     for alignments in the document's 4-gram index; the top 3 are compared
-    on windows of ``len(quote) + 40`` chars around them, ``≥ threshold`` →
-    True. Deviation from the literal spec formula (documented in the WP-B
-    note): the similarity is taken over the window's matched stretch, not
-    the whole window — SequenceMatcher's ratio against a window 40 chars
-    longer than the quote caps at 2L / (2L + 40), below 0.9 for every quote
-    shorter than 180 chars."""
+    on windows of ``len(quote) + 40`` chars around them: True when the
+    similarity over the window's matched span (spec §2.8, orchestrator
+    ruling: a whole-window ratio caps at 2L / (2L + 40)) is ``≥ threshold``
+    **and** every number token and every word of the quote occurs as a token
+    in that window — punctuation, spacing, markup and dropped words pass, a
+    substituted word or number never does (WP-B review)."""
     q = _norm_quote(quote)
     if not q:
         return None
@@ -418,11 +463,15 @@ def quote_verified(quote: str, idx: QuoteIndex, threshold: float) -> bool | None
     for j in range(len(words) - 3):
         for i in idx.grams.get(tuple(words[j:j + 4]), ()):
             votes[i - j] += 1
+    numbers, tokens = _tokens(q)
     for start, _n in votes.most_common(3):
         at = idx.starts[min(max(start, 0), len(idx.starts) - 1)]
         lo = max(0, at - 20)
-        if _span_ratio(q, idx.text[lo:lo + len(q) + 40]) >= threshold:
-            return True
+        window = idx.text[lo:lo + len(q) + 40]
+        if _span_ratio(q, window) >= threshold:
+            w_numbers, w_tokens = _tokens(window)
+            if numbers <= w_numbers and tokens <= w_tokens:
+                return True
     return False
 
 
@@ -691,12 +740,12 @@ class _Pass:
         self.ledger = SpendLedger.for_run(rc, state.get("search_spend"))
         self.recency = self.ledger.snapshot()["recency"]          # decided once, by the scout
         self.exa_on = "exa" in rc.search.providers_enabled and exa_enabled()
-        self.sources = list(state.get("sources") or [])
+        self.calls: list[dict] = []
+        self.errors: list[str] = []
+        self.sources = _keep_valid(list(state.get("sources") or []), self.errors)
         self.fetched = list(state.get("fetched") or [])
         self.evidence = list(state.get("evidence") or [])
         self.queries = list(state.get("queries") or [])
-        self.calls: list[dict] = []
-        self.errors: list[str] = []
         self.extra: dict[str, Any] = {}
         self.waves = 0
         self.done = {canonical_url(f.get("url") or "") for f in self.fetched}
@@ -738,7 +787,7 @@ class _Pass:
         self.errors += errs
         self.queries += queries
         index = {_source_key(s): i for i, s in enumerate(self.sources)}
-        for h in hits:
+        for h in _keep_valid(hits, self.errors):
             key = h.get("canonical_url") or canonical_url(h.get("url") or "")
             if key not in index:
                 index[key] = len(self.sources)
@@ -753,10 +802,12 @@ class _Pass:
 
     def pick(self, *, kind: str, cap: int, wave: int, only: set[int] | None = None,
              pinned_only: bool = False) -> list[dict]:
-        """Pinned pending sources (always) + up to ``cap`` (and the ledger's
-        ``kind`` remainder) of the others, restricted to ``only`` sub-questions."""
+        """Pinned pending sources (always; never reranked, quota'd or capped) + up
+        to ``cap`` (and the ledger's ``kind`` remainder) of the others under the
+        ``per_subq_target`` quota, restricted to ``only`` sub-questions. Pinned
+        sources are visited first, so a pinned copy wins the dedupe."""
         pending, seen = [], set()
-        for s in self.sources:
+        for s in sorted(self.sources, key=lambda s: not _is_pinned(s)):
             key = _source_key(s)
             if key and key not in seen and key not in self.done and key not in self.attempted:
                 seen.add(key)
@@ -768,7 +819,8 @@ class _Pass:
         if pinned_only or cap <= 0 or not web:
             return pinned
         if not self.rc.research.rerank:
-            return pinned + triage(web, set(), self.brief, cap=cap)
+            return pinned + _quota_pick(triage(web, set(), self.brief, cap=len(web)), cap,
+                                        self.rc.research.per_subq_target)
         r = rerank(triage(web, set(), self.brief, cap=_RERANK_MAX), self.brief, self.user_request,
                    rc=self.rc, wave=wave, rnd=self.rnd, cap=cap)
         self.note(r.calls, r.errors)
@@ -808,8 +860,11 @@ class _Pass:
     def run_waves(self, *, kind: str, search_mode: str, max_waves: int, cap: int,
                   only: set[int] | None = None, opening: list[dict] | None = None) -> None:
         """Up to ``max_waves`` waves. ``opening``: the queries searched before
-        wave 1; before every later wave, if coverage gaps remain, one
-        follow-up querygen + search (none after a querygen gave nothing)."""
+        wave 1; before every later wave, while coverage gaps and the pass's
+        fetch budget remain, one follow-up querygen + search (none after a
+        querygen gave nothing). The drain is read at the top of every wave,
+        before every pick (so no rerank call runs after it) and before every
+        fetch submit."""
         followups = True
         for w in range(1, max_waves + 1):
             if self.draining():
@@ -818,8 +873,8 @@ class _Pass:
                 self.search(opening, search_mode, w)
             elif w > 1:
                 gaps = _gap_subqs(compute_coverage(self.brief, self.evidence), self.rc.research.coverage_min_strong)
-                if not gaps:
-                    break
+                if not gaps or self.ledger.remaining(kind) <= 0:
+                    break                          # nothing to cover, or nothing left to fetch it with
                 if followups:
                     fq, calls, errs = followup_queries(self.brief, gaps, self.queries, rc=self.rc,
                                                        role="research.followup_querygen", rnd=self.rnd)
@@ -827,8 +882,8 @@ class _Pass:
                     followups = bool(fq)
                     if fq:
                         self.search(fq, search_mode, w)
-                    if self.draining():
-                        return self.stop_drained()
+            if self.draining():
+                return self.stop_drained()
             picked = self.pick(kind=kind, cap=cap, wave=w, only=only)
             if not picked:
                 if w == 1 and kind == "fetch_first" and not self.fetched:
