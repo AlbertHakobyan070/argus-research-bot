@@ -29,6 +29,7 @@ exercise ``on_callback`` and the in-flight registry with async mocks.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +40,9 @@ from argus.bot import common as bot_common
 from argus.bot import research as bot_research
 from argus.bot.app import on_callback
 from argus.config import Settings
+from argus.engines import registry
+
+from helpers import fake_engines_snapshot, make_run_config
 
 RUN_ID = "ab12cd34"
 
@@ -60,7 +64,6 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"),
         ffmpeg_path=None,
-        max_revision_rounds=3,
     )
     monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
 
@@ -86,6 +89,13 @@ def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bot_app, "_allowed", lambda _settings, _uid: True)
 
 
+@pytest.fixture(autouse=True)
+def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """Approve first resolves the engines snapshot (v4 WP-A/WP-D)."""
+    monkeypatch.setattr(registry, "active_snapshot",
+                        AsyncMock(return_value=fake_engines_snapshot()))
+
+
 def _seed_plan_inflight(*, run_id: str = RUN_ID, chat_id: int = 10001,
                         default_length: str = "medium") -> dict:
     """Populate ``_inflight[run_id]`` with the shape ``research_cmd``
@@ -93,6 +103,11 @@ def _seed_plan_inflight(*, run_id: str = RUN_ID, chat_id: int = 10001,
     has fired. Returns the seeded entry so the test can introspect it."""
     thread_id = f"tg:{chat_id}:{run_id}"
     fake_graph = MagicMock()
+    # The plan-gate checkpoint approve reads (and rewrites with the run_config).
+    fake_graph.aget_state = AsyncMock(return_value=SimpleNamespace(
+        values={"length": default_length, "run_config": make_run_config(default_length)},
+        next=("research",), created_at="2026-10-19T00:00:00+00:00"))
+    fake_graph.aupdate_state = AsyncMock()
     fake_cfg = {"configurable": {"thread_id": thread_id}}
     entry = {
         "run_id": run_id,

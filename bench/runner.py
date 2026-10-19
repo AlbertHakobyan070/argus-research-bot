@@ -6,9 +6,14 @@ results/raw.jsonl.
 
 Designed for comparison runs against the LIVE proxy + live search
 (nothing is stubbed):
-  - No model pinning: tiers resolve through llm.resolve_tier against
-    the live proxy, so runs are comparable only while it serves the
+  - Engines: the committed argus_engines.json plus the local file (the
+    bot's /engines changes live in its library and are not read),
+    resolved once per bench run; ``--profile`` picks a profile. The
+    proxy reroutes, so runs are comparable only while it serves the
     same models.
+  - Every query starts with its ``run_config`` (v4 spec §2.4):
+    ``--length`` and ``--depth`` (default: the length's preset),
+    ``origin="bench"``.
   - Auto-resumes through LangGraph interrupts (plan approval + report
     preview) without user input — the goal is to measure the graph's
     output, not the HITL UX.
@@ -17,10 +22,13 @@ Designed for comparison runs against the LIVE proxy + live search
 Usage:
     PYTHONPATH="" ./venv/Scripts/python.exe -m bench.runner \\
         --queries bench/queries.jsonl \\
-        --out bench/results/raw.jsonl \\
-        --length short
+        --out bench/results/<label>/raw.jsonl \\
+        --length short [--depth standard] [--profile free-proxy]
 
 Notes:
+    - The full final state of each query (the checkpoint's values, also
+      after a timeout or an error) is written to
+      ``<out dir>/<qid>/state.json``; the record's ``state_path`` names it.
     - Always uses a fresh checkpointer per query (MemorySaver), so
       thread_ids don't collide and previous state doesn't leak.
     - Pauses at the same two static interrupts the bot uses (plan gate
@@ -48,20 +56,40 @@ from pathlib import Path
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
+from argus.engines import registry
+from argus.engines.schema import EnginesSnapshot
 from argus.graph.graph import build_graph
+from argus.graph.run_config import PRESETS, RunConfig
+from argus.graph.state import VALID_LENGTHS
+from argus.library import Library
 
 
 logger = logging.getLogger("argus.bench.runner")
 
 
-async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
-    """Run a single query end-to-end. Auto-resume through interrupts."""
-    from argus.config import get_settings
+async def _engines_snapshot(profile: str | None) -> EnginesSnapshot:
+    """The engines every query of this bench run uses (resolved once). A
+    ``profile`` is switched to in-process, validated as ``/engines use``
+    does; the switch persists only into a throwaway in-memory library."""
+    if profile is not None:
+        lib = Library(":memory:")
+        await lib.open()
+        try:                    # an open aiosqlite connection keeps the interpreter from exiting
+            await registry.load_config(library=lib)
+            await registry.set_active_profile(profile)
+        finally:
+            await lib.close()
+    return await registry.active_snapshot()
 
+
+async def _run_one(query_obj: dict, *, length: str, depth: str | None,
+                   engines: EnginesSnapshot, timeout_s: int, state_dir: Path) -> dict:
+    """Run a single query end-to-end. Auto-resume through interrupts."""
     qid = query_obj["id"]
     query = query_obj["query"]
     thread_id = f"bench-{qid}-{uuid.uuid4().hex[:8]}"
     user_id = 0  # bench user
+    rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, origin="bench")
 
     # Fresh checkpointer per query — no state leakage.
     graph = build_graph(checkpointer=MemorySaver())
@@ -73,6 +101,7 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
         "user_request": query,
         "mode": "deep",
         "length": length,
+        "run_config": rc.model_dump(),
         "messages": [],
         "plan": None,
         "sources": [],
@@ -93,6 +122,8 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
         "difficulty": query_obj.get("difficulty", "?"),
         "thread_id": thread_id,
         "length": length,
+        "depth": rc.depth,
+        "profile": engines.profile,
         "status": "started",
         "duration_s": 0.0,
         "report_md": None,
@@ -101,6 +132,7 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
         "n_findings": 0,
         "interrupted_at": None,
         "error": None,
+        "state_path": None,
     }
     t0 = time.monotonic()
     try:
@@ -115,7 +147,8 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
             while steps < max_steps:
                 steps += 1
                 interrupted = False
-                async for ev in graph.astream(current_input, config=config, stream_mode="updates"):
+                async for ev in graph.astream(current_input, config=config, stream_mode="updates",
+                                              durability="sync"):
                     for node_name, delta in ev.items():
                         if node_name == "__interrupt__":
                             interrupted = True
@@ -158,6 +191,14 @@ async def _run_one(query_obj: dict, *, length: str, timeout_s: int) -> dict:
         logger.exception("runner: query %s failed", qid)
         record.update({"status": "error", "error": repr(e)})
     record["duration_s"] = round(time.monotonic() - t0, 2)
+    # The full final state — after a timeout or an error, the last checkpoint.
+    snap = await graph.aget_state(cfg)
+    if snap.created_at is not None:
+        state_path = state_dir / qid / "state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(snap.values, indent=2, ensure_ascii=False, default=str),
+                              encoding="utf-8")
+        record["state_path"] = str(state_path)
     return record
 
 
@@ -169,13 +210,15 @@ async def _main_async(args: argparse.Namespace) -> int:
     with queries_path.open(encoding="utf-8") as f:
         queries = [json.loads(line) for line in f if line.strip()]
 
-    logger.info("bench: running %d queries (length=%s, timeout=%ds)",
-                len(queries), args.length, args.timeout)
+    engines = await _engines_snapshot(args.profile)
+    logger.info("bench: running %d queries (length=%s, depth=%s, profile=%s, timeout=%ds)",
+                len(queries), args.length, args.depth or "preset", engines.profile, args.timeout)
 
     with out_path.open("w", encoding="utf-8") as out:
         for q in queries:
             logger.info("bench: [%s] %s", q["id"], q["query"][:60])
-            rec = await _run_one(q, length=args.length, timeout_s=args.timeout)
+            rec = await _run_one(q, length=args.length, depth=args.depth, engines=engines,
+                                 timeout_s=args.timeout, state_dir=out_path.parent)
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out.flush()
             logger.info("bench: [%s] %s in %.1fs (sources=%d, findings=%d)",
@@ -190,8 +233,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Argus Deep Research Bench runner.")
     parser.add_argument("--queries", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--length", default="short",
-                        choices=["quick", "short", "medium", "long", "lecture"])
+    parser.add_argument("--length", default="short", choices=VALID_LENGTHS)
+    parser.add_argument("--depth", default=None, choices=list(PRESETS),
+                        help="Research depth preset (default: the length's own)")
+    parser.add_argument("--profile", default=None,
+                        help="Engines profile (default: the active one in the engines files)")
     parser.add_argument("--timeout", type=int, default=300,
                         help="Per-query timeout in seconds (default 300)")
     args = parser.parse_args()

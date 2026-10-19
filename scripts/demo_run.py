@@ -132,13 +132,21 @@ def main() -> int:
     from argus import config as cfg_mod
     cfg_mod._cached = None
 
+    import asyncio
+
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
     from argus.config import get_settings
+    from argus.engines import registry
     from argus.graph import build_graph
+    from argus.graph.run_config import RunConfig
     from argus.llm import resolve_tier
 
     s = get_settings()
+    # v4: resolve the engines before any node runs (the legacy LLM wrappers
+    # read this cached snapshot), and start the run with its run_config.
+    engines = asyncio.run(registry.active_snapshot())
+    run_config = RunConfig.from_preset(length="medium", engines=engines, origin="demo")
     print("=== Argus v3 end-to-end demo ===")
     print(f"Topic: {DEMO_TOPIC}")
     print(f"Reports root: {s.reports_root}")
@@ -151,7 +159,7 @@ def main() -> int:
     cfg = {"configurable": {"thread_id": "demo"}}
     state_in = {
         "thread_id": "demo", "user_id": 0, "user_request": DEMO_TOPIC,
-        "length": "medium",
+        "length": "medium", "run_config": run_config.model_dump(),
         "messages": [], "plan": None, "sources": [], "fetched": [],
         "findings": [], "draft_md": "", "revision_notes": [],
         "revision_rounds": 0, "model_calls": [], "hitl": {"pending": False},

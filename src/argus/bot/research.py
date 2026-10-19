@@ -15,6 +15,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
 from ..engines import registry
+from ..graph.run_config import RunConfig, ensure_in_checkpoint
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS
 from ..library import mirror_run_md, new_run_id
 from . import common
@@ -25,6 +26,32 @@ from .common import (
 )
 
 logger = logging.getLogger("argus.bot")
+
+
+async def _ensure_run_config(info: dict) -> RunConfig:
+    """First step of every resume entry, before anything changes (spec §2.3,
+    §2.4): resolve the engines snapshot, then make sure the run's checkpoint
+    carries its RunConfig (a pre-v4 checkpoint gets the legacy defaults,
+    recorded in ``errors``). Raises — leaving the run as it was — when the
+    engines cannot be resolved or the checkpoint cannot get a config."""
+    engines = await registry.active_snapshot()
+    return await ensure_in_checkpoint(info["graph"], info["cfg"], engines=engines)
+
+
+async def _approve_run_config(ctx: ContextTypes.DEFAULT_TYPE, info: dict) -> None:
+    """Plan approve, before anything else changes: the run's config rebuilt
+    for the chosen length — ``rebuild``, so console overrides survive; depth
+    follows the length (the plan gate has no depth control yet) — written
+    with that length to the checkpoint, then to the library row."""
+    engines = await registry.active_snapshot()
+    rc = await ensure_in_checkpoint(info["graph"], info["cfg"], engines=engines)
+    rc = rc.rebuild(length=info["length"], engines=engines)
+    await info["graph"].aupdate_state(info["cfg"], {"length": rc.length,
+                                                    "run_config": rc.model_dump()})
+    lib = _get_library(ctx)
+    if lib is not None and not await lib.set_run_config(info["run_id"], rc.model_dump()):
+        logger.warning("run %s has no library row; its run_config is in the checkpoint only",
+                       info["run_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +186,8 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Bot not fully initialized (no graph) — restart the bot.")
         return
-    await registry.active_snapshot()
+    engines = await registry.active_snapshot()
+    rc = RunConfig.from_preset(length=length, engines=engines, origin="telegram")
 
     # v2: every run gets its own id + checkpoint thread. Multiple runs
     # per chat can coexist, and a run can be re-attached after a restart.
@@ -169,7 +197,9 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lib is not None:
         try:
             await lib.create_run(run_id=run_id, thread_id=thread_id,
-                                 chat_id=chat_id, topic=topic, length=length)
+                                 chat_id=chat_id, topic=topic, length=length,
+                                 config_json=rc.model_dump_json(), depth=rc.depth,
+                                 origin=rc.origin)
         except Exception:
             logger.exception("create_run failed; continuing without registry row")
 
@@ -184,6 +214,7 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "user_id": update.effective_user.id,
         "user_request": topic,
         "length": length,           # T7 — Length selector carry
+        "run_config": rc.model_dump(),
         "messages": [], "plan": None,
         "sources": [], "fetched": [], "findings": [],
         "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -282,7 +313,8 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Bot not fully initialized (no graph) — restart the bot.")
         return
-    await registry.active_snapshot()
+    engines = await registry.active_snapshot()
+    rc = RunConfig.from_preset(length=DEFAULT_LENGTH, engines=engines, origin="telegram")
     await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     run_id = new_run_id()
@@ -291,8 +323,10 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lib is not None:
         try:
             await lib.create_run(run_id=run_id, thread_id=thread_id,
-                                 chat_id=chat_id, topic=question,
-                                 mode="quick", status="running")
+                                 chat_id=chat_id, topic=question, length=rc.length,
+                                 mode="quick", status="running",
+                                 config_json=rc.model_dump_json(), depth=rc.depth,
+                                 origin=rc.origin)
         except Exception:
             logger.exception("create_run failed; continuing without registry row")
 
@@ -302,6 +336,7 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "user_id": update.effective_user.id,
         "user_request": question,
         "length": DEFAULT_LENGTH,
+        "run_config": rc.model_dump(),
         "messages": [], "plan": None,
         "sources": [], "fetched": [], "findings": [],
         "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -366,7 +401,7 @@ async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
 
     NB: ``state["sources"]`` is not cleared here, so scout re-seeds the
     previous wave's hits first (see the note in ``scout_node``)."""
-    await registry.active_snapshot()
+    await _ensure_run_config(info)
     if info.get("resuming"):
         return
     info["resuming"] = True
@@ -419,7 +454,7 @@ async def _revise_after_feedback(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
     """report-revise: append the user's feedback to revision_notes, set
     revision_requested, then resume from the report-preview interrupt —
     deliver passes through → revise_prep → compose → … → new preview."""
-    await registry.active_snapshot()
+    await _ensure_run_config(info)
     if info.get("resuming"):
         return
     graph = info["graph"]
@@ -481,6 +516,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             if info.get("plan_approved") is True or info.get("resuming"):
                 # Double-tap guard — one resume per plan gate.
                 return
+            # Before anything changes: a failure here (engines unresolvable,
+            # no rebuildable config) leaves the run at its gate, keyboard on.
+            await _approve_run_config(ctx, info)
             info["plan_approved"] = True
             await _safe_edit_cb(
                 q, (info.get("plan_text") or q.message.text or "")
@@ -516,6 +554,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             # next preview.
             graph = info["graph"]
             cfg = info["cfg"]
+            await _ensure_run_config(info)          # before the flag and the status change
             try:
                 await graph.aupdate_state(cfg, {"extend_requested": True})
             except Exception:
@@ -555,8 +594,12 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
     checkpoint via ``aupdate_state(as_node="deliver")`` first and passes
     ``None`` — there is no pending interrupt to resume, the graph just
     proceeds from the fork.
+
+    The chosen length is already in the checkpoint: Approve writes it
+    together with the rebuilt run_config (``_approve_run_config``); the
+    report-gate paths and /continue never change it.
     """
-    await registry.active_snapshot()
+    await _ensure_run_config(info)
     if info.get("resuming"):
         logger.warning("resume already in flight for run %s; ignoring",
                        info.get("run_id"))
@@ -569,20 +612,9 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
     progress = {"message_id": None}
     if resume_input is ...:
         resume_input = Command(resume=True)
-
-    # T7.1 — push the chosen length back into the graph state BEFORE
-    # resuming, so the compose + report_builder nodes see the user's
-    # HITL choice rather than the default. ``aupdate_state`` is the
-    # canonical way to fork a thread checkpoint from outside.
     chosen_length = (info.get("length")
                      or info.get("state", {}).get("length")
                      or DEFAULT_LENGTH)
-    try:
-        await graph.aupdate_state(cfg, {"length": chosen_length})
-    except Exception:
-        logger.exception(
-            "aupdate_state failed; defaulting length=%s", chosen_length,
-        )
 
     progress = await _stream_progress(ctx.application.bot, chat_id,
         "📚 Deep-researching approved sources…", progress)
@@ -716,7 +748,7 @@ async def _send_report_preview(ctx: ContextTypes.DEFAULT_TYPE,
 
 async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
                                 info: dict, q):
-    await registry.active_snapshot()
+    await _ensure_run_config(info)
     run_id = info["run_id"]
     chat_id = info["chat_id"]
     paths = info.get("paths") or {}

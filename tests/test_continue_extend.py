@@ -246,7 +246,6 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         media_root=Path("vault/media"),
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"), ffmpeg_path=None,
-        max_revision_rounds=3,
     )
     monkeypatch.setattr(bot_history, "get_settings", lambda: dummy)
 
@@ -338,7 +337,8 @@ class _FakeGraph:
         self.updates: list[tuple] = []
 
     async def aget_state(self, cfg):
-        return SimpleNamespace(values=self.values, next=self.nxt)
+        return SimpleNamespace(values=self.values, next=self.nxt,
+                               created_at="2026-10-19T00:00:00+00:00")
 
     async def aupdate_state(self, cfg, payload, as_node=None):
         self.updates.append((payload, as_node))

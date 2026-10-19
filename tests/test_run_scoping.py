@@ -52,7 +52,6 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"),
         ffmpeg_path=None,
-        max_revision_rounds=3,
     )
     monkeypatch.setattr(bot_research, "get_settings", lambda: dummy)
 

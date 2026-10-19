@@ -1,8 +1,9 @@
 """Per-run configuration (v4 spec §2.4): knob models, depth presets, budget helpers.
 
-Contract only — no node reads it yet (WP-D wires it). The rule for every
-node: ``rc = run_config.require(state)`` (never ``state.get``), and every
-resume entry point calls ``ensure_in_checkpoint`` first.
+Every run carries one in its checkpoint (WP-D): new-run entry points set
+``state["run_config"]``, every resume entry point calls
+``ensure_in_checkpoint`` first. No node reads it yet; the rule for every
+node is ``rc = run_config.require(state)`` (never ``state.get``).
 """
 from __future__ import annotations
 

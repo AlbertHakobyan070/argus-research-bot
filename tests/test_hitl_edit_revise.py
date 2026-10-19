@@ -27,7 +27,7 @@ from argus.engines import registry
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
 
-from helpers import fake_engines_snapshot
+from helpers import fake_engines_snapshot, make_run_config
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def _settings(monkeypatch):
         checkpoint_db=Path("c.sqlite"), library_db=Path("l.sqlite"),
         vault_root=Path("v"), media_root=Path("v/m"),
         transcripts_root=Path("v/t"), history_root=Path("v/h"),
-        ffmpeg_path=None, max_revision_rounds=3)
+        ffmpeg_path=None)
     monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
 
 
@@ -285,7 +285,9 @@ async def test_revise_reply_resumes_with_notes(monkeypatch):
     info["cfg"] = {"configurable": {"thread_id": "tg:6:ab12cd34"}}
     graph = MagicMock()
     graph.aget_state = AsyncMock(return_value=SimpleNamespace(
-        values={"revision_notes": ["prior note"]}))
+        values={"revision_notes": ["prior note"], "length": "short",
+                "run_config": make_run_config("short")},
+        created_at="2026-10-19T00:00:00+00:00"))
     graph.aupdate_state = AsyncMock()
     info["graph"] = graph
     bot_common._pending_reply[6] = ("revise_feedback", "ab12cd34")

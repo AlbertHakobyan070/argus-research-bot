@@ -50,7 +50,7 @@ def _graph_with_next(next_map: dict[str, tuple]):
 async def _seed(lib, run_id, chat_id, status, topic="t"):
     return await lib.create_run(
         run_id=run_id, thread_id=f"tg:{chat_id}:{run_id}", chat_id=chat_id,
-        topic=topic, status=status)
+        topic=topic, status=status, config_json="{}", depth="quick", origin="telegram")
 
 
 async def test_orphan_at_plan_gate_becomes_awaiting_plan_and_notifies(lib):

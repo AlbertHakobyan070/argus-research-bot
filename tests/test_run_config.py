@@ -1,4 +1,6 @@
-"""v4 WP-0 — RunConfig models, presets, budget helpers (spec §2.4)."""
+"""v4 WP-0 — RunConfig models, presets, budget helpers (spec §2.4); WP-D —
+ensure_in_checkpoint on the real ArgusState, and the Settings knobs of §7."""
+import dataclasses
 import functools
 import operator
 from datetime import datetime
@@ -8,10 +10,11 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from argus import config as config_mod
 from argus.engines.schema import ExaPrices
 from argus.graph.run_config import (
     PRESETS, ExaConfig, RunConfig, SearchConfig, ensure_in_checkpoint, require)
-from argus.graph.state import VALID_LENGTHS
+from argus.graph.state import VALID_LENGTHS, ArgusState
 from helpers import fake_engines_snapshot, make_run_config
 
 
@@ -318,3 +321,75 @@ async def test_ensure_in_checkpoint_refuses_a_checkpoint_without_length():
         await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
     assert await _checkpoint_id(graph, cfg) == before           # nothing written
     assert "run_config" not in (await graph.aget_state(cfg)).values
+
+
+async def test_ensure_in_checkpoint_on_argus_state_keeps_the_injected_config():
+    """aupdate_state silently drops a key ArgusState does not declare: the
+    injection must survive in a checkpoint of the real state schema."""
+    g = StateGraph(ArgusState)
+    g.add_node("step", lambda s: {"draft_md": ""})
+    g.add_edge(START, "step")
+    g.add_edge("step", END)
+    graph = g.compile(checkpointer=MemorySaver())
+    cfg = {"configurable": {"thread_id": "argus-pre-v4"}}
+    await graph.ainvoke({"user_request": "t", "length": "long"}, cfg)
+
+    rc = await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
+    values = (await graph.aget_state(cfg)).values
+    assert values["run_config"] == rc.model_dump()
+    assert (rc.legacy, rc.length, rc.depth) == (True, "long", "deep")
+    assert values["errors"] == ["legacy: run_config defaults applied (pre-v4 checkpoint)"]
+    assert await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot()) == rc
+    assert (await graph.aget_state(cfg)).values["errors"] == values["errors"]
+
+
+# ---------------------------------------------------------------------------
+# Settings knobs added by WP-D (spec §7): read by the run driver (WP-E1) and
+# the console (WP-E2)
+# ---------------------------------------------------------------------------
+
+_KNOB_ENV = ("ARGUS_WEBAPP_ENABLED", "ARGUS_WEBAPP_PORT", "ARGUS_ENGINES_FILE",
+             "ARGUS_ENGINES_LOCAL_FILE", "ARGUS_CANCEL_DRAIN_TIMEOUT_S", "ARGUS_SHUTDOWN_DRAIN_S")
+
+
+@pytest.fixture
+def _bare_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test")
+    for name in _KNOB_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_settings_v4_knob_defaults(_bare_env):
+    s = config_mod.Settings.load()
+    root = config_mod._PROJECT_ROOT
+    assert (s.webapp_enabled, s.webapp_port) == (True, 8787)
+    assert (s.engines_file, s.engines_local_file) == (
+        root / "argus_engines.json", root / "argus_engines.local.json")
+    assert (s.cancel_drain_timeout_s, s.shutdown_drain_s) == (300, 120)
+    assert "max_revision_rounds" not in {f.name for f in dataclasses.fields(config_mod.Settings)}
+
+
+def test_settings_v4_knobs_from_env(_bare_env, monkeypatch, tmp_path):
+    monkeypatch.setenv("ARGUS_WEBAPP_ENABLED", "false")
+    monkeypatch.setenv("ARGUS_WEBAPP_PORT", "9999")
+    monkeypatch.setenv("ARGUS_ENGINES_FILE", "conf/engines.json")        # relative → repo root
+    monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(tmp_path / "local.json"))
+    monkeypatch.setenv("ARGUS_CANCEL_DRAIN_TIMEOUT_S", "30")
+    monkeypatch.setenv("ARGUS_SHUTDOWN_DRAIN_S", "7.5")
+    s = config_mod.Settings.load()
+    assert (s.webapp_enabled, s.webapp_port) == (False, 9999)
+    assert s.engines_file == config_mod._PROJECT_ROOT / "conf" / "engines.json"
+    assert s.engines_local_file == tmp_path / "local.json"
+    assert (s.cancel_drain_timeout_s, s.shutdown_drain_s) == (30, 7.5)
+
+
+@pytest.mark.parametrize("value", ["1", "yes", "ON", "True"])
+def test_settings_webapp_enabled_accepts_true_spellings(_bare_env, monkeypatch, value):
+    monkeypatch.setenv("ARGUS_WEBAPP_ENABLED", value)
+    assert config_mod.Settings.load().webapp_enabled is True
+
+
+def test_settings_webapp_enabled_rejects_garbage(_bare_env, monkeypatch):
+    monkeypatch.setenv("ARGUS_WEBAPP_ENABLED", "maybe")
+    with pytest.raises(ValueError, match="ARGUS_WEBAPP_ENABLED"):
+        config_mod.Settings.load()

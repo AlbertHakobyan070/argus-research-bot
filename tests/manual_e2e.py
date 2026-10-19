@@ -99,7 +99,7 @@ def _banner(title: str) -> None:
 
 
 def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
-                    user_id: int, topic: str) -> dict:
+                    user_id: int, topic: str, run_config: dict) -> dict:
     """Run /research to first HITL pause, then through both resumes.
 
     Returns the final graph state. The graph's HITL pause points are
@@ -114,6 +114,8 @@ def _drive_research(graph: CompiledStateGraph, *, thread_id: str,
         "thread_id": thread_id,
         "user_id": user_id,
         "user_request": topic,
+        "length": run_config["length"],
+        "run_config": run_config,       # v4 WP-D: every new run carries its RunConfig
         "messages": [],
         "plan": None,
         "sources": [],
@@ -193,11 +195,17 @@ def main() -> int:
     # v4 WP-A: the nodes' legacy LLM wrappers read the registry's cached
     # snapshot, so resolve the engines config first (as the bot does).
     from argus.engines import registry
-    asyncio.run(registry.active_snapshot())
+    from argus.graph.run_config import RunConfig
+    engines = asyncio.run(registry.active_snapshot())
+    # Graph-direct live check (scripts/live_check.py replaces this script in
+    # WP-G): length short → the quick preset.
+    run_config = RunConfig.from_preset(length="short", engines=engines,
+                                       origin="live_check").model_dump()
 
     try:
         final = _drive_research(graph, thread_id=thread_id,
-                                user_id=user_id, topic=topic)
+                                user_id=user_id, topic=topic,
+                                run_config=run_config)
     except Exception as exc:
         print(f"\nFATAL during drive: {exc!r}")
         import traceback
@@ -241,8 +249,14 @@ def main() -> int:
     print(f"  [{'PASS' if has_citation else 'FAIL'}] "
           f"md has citation pattern")
 
+    # Check 6: the run carried its run_config to the end (v4 WP-D).
+    preset_origin = (final.get("run_config") or {}).get("preset_origin")
+    pass_run_config = preset_origin == "quick"
+    print(f"  [{'PASS' if pass_run_config else 'FAIL'}] "
+          f"run_config.preset_origin: {preset_origin!r}")
+
     overall = (pass_finding and pass_fetched and pass_md_path
-               and pass_md_nonempty and has_citation)
+               and pass_md_nonempty and has_citation and pass_run_config)
     print(f"\n  OVERALL: {'PASS' if overall else 'BLOCK'}")
 
     if md_text:

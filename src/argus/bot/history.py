@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
 from ..engines import registry
+from ..graph.run_config import ensure_in_checkpoint
 from ..graph.state import DEFAULT_LENGTH
 from ..library import Library
 from ..media import extract_urls
@@ -252,7 +253,7 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Run {run_id} is already resuming — hang on.")
         return
-    await registry.active_snapshot()
+    engines = await registry.active_snapshot()
     cfg = {"configurable": {"thread_id": run["thread_id"]}}
     try:
         snap = await graph.aget_state(cfg)
@@ -275,6 +276,14 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     }
 
     nxt = tuple(snap.next or ())
+    if nxt and nxt not in (("research",), ("fetcher",), ("deliver",)):
+        await update.message.reply_text(
+            f"Run {run_id} is mid-pipeline (next: {', '.join(nxt)}) — "
+            "wait for it to pause or finish.")
+        return
+    # Re-attach and the extend fork are resumes: the run's config first
+    # (legacy defaults for a pre-v4 checkpoint), before anything changes.
+    await ensure_in_checkpoint(graph, cfg, engines=engines)
     if nxt in (("research",), ("fetcher",)):
         # Paused at the plan gate (possibly before a restart) — re-render.
         # ("fetcher",) accepted for pre-v3 checkpoints.
@@ -297,11 +306,6 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         info["paths"] = cur.get("report_paths") or {}
         await _send_report_preview(ctx, info)
         await _set_run_status(ctx, run_id, "awaiting_report")
-        return
-    if nxt:
-        await update.message.reply_text(
-            f"Run {run_id} is mid-pipeline (next: {', '.join(nxt)}) — "
-            "wait for it to pause or finish.")
         return
 
     # Finished run → extend fork. Merge pending appended sources into the

@@ -14,7 +14,14 @@ startup (PTB ``post_init``) and closed at shutdown. Tables:
 - ``run_sources``  — sources appended to a run (/append) awaiting the
                      next /continue. ``ref`` is a URL or ``asset:<id>``.
 - ``settings``     — global key/value toggles, e.g. ``media_quality``
-                     (the /quality setting).
+                     (the /quality setting), and the ``engines.*`` JSON
+                     values of the engines registry.
+
+v4 (spec §2.4) adds to ``runs``: ``config_json`` (the run's RunConfig;
+its ``length``/``depth`` columns mirror it), ``depth``, ``archetype``,
+``origin`` and ``exa_usd`` (per-run Exa spend). ``_migrate`` adds them to
+an existing DB: guarded, additive only, idempotent; pre-v4 rows keep NULL
+there (``origin`` defaults to ``'telegram'``, the only pre-v4 writer).
 
 The DB itself lives in the project directory (NOT the synced Obsidian
 vault — SQLite WAL + sync tooling is a corruption hazard). The vault
@@ -26,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -95,6 +103,25 @@ CREATE TABLE IF NOT EXISTS run_sources (
 );
 """
 
+# Columns v4 adds to ``runs`` (spec §2.4), in the order _migrate adds them.
+_V4_RUN_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("config_json", "TEXT"), ("depth", "TEXT"), ("archetype", "TEXT"),
+    ("origin", "TEXT DEFAULT 'telegram'"), ("exa_usd", "REAL"))
+# What update_run may set (the identity columns and created_at never change).
+_UPDATABLE_RUN_COLUMNS = frozenset({"topic", "length", "mode", "status", "report_dir",
+                                    *(name for name, _ in _V4_RUN_COLUMNS)})
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """Add each missing v4 column to ``runs``. Additive only, so it is safe
+    on any pre-v4 DB and a no-op on a migrated one."""
+    async with db.execute("PRAGMA table_info(runs)") as cur:
+        have = {row[1] for row in await cur.fetchall()}
+    for name, decl in _V4_RUN_COLUMNS:
+        if name not in have:
+            await db.execute(f"ALTER TABLE runs ADD COLUMN {name} {decl}")
+    await db.commit()
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -107,6 +134,15 @@ def new_run_id() -> str:
 
 def _row_to_run(row: aiosqlite.Row) -> dict[str, Any]:
     return dict(row)
+
+
+def _require_json_object(text: str) -> None:
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f"config_json is not JSON ({e})") from e
+    if not isinstance(value, dict):
+        raise ValueError(f"config_json must be a JSON object, got {type(value).__name__}")
 
 
 def _row_to_asset(row: aiosqlite.Row) -> dict[str, Any]:
@@ -141,6 +177,7 @@ class Library:
         await db.execute("PRAGMA foreign_keys=ON")
         await db.executescript(_SCHEMA)
         await db.commit()
+        await _migrate(db)
         self._db = db
 
     async def close(self) -> None:
@@ -158,21 +195,86 @@ class Library:
     async def create_run(self, *, run_id: str, thread_id: str, chat_id: int,
                          topic: str, length: str = "short",
                          mode: str = "deep",
-                         status: str = "planning") -> dict[str, Any]:
+                         status: str = "planning",
+                         config_json: str, depth: str,
+                         archetype: str | None = None,
+                         origin: str) -> dict[str, Any]:
+        """``config_json`` is the run's RunConfig as JSON text
+        (``rc.model_dump_json()``); ``length``/``depth``/``origin`` are its
+        own values."""
         if status not in VALID_RUN_STATUSES:
             raise ValueError(f"unknown run status {status!r}")
+        _require_json_object(config_json)
         db = self._conn()
         ts = _now()
         await db.execute(
             "INSERT INTO runs (run_id, thread_id, chat_id, topic, length,"
-            " mode, status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (run_id, thread_id, chat_id, topic, length, mode, status, ts, ts),
+            " mode, status, created_at, updated_at, config_json, depth,"
+            " archetype, origin)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, thread_id, chat_id, topic, length, mode, status, ts, ts,
+             config_json, depth, archetype, origin),
         )
         await db.commit()
         run = await self.get_run(run_id)
         assert run is not None
         return run
+
+    async def set_run_config(self, run_id: str, config: Mapping[str, Any]) -> bool:
+        """Store a run's (re)built RunConfig dict, with the ``length`` and
+        ``depth`` columns it implies — Approve with another length must
+        update the row (the v3 stale-length bug). False when the run does
+        not exist."""
+        db = self._conn()
+        cur = await db.execute(
+            "UPDATE runs SET config_json = ?, length = ?, depth = ?, updated_at = ?"
+            " WHERE run_id = ?",
+            (json.dumps(dict(config), ensure_ascii=False), config["length"],
+             config["depth"], _now(), run_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def get_run_config(self, run_id: str) -> dict[str, Any] | None:
+        """The stored RunConfig dict; None for an unknown run or a pre-v4 row."""
+        db = self._conn()
+        async with db.execute(
+                "SELECT config_json FROM runs WHERE run_id = ?", (run_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return json.loads(row[0])
+
+    async def update_run(self, run_id: str, /, **cols: Any) -> bool:
+        """Set ``runs`` columns by name (e.g. ``exa_usd``, ``archetype``);
+        ``updated_at`` follows. Unknown columns, the identity columns and an
+        unknown status raise ValueError. False when the run does not exist."""
+        if not cols:
+            raise ValueError("update_run needs at least one column")
+        bad = sorted(set(cols) - _UPDATABLE_RUN_COLUMNS)
+        if bad:
+            raise ValueError(f"update_run cannot set {', '.join(bad)} "
+                             f"(updatable: {', '.join(sorted(_UPDATABLE_RUN_COLUMNS))})")
+        if "status" in cols and cols["status"] not in VALID_RUN_STATUSES:
+            raise ValueError(f"unknown run status {cols['status']!r}")
+        db = self._conn()
+        sets = ", ".join(f"{name} = ?" for name in cols)
+        cur = await db.execute(
+            f"UPDATE runs SET {sets}, updated_at = ? WHERE run_id = ?",
+            (*cols.values(), _now(), run_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def exa_usd_month_to_date(self) -> float:
+        """Exa spend (``runs.exa_usd``) of the runs created this calendar
+        month, UTC; a run without a recorded spend counts 0."""
+        # ponytail: by created_at — a run that spans midnight on the 1st counts in its start month
+        start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        db = self._conn()
+        async with db.execute(
+                "SELECT COALESCE(SUM(exa_usd), 0.0) FROM runs WHERE created_at >= ?",
+                (start.isoformat(timespec="seconds"),)) as cur:
+            row = await cur.fetchone()
+        return float(row[0])
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         db = self._conn()
@@ -360,6 +462,15 @@ class Library:
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value))
         await db.commit()
+
+    async def get_json(self, key: str, default: Any = None) -> Any:
+        """A JSON setting, decoded; ``default`` when unset. A stored value
+        that is not JSON raises ``json.JSONDecodeError``."""
+        raw = await self.get_setting(key)
+        return default if raw is None else json.loads(raw)
+
+    async def set_json(self, key: str, value: Any) -> None:
+        await self.set_setting(key, json.dumps(value, ensure_ascii=False))
 
     # -- run_sources (append/continue) ----------------------------------------
 

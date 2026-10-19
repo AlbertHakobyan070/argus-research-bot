@@ -31,7 +31,7 @@ from argus.engines import llm_openai, registry
 from argus.engines.registry import EngineConfigError
 from argus.library import Library
 
-from helpers import fake_engines_snapshot
+from helpers import fake_engines_snapshot, make_run_config
 
 CFG: dict = {
     "active_profile": "main",
@@ -69,7 +69,7 @@ def _settings(tmp_path: Path, **kw) -> Settings:
                 reports_root=tmp_path / "reports", checkpoint_db=tmp_path / "cp.sqlite",
                 library_db=tmp_path / "lib.sqlite", vault_root=tmp_path / "vault",
                 media_root=tmp_path / "vault/media", transcripts_root=tmp_path / "vault/transcripts",
-                history_root=tmp_path / "vault/history", ffmpeg_path=None, max_revision_rounds=3)
+                history_root=tmp_path / "vault/history", ffmpeg_path=None)
     base.update(kw)
     return Settings(**base)
 
@@ -214,13 +214,15 @@ async def test_engines_show_last_run_tally_judge_diversity_and_exa(loaded, tmp_p
                   requested_model="s1", served_model="openai/gpt-oss-120b", routed_via="groq/x",
                   ok=True) for r in ("legacy.strong", "legacy.judge")]
     (rep / "metadata.json").write_text(json.dumps({"model_calls": calls}), encoding="utf-8")
-    await loaded.create_run(run_id="ab12cd34", thread_id="tg:1:ab12cd34", chat_id=1, topic="t")
+    await loaded.create_run(run_id="ab12cd34", thread_id="tg:1:ab12cd34", chat_id=1, topic="t",
+                            config_json="{}", depth="quick", origin="telegram")
     await loaded.set_run_status("ab12cd34", "done", report_dir=str(rep))
+    await loaded.update_run("ab12cd34", exa_usd=0.12)
 
     text = await _engines(loaded)
     assert "Last run ab12cd34" in text and "openai/gpt-oss-120b ×2" in text
     assert "judge diversity ⚠" in text and "/engines tier judge" in text
-    assert "Exa this month: n/a" in text
+    assert "Exa this month: $0.12" in text
 
 
 async def test_engines_is_refused_for_strangers(loaded, monkeypatch):
@@ -366,9 +368,11 @@ class _Graph:
         return gen()
 
     async def aget_state(self, cfg):
+        # a v4 checkpoint: ensure_in_checkpoint finds its run_config and writes nothing
         return SimpleNamespace(values={"plan": {"summary": "s", "sub_questions": ["q"],
-                                                "planned_sources": []}, "report_paths": {}},
-                               next=())
+                                                "planned_sources": []}, "report_paths": {},
+                                       "length": "short", "run_config": make_run_config("short")},
+                               next=(), created_at="2026-10-19T00:00:00+00:00")
 
 
 def _info(graph) -> dict:

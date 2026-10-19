@@ -48,7 +48,6 @@ def _settings(tmp_path: Path) -> Settings:
         transcripts_root=tmp_path / "vault" / "transcripts",
         history_root=tmp_path / "vault" / "history",
         ffmpeg_path=None,
-        max_revision_rounds=3,
     )
 
 
@@ -171,7 +170,8 @@ async def test_perform_delete_run_removes_dir_checkpoint_and_row(tmp_path,
     rd.mkdir(parents=True)
     (rd / "report.md").write_text("r", encoding="utf-8")
     await lib.create_run(run_id="dead1234", thread_id="tg:1:dead1234",
-                         chat_id=1, topic="t", status="done")
+                         chat_id=1, topic="t", status="done",
+                         config_json="{}", depth="quick", origin="telegram")
     saver = MagicMock()
     saver.adelete_thread = AsyncMock()
 
