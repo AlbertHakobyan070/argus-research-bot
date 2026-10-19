@@ -37,7 +37,7 @@ import openai  # noqa: E402
 from langchain_core.messages import HumanMessage, SystemMessage  # noqa: E402
 
 from argus.engines import registry  # noqa: E402
-from argus.engines.llm_openai import OpenAICompatDriver  # noqa: E402
+from argus.engines.llm_openai import DriverError, OpenAICompatDriver  # noqa: E402
 from argus.engines.registry import EngineConfigError  # noqa: E402
 from argus.engines.schema import EngineSpec, EnginesConfig, ProviderSpec  # noqa: E402
 from argus.llm import strip_reasoning  # noqa: E402
@@ -91,11 +91,12 @@ class Probe:
         return text.replace(self.key, "***") if self.key else text
 
     def row(self, check: str, status: str, resp=None, ms: int | None = None, detail: str = "") -> None:
+        """Every printed detail passes through redact() here, failure texts included."""
         self.failed |= status == "FAIL"
         tokens = (f"{resp.usage['completion_tokens']}/{resp.usage['reasoning_tokens']}" if resp else "")
         self.rows.append([self.prov.name, resp.served_model if resp else self.model, check, status,
                           resp.finish_reason if resp else "", tokens, "" if ms is None else str(ms),
-                          detail.replace("|", "/").replace("\n", " ")[:110]])
+                          self.redact(detail).replace("|", "/").replace("\n", " ")[:110]])
 
     def call(self, messages, *, max_tokens: int, json_mode: bool = False, temperature: float | None = None,
              engine: EngineSpec | None = None):
@@ -103,15 +104,14 @@ class Probe:
         try:
             resp = _driver.complete(engine or self.engine, self.prov, messages, temperature=temperature,
                                     max_tokens=max_tokens, json_mode=json_mode)
-        except (openai.APIError, EngineConfigError) as e:
+        except (openai.APIError, DriverError, EngineConfigError) as e:   # every driver failure: a row, never a crash
             return None, e, int((time.monotonic() - t0) * 1000)
         if resp.routed_via:
             self.routed.add(resp.routed_via)
         return resp, None, int((time.monotonic() - t0) * 1000)
 
     def error(self, check: str, err: Exception, ms: int, *, expected: bool = True) -> None:
-        self.row(check, "FAIL" if expected else "info", ms=ms,
-                 detail=self.redact(f"{type(err).__name__}: {err}"))
+        self.row(check, "FAIL" if expected else "info", ms=ms, detail=f"{type(err).__name__}: {err}")
 
     def thinking_hint(self, check: str, resp) -> None:
         if not strip_reasoning(resp.text) and resp.finish_reason == "length":
@@ -199,7 +199,7 @@ def probe_provider(cfg: EnginesConfig, prov: ProviderSpec, model: str | None) ->
         status, detail = listing_row
         if chosen and listed is not None and chosen not in listed:
             status, detail = "FAIL", f"{detail}; {chosen} is not among them"
-        pr.row("models", status, detail=pr.redact(detail))
+        pr.row("models", status, detail=detail)
     if chosen is None:
         pr.row("model", "FAIL", detail="the config names no model for this provider: "
                                         "pass --provider NAME --model ID")

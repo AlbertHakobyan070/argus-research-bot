@@ -287,6 +287,24 @@ async def test_post_init_survives_a_local_engines_file_that_is_not_utf8(
                for r in caplog.records)
 
 
+async def test_post_init_survives_a_local_engines_file_it_cannot_stat(monkeypatch, tmp_path, no_network):
+    """Re-review residual: a PermissionError from the stat is a startup
+    problem like the others, with no encoding advice."""
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        if self.name == "engines.local.json":
+            raise PermissionError(13, "Access is denied", str(self))
+        return real_is_file(self)
+    monkeypatch.setattr(Path, "is_file", is_file)
+    app = await _post_init(monkeypatch, tmp_path, json.dumps(CFG))
+    assert "graph" in app.bot_data, "startup completed"
+    app.bot.send_message.assert_awaited_once()
+    text = app.bot.send_message.await_args.kwargs["text"]
+    assert "engines.local.json" in text and "cannot be read (PermissionError:" in text
+    assert "UTF-8" not in text
+
+
 async def test_post_init_dms_static_problems_once_and_warns_on_removed_knobs(
         monkeypatch, tmp_path, no_network, caplog):
     caplog.set_level(logging.WARNING, logger="argus.bot")

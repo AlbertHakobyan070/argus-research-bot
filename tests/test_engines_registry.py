@@ -10,8 +10,10 @@ import copy
 import importlib.util
 import json
 import sys
+from pathlib import Path
 
 import httpx
+import openai
 import pytest
 
 from argus.engines import llm_openai, registry
@@ -260,8 +262,27 @@ async def test_load_config_reads_a_bom_and_names_a_file_that_is_not_utf8(tmp_pat
         local.write_bytes(text.encode(encoding))
         with pytest.raises(EngineConfigError) as ei:
             await registry.load_config([defaults, str(local)])
-        assert str(local) in str(ei.value) and "UnicodeDecodeError" in str(ei.value), encoding
+        assert str(local) in str(ei.value) and "is not UTF-8" in str(ei.value), encoding
         assert "save it as UTF-8" in str(ei.value)
+
+
+async def test_load_config_names_a_file_it_cannot_stat_without_utf8_advice(tmp_path, monkeypatch):
+    """A PermissionError from the stat (is_file) or the read is an
+    EngineConfigError naming the file and the error, with no encoding advice."""
+    defaults = _write(tmp_path, "d.json", BASE)
+    local = tmp_path / "local.json"
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        if self.name == "local.json":
+            raise PermissionError(13, "Access is denied", str(self))
+        return real_is_file(self)
+    monkeypatch.setattr(Path, "is_file", is_file)
+    with pytest.raises(EngineConfigError) as ei:
+        await registry.load_config([defaults, str(local)])
+    msg = str(ei.value)
+    assert str(local) in msg and "cannot be read (PermissionError:" in msg and "Access is denied" in msg
+    assert "UTF-8" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -463,13 +484,19 @@ def test_summarize_calls():
 # scripts/engines_probe.py
 # ---------------------------------------------------------------------------
 
-def test_probe_all_with_no_key_set_says_why_and_exits_non_zero(monkeypatch, tmp_path, capsys, no_network):
+@pytest.fixture
+def probe(monkeypatch, tmp_path):
+    """The script, loaded as a module, with no local engines file."""
     monkeypatch.setattr(sys, "path", list(sys.path))          # the script prepends src/ on import
     monkeypatch.delenv("PYTHONPATH", raising=False)            # and pops PYTHONPATH
     spec = importlib.util.spec_from_file_location("engines_probe", registry._ROOT / "scripts" / "engines_probe.py")
-    probe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(probe)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(tmp_path / "absent.json"))
+    return module
+
+
+def test_probe_all_with_no_key_set_says_why_and_exits_non_zero(probe, monkeypatch, capsys, no_network):
     shipped = json.loads((registry._ROOT / "argus_engines.json").read_text(encoding="utf-8"))
     for p in shipped["providers"].values():
         if p.get("api_key_env"):
@@ -481,3 +508,47 @@ def test_probe_all_with_no_key_set_says_why_and_exits_non_zero(monkeypatch, tmp_
     assert "Nothing was probed: no provider has its key set" in out
     assert "FREELLMAPI_API_KEY is not set" in out and "keyless local server" in out
     assert "| provider |" not in out, "no empty table"
+
+
+PROBE_CFG = {
+    "active_profile": "main",
+    "providers": {"pk": {"name": "pk", "base_url": "http://pk/v1", "api_key_env": "T_PK_KEY",
+                         "models_endpoint": False, "known_models": ["m"]}},
+    "profiles": {"main": {"name": "main",
+                          "tiers": {t: {"provider": "pk", "model": "m"} for t in ("cheap", "strong", "judge")}}},
+}
+CHECKS = ["plain", "json_mode", "temperature", "cap16", "json200"]
+
+
+@pytest.mark.parametrize("answer", [
+    lambda: httpx.Response(200, json={"error": {"message": "All models exhausted", "code": 429}}),
+    lambda: httpx.Response(200, json={"error": {"message": "bad key sk-leaky-123", "code": 401}}),
+    lambda: httpx.Response(200, json={"id": "x", "object": "chat.completion", "created": 1, "model": "m",
+                                      "choices": []}),
+    lambda: httpx.Response(200, text="<html>bad gateway sk-leaky-123</html>",
+                           headers={"content-type": "text/html"}),
+    lambda: httpx.Response(401, json={"error": {"message": "invalid api key sk-leaky-123"}}),
+], ids=["200-error-body", "200-error-body-echoing-the-key", "empty-choices", "html-echoing-the-key",
+        "401-echoing-the-key"])
+def test_probe_turns_each_unusable_answer_into_a_fail_row_and_never_prints_the_key(
+        probe, monkeypatch, tmp_path, capsys, answer):
+    """Re-review N1: the real driver and SDK on a mock transport. Every
+    check fails with a row of its own, the table is printed, and the key the
+    provider echoes never reaches the output."""
+    engines = tmp_path / "engines.json"
+    engines.write_text(json.dumps(PROBE_CFG), encoding="utf-8")
+    monkeypatch.setenv("ARGUS_ENGINES_FILE", str(engines))
+    monkeypatch.setenv("T_PK_KEY", "sk-leaky-123")
+    monkeypatch.setattr(llm_openai, "OpenAI", lambda **kw: openai.OpenAI(
+        **kw, http_client=httpx.Client(transport=httpx.MockTransport(lambda request: answer()))))
+    monkeypatch.setattr(probe, "_driver", llm_openai.OpenAICompatDriver())
+    monkeypatch.setattr(sys, "argv", ["engines_probe.py", "--provider", "pk"])
+
+    assert probe.main() == 1
+    out = capsys.readouterr().out
+    assert out.startswith("| provider | model | check |"), "the table is printed"
+    rows = {cells[2]: cells[3] for cells in (line.split(" | ") for line in out.splitlines())
+            if len(cells) > 3 and cells[0] == "| pk"}          # check → status
+    assert [rows.get(check) for check in CHECKS] == ["FAIL"] * len(CHECKS), rows
+    assert rows["routed_via"] == "info"
+    assert "sk-leaky-123" not in out

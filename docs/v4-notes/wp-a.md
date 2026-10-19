@@ -7,7 +7,9 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - `src/argus/engines/registry.py` (new), the async registry:
   - `load_config(paths=None, library=None)` merges the layers, lowest first: the defaults file (`ARGUS_ENGINES_FILE`, default `argus_engines.json`), the optional local file (`ARGUS_ENGINES_LOCAL_FILE`, default `argus_engines.local.json`), and the library settings keys `engines.active_profile`, `engines.overrides` and `engines.transcriber` (JSON, through `Library.get_setting`/`set_setting`). Dicts merge key by key. An engine spec (a dict with `provider`), a list or a scalar replaces. The file read runs in a worker thread.
     - Files are read as `utf-8-sig`, so a UTF-8 file with a BOM (Notepad) loads.
-    - A file that can't be read or decoded (a Windows ANSI file with non-ASCII text, a UTF-16 file from PowerShell 5.1 `>`) raises `EngineConfigError` naming the file and the problem. At startup that is one more logged and DM'd problem, never a crash.
+    - A file that can't be decoded (a Windows ANSI file with non-ASCII text, a UTF-16 file from PowerShell 5.1 `>`) raises `EngineConfigError` naming the file: "… is not UTF-8 (…); save it as UTF-8".
+    - A file that can't be stat'ed or read raises "… cannot be read (<error>)", with no encoding advice. The stat is inside the same guard, so a `PermissionError` from `is_file()` is covered.
+    - At startup either is one more logged and DM'd problem, never a crash.
   - Startup checks, with no I/O:
     - `validate_schema(cfg)`: the pydantic validators, names that match their keys, and every `model_from_preferences` pointing at a preference list its provider has.
     - `static_problems(cfg)`: covers the active profile's primaries only. It reports a missing `api_key_env` (one line per provider) and a fixed id outside a `known_models` provider's list.
@@ -34,7 +36,11 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
       - `exhausted_attempts` is the sum of those `<n>`.
     - The row also has `skipped` and `degraded` (from the `skip:` and `degrade:` lines), `served_models`, `fallbacks`, `retries` and `avg_latency_ms`.
     - Top level: `calls` (logical), `exhausted`, `attempts`, `reroute_rate`, `judge_families`, `writer_families`, `judge_writer_same_family` (`None` when unknown), `warnings`, `degradations`, and `exa_usd` when it is given.
-    - **During Phases 1–2, the per-attempt records of an exhausted legacy call are absent from `model_calls`.** The v3 call sites are outside WP-A: they catch the `EngineError` and keep only its text, and some (scout and follow-up query generation) only log it. So an exhausted call is visible only where its call site quotes the facade's message in `errors`. The node migrations append `EngineError.attempts` to `model_calls` later.
+    - **During Phases 1–2, the per-attempt records of an exhausted legacy call are absent from `model_calls`.** The v3 call sites are outside WP-A: they catch the `EngineError` and keep only its text, so an exhausted call is visible only where its call site quotes the facade's message in `errors`.
+      - The digest, brief draft, scout query generation (`scout: querygen failed (…)`), outline, compose and panel call sites quote it.
+      - Two only log it: the brief re-draft (`graph/brief.py`, "brief re-draft failed … keeping first") and the follow-up query generation (`graph/research.py`, "followup querygen failed … deterministic fallback").
+      - Intake and the quick answer don't catch it, so an exhaustion there fails the run.
+      - The node migrations append `EngineError.attempts` to `model_calls` later.
 - `src/argus/engines/llm_openai.py` (new), the driver. It calls the openai SDK directly:
   - One client per (provider, model), built with `max_retries=0`, `api_key=registry.api_key(...)`, the provider's `timeout_s` and the provider's `headers`.
   - `with_raw_response`, so response headers are read.
@@ -78,7 +84,8 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - `scripts/engines_probe.py` (new):
   - Usage: `[--provider NAME | --all] [--model ID]`.
   - For each provider whose key is set, it lists the models and then makes single direct calls through the driver: `plain` at 20 tokens, `json_mode`, `temperature=0.2`, the `cap16` check, and a 200-token JSON call that must return content. It also reports whether `routed_via` was captured.
-  - It prints a Markdown table and suggested flag changes. It never prints keys; a key echoed in an error is redacted.
+  - It prints a Markdown table and suggested flag changes. It never prints keys: every row's text passes through one redaction step, so a key echoed in an error comes out as `***`.
+  - Every driver failure (`openai.APIError`, `DriverError`, `EngineConfigError`) gives that check a FAIL row. The run continues and the table is printed.
   - It exits 1 when a call failed or a check did not hold. `--all` skips keyless local servers; pass them by name. When nothing can be probed (no key set), it says so and exits 1, with no empty table.
 - Shared-file edits:
   - `src/argus/bot/app.py`:
@@ -148,6 +155,9 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
   - `test_llm_facade.py`: error bodies, no choices, non-JSON and non-completion bodies through the real driver and SDK; key redaction; exhaustion by policy; the truncation retry without a budget; the `ALL_SKIPPED_RAISES` case reworked to check the facade's `EngineSkipped`; and the risk-9 scenario through `report_builder_node`.
   - `test_engines_registry.py`: the decoding cases, a `/models` error that quotes the key, the new `summarize_calls` fields, and the probe's `--all` with no key.
   - `test_engines_cmd.py`: startup with a cp1252 or UTF-16 local file.
+- Fix round 2:
+  - `test_engines_registry.py`: the probe over five unusable answers (a 200 error body, one that echoes the key, empty choices, HTML that echoes the key, a 401 that echoes the key), and a file whose stat raises `PermissionError`.
+  - `test_engines_cmd.py`: startup with that `PermissionError`.
 
 ### Verification evidence (2026-10-19)
 
@@ -225,3 +235,16 @@ The fix round made no live calls. Logs are in `A:\DS_Vault\caches\tmp\claude\A--
   - `startup_check.py`: cp1252 and UTF-16 give `EngineConfigError (caught by _post_init)`, and the BOM file loads.
   - `risk9_check.py`: the digests' error lines now carry "after 3 attempts". Its last line still reads the removed per-row `errors` field, so it stops with `KeyError`. `test_exhausted_legacy_digests_count_as_calls_in_the_report_metadata` checks the new fields instead.
 - **Static scan:** clean apart from the known `__file__` false positive. **Model-id check:** none outside the spec list.
+
+### Fix round 2 — verification evidence (2026-10-19)
+
+The fix round made no live calls. Logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t4fix2\`. The re-review's repro is `scratchpad\t4-rereview\probe_crash.py`.
+
+- **RED** (`red_fix2.log`): the round-2 test files run against `7d9bd04` (extracted with `git archive`) → `7 failed, 42 passed`.
+  - Each probe case escaped with `argus.engines.llm_openai.DriverError`, one of them carrying "bad key sk-leaky-123" in the traceback.
+  - The stat cases escaped with `PermissionError: [Errno 13] Access is denied`.
+  - The decode message lacked "is not UTF-8".
+  - The 401 case passed already: SDK status errors were caught and redacted before.
+- **GREEN, focused** (`green_fix2.log`): `test_engines_registry.py`, `test_engines_cmd.py`, `test_llm_facade.py` and `test_llm_retry.py` → `91 passed`.
+- **Full suite, proxy URL on a closed port** (`suite_fix2.log`): `2 failed, 653 passed, 1 skipped, 1 warning, 2 errors`. Only the live tests failed, as by design with no proxy: `test_llm.py` ×2 and the `test_graph.py` fixture ×2.
+- **`probe_crash.py` after the fix** (`probe_crash_after.log`): all four shapes give "probe survived", each with a FAIL row first. The echoed key prints as `bad key ***`.

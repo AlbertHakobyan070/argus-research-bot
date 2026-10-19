@@ -124,15 +124,18 @@ async def load_config(paths: Sequence[str | Path] | None = None, library: Any = 
 def _read_files(files: list[Path]) -> dict:
     merged: dict = {}
     for i, path in enumerate(files):
-        if not path.is_file():
-            if i == 0:
-                raise EngineConfigError(f"engines file not found: {path}")
-            continue
+        try:                                       # the stat too: is_file() raises PermissionError
+            if not path.is_file():
+                if i == 0:
+                    raise EngineConfigError(f"engines file not found: {path}")
+                continue
+            text = path.read_text(encoding="utf-8-sig")                   # a BOM (Notepad) is fine
+        except UnicodeDecodeError as e:
+            raise EngineConfigError(f"{path}: is not UTF-8 ({e}); save it as UTF-8") from e
+        except OSError as e:
+            raise EngineConfigError(f"{path}: cannot be read ({type(e).__name__}: {e})") from e
         try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))     # a BOM (Notepad) is fine
-        except (OSError, UnicodeDecodeError) as e:
-            raise EngineConfigError(f"{path}: cannot be read as UTF-8 ({type(e).__name__}: {e}); "
-                                    "save it as UTF-8") from e
+            data = json.loads(text)
         except json.JSONDecodeError as e:
             raise EngineConfigError(f"{path}: invalid JSON ({e})") from e
         if not isinstance(data, dict):
