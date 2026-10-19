@@ -528,6 +528,16 @@ def _digest_chunks(text: str, research) -> list[str]:
     return [_head_and_middle(text[i * size:(i + 1) * size], head, mid) for i in range(k)]
 
 
+def _word_cut(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` chars at the last whitespace at or before
+    ``limit`` (a single token longer than ``limit`` keeps the hard cut), so a quote
+    shortened here never ends in a word fragment the token rule rejects."""
+    if len(text) <= limit:
+        return text
+    cut = next((i for i in range(limit, 0, -1) if text[i].isspace()), 0)
+    return text[:cut].rstrip() or text[:limit]
+
+
 def _digest_reply(text: str) -> dict:
     """The validate hook: the reply's JSON, normalised (raises on no JSON)."""
     data = parse_json_obj(text, require_any=("relevance", "claims"))
@@ -536,7 +546,7 @@ def _digest_reply(text: str) -> dict:
         if not isinstance(c, dict) or not str(c.get("text") or "").strip():
             continue
         conf = c.get("confidence") if c.get("confidence") in ("high", "medium", "low") else "medium"
-        claims.append({"text": str(c["text"])[:500], "quote": str(c.get("quote") or "")[:250],
+        claims.append({"text": str(c["text"])[:500], "quote": _word_cut(str(c.get("quote") or ""), 250),
                        "confidence": conf})
     try:
         relevance = max(0, min(5, int(data.get("relevance", 0))))

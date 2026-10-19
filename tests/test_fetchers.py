@@ -63,7 +63,7 @@ class _Net:
 @pytest.fixture
 def net(monkeypatch, tmp_path):
     n = _Net()
-    monkeypatch.setattr(fetchers, "_http_client", lambda cfg: httpx.Client(
+    monkeypatch.setattr(fetchers, "_http_client", lambda cfg, **_: httpx.Client(
         transport=httpx.MockTransport(n.handler), timeout=cfg.timeout_s))
     monkeypatch.setattr(fetchers, "_resolve", lambda host: n.dns.get(host, [PUBLIC_IP]))
     monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
@@ -163,16 +163,12 @@ def test_native_refuses_private_targets_and_caps_bytes(net, monkeypatch):
         "http://[64:ff9b::7f00:1]/",                  # NAT64 prefix embedding 127.0.0.1
         "http://127.0.0.1\\@evil.example/",           # WHATWG: "\" is "/", so the host is 127.0.0.1
         "https://proxy.example.net.:3001/admin",      # the proxy's own name with a trailing dot
-        f"https://{PUBLIC_IP}:3001/admin",            # the proxy's own address and port
     ]
     for url in private:
         res = _fetch({"url": url})
         assert not res.ok
         assert res.error.startswith("refused: private address"), (url, res.error)
     assert net.requests == [], "no request ever reached a private target"
-    res = _fetch({"url": f"https://{PUBLIC_IP}/page"})
-    assert "refused" not in res.error, "the endpoint's address on another port is not the endpoint"
-    net.requests.clear()
 
     # a public page redirecting to a private address is refused at that hop
     net.routes["https://public.example/r"] = httpx.Response(
@@ -415,6 +411,7 @@ def test_dns_rebinding_never_reaches_a_loopback_server(monkeypatch, tmp_path):
     monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
     for env in ("EXA_API_KEY", "FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
         monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")              # no proxy from this machine's environment or registry
     try:
         res = _fetch({"url": f"http://rebind.test:{port}/admin"})
     finally:
@@ -562,3 +559,125 @@ def test_a_pinned_source_counts_its_exa_contents_page_and_never_takes(net, monke
     assert item["rungs_tried"] == [{"rung": "native", "error": "HTTP 403"}, {"rung": "exa_contents", "error": ""}]
     snap = ledger.snapshot()
     assert snap["exa_contents_pages"] == 1 and snap["exa_usd"] == pytest.approx(0.001), "counted, so it is visible"
+
+
+# ---------------------------------------------------------------------------
+# WP-B fix round 2
+# ---------------------------------------------------------------------------
+
+def test_own_endpoints_are_matched_by_host_and_port_never_by_address(net, monkeypatch):
+    """§2.8: a public endpoint's address is shared (a CDN, a tunnel edge), so only its
+    normalised name and port are refused; a private endpoint is refused by the
+    private-address rule whatever reaches it. (At da8762f every site on the
+    endpoint's address and port was refused.)"""
+    net.dns.update({"proxy.example.net": [PUBLIC_IP], "neighbour.example.org": [PUBLIC_IP]})
+    monkeypatch.setenv("FREELLMAPI_BASE_URL", "https://proxy.example.net:3001/v1")
+    for url in ("https://proxy.example.net.:3001/admin", "https://PROXY.Example.NET:3001/admin"):
+        res = _fetch({"url": url})
+        assert res.error == "refused: private address (own endpoint proxy.example.net:3001)", (url, res.error)
+    assert net.requests == []
+
+    for url in ("https://neighbour.example.org:3001/page", f"https://{PUBLIC_IP}:3001/page"):
+        net.routes[url] = httpx.Response(200, html=ARTICLE)
+        res = _fetch({"url": url})
+        assert res.ok, (url, res.error)
+    assert [r.url.host for r in net.requests] == [PUBLIC_IP, PUBLIC_IP], "the endpoint's own address and port"
+
+    monkeypatch.setenv("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")
+    res = _fetch({"url": "http://127.0.0.1:3001/v1/models"})
+    assert res.error == "refused: private address (127.0.0.1 → 127.0.0.1)", res.error
+
+
+@pytest.fixture
+def fake_proxy():
+    """A loopback HTTP proxy recording each request line and, after a ``CONNECT``,
+    the TLS ClientHello that follows; then it hangs up, so nothing leaves the machine."""
+    import socket
+    import threading
+
+    seen: list[tuple[str, bytes]] = []
+    server = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:                        # the server socket closed: the test is over
+                return
+            with conn:
+                head = b""
+                while b"\r\n\r\n" not in head and (chunk := conn.recv(4096)):
+                    head += chunk
+                line, hello = head.split(b"\r\n", 1)[0].decode(), b""
+                if line.startswith("CONNECT "):
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    while len(hello) < 5 or len(hello) < 5 + int.from_bytes(hello[3:5], "big"):
+                        if not (chunk := conn.recv(4096)):
+                            break
+                        hello += chunk
+                seen.append((line, hello))
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield server.getsockname()[1], seen
+    server.close()
+
+
+def _real_transport_offline(monkeypatch, tmp_path, dns: dict[str, list[str]]) -> list[tuple]:
+    """The real httpx transport; every connection but to loopback refused (and
+    recorded), ``_resolve`` answering from ``dns``, no proxy from the environment."""
+    import socket
+
+    real_connect = socket.create_connection
+    connects: list[tuple] = []
+
+    def connect(address, *a, **kw):
+        connects.append(address)
+        if address[0] != "127.0.0.1":
+            raise ConnectionRefusedError("hermetic: no connection leaves the machine")
+        return real_connect(address, *a, **kw)
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    monkeypatch.setattr(fetchers, "_resolve", lambda host: dns.get(host, [PUBLIC_IP]))
+    monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
+    monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
+    for env in ("EXA_API_KEY", "FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(env, raising=False)
+    return connects
+
+
+def test_through_an_environment_proxy_the_hop_goes_by_name(monkeypatch, tmp_path, fake_proxy):
+    """§2.8: when an HTTP(S) proxy from the environment applies (httpx's trust_env
+    selection), the hop goes to it by name — the proxy resolves, so the IP pin cannot
+    apply — and TLS starts for the name. The guard still runs first, on our own
+    resolution. (At da8762f the hop went as an IP URL: ``CONNECT <address>``, and TLS
+    was verified against the address.)"""
+    port, seen = fake_proxy
+    connects = _real_transport_offline(monkeypatch, tmp_path, {"inner.example": ["10.0.0.9"]})
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{port}")
+
+    res = _fetch({"url": "https://docs.example.org/page"})
+    assert [line for line, _ in seen] == ["CONNECT docs.example.org:443 HTTP/1.1"], seen
+    assert b"docs.example.org" in seen[0][1], "the ClientHello names the host (SNI), as no IP URL would"
+    assert connects == [("127.0.0.1", port)], "only the proxy is connected to, never the checked address"
+    assert not res.ok and res.error.startswith("native: ConnectError"), res.error    # the fake proxy hangs up
+
+    seen.clear()
+    connects.clear()
+    res = _fetch({"url": "https://inner.example/x"})
+    assert res.error == "refused: private address (inner.example → 10.0.0.9)", res.error
+    assert seen == [] and connects == [], "the guard runs first, on our own resolution"
+
+
+def test_no_proxy_covering_the_host_keeps_the_ip_pin(monkeypatch, tmp_path, fake_proxy):
+    """A host ``NO_PROXY`` covers goes to the checked address and never through the
+    proxy — not even as the IP URL, which ``NO_PROXY``'s name does not cover."""
+    port, seen = fake_proxy
+    connects = _real_transport_offline(monkeypatch, tmp_path, {})
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("NO_PROXY", "docs.example.org")
+
+    res = _fetch({"url": "https://docs.example.org/page"})
+    assert connects == [(PUBLIC_IP, 443)], "the pinned connection to the checked address"
+    assert seen == [], "the proxy is never asked"
+    assert not res.ok and res.error.startswith("native: ConnectError"), res.error

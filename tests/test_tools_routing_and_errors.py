@@ -156,7 +156,7 @@ def offline(monkeypatch, tmp_path):
     """The v4 fetch chain on a fake network: ``routes[url]`` → Response."""
     routes: dict = {}
     from helpers import as_stream, request_url
-    monkeypatch.setattr(fetchers, "_http_client", lambda cfg: httpx.Client(
+    monkeypatch.setattr(fetchers, "_http_client", lambda cfg, **_: httpx.Client(
         transport=httpx.MockTransport(lambda r: as_stream(routes.get(request_url(r), httpx.Response(404))))))
     monkeypatch.setattr(fetchers, "_resolve", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)

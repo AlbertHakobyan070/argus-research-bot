@@ -21,10 +21,13 @@ Guards (spec §2.8, WP-B review):
   address the host resolves to must be global — an IPv6 address carrying an
   IPv4 one (mapped, compatible, NAT64) is judged by that IPv4 — and must not be
   this server's own endpoint (the proxy, the console's public URL; compared by
-  name and by resolved address and port); else ``error = "refused: private
+  normalised name and port, never by address); else ``error = "refused: private
   address (…)"`` and the chain stops;
 - ``native`` sends each hop to the address the guard checked — never a second
   DNS lookup — with the original ``Host`` header and TLS ``sni_hostname``;
+  through an HTTP(S) proxy from the environment (httpx's ``trust_env``
+  selection, ``NO_PROXY`` included) the hop goes by name instead: the proxy
+  resolves it, so the pin cannot apply (the guard still checks first);
 - every download stops at ``FetchConfig.max_bytes`` decoded bytes: requests send
   ``Accept-Encoding: gzip, deflate``, bodies go through a bounded decompressor,
   any other ``Content-Encoding`` is refused. Text on disk is capped at
@@ -175,42 +178,32 @@ def _judged(addr: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     return ip
 
 
-def _own_endpoints() -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+def _own_endpoints() -> set[tuple[str, int]]:
     """This server's own endpoints — the proxy (``FREELLMAPI_BASE_URL``) and the
-    console's public URL — as ``(host, port)`` and ``(address, port)`` pairs.
-    Their loopback defaults are refused as private anyway."""
-    names: set[tuple[str, int]] = set()
-    addrs: set[tuple[str, int]] = set()
+    console's public URL — as normalised ``(host, port)`` pairs. Never compared by
+    address: a public endpoint's address is shared (a CDN, a tunnel edge), and a
+    private one is refused by the private-address rule anyway."""
+    own: set[tuple[str, int]] = set()
     for env in ("FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL"):
         parts = urlsplit(os.environ.get(env, "").strip())
         host = _norm_host(parts.hostname or "")
-        if not host:
-            continue
-        port = _port(parts)
-        names.add((host, port))
-        try:
-            found = _addresses(host)
-        except _RungError:
-            continue        # an endpoint name that does not resolve has no address to compare; its name still counts
-        addrs |= {(str(_judged(a)), port) for a in found}
-    return names, addrs
+        if host:
+            own.add((host, _port(parts)))
+    return own
 
 
 def check_target(url: str) -> list[str]:
-    """The addresses ``url``'s host resolves to, each one checked: ``_Refused`` for a
-    non-global address or this server's own endpoint, ``_RungError`` for a malformed
-    URL or a name that does not resolve."""
+    """The addresses ``url``'s host resolves to, each one checked: ``_Refused`` for
+    this server's own endpoint or a non-global address, ``_RungError`` for a
+    malformed URL or a name that does not resolve."""
     host, port = _split(url)
-    names, own = _own_endpoints()
-    if (host, port) in names:
+    if (host, port) in _own_endpoints():
         raise _Refused(f"refused: private address (own endpoint {host}:{port})")
     addrs = _addresses(host)
     for a in addrs:
         ip = _judged(a)
         if not ip.is_global:
             raise _Refused(f"refused: private address ({host} → {ip})")
-        if (str(ip), port) in own:
-            raise _Refused(f"refused: private address (own endpoint {host} → {ip}:{port})")
     return addrs
 
 
@@ -218,18 +211,28 @@ def check_target(url: str) -> list[str]:
 # HTTP: every hop through the guard and to the address it checked, the byte cap
 # ---------------------------------------------------------------------------
 
-def _http_client(cfg: FetchConfig) -> httpx.Client:
+def _http_client(cfg: FetchConfig, *, pinned: bool = False) -> httpx.Client:
     """No keep-alive: the pool keys connections by address, so a later hop to another
-    name on the same address would reuse a TLS session verified for the first name."""
+    name on the same address would reuse a TLS session verified for the first name.
+    httpx's ``trust_env`` mounts the environment's HTTP(S) proxies (``NO_PROXY``
+    honoured); a ``pinned`` client has an explicit transport, so httpx mounts none and
+    a request to a checked address never goes through a proxy."""
+    limits = httpx.Limits(max_keepalive_connections=0)
     return httpx.Client(timeout=cfg.timeout_s, follow_redirects=False,
-                        headers={"User-Agent": _UA, "Accept-Encoding": _ACCEPT_ENCODING},
-                        limits=httpx.Limits(max_keepalive_connections=0))
+                        headers={"User-Agent": _UA, "Accept-Encoding": _ACCEPT_ENCODING}, limits=limits,
+                        transport=httpx.HTTPTransport(limits=limits) if pinned else None)
 
 
-def _open(client: httpx.Client, url: str, addrs: list[str]) -> httpx.Response:
-    """A streamed GET of ``url`` sent to the checked addresses in order (the next one
+def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -> httpx.Response:
+    """A streamed GET of ``url``. When an HTTP(S) proxy from the environment applies
+    to it, by name through ``env``: the proxy resolves the name, so the pin cannot
+    apply. Otherwise on ``pinned``, to the checked addresses in order (the next one
     only when a connection fails): ``scheme://<address>[:port]/path?query`` with the
     original ``Host`` header and ``sni_hostname``, so TLS still verifies the real name."""
+    # httpx's own trust_env selection (it has no public call for it): the one send() makes
+    if env._transport_for_url(httpx.URL(url)) is not env._transport:
+        return env.send(env.build_request("GET", url, headers={"Accept-Encoding": _ACCEPT_ENCODING}),
+                        stream=True)
     parts = urlsplit(url)
     name = _norm_host(parts.hostname or "")
     if ":" not in name:                            # an IPv6 literal is already ASCII
@@ -240,10 +243,10 @@ def _open(client: httpx.Client, url: str, addrs: list[str]) -> httpx.Response:
 
     def send(addr: str) -> httpx.Response:
         netloc = (f"[{addr}]" if ":" in addr else addr) + (f":{parts.port}" if parts.port else "")
-        request = client.build_request(
+        request = pinned.build_request(
             "GET", urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, "")),
             headers={"Host": host, "Accept-Encoding": _ACCEPT_ENCODING}, extensions={"sni_hostname": name})
-        return client.send(request, stream=True)
+        return pinned.send(request, stream=True)
 
     *rest, last = addrs
     for addr in rest:
@@ -295,11 +298,14 @@ def _read_body(r: httpx.Response, cfg: FetchConfig) -> bytes:
 def _get(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, bytes, str]:
     """(final URL, decoded body, content-type) of a GET: at most ``_MAX_REDIRECTS``
     redirects, every hop read the WHATWG way, through the guard and sent to the
-    address it checked; the body under the byte cap."""
+    address it checked — or by name through the environment's proxy, when one
+    applies (``_open``); the body under the byte cap. ``client`` trusts the
+    environment; the pinned hops go on a client of their own."""
+    pinned = _http_client(cfg, pinned=True)
     try:
         for _ in range(_MAX_REDIRECTS + 1):
             url = _whatwg(url)
-            r = _open(client, url, check_target(url))
+            r = _open(client, pinned, url, check_target(url))
             try:
                 if r.status_code in _REDIRECTS:
                     location = r.headers.get("location")
@@ -317,6 +323,8 @@ def _get(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, bytes, 
                 r.close()
     except (httpx.TransportError, httpx.InvalidURL) as e:     # network, timeout, protocol; a URL httpx rejects
         raise _RungError(f"{type(e).__name__}: {e}") from e
+    finally:
+        pinned.close()
     raise _RungError(f"more than {_MAX_REDIRECTS} redirects")
 
 

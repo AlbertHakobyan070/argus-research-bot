@@ -6,12 +6,13 @@ WP-B review's token rule). The bound: ≤ 50 ms per 250-char quote on a
 60 000-char document."""
 from __future__ import annotations
 
+import json
 import random
 import time
 
 import pytest
 
-from argus.graph.research import QuoteIndex, quote_verified
+from argus.graph.research import QuoteIndex, _digest_reply, _norm_quote, quote_verified
 
 FUZZY = 0.9
 
@@ -149,3 +150,37 @@ def test_a_substituted_word_or_number_never_verifies(label, quote):
 ])
 def test_legitimate_fuzzy_quotes_still_verify(label, quote):
     assert quote_verified(quote, PROSE_IDX, FUZZY) is True, label
+
+
+# ---------------------------------------------------------------------------
+# WP-B fix round 2: the digest cuts a long quote at a word boundary
+# ---------------------------------------------------------------------------
+
+LONG = ("When the user extends a finished run, the research node grants one fresh allowance of fetches and "
+        "Exa searches, widens the queries for every sub-question, and runs its waves again; the evidence it "
+        "finds is merged with the earlier notes, the outline keeps its section titles, and only the sections "
+        "whose sub-questions gained strong notes are rewritten before the report is delivered again.")
+
+
+def _digested_quote(quote: str) -> str:
+    reply = json.dumps({"relevance": 4, "claims": [{"text": "a claim", "quote": quote}]})
+    return _digest_reply(reply)["claims"][0]["quote"]
+
+
+def test_the_digest_cuts_a_long_quote_at_a_word_boundary():
+    """``_digest_reply`` keeps a long quote up to the last whitespace at or before
+    its limit, so a quote it shortened never ends in a fragment the token rule
+    rejects. (At da8762f the hard cut split a word, and an edited quote failed.)"""
+    idx = QuoteIndex(_doc(20_000, seed=11) + " " + LONG + " " + _doc(20_000, seed=13))
+    edited = LONG.replace(",", "").replace(";", " -")              # a digest LLM's punctuation edits
+    assert edited[249].isalpha() and edited[250].isalpha(), "a hard cut at 250 would split a word"
+    cut = _digested_quote(edited)
+    assert edited.startswith(cut) and len(cut) <= 250 and edited[len(cut)].isspace(), cut
+    assert quote_verified(cut, idx, FUZZY) is True
+    assert quote_verified(edited[:250], idx, FUZZY) is False, "the hard cut ends in a fragment"
+
+    verbatim = _digested_quote(LONG)
+    assert LONG.startswith(verbatim) and LONG[len(verbatim)].isspace()
+    assert _norm_quote(verbatim) in idx.text and quote_verified(verbatim, idx, FUZZY) is True, (
+        "a fragment-free cut quote verifies by exact substring, as before")
+    assert _digested_quote("x" * 300) == "x" * 250, "a single token longer than the limit keeps the hard cut"
