@@ -133,6 +133,9 @@ def _mock_llm(monkeypatch, responses: list[str]):
     monkeypatch.setattr(brief_mod.llm, "chat_for_tier", fake_chat_for_tier)
     monkeypatch.setattr(brief_mod.llm, "invoke_with_retry", fake_invoke)
     monkeypatch.setattr(brief_mod.llm, "resolve_tier", lambda t: "fake")
+    monkeypatch.setattr(brief_mod.llm, "record_from_response", lambda tier, req, resp: brief_mod.llm.CallRecord(
+        role=f"legacy.{tier}", tier=tier, profile="fake", provider="fake",
+        requested_model=req, served_model="fake", routed_via=""))
     return calls
 
 

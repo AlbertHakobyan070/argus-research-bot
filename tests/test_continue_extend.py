@@ -28,10 +28,13 @@ from argus.bot import common as bot_common
 from argus.bot import history as bot_history
 from argus.bot.history import append_cmd, continue_cmd
 from argus.config import Settings
+from argus.engines import registry
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
 from argus.graph import research as research_mod
 from argus.graph import search_providers as sp_mod
+
+from helpers import fake_engines_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +246,16 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         media_root=Path("vault/media"),
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"), ffmpeg_path=None,
-        request_timeout_seconds=60.0, max_revision_rounds=3,
+        max_revision_rounds=3,
     )
     monkeypatch.setattr(bot_history, "get_settings", lambda: dummy)
+
+
+@pytest.fixture(autouse=True)
+def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """/continue first awaits registry.active_snapshot() (v4 WP-A)."""
+    monkeypatch.setattr(registry, "active_snapshot",
+                        AsyncMock(return_value=fake_engines_snapshot()))
 
 
 class _FakeLib:

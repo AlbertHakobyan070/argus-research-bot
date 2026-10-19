@@ -1,299 +1,335 @@
-"""FreeLLMAPI model-tier routing.
+"""LLM facade (v4 spec §2.3): ``complete()``, ``CallRecord``, ``strip_reasoning()``.
 
-FreeLLMAPI exposes an OpenAI-compatible /v1/models endpoint behind a single
-Bearer token. We:
+Every call names a role; its binding (primary, fallbacks, failure policy)
+comes from an ``EnginesSnapshot``. On each engine: connection errors, 5xx
+and 429 get up to three tries with backoff, honouring ``Retry-After`` up to
+the provider's ``retry_after_cap_s``; a timeout is retried at most
+``timeout_retry_max`` times; any other error fails that engine (the SDK
+itself never retries). Then tagged reasoning blocks are stripped; a JSON
+role cut off at the token limit gets one retry with double the budget; a
+reply the ``validate`` hook rejects gets one retry with "Reply with only the
+JSON object.". Then the next fallback, then the binding's ``on_exhausted``:
+``raise`` → ``EngineError``, ``skip_item`` → ``EngineSkipped``, ``degrade`` →
+``EngineDegraded``. Every attempt is a ``CallRecord``.
 
-  1. Resolve the live model ID list on first use, then cache it for the
-     process (never assume a fixed list).
-  2. Map three tiers (cheap / strong / judge) onto concrete model IDs,
-     preferring specific names but falling back to ``auto`` if a preferred
-     model disappears.
-  3. Expose helpers that build a ``ChatOpenAI`` pointed at the proxy for any
-     given tier.
-
-Every call logs the actual model+provider that served it so we can prove
-fallback happened.
+The wrappers at the bottom keep the Phase 1 nodes unchanged: they route
+through ``complete`` with role ``legacy.<tier>`` on the registry's cached
+snapshot. WP-H deletes them.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
-import os
+import re
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any
 
-import httpx
-from langchain_openai import ChatOpenAI
-from tenacity import (
-    AsyncRetrying, retry_if_exception_type, stop_after_attempt,
-    wait_exponential,
-)
+import openai
+from langchain_core.messages import BaseMessage, HumanMessage
 
-from .config import get_settings
+from .engines import registry
+from .engines.llm_openai import OpenAICompatDriver
+from .engines.registry import EngineConfigError  # noqa: F401  (re-export: llm.EngineConfigError)
+from .engines.roles import DEGRADABLE_ROLES, JSON_ROLES, LEGACY_ROLES, ROLES
+from .engines.schema import EngineSpec, EnginesSnapshot, ProviderSpec, ResolvedBinding
 
 logger = logging.getLogger("argus.llm")
-
-Tier = Literal["cheap", "strong", "judge"]
-
-# Transient errors worth retrying: transport/timeout/5xx/rate-limit.
-# NEVER retry parse errors or 4xx (a bad request won't fix itself) — the
-# nodes' JSON-parse fallbacks handle malformed-but-delivered responses.
-try:
-    import openai as _openai
-    _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
-        _openai.APIConnectionError, _openai.APITimeoutError,
-        _openai.RateLimitError, _openai.InternalServerError,
-        httpx.TransportError, httpx.TimeoutException,
-    )
-except Exception:  # pragma: no cover - openai always present via langchain
-    _TRANSIENT_EXC = (httpx.TransportError, httpx.TimeoutException)
-
-_RETRY_ATTEMPTS = int(os.environ.get("ARGUS_LLM_RETRIES", "3"))
-
-# Preferred model IDs per tier. We try these in order against the live
-# /v1/models list and pick the first one that's present. If none match
-# we fall back to "auto" (the proxy's own router).
-PREFERRED: dict[Tier, list[str]] = {
-    "cheap": [
-        "llama-3.1-8b-instant",
-        "gemini-2.5-flash-lite",
-        "gemini-3.1-flash-lite-preview",
-        "Meta-Llama-3.3-70B-Instruct",
-        "groq/compound-mini",
-    ],
-    "strong": [
-        "qwen/qwen3-coder:free",
-        "deepseek-ai/deepseek-v4-flash",
-        "nvidia/nemotron-3-super-120b-a12b:free",
-        "gemini-3.5-flash",
-        "DeepSeek-V3.2",
-        "meta-llama/llama-3.1-70b-instruct",
-        "mistral-large-latest",
-    ],
-    # The judge should be from a DIFFERENT family than the strong model
-    # so we don't double-count the same model's blind spots.
-    "judge": [
-        "openai/gpt-oss-120b:free",
-        "gemini-3.5-flash",
-        "gemini-2.5-flash",
-        "Llama-4-Maverick-17B-128E-Instruct",
-        "cogito-2.1:671b",
-    ],
-}
-
-# Cache resolved choices per process. NOT refreshed automatically: only a
-# ``force=True`` call re-reads /v1/models, and nothing in src/ passes one
-# (tests/test_llm.py does), so a tier keeps its model until the bot
-# restarts even if the proxy stops serving it.
-_resolved_cache: dict[Tier, str] = {}
-_model_list_cache: list[str] = []
-_cache_signature: tuple[str, int] | None = None
 
 
 @dataclass
 class CallRecord:
-    """One LLM call's provenance for telemetry + per-call transparency."""
-
-    tier: Tier
+    """One attempt's provenance; ``model_dump()`` is the flat dict appended
+    to ``state["model_calls"]``."""
+    role: str
+    tier: str
+    profile: str
+    provider: str
     requested_model: str
     served_model: str
-    served_provider: str
+    routed_via: str                 # header x-routed-via, else body _routed_via / x_groq, else ""
+    served_provider: str = ""       # v3-compatible: the provider segment of routed_via
+    attempt: int = 1
+    fallback_rank: int = 0
+    ok: bool = True
+    error: str = ""
+    latency_ms: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    finish_reason: str = ""
+    json_mode: bool = False
+    retry_reason: str = ""          # "transient" | "timeout" | "retry_after" | "truncated" | "unparseable" | "diversity_rerun"
+    item: str = ""
+    cached: bool = False
     extra: dict = field(default_factory=dict)
 
     def model_dump(self) -> dict:
-        """Pydantic-style dict for symmetry with our other state models."""
-        return {
-            "tier": self.tier,
-            "requested_model": self.requested_model,
-            "served_model": self.served_model,
-            "served_provider": self.served_provider,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "extra": dict(self.extra),
-        }
+        return dataclasses.asdict(self)
 
 
-def _signature() -> tuple[str, int]:
-    s = get_settings()
-    return (s.freellmapi_api_key, s.freellmapi_base_url.__hash__())
+NOT_VALIDATED = object()            # LLMResult.parsed when no validate() was given
 
 
-def fetch_live_models(force: bool = False) -> list[str]:
-    """Return the live FreeLLMAPI /v1/models IDs (cached)."""
-    global _model_list_cache, _cache_signature
-    sig = _signature()
-    if not force and _model_list_cache and _cache_signature == sig:
-        return _model_list_cache
-    s = get_settings()
-    url = f"{s.freellmapi_base_url}/models"
-    headers = {"Authorization": f"Bearer {s.freellmapi_api_key}"}
-    import time
-    data = None
-    for i in range(1, 4):
+@dataclass
+class LLMResult:
+    text: str
+    parsed: Any
+    record: CallRecord              # the attempt that succeeded
+    records: list[CallRecord]       # every attempt, failed fallbacks included
+
+
+class EngineError(RuntimeError):
+    """Every engine of a role failed (``on_exhausted == "raise"``)."""
+
+    def __init__(self, message: str, *, role: str, attempts: list[CallRecord]):
+        super().__init__(message)
+        self.role = role
+        self.attempts = attempts
+
+
+class EngineSkipped(EngineError):
+    """``on_exhausted == "skip_item"``: caught only by per-item call sites."""
+
+
+class EngineDegraded(EngineError):
+    """``on_exhausted == "degrade"``: caught only by the owning node, which
+    applies exactly ``degradation``."""
+
+    def __init__(self, message: str, *, role: str, attempts: list[CallRecord], degradation: str):
+        super().__init__(message, role=role, attempts=attempts)
+        self.degradation = degradation
+
+
+_REASONING_BLOCK = re.compile(r"<(think|thinking|reasoning|analysis)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove tagged ``<think>``/``<thinking>``/``<reasoning>``/``<analysis>``
+    blocks, nothing else (untagged reasoning is the validate hook's job)."""
+    return _REASONING_BLOCK.sub("", text or "").strip()
+
+
+_TRANSIENT_TRIES = 3
+_TRUNCATION_CAP = 4096
+_NUDGE = "Reply with only the JSON object."
+_driver = OpenAICompatDriver()
+_sleep = time.sleep
+
+
+class _RateLimiter:
+    """``ProviderSpec.rpm_limit``: at most that many requests per provider
+    in any 60 s window; thread-safe (nodes call from pools)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sent: dict[str, deque] = {}
+
+    def wait(self, provider: ProviderSpec) -> None:
+        if not provider.rpm_limit:
+            return
+        while True:
+            with self._lock:
+                sent = self._sent.setdefault(provider.name, deque())
+                now = time.monotonic()
+                while sent and now - sent[0] >= 60.0:
+                    sent.popleft()
+                if len(sent) < provider.rpm_limit:
+                    sent.append(now)
+                    return
+                delay = 60.0 - (now - sent[0])
+            _sleep(delay)
+
+
+_limiter = _RateLimiter()
+
+
+def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot,
+             temperature: float | None = None, max_tokens: int | None = None,
+             json_mode: bool | None = None, expect_json: bool | None = None,
+             validate: Callable[[str], Any] | None = None, item: str = "") -> LLMResult:
+    if role not in ROLES and role not in LEGACY_ROLES:
+        raise ValueError(f"unknown role {role!r}")
+    binding = engines.roles.get(role)
+    if binding is None:
+        raise ValueError(f"role {role} is not bound in the engines snapshot (profile {engines.profile})")
+    if expect_json is None:
+        expect_json = role in JSON_ROLES
+    records: list[CallRecord] = []
+    for rank, engine in enumerate([binding.primary, *binding.fallbacks]):
+        result = _on_engine(role, binding, engine, rank, messages, engines.profile, records,
+                            temperature=temperature, max_tokens=max_tokens, json_mode=json_mode,
+                            expect_json=expect_json, validate=validate, item=item)
+        if result is not None:
+            return result
+    msg = f"role {role}: every engine failed (last: {records[-1].error})"
+    logger.warning("llm %s", msg)
+    if binding.on_exhausted == "skip_item":
+        raise EngineSkipped(msg, role=role, attempts=records)
+    if binding.on_exhausted == "degrade":
+        raise EngineDegraded(msg, role=role, attempts=records, degradation=DEGRADABLE_ROLES[role])
+    raise EngineError(msg, role=role, attempts=records)
+
+
+def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: int,
+               messages: list[BaseMessage], profile: str, records: list[CallRecord], *,
+               temperature: float | None, max_tokens: int | None, json_mode: bool | None,
+               expect_json: bool, validate: Callable[[str], Any] | None, item: str) -> LLMResult | None:
+    """Every attempt on one engine: its LLMResult, or None when it failed."""
+    def record(**kw) -> CallRecord:
+        rec = CallRecord(**{"role": role, "tier": binding.tier, "profile": profile,
+                            "provider": engine.provider, "requested_model": engine.model or "",
+                            "served_model": "", "routed_via": "", "fallback_rank": rank,
+                            "item": item, **kw})
+        records.append(rec)
+        return rec
+
+    try:
+        provider = registry.provider(engine.provider)
+    except EngineConfigError as e:
+        record(ok=False, error=str(e))
+        return None
+    if json_mode is None:
+        json_mode = (engine.json_mode if engine.json_mode is not None
+                     else role in JSON_ROLES and provider.supports_json_mode)
+    temperature = temperature if temperature is not None else engine.temperature
+    budget = max_tokens if max_tokens is not None else engine.max_tokens
+    msgs = list(messages)
+    attempt = transient = timeouts = 0
+    reason = ""
+    truncated = nudged = False
+    while True:
+        attempt += 1
+        _limiter.wait(provider)
+        t0 = time.monotonic()
         try:
-            with httpx.Client(timeout=15.0) as c:
-                r = c.get(url, headers=headers)
-                r.raise_for_status()
-                data = r.json()
-            break
-        except (httpx.TransportError, httpx.TimeoutException) as e:
-            if i >= 3:
-                raise
-            logger.warning("models fetch transient error (%s); retry %d/3",
-                           type(e).__name__, i)
-            time.sleep(min(4.0, 2.0 ** (i - 1)))
-    ids = sorted({m["id"] for m in data.get("data", []) if "id" in m})
-    _model_list_cache = ids
-    _cache_signature = sig
-    logger.info("FreeLLMAPI models resolved: %d live IDs", len(ids))
-    return ids
-
-
-def resolve_tier(tier: Tier, force: bool = False) -> str:
-    """Pick a concrete model ID for the given tier, or ``auto`` as fallback."""
-    if not force and tier in _resolved_cache:
-        return _resolved_cache[tier]
-    ids = fetch_live_models(force=force)
-    for candidate in PREFERRED[tier]:
-        if candidate in ids:
-            _resolved_cache[tier] = candidate
-            logger.info("Tier %s -> %s", tier, candidate)
-            return candidate
-    # Tier's preferred list all gone -> use the proxy's own router.
-    _resolved_cache[tier] = "auto"
-    logger.warning(
-        "Tier %s: no preferred model present, falling back to proxy 'auto'",
-        tier,
-    )
-    return "auto"
-
-
-def pick_strong_and_judge(force: bool = False) -> tuple[str, str]:
-    """Pick strong + judge model IDs such that they are from different families.
-
-    Family is approximated by the leading path segment (``openai/``,
-    ``qwen/``, ``meta-llama/``, …). If the chosen strong model and the
-    chosen judge share a family, walk the judge preference list to find
-    a different family.
-
-    Blind spot: an id WITHOUT a slash is its own family (minus any
-    ``:tag``), so ``gemini-3.5-flash`` and ``gemini-2.5-flash`` count as
-    different families, as do ``DeepSeek-V3.2`` and ``deepseek-ai/…`` —
-    the diversity guarantee only holds between slash-prefixed ids.
-
-    Side effect: overwrites the process-wide strong/judge cache, so later
-    ``chat_for_tier("judge")`` calls get the diversified judge too.
-    """
-    ids = fetch_live_models(force=force)
-    strong = _first_present(PREFERRED["strong"], ids) or "auto"
-    judge = _first_present(PREFERRED["judge"], ids) or "auto"
-    if judge != "auto" and strong != "auto":
-        if _family(judge) == _family(strong):
-            for cand in PREFERRED["judge"]:
-                if cand in ids and _family(cand) != _family(strong):
-                    judge = cand
-                    break
-    _resolved_cache["strong"] = strong
-    _resolved_cache["judge"] = judge
-    logger.info("strong=%s judge=%s (families %s/%s)",
-                strong, judge, _family(strong), _family(judge))
-    return strong, judge
-
-
-def _first_present(candidates: list[str], ids: list[str]) -> str | None:
-    for c in candidates:
-        if c in ids:
-            return c
-    return None
-
-
-def _family(model_id: str) -> str:
-    """Coarse family bucket so judge != strong."""
-    mid = model_id.lower()
-    if mid.startswith("auto") or "/" not in mid:
-        return mid.split(":")[0]
-    return mid.split("/")[0].lstrip("@")
-
-
-def chat_for_tier(tier: Tier, *, temperature: float = 0.2,
-                  max_tokens: int | None = None,
-                  model_override: str | None = None) -> ChatOpenAI:
-    """Build a ChatOpenAI pointed at FreeLLMAPI for a given tier."""
-    s = get_settings()
-    model = model_override or resolve_tier(tier)
-    # Disable langchain tracing / callbacks that ping langsmith.
-    os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
-    kwargs: dict = dict(
-        model=model,
-        base_url=s.freellmapi_base_url,
-        api_key=s.freellmapi_api_key,
-        temperature=temperature,
-        timeout=s.request_timeout_seconds,
-    )
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    return ChatOpenAI(**kwargs)
-
-
-def invoke_with_retry(chat: ChatOpenAI, messages, *,
-                      attempts: int = _RETRY_ATTEMPTS):
-    """chat.invoke with bounded exponential-backoff retry on TRANSIENT
-    errors only (transport / timeout / 5xx / rate-limit). A delivered-but-
-    malformed response is NOT an exception here — the node's JSON-parse
-    fallback owns that. Sync: nodes run on LangGraph worker threads."""
-    import time
-    last: BaseException | None = None
-    for i in range(1, max(1, attempts) + 1):
+            resp = _driver.complete(engine, provider, msgs, temperature=temperature,
+                                    max_tokens=budget, json_mode=json_mode)
+        except (openai.APIError, EngineConfigError) as e:
+            record(attempt=attempt, ok=False, error=f"{type(e).__name__}: {e}"[:300],
+                   latency_ms=_ms(t0), json_mode=json_mode, retry_reason=reason)
+            logger.warning("llm %s %s/%s attempt %d failed: %s: %s", role, engine.provider,
+                           engine.model, attempt, type(e).__name__, e)
+            if isinstance(e, openai.APITimeoutError):
+                if timeouts < provider.timeout_retry_max:
+                    timeouts += 1
+                    reason = "timeout"
+                    continue
+                return None
+            if _is_transient(e) and transient < _TRANSIENT_TRIES - 1:
+                transient += 1
+                wait = _retry_after(e, provider)
+                reason = "transient" if wait is None else "retry_after"
+                _sleep(min(8.0, 2.0 ** (transient - 1)) if wait is None else wait)
+                continue
+            return None
+        rec = record(attempt=attempt, latency_ms=_ms(t0), json_mode=json_mode, retry_reason=reason,
+                     served_model=resp.served_model, routed_via=resp.routed_via,
+                     served_provider=resp.routed_via.split("/", 1)[0] if resp.routed_via else "",
+                     prompt_tokens=int(resp.usage.get("prompt_tokens") or 0),
+                     completion_tokens=int(resp.usage.get("completion_tokens") or 0),
+                     reasoning_tokens=int(resp.usage.get("reasoning_tokens") or 0),
+                     finish_reason=resp.finish_reason,
+                     extra={"headers": dict(resp.headers)} if resp.headers else {})
+        text = strip_reasoning(resp.text)
+        if (expect_json and resp.finish_reason == "length" and binding.retry_on_truncation
+                and not truncated and budget and budget < _TRUNCATION_CAP):
+            rec.ok, rec.error = False, "truncated (finish_reason=length)"
+            truncated, budget, reason = True, min(budget * 2, _TRUNCATION_CAP), "truncated"
+            continue
+        if validate is None:
+            return LLMResult(text=text, parsed=NOT_VALIDATED, record=rec, records=list(records))
         try:
-            return chat.invoke(messages)
-        except _TRANSIENT_EXC as e:  # transient — back off and retry
-            last = e
-            if i >= attempts:
-                break
-            delay = min(8.0, 2.0 ** (i - 1))
-            logger.warning("LLM call transient error (%s); retry %d/%d in %.0fs",
-                           type(e).__name__, i, attempts, delay)
-            time.sleep(delay)
-    assert last is not None
-    raise last
+            parsed = validate(text)
+        except Exception as e:   # the hook rejecting a reply is an outcome: recorded, retried, then on_exhausted
+            rec.ok, rec.error = False, f"unparseable: {type(e).__name__}: {e}"[:300]
+            if nudged:
+                return None
+            nudged, reason = True, "unparseable"
+            msgs = [*messages, HumanMessage(content=_NUDGE)]
+            continue
+        return LLMResult(text=text, parsed=parsed, record=rec, records=list(records))
 
 
-async def ainvoke_with_retry(chat: ChatOpenAI, messages, *,
-                             attempts: int = _RETRY_ATTEMPTS):
-    """Async counterpart of :func:`invoke_with_retry`."""
-    async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(max(1, attempts)),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            retry=retry_if_exception_type(_TRANSIENT_EXC),
-            reraise=True):
-        with attempt:
-            return await chat.ainvoke(messages)
+def _is_transient(e: Exception) -> bool:
+    if isinstance(e, openai.APIConnectionError):
+        return True
+    return isinstance(e, openai.APIStatusError) and (e.status_code == 429 or e.status_code >= 500)
 
 
-def record_from_response(tier: Tier, requested: str,
-                         response) -> CallRecord:
-    """Extract provenance from a langchain AIMessage-or-ChatResult response."""
-    served = getattr(response, "response_metadata", {}).get("model_name") \
-        or requested
-    provider = ""
-    meta = getattr(response, "response_metadata", {}) or {}
-    # FreeLLMAPI embeds _routed_via under raw response; langchain may surface
-    # part of it. Try a few keys.
-    for k in ("_routed_via", "routed_via", "x_groq", "provider"):
-        v = meta.get(k)
-        if isinstance(v, dict) and "platform" in v:
-            provider = v["platform"]
-            break
-        if isinstance(v, str):
-            provider = v
-            break
-    usage = getattr(response, "usage_metadata", None) or {}
-    return CallRecord(
-        tier=tier,
-        requested_model=requested,
-        served_model=served,
-        served_provider=provider,
-        prompt_tokens=int(usage.get("input_tokens", 0) or 0),
-        completion_tokens=int(usage.get("output_tokens", 0) or 0),
-    )
+def _retry_after(e: Exception, provider: ProviderSpec) -> float | None:
+    response = getattr(e, "response", None)
+    value = response.headers.get("retry-after") if response is not None else None
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return max(0.0, min(seconds, provider.retry_after_cap_s))
+
+
+def _ms(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1–2 legacy wrappers (WP-H deletes them): the v3 call sites stay
+# unchanged and route through complete(role="legacy.<tier>").
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _LegacyChat:
+    tier: str
+    temperature: float | None
+    max_tokens: int | None
+    model_override: str | None
+
+
+@dataclass
+class _LegacyResponse:
+    content: str
+    result: LLMResult
+
+
+def chat_for_tier(tier: str, *, temperature: float | None = 0.2, max_tokens: int | None = None,
+                  model_override: str | None = None) -> _LegacyChat:
+    return _LegacyChat(tier, temperature, max_tokens, model_override)
+
+
+def invoke_with_retry(chat: _LegacyChat, messages: list[BaseMessage]) -> _LegacyResponse:
+    engines = registry.current_snapshot_cached()
+    role = f"legacy.{chat.tier}"
+    bound = engines.roles[role].primary.model
+    if chat.model_override is not None and chat.model_override != bound:
+        raise ValueError(f"{role}: model_override {chat.model_override!r} differs from the bound "
+                         f"model {bound!r}")
+    result = complete(role, messages, engines=engines, temperature=chat.temperature,
+                      max_tokens=chat.max_tokens)
+    return _LegacyResponse(content=result.text, result=result)
+
+
+def record_from_response(tier: str, requested: str, response: _LegacyResponse) -> CallRecord:
+    """The successful attempt's record; earlier failed attempts ride along
+    in ``extra["prior_attempts"]`` (the call sites append one dict)."""
+    result = response.result
+    prior = [a.model_dump() for a in result.records[:-1]]
+    if not prior:
+        return result.record
+    return dataclasses.replace(result.record, extra={**result.record.extra, "prior_attempts": prior})
+
+
+def resolve_tier(tier: str) -> str:
+    return registry.current_snapshot_cached().roles[f"legacy.{tier}"].primary.model
+
+
+def pick_strong_and_judge() -> tuple[str, str]:
+    return resolve_tier("strong"), resolve_tier("judge")

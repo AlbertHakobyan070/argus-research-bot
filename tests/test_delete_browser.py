@@ -48,7 +48,7 @@ def _settings(tmp_path: Path) -> Settings:
         transcripts_root=tmp_path / "vault" / "transcripts",
         history_root=tmp_path / "vault" / "history",
         ffmpeg_path=None,
-        request_timeout_seconds=60.0, max_revision_rounds=3,
+        max_revision_rounds=3,
     )
 
 

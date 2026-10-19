@@ -190,6 +190,10 @@ def main() -> int:
     from langgraph.checkpoint.memory import MemorySaver
     saver = MemorySaver()
     graph = build_graph(checkpointer=saver)
+    # v4 WP-A: the nodes' legacy LLM wrappers read the registry's cached
+    # snapshot, so resolve the engines config first (as the bot does).
+    from argus.engines import registry
+    asyncio.run(registry.active_snapshot())
 
     try:
         final = _drive_research(graph, thread_id=thread_id,

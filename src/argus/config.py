@@ -43,7 +43,6 @@ class Settings:
     transcripts_root: Path
     history_root: Path
     ffmpeg_path: str | None         # unread: media.resolve_ffmpeg reads ARGUS_FFMPEG itself
-    request_timeout_seconds: float
     max_revision_rounds: int        # unread: panel.route_after_panel reads ARGUS_MAX_REVISIONS itself
 
     @classmethod
@@ -55,11 +54,9 @@ class Settings:
         # bot._allowed() then rejects every user.
         allowed = int(os.environ.get("TELEGRAM_ALLOWED_USER_ID", "0") or "0")
 
-        if not key or not key.startswith("freellmapi-"):
-            raise RuntimeError(
-                "FREELLMAPI_API_KEY missing or malformed in .env "
-                "(expected 'freellmapi-<key>')."
-            )
+        # FREELLMAPI_API_KEY is not checked here: the bot must start without
+        # it (media, /find). The engines registry reports a missing key at
+        # startup and refuses a run that needs it (v4 spec §2.2).
         if not token or ":" not in token:
             raise RuntimeError(
                 "TELEGRAM_BOT_TOKEN missing or malformed in .env "
@@ -99,7 +96,6 @@ class Settings:
             transcripts_root=transcripts_root,
             history_root=history_root,
             ffmpeg_path=os.environ.get("ARGUS_FFMPEG") or None,
-            request_timeout_seconds=float(os.environ.get("ARGUS_TIMEOUT", "60")),
             max_revision_rounds=int(os.environ.get("ARGUS_MAX_REVISIONS", "3")),
         )
 

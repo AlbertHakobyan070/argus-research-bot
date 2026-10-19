@@ -16,13 +16,15 @@ from telegram.ext import (
 
 from ..cache_cleanup import cleanup_argus_ytt_cache
 from ..config import get_settings
+from ..engines import registry
+from ..engines.registry import EngineConfigError
 from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from ..library import Library
 from ..media import resolve_ffmpeg
-from . import delete, history, media, research
+from . import delete, engines_cmd, history, media, research
 from .common import (
     _TG_CONNECT_TIMEOUT_S, _TG_MEDIA_WRITE_TIMEOUT_S, _TG_POOL_TIMEOUT_S,
-    _TG_READ_TIMEOUT_S, _TG_WRITE_TIMEOUT_S, _allowed, _set_run_status,
+    _TG_READ_TIMEOUT_S, _TG_WRITE_TIMEOUT_S, _allowed, _safe_send, _set_run_status,
 )
 
 logger = logging.getLogger("argus.bot")
@@ -36,6 +38,7 @@ logger = logging.getLogger("argus.bot")
 # has awaited the app.create_task tasks; POST_SHUTDOWN_HOOKS at the start
 # of _post_shutdown, before the library and checkpoint saver close.
 HANDLER_MODULES = [research, media, history, delete]
+HANDLER_MODULES.append(engines_cmd)
 POST_INIT_HOOKS: list = []
 POST_STOP_HOOKS: list = []
 POST_SHUTDOWN_HOOKS: list = []
@@ -164,6 +167,25 @@ async def _post_init(app: Application) -> None:
                        "subprocesses will not work on Windows", loop_name)
     logger.info("post_init: saver + library + graphs ready (loop=%s, "
                 "library=%s)", loop_name, s.library_db)
+    # Engines (v4 WP-A, spec §2.2): load and check statically, no network,
+    # so the bot starts with the LLM proxy down (media, /find, /runs).
+    # Problems are logged and DM'd once; runs are refused at run start.
+    try:
+        engines_cfg = await registry.load_config(library=lib)
+        registry.validate_schema(engines_cfg)
+        problems = registry.static_problems(engines_cfg)
+    except EngineConfigError as e:
+        problems = [str(e)]
+    for problem in problems:
+        logger.warning("engines: %s", problem)
+    if problems and s.telegram_allowed_user_id:
+        await _safe_send(app.bot, s.telegram_allowed_user_id,
+                         "⚠️ Engines configuration problems (research runs are refused "
+                         "until fixed; /engines shows the state):\n"
+                         + "\n".join(f"• {p}" for p in problems), parse_mode=None)
+    for knob, replacement in registry.REMOVED_ENV_KNOBS.items():
+        if knob in os.environ:
+            logger.warning("%s is set but no longer read; replaced by %s", knob, replacement)
     # Reconcile runs orphaned by the previous process (crash / restart):
     # their in-memory _inflight is gone, so their inline buttons are dead.
     # Recover what we can from checkpoints and tell each user.

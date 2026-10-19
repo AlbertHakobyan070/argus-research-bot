@@ -23,8 +23,11 @@ from argus.bot import common as bot_common
 from argus.bot import research as bot_research
 from argus.bot.app import on_callback, on_text
 from argus.config import Settings
+from argus.engines import registry
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
+
+from helpers import fake_engines_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,9 @@ def test_brief_incorporates_plan_feedback(monkeypatch):
     monkeypatch.setattr(brief_mod.llm, "invoke_with_retry",
                         lambda chat, msgs, **kw: chat.invoke(msgs))
     monkeypatch.setattr(brief_mod.llm, "resolve_tier", lambda t: "m")
+    monkeypatch.setattr(brief_mod.llm, "record_from_response", lambda tier, req, resp: brief_mod.llm.CallRecord(
+        role=f"legacy.{tier}", tier=tier, profile="fake", provider="fake",
+        requested_model=req, served_model="m", routed_via=""))
 
     out = brief_mod.brief_node({
         "user_request": "topic",
@@ -192,8 +198,15 @@ def _settings(monkeypatch):
         checkpoint_db=Path("c.sqlite"), library_db=Path("l.sqlite"),
         vault_root=Path("v"), media_root=Path("v/m"),
         transcripts_root=Path("v/t"), history_root=Path("v/h"),
-        ffmpeg_path=None, request_timeout_seconds=60.0, max_revision_rounds=3)
+        ffmpeg_path=None, max_revision_rounds=3)
     monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
+
+
+@pytest.fixture(autouse=True)
+def _engines_resolved(monkeypatch):
+    """Drive entries first await registry.active_snapshot() (v4 WP-A)."""
+    monkeypatch.setattr(registry, "active_snapshot",
+                        AsyncMock(return_value=fake_engines_snapshot()))
 
 
 def _seed(run_id="ab12cd34", chat_id=5, awaiting="plan_approval"):

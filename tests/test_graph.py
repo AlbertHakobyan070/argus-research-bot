@@ -8,6 +8,7 @@ cited report through the v3 engine.
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 from argus.config import get_settings
+from argus.engines import registry
 from argus.graph import build_graph, quick_answer_graph
+
+
+@pytest.fixture(autouse=True)
+def _live_engines(monkeypatch):
+    """The nodes' legacy LLM wrappers read the registry's cached snapshot
+    (v4 WP-A): resolve the shipped engines config against the live proxy,
+    as every bot drive entry does first."""
+    monkeypatch.setattr(registry, "_state", registry._State())
+    asyncio.run(registry.load_config([str(registry._ROOT / "argus_engines.json")]))
+    asyncio.run(registry.active_snapshot())
 
 
 def _make_state_in(thread_id: str, user_id: int, text: str) -> dict:

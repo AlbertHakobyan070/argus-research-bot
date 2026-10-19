@@ -23,6 +23,9 @@ from argus.bot import common as bot_common
 from argus.bot import research as bot_research
 from argus.bot.research import research_cmd
 from argus.config import Settings
+from argus.engines import registry
+
+from helpers import fake_engines_snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +52,6 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"),
         ffmpeg_path=None,
-        request_timeout_seconds=60.0,
         max_revision_rounds=3,
     )
     monkeypatch.setattr(bot_research, "get_settings", lambda: dummy)
@@ -58,6 +60,13 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bot_research, "_allowed", lambda _s, _uid: True)
+
+
+@pytest.fixture(autouse=True)
+def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """/research first awaits registry.active_snapshot() (v4 WP-A)."""
+    monkeypatch.setattr(registry, "active_snapshot",
+                        AsyncMock(return_value=fake_engines_snapshot()))
 
 
 class _FakeGraph:

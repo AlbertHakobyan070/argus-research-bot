@@ -14,6 +14,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
+from ..engines import registry
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS
 from ..library import mirror_run_md, new_run_id
 from . import common
@@ -158,6 +159,7 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Bot not fully initialized (no graph) — restart the bot.")
         return
+    await registry.active_snapshot()
 
     # v2: every run gets its own id + checkpoint thread. Multiple runs
     # per chat can coexist, and a run can be re-attached after a restart.
@@ -280,6 +282,7 @@ async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Bot not fully initialized (no graph) — restart the bot.")
         return
+    await registry.active_snapshot()
     await ctx.application.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     run_id = new_run_id()
@@ -363,6 +366,7 @@ async def _replan_after_edit(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
 
     NB: ``state["sources"]`` is not cleared here, so scout re-seeds the
     previous wave's hits first (see the note in ``scout_node``)."""
+    await registry.active_snapshot()
     if info.get("resuming"):
         return
     info["resuming"] = True
@@ -415,6 +419,7 @@ async def _revise_after_feedback(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
     """report-revise: append the user's feedback to revision_notes, set
     revision_requested, then resume from the report-preview interrupt —
     deliver passes through → revise_prep → compose → … → new preview."""
+    await registry.active_snapshot()
     if info.get("resuming"):
         return
     graph = info["graph"]
@@ -551,6 +556,7 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
     ``None`` — there is no pending interrupt to resume, the graph just
     proceeds from the fork.
     """
+    await registry.active_snapshot()
     if info.get("resuming"):
         logger.warning("resume already in flight for run %s; ignoring",
                        info.get("run_id"))
@@ -710,6 +716,7 @@ async def _send_report_preview(ctx: ContextTypes.DEFAULT_TYPE,
 
 async def _resume_after_report(ctx: ContextTypes.DEFAULT_TYPE,
                                 info: dict, q):
+    await registry.active_snapshot()
     run_id = info["run_id"]
     chat_id = info["chat_id"]
     paths = info.get("paths") or {}

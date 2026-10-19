@@ -10,6 +10,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
+from ..engines import registry
 from ..graph.state import DEFAULT_LENGTH
 from ..library import Library
 from ..media import extract_urls
@@ -251,6 +252,7 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Run {run_id} is already resuming — hang on.")
         return
+    await registry.active_snapshot()
     cfg = {"configurable": {"thread_id": run["thread_id"]}}
     try:
         snap = await graph.aget_state(cfg)

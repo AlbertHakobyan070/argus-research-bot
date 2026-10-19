@@ -28,6 +28,8 @@ import json
 from datetime import datetime
 from typing import Any
 
+from ..engines.registry import summarize_calls
+
 
 def _section_label(name: str) -> str:
     """Trim noisy prefixes so the title page line stays tight.
@@ -203,7 +205,8 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
                             revision_rounds: int,
                             validated_assessment: dict | None,
                             lecture_appendix: dict | None,
-                            model_calls: list[dict]) -> dict[str, Any]:
+                            model_calls: list[dict],
+                            errors: list[str] | None = None) -> dict[str, Any]:
     """Build the ``metadata.json`` sidecar dict.
 
     Two consumers:
@@ -227,6 +230,7 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
         "validated_assessment": validated_assessment or {},
         "lecture_appendix": lecture_appendix or {},
         "model_calls": model_calls,
+        "engines": summarize_calls(model_calls, errors),   # v4 provenance summary (spec §2.3)
     }
 
 

@@ -51,8 +51,9 @@ class _FakeResp:
 
 
 def _fake_record(tier, req, resp):
-    return CallRecord(tier=tier, requested_model=req,
-                      served_model="fake", served_provider="fake")
+    return CallRecord(role=f"legacy.{tier}", tier=tier, profile="fake", provider="fake",
+                      requested_model=req, served_model="fake", routed_via="",
+                      served_provider="fake")
 
 
 def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
