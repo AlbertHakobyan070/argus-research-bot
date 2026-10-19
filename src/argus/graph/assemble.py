@@ -1,10 +1,13 @@
-"""Report assembly (v4 spec §2.8): TL;DR → sections → Analysis → Sources.
+"""Report assembly (v4 spec §2.8): TL;DR → sections → Analysis → appendices → Sources.
 
-The helpers moved here unchanged from compose.py; ``assemble_draft``
-reproduces compose's inline assembly, except that its TL;DR heading is
-always ``## TL;DR`` (compose says ``## Executive TL;DR`` for lecture; the
-signature carries no length). WP-C implements ``normalize_cite_markers``
-(identity until then).
+The helpers moved here unchanged from compose.py. ``assemble_draft``
+reproduces compose's sectioned assembly (lecture passes
+``tldr_heading="Executive TL;DR"``), but not its flat path (``tldr``/``short``,
+or a brief with one sub-question): ``flat=True`` adds ``## Findings``, and the
+flat writer emits its own ``## TL;DR`` and ``## Key Findings``. So the flat
+path must not move onto ``assemble_draft`` before WP-C removes the flat
+writer's own headings, or those reports get ``## Findings`` above the model's
+headings. WP-C implements ``normalize_cite_markers`` (identity until then).
 """
 from __future__ import annotations
 
@@ -81,18 +84,24 @@ def normalize_cite_markers(md: str) -> str:
 
 
 def assemble_draft(*, tldr: str | None, sections: list[dict], analysis_md: str | None,
-                   fetched: list[dict], flat: bool) -> str:
-    """TL;DR → sections (flat: ``## Findings`` + body) → ``## Analysis`` → ``## Sources``.
+                   appendices: list[str] | None = None, fetched: list[dict], flat: bool,
+                   tldr_heading: str = "TL;DR") -> str:
+    """``## <tldr_heading>`` → sections (flat: ``## Findings`` + body) →
+    ``## Analysis`` → appendices → ``## Sources``.
 
-    Blank ``tldr``/``analysis_md`` are omitted; Sources lists the ids
-    cited anywhere above it.
+    Each appendix is a markdown block with its own heading. Blank ``tldr``,
+    ``analysis_md`` and appendices are omitted; Sources lists the ids cited
+    anywhere above it, appendices included.
     """
     if flat:
         body = "## Findings\n\n" + "\n\n".join(s["md"] for s in sections)
     else:
         body = "\n\n".join(f"## {s['title']}\n\n{s['md']}" for s in sections)
     if tldr and tldr.strip():
-        body = f"## TL;DR\n\n{tldr.strip()}\n\n{body}"
+        body = f"## {tldr_heading}\n\n{tldr.strip()}\n\n{body}"
     if analysis_md and analysis_md.strip():
         body = f"{body}\n\n## Analysis\n\n{analysis_md.strip()}"
+    for appendix in appendices or []:
+        if appendix.strip():
+            body = f"{body}\n\n{appendix.strip()}"
     return body + "\n" + build_sources_block(body, fetched)

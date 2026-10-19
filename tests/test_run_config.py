@@ -1,4 +1,5 @@
 """v4 WP-0 — RunConfig models, presets, budget helpers (spec §2.4)."""
+import functools
 import operator
 from datetime import datetime
 from typing import Annotated, TypedDict
@@ -7,16 +8,21 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from argus.engines.schema import ExaPrices
 from argus.graph.run_config import (
-    PRESETS, RunConfig, ensure_in_checkpoint, require)
+    PRESETS, ExaConfig, RunConfig, SearchConfig, ensure_in_checkpoint, require)
 from argus.graph.state import VALID_LENGTHS
-from conftest import fake_engines_snapshot, make_run_config
+from helpers import fake_engines_snapshot, make_run_config
 
 
 def _rc(depth=None, length="medium", **overrides) -> RunConfig:
     return RunConfig.from_preset(length=length, depth=depth,
                                  engines=fake_engines_snapshot(),
                                  overrides=overrides, origin="bench")
+
+
+def _knob(rc: RunConfig, key: str):
+    return functools.reduce(getattr, key.split("."), rc)
 
 
 # The §2.4 table, column by column.
@@ -35,6 +41,33 @@ PANEL = {"quick": (True, False, 0), "standard": (True, True, 1),
 # Exa searches.
 SPLIT = {"quick": ((12, 0), (6, 0)), "standard": ((32, 16), (12, 4)),
          "deep": ((48, 30), (20, 6)), "exhaustive": ((72, 36), (30, 6))}
+# The bounds written inline in the §2.4 knob classes: (key, floor, ceiling),
+# None where the spec gives no inline bound (every numeric knob is >= 0).
+BOUNDS = [
+    ("search.exa.max_searches", None, 60),
+    ("search.exa.max_contents_pages", None, 200),
+    ("search.exa.num_results", 1, 20),
+    ("search.arxiv.max_queries_per_run", None, 6),
+    ("fetch.concurrency", 1, 8),
+    ("research.waves", 1, 6),
+    ("research.fetch_per_wave", 1, 30),
+    ("research.total_fetch_cap", None, 150),
+    ("research.gap_fetch_per_wave", None, 20),
+    ("research.per_subq_target", 1, 8),
+    ("research.coverage_min_strong", 0, 5),
+    ("research.gap_waves_max", None, 3),
+    ("research.digest_chunks_long_doc", 1, 6),
+    ("research.digest_concurrency", 1, 8),
+    ("research.writer_min_relevance", 0, 5),
+    ("research.quote_verify_fuzzy", None, 1),
+    ("compose.concurrency", 1, 6),
+    ("compose.section_min_notes", 1, 5),
+    ("panel.judge_batch_size", 4, 20),
+    ("panel.max_compose_revisions", None, 3),
+    ("panel.rewrite_flag_ratio", None, 1),
+]
+_PRICES = ExaPrices(price_per_search_usd=0.007, price_per_page_usd=0.001,
+                    prices_as_of="2026-10-18")
 
 
 def test_presets_cover_every_depth():
@@ -68,12 +101,29 @@ def test_budget_helpers_first_pass_is_total_minus_reserve(depth):
     assert rc.search.exa.max_searches - rc.exa_search_reserve() == exa_first
 
 
-def test_exa_cost_estimate_uses_configured_prices():
+def test_exa_cost_estimate_uses_the_given_prices():
     # standard: 16 searches · $0.007 + (16 · 8 results + 40 pages) · $0.001
-    assert _rc("standard").exa_cost_estimate_usd() == pytest.approx(0.28)
-    doubled = _rc("standard", **{"search.exa.price_per_search_usd": 0.014,
-                                 "search.exa.price_per_page_usd": 0.002})
-    assert doubled.exa_cost_estimate_usd() == pytest.approx(0.56)
+    assert _rc("standard").exa_cost_estimate_usd(_PRICES) == pytest.approx(0.28)
+    doubled = ExaPrices(price_per_search_usd=0.014, price_per_page_usd=0.002,
+                        prices_as_of="2026-10-18")
+    assert _rc("standard").exa_cost_estimate_usd(doubled) == pytest.approx(0.56)
+
+
+def test_exa_cost_estimate_without_prices_is_none():
+    assert _rc("standard").exa_cost_estimate_usd(None) is None   # shown as "n/a"
+
+
+def test_fix_round_knob_defaults_and_removed_fields():
+    rc = _rc("standard")
+    assert rc.fetch.max_bytes == 25_000_000
+    assert rc.panel.judge_batch_size == 10
+    assert rc.overrides_applied == {}
+    assert not ({"price_per_search_usd", "price_per_page_usd", "prices_as_of"}
+                & set(ExaConfig.model_fields))
+    assert "source_mix_min" not in SearchConfig.model_fields
+    assert "archetype_override" not in RunConfig.model_fields
+    with pytest.raises(ValueError, match="precision_mode"):
+        _rc("standard", **{"panel.precision_mode": "llm"})
 
 
 def test_default_depth():
@@ -86,9 +136,10 @@ def test_default_depth():
 
 def test_from_preset_defaults_depth_from_length():
     rc = RunConfig.from_preset(length="long", engines=fake_engines_snapshot(),
-                               origin="telegram")
+                               overrides=None, origin="telegram")
     assert (rc.length, rc.depth, rc.preset_origin) == ("long", "deep", "deep")
     assert rc.origin == "telegram"
+    assert rc.overrides_applied == {}
     datetime.fromisoformat(rc.created_at)
     with pytest.raises(ValueError, match="unknown depth"):
         _rc("ultra")
@@ -101,19 +152,21 @@ def test_quick_preset_turns_analyst_off_only_for_tldr():
 
 
 def test_from_preset_overrides_by_dotted_key():
-    rc = _rc("standard", **{"research.waves": 2, "search.exa.num_results": 5,
-                            "panel.coverage": False, "fetch.concurrency": 2,
-                            "search.source_mix_min": {"paper": 2},
-                            "recency": "m"})
+    overrides = {"research.waves": 2, "search.exa.num_results": 5,
+                 "panel.coverage": False, "fetch.concurrency": 2, "recency": "m"}
+    rc = _rc("standard", **overrides)
     assert (rc.research.waves, rc.search.exa.num_results, rc.panel.coverage,
             rc.fetch.concurrency, rc.recency) == (2, 5, False, 2, "m")
-    assert rc.search.source_mix_min == {"paper": 2}
     assert rc.research.fetch_per_wave == 14      # untouched preset value
     assert rc.preset_origin == "standard"
+    assert rc.overrides_applied == overrides
 
 
 @pytest.mark.parametrize("key", ["research.wavez", "research", "depth", "length",
-                                 "legacy", "engines.profile", "search.exa.nope"])
+                                 "legacy", "engines.profile", "search.exa.nope",
+                                 "overrides_applied", "archetype_override",
+                                 "search.source_mix_min",
+                                 "search.exa.price_per_search_usd"])
 def test_unknown_override_key_rejected(key):
     with pytest.raises(ValueError, match="unknown run_config override"):
         RunConfig.from_preset(length="medium", depth="standard",
@@ -123,12 +176,8 @@ def test_unknown_override_key_rejected(key):
 
 @pytest.mark.parametrize("key,value,match", [
     ("research.waves", "many", "waves"),                    # type
-    ("research.waves", -1, "research.waves must be >= 0"),
-    ("search.source_mix_min", {"repo": -2}, "source_mix_min.repo must be >= 0"),
-    ("compose.concurrency", 0, "compose.concurrency must be >= 1"),
-    ("research.digest_concurrency", 0, "digest_concurrency must be >= 1"),
-    ("panel.rewrite_flag_ratio", 1.5, "rewrite_flag_ratio must be <= 1"),
-    ("research.quote_verify_fuzzy", 1.1, "quote_verify_fuzzy must be <= 1"),
+    ("research.digest_head_chars", -1, "research.digest_head_chars must be >= 0"),
+    ("search.arxiv.min_interval_s", -0.5, "min_interval_s must be >= 0"),
     # standard reserves 2 gap waves × 8 fetches and 2 × 2 Exa searches.
     ("research.total_fetch_cap", 10, "total_fetch_cap"),
     ("search.exa.max_searches", 3, "max_searches"),
@@ -138,15 +187,55 @@ def test_override_bounds(key, value, match):
         _rc("standard", **{key: value})
 
 
-def test_legacy_is_standard_preset_marked_legacy():
-    rc = RunConfig.legacy(engines=fake_engines_snapshot())
-    assert (rc.legacy, rc.origin, rc.depth, rc.preset_origin) == (
-        True, "legacy", "standard", "standard")
-    assert rc.length == "medium"     # the length whose default depth is standard
-    assert rc.research == _rc("standard").research
-    # Field and constructor share the name: instances read the field.
+@pytest.mark.parametrize("key,floor,ceiling", BOUNDS)
+def test_inline_floors_and_ceilings(key, floor, ceiling):
+    if floor is not None:
+        assert _knob(_rc("standard", **{key: floor}), key) == floor
+        with pytest.raises(ValueError, match=f"{key} must be >= {floor}"):
+            _rc("standard", **{key: floor - 1})
+    if ceiling is not None:
+        assert _knob(_rc("standard", **{key: ceiling}), key) == ceiling
+        with pytest.raises(ValueError, match=f"{key} must be <= {ceiling}"):
+            _rc("standard", **{key: ceiling + 1})
+
+
+def test_for_legacy_checkpoint_follows_the_checkpoint_length():
+    rc = RunConfig.for_legacy_checkpoint(engines=fake_engines_snapshot(),
+                                         length="long")
+    assert (rc.length, rc.depth, rc.preset_origin) == ("long", "deep", "deep")
+    assert (rc.legacy, rc.origin) == (True, "legacy")
+    assert rc.research == _rc("deep", length="long").research
+    short = RunConfig.for_legacy_checkpoint(engines=fake_engines_snapshot(),
+                                            length="short")
+    assert (short.depth, short.legacy) == ("quick", True)
+    # The field keeps its name and default; no constructor is attached under it.
     assert _rc().legacy is False
     assert RunConfig.model_fields["legacy"].default is False
+    assert not callable(getattr(RunConfig, "legacy", None))
+
+
+def test_rebuild_reapplies_overrides_applied():
+    overrides = {"research.waves": 2, "panel.coverage": False, "recency": "m"}
+    rc = _rc("standard", **overrides)
+    other = fake_engines_snapshot().model_copy(update={"profile": "other"})
+    new = rc.rebuild(length="long", depth="exhaustive", engines=other)
+    assert (new.length, new.depth, new.preset_origin) == (
+        "long", "exhaustive", "exhaustive")
+    assert (new.research.waves, new.panel.coverage, new.recency) == (2, False, "m")
+    assert new.research.fetch_per_wave == 20     # exhaustive's preset, not standard's
+    assert new.overrides_applied == overrides
+    assert (new.engines.profile, new.origin, new.legacy) == ("other", "bench", False)
+    # depth=None → default_depth(length); the overrides still apply.
+    quick = rc.rebuild(length="short", engines=fake_engines_snapshot())
+    assert (quick.depth, quick.research.waves, quick.recency) == ("quick", 2, "m")
+
+
+def test_rebuild_keeps_the_legacy_mark():
+    rc = RunConfig.for_legacy_checkpoint(engines=fake_engines_snapshot(),
+                                         length="medium")
+    new = rc.rebuild(length="long", engines=fake_engines_snapshot())
+    assert (new.length, new.depth, new.legacy, new.origin) == (
+        "long", "deep", True, "legacy")
 
 
 def test_require_missing_or_invalid_raises_naming_run_config():
@@ -158,6 +247,14 @@ def test_require_missing_or_invalid_raises_naming_run_config():
         require({"run_config": {"length": "short"}})
 
 
+def test_require_rejects_a_config_whose_length_differs_from_the_state():
+    raw = make_run_config("short")
+    assert require({"run_config": raw, "length": "short"}).length == "short"
+    assert require({"run_config": raw, "length": None}).length == "short"  # length not set
+    with pytest.raises(ValueError, match=r"run_config.*'short'.*'medium'"):
+        require({"run_config": raw, "length": "medium"})
+
+
 def test_require_round_trips_make_run_config():
     rc = require({"run_config": make_run_config()})
     assert (rc.length, rc.depth, rc.engines.profile) == ("short", "quick", "fake")
@@ -167,6 +264,7 @@ def test_require_round_trips_make_run_config():
 
 class _S(TypedDict, total=False):
     x: int
+    length: str
     run_config: dict
     errors: Annotated[list[str], operator.add]
 
@@ -179,18 +277,44 @@ def _tiny_graph():
     return g.compile(checkpointer=MemorySaver())
 
 
+async def _checkpoint_id(graph, cfg):
+    return (await graph.aget_state(cfg)).config["configurable"].get("checkpoint_id")
+
+
 async def test_ensure_in_checkpoint_injects_legacy_once():
     graph = _tiny_graph()
     cfg = {"configurable": {"thread_id": "pre-v4"}}
-    await graph.ainvoke({"x": 0}, cfg)               # checkpoint without run_config
+    await graph.ainvoke({"x": 0, "length": "long"}, cfg)   # no run_config
 
     rc = await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
     values = (await graph.aget_state(cfg)).values
-    assert rc.legacy is True
+    assert (rc.legacy, rc.origin, rc.length, rc.depth) == (True, "legacy", "long", "deep")
     assert require(values) == rc
     assert values["errors"] == [
         "legacy: run_config defaults applied (pre-v4 checkpoint)"]
 
+    written = await _checkpoint_id(graph, cfg)
     again = await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
     assert again == rc
+    assert await _checkpoint_id(graph, cfg) == written          # nothing written
     assert (await graph.aget_state(cfg)).values["errors"] == values["errors"]
+
+
+async def test_ensure_in_checkpoint_refuses_a_thread_that_never_ran():
+    graph = _tiny_graph()
+    cfg = {"configurable": {"thread_id": "never-ran"}}
+    with pytest.raises(ValueError, match="no checkpoint for thread 'never-ran'"):
+        await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
+    snap = await graph.aget_state(cfg)
+    assert (snap.created_at, snap.values) == (None, {})         # nothing written
+
+
+async def test_ensure_in_checkpoint_refuses_a_checkpoint_without_length():
+    graph = _tiny_graph()
+    cfg = {"configurable": {"thread_id": "no-length"}}
+    await graph.ainvoke({"x": 0}, cfg)
+    before = await _checkpoint_id(graph, cfg)
+    with pytest.raises(ValueError, match="thread 'no-length'.*length"):
+        await ensure_in_checkpoint(graph, cfg, engines=fake_engines_snapshot())
+    assert await _checkpoint_id(graph, cfg) == before           # nothing written
+    assert "run_config" not in (await graph.aget_state(cfg)).values

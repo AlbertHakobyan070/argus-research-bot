@@ -61,6 +61,30 @@ def test_analysis_follows_sections_and_feeds_sources():
     assert "2. [https://example.com/vendors]" in md   # cited only in Analysis
 
 
+def test_tldr_heading_is_configurable():
+    # Lecture passes "Executive TL;DR", the heading compose writes for it today.
+    md = assemble_draft(tldr="Alpha is a thing [1].", sections=SECTIONS,
+                        analysis_md=None, fetched=FETCHED, flat=False,
+                        tldr_heading="Executive TL;DR")
+    assert md == ("## Executive TL;DR\n\nAlpha is a thing [1].\n\n"
+                  + EXPECTED_NO_TLDR)
+
+
+def test_appendices_render_before_sources_and_feed_them():
+    md = assemble_draft(
+        tldr=None, sections=SECTIONS[:1], analysis_md="Takeaway [1].",
+        appendices=["## Uncited specifics\n\n- It grew 40% in 2024 [2].\n",
+                    "  ",                                   # blank: omitted
+                    "## Flagged claims\n\n- A cut claim [9]."],
+        fetched=FETCHED, flat=False)
+    # [2] is cited only in an appendix and still gets its Sources entry.
+    assert md == (
+        "## Background\n\nAlpha was first described in 2019 [1]. Later work "
+        "refined it [3].\n\n## Analysis\n\nTakeaway [1].\n\n"
+        "## Uncited specifics\n\n- It grew 40% in 2024 [2].\n\n"
+        "## Flagged claims\n\n- A cut claim [9].\n\n" + _SOURCES)
+
+
 def test_flat_renders_findings_heading():
     md = assemble_draft(tldr="T [1].", sections=[{"title": "Report",
                                                   "md": "Body [3]."}],

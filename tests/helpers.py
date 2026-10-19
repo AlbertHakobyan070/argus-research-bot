@@ -2,7 +2,7 @@
 
 Plain functions, not pytest fixtures — import them where needed::
 
-    from conftest import fake_engines_snapshot, make_run_config
+    from helpers import fake_engines_snapshot, make_run_config
     state = {"run_config": make_run_config("medium", **{"research.waves": 1})}
 """
 from argus.engines.roles import (

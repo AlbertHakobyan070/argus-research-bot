@@ -7,7 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "langchain>=1.3,<2",
     "langchain-openai>=1.3,<2",
-    "langgraph>=1.2,<2",
+    "langgraph>=1.2.8,<2",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "aiosqlite>=0.20",
     "python-telegram-bot[ext]>=21.6",
@@ -24,6 +24,8 @@ dependencies = [
     "aiohttp>=3.14,<4",
     "trafilatura>=2.3,<3",
     "pypdf>=6,<7",
+    # v4: the engines driver calls the openai SDK directly (already installed via langchain-openai)
+    "openai>=2.44,<3",
 ]
 
 [project.optional-dependencies]

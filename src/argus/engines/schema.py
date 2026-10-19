@@ -33,14 +33,17 @@ class ProviderSpec(BaseModel):
     base_url_env: str | None = None
     api_key_env: str | None = None                                   # env var NAME; None for keyless local servers
     headers: dict[str, str] = {}                                     # e.g. OpenRouter HTTP-Referer / X-Title
-    extra_body: dict = {}                                            # provider-specific request fields (e.g. Groq reasoning_format)
+    extra_body: dict = {}                                            # provider-level request fields; EngineSpec.extra_body is merged over it
     supports_json_mode: bool = False                                 # send response_format={"type":"json_object"} when a role asks
-    supports_temperature: bool = True                                # False → omit temperature/top_p entirely (Anthropic Claude 4.7+/5)
+    supports_temperature: bool = True                                # provider default; EngineSpec may override per model
+    token_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"   # openai → "max_completion_tokens"
     models_endpoint: bool = True                                     # GET {base_url}/models works with the same auth
     known_models: list[str] = []                                     # static list when models_endpoint is False (only VERIFIED ids)
     model_preferences: dict[str, list[str]] = {}                     # tier -> ordered candidate ids (FreeLLMAPI only); "auto" allowed last
     rpm_limit: int | None = None                                     # client-side token bucket; None = unlimited
-    timeout_s: float = 60.0
+    timeout_s: float = 60.0                                          # paid providers set ≥ 300 in argus_engines.json (R7)
+    timeout_retry_max: int = 1                                       # a timed-out request is retried at most once
+    retry_after_cap_s: float = 30.0                                  # Retry-After is honoured up to this bound
     notes: str = ""                                                  # caveats shown in /engines and the console
 
     @model_validator(mode="after")
@@ -54,11 +57,20 @@ class ProviderSpec(BaseModel):
 
 class EngineSpec(BaseModel):
     provider: str
-    model: str | None = None                                         # concrete id, or None → see model_from_preferences
+    model: str | None = None                                         # concrete id, or None → see model_from_preferences (not both: validator)
     model_from_preferences: str | None = None                        # tier name resolved against provider.model_preferences + live list
     temperature: float | None = None
     max_tokens: int | None = None
     json_mode: bool | None = None                                    # None → role default (JSON_ROLES and provider.supports_json_mode)
+    extra_body: dict = {}                                            # per-model/per-role request fields (thinking/reasoning controls), merged over the provider's
+    supports_temperature: bool | None = None                         # None → provider value
+
+    @model_validator(mode="after")
+    def _one_model_source(self) -> EngineSpec:
+        if self.model is not None and self.model_from_preferences is not None:
+            raise ValueError(f"provider {self.provider}: set model or model_from_preferences, not both "
+                             f"(got {self.model!r} and {self.model_from_preferences!r})")
+        return self
 
 
 class RoleBinding(BaseModel):
@@ -77,8 +89,15 @@ def _check_roles(roles: dict[str, RoleBinding]) -> None:
 class Profile(BaseModel):
     name: str
     description: str = ""
-    tiers: dict[Tier, EngineSpec]
+    tiers: dict[Tier, EngineSpec]                                    # keys can only be tiers; the validator requires all three
     roles: dict[str, RoleBinding] = {}                               # overrides by role id
+
+    @model_validator(mode="after")
+    def _all_tiers(self) -> Profile:
+        missing = [t for t in get_args(Tier) if t not in self.tiers]
+        if missing:
+            raise ValueError(f"profile {self.name}: tiers must hold exactly {get_args(Tier)} (missing {missing})")
+        return self
 
     @model_validator(mode="after")
     def _roles_valid(self) -> Profile:
@@ -96,11 +115,11 @@ class ProfileOverrides(BaseModel):                                   # persisted
         return self
 
 
-class TranscriberConfig(BaseModel):                                  # WP-F fills; schema fixed here; persisted under library key engines.transcriber
+class TranscriberConfig(BaseModel):                                  # data lives in argus_engines.json (WP-F); persisted under library key engines.transcriber
     youtube: list[Literal["captions", "asr"]] = ["captions", "asr"]  # ordered; the documented captions→ASR fallback, recorded in TranscriptResult.backend
     asr_engine: Literal["faster_whisper", "openai_audio"] = "faster_whisper"
-    faster_whisper: dict = {"model": "small", "device": "cpu", "compute_type": "int8"}
-    openai_audio: dict = {"provider": "groq", "model": "whisper-large-v3-turbo", "chunk_seconds": 600, "language": None}
+    faster_whisper: dict = {}                                        # {"model","device","compute_type"} from the JSON block
+    openai_audio: dict = {}                                          # {"provider","model","chunk_seconds","language"} from the JSON block
 
 
 def _engine_specs(label: str, tiers: dict, roles: dict[str, RoleBinding]) -> Iterator[tuple[str, EngineSpec]]:
@@ -111,6 +130,16 @@ def _engine_specs(label: str, tiers: dict, roles: dict[str, RoleBinding]) -> Ite
             yield f"{label} role {role}", spec
 
 
+class ExaPrices(BaseModel):
+    price_per_search_usd: float
+    price_per_page_usd: float
+    prices_as_of: str
+
+
+class PricingConfig(BaseModel):                                      # dated data, lives in argus_engines.json
+    exa: ExaPrices | None = None                                     # None → estimates show "n/a"
+
+
 class EnginesConfig(BaseModel):
     version: int = 1
     providers: dict[str, ProviderSpec]
@@ -118,6 +147,7 @@ class EnginesConfig(BaseModel):
     active_profile: str
     overrides: dict[str, ProfileOverrides] = {}                      # merged from library settings `engines.overrides` at load
     transcriber: TranscriberConfig = TranscriberConfig()
+    pricing: PricingConfig = PricingConfig()
 
     @model_validator(mode="after")
     def _references_resolve(self) -> EnginesConfig:

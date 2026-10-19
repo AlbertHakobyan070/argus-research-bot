@@ -9,11 +9,11 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError, model_validator
 
-from ..engines.schema import EnginesSnapshot
+from ..engines.schema import EnginesSnapshot, ExaPrices
 from .state import Length
 
 Depth = Literal["quick", "standard", "deep", "exhaustive"]
@@ -26,9 +26,6 @@ class ExaConfig(BaseModel):
     num_results: int = 8
     text_max_chars: int = 12000
     text_max_chars_paper: int = 20000
-    price_per_search_usd: float = 0.007         # Exa list prices; display only, never hardcoded in code
-    price_per_page_usd: float = 0.001
-    prices_as_of: str = "2026-10-18"
 
 
 class ArxivConfig(BaseModel):
@@ -43,13 +40,13 @@ class SearchConfig(BaseModel):
     arxiv: ArxivConfig
     github_mode: Literal["exa_domain", "repo_search", "off"] = "exa_domain"
     ddgs_max_results: int = 10
-    source_mix_min: dict[Literal["paper", "repo", "web"], int] = {}
 
 
 class FetchConfig(BaseModel):
     chain: list[Literal["exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth"]] = [
         "exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth"]
     max_chars_on_disk: int = 60000
+    max_bytes: int = 25_000_000                 # download cap; PDFs are often > 5 MB
     timeout_s: int = 30
     concurrency: int = 4
 
@@ -83,7 +80,8 @@ class PanelConfig(BaseModel):
     enabled: bool = True
     grounding: bool = True
     coverage: bool = True
-    precision_mode: Literal["deterministic", "llm", "off"] = "deterministic"
+    precision_mode: Literal["deterministic", "off"] = "deterministic"
+    judge_batch_size: int = 10
     max_compose_revisions: int = 1
     coverage_to_research: bool = True
     diversity_rerun: bool = True
@@ -142,9 +140,22 @@ PRESETS: dict[Depth, dict] = {
 _DEFAULT_DEPTH: dict[str, Depth] = {"tldr": "quick", "short": "quick", "medium": "standard",
                                     "long": "deep", "lecture": "deep"}
 _KNOB_GROUPS = ("research", "search", "fetch", "compose", "panel")
-_OVERRIDABLE = (*_KNOB_GROUPS, "recency", "archetype_override")    # roots a dotted override may address
-_POOL_KNOBS = ("research.digest_concurrency", "fetch.concurrency", "compose.concurrency")
-_RATIO_KNOBS = ("research.quote_verify_fuzzy", "panel.rewrite_flag_ratio")
+_OVERRIDABLE = (*_KNOB_GROUPS, "recency")                          # roots a dotted override may address
+# The bounds written inline in spec §2.4, as (floor, ceiling). Every other
+# numeric knob only has the floor 0.
+_BOUNDS: dict[str, tuple[float, float]] = {
+    "search.exa.max_searches": (0, 60), "search.exa.max_contents_pages": (0, 200),
+    "search.exa.num_results": (1, 20), "search.arxiv.max_queries_per_run": (0, 6),
+    "fetch.concurrency": (1, 8),
+    "research.waves": (1, 6), "research.fetch_per_wave": (1, 30), "research.total_fetch_cap": (0, 150),
+    "research.gap_fetch_per_wave": (0, 20), "research.per_subq_target": (1, 8),
+    "research.coverage_min_strong": (0, 5), "research.gap_waves_max": (0, 3),
+    "research.digest_chunks_long_doc": (1, 6), "research.digest_concurrency": (1, 8),
+    "research.writer_min_relevance": (0, 5), "research.quote_verify_fuzzy": (0, 1),
+    "compose.concurrency": (1, 6), "compose.section_min_notes": (1, 5),
+    "panel.judge_batch_size": (4, 20), "panel.max_compose_revisions": (0, 3),
+    "panel.rewrite_flag_ratio": (0, 1),
+}
 
 
 def _leaves(data: dict, prefix: str = "") -> Iterator[tuple[str, object]]:
@@ -162,30 +173,29 @@ class RunConfig(BaseModel):
     depth: Depth
     preset_origin: str                                         # preset name the values came from
     recency: Literal["d", "w", "m", "y"] | None = None         # None → brief's time-sensitivity hint decides
-    archetype_override: str | None = None
     research: ResearchConfig
     search: SearchConfig
     fetch: FetchConfig
     compose: ComposeConfig
     panel: PanelConfig
     engines: EnginesSnapshot
+    overrides_applied: dict[str, Any] = {}                     # the dotted overrides from_preset applied (console / bench)
     created_at: str
     origin: Literal["telegram", "webapp", "bench", "live_check", "demo", "legacy"] = "telegram"
     legacy: bool = False
 
     @model_validator(mode="after")
     def _bounds(self) -> RunConfig:
-        """No negative knob; worker pools >= 1; ratios <= 1; the gap reserve fits the caps that include it."""
-        knobs = dict(_leaves(self.model_dump(include=set(_KNOB_GROUPS))))
-        for key, value in knobs.items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
-                raise ValueError(f"{key} must be >= 0 (got {value})")
-        for key in _POOL_KNOBS:
-            if knobs[key] < 1:
-                raise ValueError(f"{key} must be >= 1 (got {knobs[key]})")
-        for key in _RATIO_KNOBS:
-            if knobs[key] > 1:
-                raise ValueError(f"{key} must be <= 1 (got {knobs[key]})")
+        """Every numeric knob within its §2.4 bounds (floor 0 where the spec gives
+        none); the gap reserve fits the caps that include it."""
+        for key, value in _leaves(self.model_dump(include=set(_KNOB_GROUPS))):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            floor, ceiling = _BOUNDS.get(key, (0, None))
+            if value < floor:
+                raise ValueError(f"{key} must be >= {floor} (got {value})")
+            if ceiling is not None and value > ceiling:
+                raise ValueError(f"{key} must be <= {ceiling} (got {value})")
         if self.first_pass_fetch_cap() < 0:
             raise ValueError(f"research.total_fetch_cap ({self.research.total_fetch_cap}) must include the gap "
                              f"reserve gap_waves_max × gap_fetch_per_wave ({self.gap_reserve()})")
@@ -203,12 +213,14 @@ class RunConfig(BaseModel):
 
     @classmethod
     def from_preset(cls, *, length: str, depth: str | None = None, engines: EnginesSnapshot,
-                    overrides: dict = {}, origin: str) -> RunConfig:
+                    overrides: Mapping[str, Any] | None = None, origin: str) -> RunConfig:
         """Preset for ``depth`` (default: ``default_depth(length)``), then dotted-key
-        overrides such as ``{"research.waves": 2}``; unknown keys raise ValueError."""
+        overrides such as ``{"research.waves": 2}``, recorded in ``overrides_applied``;
+        unknown keys raise ValueError."""
         depth = depth or cls.default_depth(length)
         if depth not in PRESETS:
             raise ValueError(f"unknown depth {depth!r}")
+        overrides = copy.deepcopy(dict(overrides or {}))
         preset = copy.deepcopy(PRESETS[depth])
         if depth == "quick" and length == "tldr":   # table: compose.analyst "on unless length=tldr"
             preset["compose"]["analyst"] = False
@@ -224,7 +236,23 @@ class RunConfig(BaseModel):
             for part in path:
                 node = node[part]
             node[leaf] = value
+        data["overrides_applied"] = overrides
         return cls.model_validate(data)
+
+    @classmethod
+    def for_legacy_checkpoint(cls, *, engines: EnginesSnapshot, length: str) -> RunConfig:
+        """Pre-v4 checkpoints: the preset of ``default_depth(length)`` for the
+        checkpoint's own length, marked ``legacy=True``, ``origin="legacy"``."""
+        rc = cls.from_preset(length=length, engines=engines, origin="legacy")
+        return rc.model_copy(update={"legacy": True})
+
+    def rebuild(self, *, length: str, depth: str | None = None, engines: EnginesSnapshot) -> RunConfig:
+        """Plan-gate changes: ``from_preset`` for the new length/depth/engines,
+        re-applying ``overrides_applied`` so console overrides are never silently
+        dropped; ``origin`` and ``legacy`` carry over."""
+        rc = self.from_preset(length=length, depth=depth, engines=engines,
+                              overrides=self.overrides_applied, origin=self.origin)
+        return rc.model_copy(update={"legacy": self.legacy})
 
     def gap_reserve(self) -> int:
         return self.research.gap_waves_max * self.research.gap_fetch_per_wave
@@ -235,45 +263,47 @@ class RunConfig(BaseModel):
     def exa_search_reserve(self) -> int:
         return self.research.gap_waves_max * 2
 
-    def exa_cost_estimate_usd(self) -> float:
-        """Upper-bound Exa spend from the configured prices; display it as "≈"."""
+    def exa_cost_estimate_usd(self, prices: ExaPrices | None) -> float | None:
+        """Upper-bound Exa spend at ``prices`` (``EnginesConfig.pricing.exa``); display
+        it as "≈". No prices configured → None, shown as "n/a"."""
+        if prices is None:
+            return None
         exa = self.search.exa
-        return (exa.max_searches * exa.price_per_search_usd
-                + (exa.max_searches * exa.num_results + exa.max_contents_pages) * exa.price_per_page_usd)
-
-
-def _legacy(cls, *, engines: EnginesSnapshot) -> RunConfig:
-    """Pre-v4 checkpoints: standard preset, legacy=True, origin="legacy".
-    length="medium" is the length whose default depth is standard."""
-    rc = cls.from_preset(length="medium", depth="standard", engines=engines, origin="legacy")
-    return rc.model_copy(update={"legacy": True})
-
-
-# Spec §2.4 names both a field and this constructor ``legacy``. Pydantic would
-# take a classmethod defined in the class body as the field's default, so it is
-# attached after the class is built; instances still read the bool field.
-# A subclass would inherit the method as its default — do not subclass RunConfig.
-RunConfig.legacy = classmethod(_legacy)
+        return (exa.max_searches * prices.price_per_search_usd
+                + (exa.max_searches * exa.num_results + exa.max_contents_pages) * prices.price_per_page_usd)
 
 
 def require(state: Mapping) -> RunConfig:
-    """The run's RunConfig; a missing or invalid ``run_config`` raises ValueError."""
+    """The run's RunConfig. A missing or invalid ``run_config``, or one whose
+    ``length`` differs from a set ``state["length"]``, raises ValueError."""
     raw = state.get("run_config")
     if raw is None:
         raise ValueError("state['run_config'] missing — every entry point must set it")
     try:
-        return RunConfig.model_validate(raw)
+        rc = RunConfig.model_validate(raw)
     except ValidationError as e:
         raise ValueError(f"state['run_config'] invalid — {e}") from e
+    length = state.get("length")
+    if length is not None and length != rc.length:
+        raise ValueError(f"state['run_config'] has length {rc.length!r} but state['length'] is {length!r}")
+    return rc
 
 
 async def ensure_in_checkpoint(graph, cfg: dict, *, engines: EnginesSnapshot) -> RunConfig:
-    """Resume paths: inject ``RunConfig.legacy()`` (visibly, via ``errors``) into a
-    pre-v4 checkpoint that has no ``run_config``; return the thread's config."""
+    """Resume paths: the thread's RunConfig. A pre-v4 checkpoint (no ``run_config``)
+    gets ``for_legacy_checkpoint`` for its own length, recorded in ``errors``. A thread
+    with no checkpoint, or a checkpoint without ``length``, raises ValueError and
+    nothing is written."""
     snap = await graph.aget_state(cfg)
+    thread_id = cfg["configurable"]["thread_id"]
+    if snap.created_at is None:
+        raise ValueError(f"no checkpoint for thread {thread_id!r}")
     if snap.values.get("run_config") is not None:
         return require(snap.values)
-    rc = RunConfig.legacy(engines=engines)
+    length = snap.values.get("length")
+    if length is None:
+        raise ValueError(f"checkpoint for thread {thread_id!r} has no length — cannot build its legacy run_config")
+    rc = RunConfig.for_legacy_checkpoint(engines=engines, length=length)
     await graph.aupdate_state(cfg, {"run_config": rc.model_dump(),
                                     "errors": ["legacy: run_config defaults applied (pre-v4 checkpoint)"]})
     return rc

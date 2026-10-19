@@ -1,76 +1,113 @@
 # WP-0 — Prep
 
-## WP-0a — contracts, dependencies, test fixtures (Task 1)
+## WP-0a — contracts, dependencies, test fixtures (Task 1 and its fix round)
 
-Spec: `docs/argus-v4-design.md` §3 WP-0 items 1, 2, 4, 6; contracts §2.1, §2.2, §2.4 and the `assemble` signatures of §2.8.
+Spec: `docs/argus-v4-design.md` §3 WP-0 Task 1; contracts §2.1, §2.2, §2.4 and the `assemble_draft` bullet of §2.8. The first commit built the contracts. The fix round, in its own commit, applied spec §2.0 (F1–F20) exactly, together with the Task 1 review findings. The §2 contracts are frozen after the fix round; changing them needs the orchestrator.
 
 ### What changed
 
-- `pyproject.toml`: added `aiohttp>=3.14,<4`, `trafilatura>=2.3,<3`, `pypdf>=6,<7` to `dependencies`; nothing removed.
+- `pyproject.toml`:
+  - First commit: `aiohttp>=3.14,<4`, `trafilatura>=2.3,<3` and `pypdf>=6,<7` added to `dependencies`; nothing removed.
+  - Fix round: `langgraph>=1.2.8,<2` (was `>=1.2,<2`), for the APIs WP-A uses (`RunControl`, `GraphDrained`, `durability`, `runtime` injection), and `openai>=2.44,<3`, which the WP-A driver imports directly. The venv already had both inside these pins, so nothing was installed.
 - `.gitignore`: `tools/bin/`, `argus_engines.local.json`, `bench/results/`, `docs/v4-notes/.scratch/`.
-- New contract modules. They have no behaviour, and no node or bot code calls them yet:
-  - `src/argus/engines/roles.py`: the §2.1 tables verbatim, plus a `Tier` alias (`Literal["cheap","strong","judge"]`) shared with the schema.
-  - `src/argus/engines/schema.py`: the §2.2 models verbatim, with these validators:
+- Contract modules. They have no behaviour, and no node or bot code calls them yet:
+  - `src/argus/engines/roles.py`: the §2.1 tables verbatim, including `ALL_SKIPPED_RAISES`, plus a `Tier` alias (`Literal["cheap","strong","judge"]`) shared with the schema.
+  - `src/argus/engines/schema.py`: the §2.2 models verbatim, including `ExaPrices` and `PricingConfig`, with these validators:
     - `active_profile ∈ profiles`; `overrides` keys ⊆ `profiles`.
     - Every `EngineSpec.provider ∈ providers`: profile tiers, role primaries and fallbacks, override tiers and roles.
+    - `EngineSpec` sets at most one of `model` and `model_from_preferences`. Setting neither is allowed: the model is chosen later.
+    - `Profile.tiers` holds every tier. Its keys can only be tiers, so it holds exactly the tier set. Override tiers stay partial.
     - Profile and override `roles` keys ⊆ `ROLES`. An unknown role raises `ValueError`.
     - `on_exhausted` policy: `skip_item` only for skippable roles, `degrade` only for degradable roles, must-raise roles only `raise`.
     - `model_preferences` keys ⊆ tiers.
     - `ResolvedBinding`: the role is in `ROLES ∪ LEGACY_ROLES` and the policy fits it. `EnginesSnapshot`: each key equals its binding's role.
   - `src/argus/graph/run_config.py`: the §2.4 models verbatim, plus:
     - `PRESETS`, copied from the table.
-    - `RunConfig.default_depth`, `from_preset` (dotted-key overrides) and `legacy`.
-    - The budget helpers `gap_reserve`, `first_pass_fetch_cap` and `exa_search_reserve`.
-    - `exa_cost_estimate_usd`, which reads the prices from the `ExaConfig` fields.
+    - `RunConfig.default_depth`, `from_preset` (dotted-key overrides, recorded in `overrides_applied`), `for_legacy_checkpoint` and `rebuild`.
+    - The bounds validator, and the budget helpers `gap_reserve`, `first_pass_fetch_cap` and `exa_search_reserve`.
+    - `exa_cost_estimate_usd(prices)`, which takes the prices from `EnginesConfig.pricing.exa` and returns `None` when there are none.
     - `require(state)` and `ensure_in_checkpoint(graph, cfg, *, engines)`.
   - `src/argus/graph/assemble.py`: `strip_fences`, `strip_duplicate_heading` (with its private `_normalize_heading_text`), `CITE_RE` and `build_sources_block`, moved verbatim from `compose.py`. Also new:
-    - `assemble_draft(*, tldr, sections, analysis_md, fetched, flat)`, which renders TL;DR, then sections (flat: `## Findings` + body), then `## Analysis`, then `## Sources`.
+    - `assemble_draft(*, tldr, sections, analysis_md, appendices=None, fetched, flat, tldr_heading="TL;DR")`. It renders the TL;DR under `## <tldr_heading>`, then the sections (flat: `## Findings` + body), `## Analysis`, the appendices, and `## Sources`, which lists the ids cited anywhere above it, appendices included.
     - `normalize_cite_markers`, which returns its input unchanged until WP-C.
-- `src/argus/graph/compose.py`:
-  - The moved definitions are deleted and imported from `assemble`. The four call sites now use the public names.
+- `src/argus/graph/compose.py` (first commit):
+  - The moved definitions are deleted and imported from `assemble`. Its call sites use the public names.
   - The unused `import re` is dropped, and `build_sources_block` leaves `__all__`, so there is no re-export.
   - `compose_node` still assembles inline; WP-C switches it to `assemble_draft`.
-- `tests/conftest.py` (new): plain helper functions, not pytest fixtures. Import them with `from conftest import make_run_config, fake_engines_snapshot`.
-  - `fake_engines_snapshot()` binds every `ROLES` id and the three `legacy.*` ids to provider `"fake"`, with the shipped §2.2 failure policy.
+- `tests/helpers.py`: plain helper functions, not pytest fixtures. Import them with `from helpers import make_run_config, fake_engines_snapshot`, never from `conftest`. The first commit had them in `tests/conftest.py`; the fix round moved them and deleted that file.
+  - `fake_engines_snapshot()` binds every `ROLES` id and the `legacy.*` ids to provider `"fake"`, with the shipped §2.2 failure policy.
   - `make_run_config(length="short", depth=None, **overrides) -> dict` builds from the presets. Overrides use dotted keys, e.g. `**{"research.waves": 1}`.
 
-### Dependencies (resolved by `uv pip install -e ".[dev,asr]"`, 2026-10-19)
+### Fix round (spec §2.0)
 
-- `aiohttp` 3.14.5, `trafilatura` 2.3.1, `pypdf` 6.21.1, plus their transitive dependencies.
-- The install also satisfied extras that `pyproject.toml` already declared but the venv lacked: `python-telegram-bot[ext]` → APScheduler and tornado, with `cachetools` raised to the 7.x range that PTB pins.
+- Roles (F2–F5):
+  - `compose.tldr` and `panel.precision` are gone from every table, because v4 has no LLM TL;DR and no LLM precision scan.
+  - `research.extend_querygen` is new: cheap tier, JSON role, degrades to `skip_extend_wave`.
+  - `research.rerank` degrades to `keyword_triage` instead of skipping.
+  - `ALL_SKIPPED_RAISES` names the per-item roles whose node raises when every item was skipped (§2.3).
+- Schema (F6–F10):
+  - `ProviderSpec` gains `token_param`, `timeout_retry_max` and `retry_after_cap_s`.
+  - `EngineSpec` gains `extra_body`, `supports_temperature` and the at-most-one-model validator.
+  - `Profile` gains the every-tier validator.
+  - `TranscriberConfig.faster_whisper` and `openai_audio` default to `{}`; their data moves to `argus_engines.json` with WP-F.
+  - `ExaPrices`, `PricingConfig` and `EnginesConfig.pricing` are new.
+- RunConfig (F11–F17):
+  - The Exa price fields leave `ExaConfig`; prices now come from `EnginesConfig.pricing`.
+  - `search.source_mix_min` and `archetype_override` are deleted, also as override roots.
+  - New knobs: `fetch.max_bytes` and `panel.judge_batch_size`. `precision_mode` loses `"llm"`.
+  - The §2.4 floors and ceilings are enforced.
+  - New: `overrides_applied` and `rebuild`.
+  - `for_legacy_checkpoint` replaces the first commit's `legacy` classmethod, which was attached after the class was built. The `legacy` bool field stays.
+  - `require` checks the length.
+- `assemble_draft` (F18): `appendices` and `tldr_heading`.
+- Helpers (F19): `tests/conftest.py` became `tests/helpers.py`.
+- Review findings in the same commit:
+  - `ensure_in_checkpoint` refuses a thread that has no checkpoint (Important 1).
+  - The flat-path warning, in `assemble.py` and in decision 6 below (Minor 1).
+  - This note no longer hardcodes counts or resolved versions (Minor 4), and the stale remark about the plan's Task 5 wording is gone (Minor 5).
+  - The first `common.py` sub-heading in WP-0c is reworded.
+
+### Dependencies (resolved by `uv pip install -e ".[dev,asr]"` in the first commit, 2026-10-19)
+
+- `aiohttp`, `trafilatura` and `pypdf`, plus their transitive dependencies, at the versions `uv` resolved inside the pins.
+- The install also satisfied extras that `pyproject.toml` already declared but the venv lacked: `python-telegram-bot[ext]` → APScheduler and tornado, with `cachetools` raised into the range that PTB pins.
 - It also bumped `charset-normalizer`, `lxml` and `urllib3`.
 - `uv pip check` reports every installed package compatible.
 - `src/` uses neither `job_queue` nor webhooks.
 
-### Contract decisions where the spec is silent or self-conflicting
+### Contract decisions where the spec is silent
 
-1. **`RunConfig.legacy`: one name for both a field and a classmethod (§2.4).**
-   - Pydantic treats a classmethod defined in the class body as the field's default. That breaks the model: instances get the bound method instead of `False`.
-   - So the constructor is attached after the class is built (`RunConfig.legacy = classmethod(_legacy)`). `RunConfig.legacy(engines=…)` constructs, and `rc.legacy` reads the bool field.
-   - A subclass would inherit the method as its field default, so do not subclass `RunConfig`.
-2. **The length of `legacy()` is `"medium"`.** The signature takes no length, and medium is the length whose default depth is the standard preset. A resumed pre-v4 checkpoint keeps its own `state["length"]`, which stays authoritative.
-3. **"Bounds" (item 6).**
-   - Every numeric knob is ≥ 0. The three worker pools (`research.digest_concurrency`, `fetch.concurrency`, `compose.concurrency`) are ≥ 1.
-   - `research.quote_verify_fuzzy` and `panel.rewrite_flag_ratio` are ≤ 1.
+1. **Bounds.**
+   - The floors and ceilings written inline in §2.4 live in one table in `run_config.py`, enforced by the `RunConfig` bounds validator. So `from_preset` with an out-of-bounds override raises a pydantic `ValidationError` (a `ValueError`) that names the dotted key and the bound.
+   - Every other numeric knob has the floor 0.
    - `total_fetch_cap ≥ gap_waves_max × gap_fetch_per_wave` and `exa.max_searches ≥ gap_waves_max × 2`, because the caps include the reserve.
-   - Violations raise `ValueError`, naming the dotted key.
-4. **Overrides.**
-   - Keys are dotted leaf paths under `research`, `search`, `fetch`, `compose` and `panel`, or the top-level `recency` and `archetype_override`.
-   - Dict knobs such as `search.source_mix_min` are set as a whole.
-   - Any other key raises `ValueError`. That includes `length`, `depth`, `engines.*` and `legacy`, since the first two have their own parameters.
-5. **`require`.** A missing key raises the spec message verbatim. A present but invalid value raises `ValueError("state['run_config'] invalid — …")`, chained to the pydantic error.
-6. **`compose.analyst` "on unless length=tldr".** This applies to the quick preset only, as in the table. WP-I's `analyst_node` also no-ops for `tldr`.
-7. **TL;DR heading.**
-   - `assemble_draft` always renders `## TL;DR`. Today's sectioned compose uses `## Executive TL;DR` for `lecture`.
-   - The frozen signature has no length, so that variant cannot be expressed. This matters only once WP-C moves `compose_node` onto `assemble_draft`.
-8. **Legacy error string.**
-   - `ensure_in_checkpoint` records `"legacy: run_config defaults applied (pre-v4 checkpoint)"`, as in spec §2.4.
-   - The plan's Task 5 text words it `"run_config: legacy defaults applied (pre-v4 checkpoint)"`. The spec wins, and the `legacy:` prefix is what WP-C's degradation notes read.
-   - `run_config` is not an `ArgusState` key until WP-D adds it, so the test drives `ensure_in_checkpoint` on a small `MemorySaver` graph that declares it.
+2. **Overrides.**
+   - Keys are dotted leaf paths under `research`, `search`, `fetch`, `compose` and `panel`, or the top-level `recency`.
+   - Any other key raises `ValueError`. That includes `length` and `depth` (they have their own parameters), `engines.*`, `legacy`, `overrides_applied` and the deleted fields.
+   - `from_preset` records the overrides as given, deep-copied, in `overrides_applied`.
+   - `rebuild` calls `from_preset` with the new length, depth and engines and `overrides=overrides_applied`. It keeps `origin` and `legacy`, and gets a new `created_at`.
+   - A recorded override that does not fit the new preset raises: for example, a `total_fetch_cap` below a deeper preset's gap reserve.
+3. **`require`.**
+   - A missing key raises the spec message verbatim.
+   - A present but invalid value raises `ValueError("state['run_config'] invalid — …")`, chained to the pydantic error.
+   - A `run_config` whose `length` differs from a set (non-`None`) `state["length"]` raises, naming both lengths.
+4. **`ensure_in_checkpoint`.**
+   - A thread with no checkpoint (`created_at is None`) raises `ValueError("no checkpoint for thread …")`. Before the fix round, a `thread_id` that never ran got a checkpoint holding the legacy config, with `next` at the graph's first node.
+   - A present `run_config` is returned through `require`, and nothing is written.
+   - Otherwise the checkpoint's own `length` picks the legacy preset. A checkpoint without `length` raises `ValueError` naming the thread. Neither refusal writes anything.
+   - The recorded line is the spec's `"legacy: run_config defaults applied (pre-v4 checkpoint)"`. WP-C's degradation notes read its `legacy:` prefix.
+   - `run_config` is not an `ArgusState` key until WP-D adds it, so the tests drive `ensure_in_checkpoint` on a small `MemorySaver` graph that declares it. LangGraph's `aupdate_state` silently drops an undeclared key, so WP-D must add the key in the same change that wires `ensure_in_checkpoint`.
+5. **`compose.analyst` "on unless length=tldr".** This applies to the quick preset only, as in the table. WP-I's `analyst_node` also no-ops for `tldr`.
+6. **`assemble_draft` and today's compose.**
+   - With `tldr_heading` (lecture passes `"Executive TL;DR"`), it reproduces compose's sectioned assembly.
+   - It does not reproduce compose's flat path, which serves `tldr` and `short` and any brief with one sub-question. `flat=True` adds `## Findings`, while the flat writer emits its own `## TL;DR` and `## Key Findings`.
+   - So the flat path must not move onto `assemble_draft` before WP-C removes the flat writer's own headings. Otherwise those reports get `## Findings` above the model's `## TL;DR` and `## Key Findings`.
+   - Each appendix is a markdown block with its own heading. Blank `tldr`, `analysis_md` and appendices are omitted.
+7. **`exa_cost_estimate_usd` with Exa disabled.** It follows the spec formula, so it still reports a cost when `"exa"` is not in `search.providers_enabled`. Whether to show zero is a display question for WP-E1.
 
 ### Behaviour changes for handoff.md
 
-None. No node or bot behaviour changes in this step. The venv gains the three dependencies above.
+None. No node or bot behaviour changes. The first commit added the dependencies above to the venv; the fix round installed nothing.
 
 ### New env vars
 
@@ -78,14 +115,37 @@ None.
 
 ### Test files touched
 
-- New: `tests/conftest.py`, `tests/test_engines_schema.py`, `tests/test_run_config.py`, `tests/test_assemble.py`.
-- Modified: `tests/test_compose_headings.py`. Its one import line now points at `argus.graph.assemble`. The test bodies are unchanged.
+- First commit:
+  - New: `tests/test_engines_schema.py`, `tests/test_run_config.py`, `tests/test_assemble.py`, and the helpers module (then `tests/conftest.py`).
+  - Modified: `tests/test_compose_headings.py`. Its import of the moved helpers now points at `argus.graph.assemble`; the test bodies are unchanged.
+- Fix round: `tests/conftest.py` renamed to `tests/helpers.py`, with its docstring updated. The new test files above are extended and import from `helpers`.
 
 ### Verification evidence (2026-10-19)
 
+First commit:
 - **Assembly capture.** `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\capture_assembly.py` drives the real `compose_node` sectioned path at 012a756 with only the writer, TL;DR and extraction LLM calls stubbed. It ran before anything moved. The expected strings in `tests/test_assemble.py` were then checked programmatically against the capture's output, with and without a TL;DR, and matched.
 - **RED.** The focused run failed at collection with `ModuleNotFoundError: No module named 'argus.engines'`.
-- **GREEN.** The focused run (the three new files plus `test_compose_headings.py`) passed. The full suite is green, with only the new tests added on top of the baseline.
+- **GREEN.** The focused run (the new test files plus `test_compose_headings.py`) passed. The full suite is green, with only the new tests added on top of the baseline.
+
+Fix round (scripts and logs in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t1fix\`):
+- **RED-1**, with only the tests changed (`red1.log`, `red1_assemble.log`):
+  - The test files that import the helpers fail at collection on the new contract names (`ALL_SKIPPED_RAISES`, `ExaPrices`).
+  - The new `assemble_draft` tests fail with `TypeError` on `tldr_heading` and `appendices`.
+  - `import helpers` fails.
+- **RED-2**, after adding only the names the tests import and moving the helpers (`red2.log`, `red2_tbline.log`):
+  - Every new behavioural case fails on its own: removed roles still present, validators that do not raise, missing fields and methods, the old `exa_cost_estimate_usd` signature, bounds not enforced, the legacy config built from the standard preset instead of the checkpoint's length, and refusals not raised.
+  - The only bounds cases that pass are the ratio ceilings (`quote_verify_fuzzy`, `rewrite_flag_ratio`) that the first commit already enforced.
+- **GREEN.** The focused run (the test files above plus `test_compose_headings.py`) passed (`green_focused.log`). The full suite is green, including the live-proxy tests (`full_suite.log`).
+- **Spec fidelity** (`spec_fidelity.py`, `spec_fidelity.log`):
+  - It executes the §2.1 and §2.2 blocks and parses the §2.4 knob-class lines.
+  - All of these match: the role tables; the §2.2 model fields (names, order, annotations, defaults); the §2.4 knob and `RunConfig` fields (names, order, defaults) and inline bounds; and the §2.4/§2.8 signatures.
+  - Run against the pre-fix modules (extracted from HEAD with `git archive`), the same script fails in each of those areas (`spec_fidelity_at_HEAD.log`).
+- **Important 1, before and after** (`probe_old_ensure.py`): on a thread that never ran, the pre-fix `ensure_in_checkpoint` wrote a checkpoint with the legacy config and `next` at the graph's first node; the fix round raises and writes nothing.
+- **Static checks.**
+  - The import smoke with `-W error` passes.
+  - The installed `langgraph` and `openai` satisfy the new pins.
+  - There are no unused imports in the touched files.
+  - No `conftest` import or deleted name is left, outside the tests that assert its absence.
 
 ## WP-0b — dead code and hidden fallbacks (Task 2)
 
@@ -250,7 +310,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-0 item 3 and §1.2. A pure move: no behav
 Written before anything moved, and covering every top-level statement of `bot.py`. A symbol is "placed" when item 3 names it or names the feature it belongs to. Anything item 3 does not place goes to `common.py` and is listed as such.
 
 `common.py`:
-- Named in item 3: `HELP_TEXT`, `_LENGTH_LABELS`, `_parse_length`, `_inflight`, `_pending_reply`, `_bot_data_get`, `_get_library`, `_set_run_status`, `_parse_indices`, `_allowed`, `_safe_send`, `_safe_edit_cb`, `_stream_progress`, `_html_escape_for_tg`, `_md_escape`, `_fmt_duration`, `_STATUS_GLYPHS`, `_fmt_bytes`, and the `_TG_*` constants (`_TG_UPLOAD_CAP_BYTES`, `_TG_CONNECT_TIMEOUT_S`, `_TG_READ_TIMEOUT_S`, `_TG_WRITE_TIMEOUT_S`, `_TG_POOL_TIMEOUT_S`, `_TG_MEDIA_WRITE_TIMEOUT_S`).
+- Shared helpers and constants, placed in `common.py`: `HELP_TEXT`, `_LENGTH_LABELS`, `_parse_length`, `_inflight`, `_pending_reply`, `_bot_data_get`, `_get_library`, `_set_run_status`, `_parse_indices`, `_allowed`, `_safe_send`, `_safe_edit_cb`, `_stream_progress`, `_html_escape_for_tg`, `_md_escape`, `_fmt_duration`, `_STATUS_GLYPHS`, `_fmt_bytes`, and the `_TG_*` constants (`_TG_UPLOAD_CAP_BYTES`, `_TG_CONNECT_TIMEOUT_S`, `_TG_READ_TIMEOUT_S`, `_TG_WRITE_TIMEOUT_S`, `_TG_POOL_TIMEOUT_S`, `_TG_MEDIA_WRITE_TIMEOUT_S`).
 - Not placed by item 3, so here by the brief's rule:
   - `_HELP_MD_PATH`: the `/help full` guide path, beside `HELP_TEXT`. Used by `history.help_cmd`.
   - `_chat_entries`: a query over `_inflight`. Used by `history.status_cmd` and `history.cancel_cmd`.
