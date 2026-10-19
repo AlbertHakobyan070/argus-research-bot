@@ -157,6 +157,10 @@ def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot
              temperature: float | None = None, max_tokens: int | None = None,
              json_mode: bool | None = None, expect_json: bool | None = None,
              validate: Callable[[str], Any] | None = None, item: str = "") -> LLMResult:
+    """Whatever a provider answers, this raises only ``EngineError`` (or its
+    subclasses ``EngineSkipped`` / ``EngineDegraded``, by policy), never a
+    provider's own exception; ``ValueError`` only for an unknown or unbound
+    role. (A ``validate`` hook's exception is a failed attempt, not raised.)"""
     if role not in ROLES and role not in LEGACY_ROLES:
         raise ValueError(f"unknown role {role!r}")
     binding = engines.roles.get(role)
@@ -215,6 +219,8 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
         try:
             resp = _driver.complete(engine, provider, msgs, temperature=temperature,
                                     max_tokens=budget, json_mode=json_mode)
+            if not isinstance(resp.text, str):     # any driver: strip_reasoning and validate only see text
+                raise DriverError(f"provider {provider.name}: unexpected content type {type(resp.text).__name__}")
         except (openai.APIError, DriverError, EngineConfigError) as e:
             error = _redact(f"{type(e).__name__}: {e}", provider)
             record(attempt=attempt, ok=False, error=error[:300],

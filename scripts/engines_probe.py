@@ -70,6 +70,11 @@ def pick_model(cfg: EnginesConfig, prov: ProviderSpec, listed: list[str] | None)
     return None
 
 
+def _cell(text: str, width: int) -> str:
+    """One Markdown table cell: no pipe, no newline, bounded width."""
+    return text.replace("|", "/").replace("\n", " ")[:width]
+
+
 def _parses(text: str) -> bool:
     try:
         return isinstance(json.loads(text), dict)
@@ -91,12 +96,14 @@ class Probe:
         return text.replace(self.key, "***") if self.key else text
 
     def row(self, check: str, status: str, resp=None, ms: int | None = None, detail: str = "") -> None:
-        """Every printed detail passes through redact() here, failure texts included."""
+        """Every cell the provider controls (served model, finish reason, the
+        detail with any failure text) passes through redact() here."""
         self.failed |= status == "FAIL"
         tokens = (f"{resp.usage['completion_tokens']}/{resp.usage['reasoning_tokens']}" if resp else "")
-        self.rows.append([self.prov.name, resp.served_model if resp else self.model, check, status,
-                          resp.finish_reason if resp else "", tokens, "" if ms is None else str(ms),
-                          self.redact(detail).replace("|", "/").replace("\n", " ")[:110]])
+        model = self.redact(resp.served_model) if resp else self.model
+        finish = self.redact(resp.finish_reason) if resp else ""
+        self.rows.append([self.prov.name, _cell(model, 60), check, status, _cell(finish, 30), tokens,
+                          "" if ms is None else str(ms), _cell(self.redact(detail), 110)])
 
     def call(self, messages, *, max_tokens: int, json_mode: bool = False, temperature: float | None = None,
              engine: EngineSpec | None = None):

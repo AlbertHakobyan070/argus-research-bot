@@ -50,6 +50,8 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
   - `extra_body` is the provider's, merged with the engine's.
   - `routed_via` comes from the header `x-routed-via`, else the body's `_routed_via`, else `x_groq`.
   - An unusable response raises `DriverError` and is never an empty success. That covers an `error` object in the body (FreeLLMAPI and upstreams send these with HTTP 200), no choices, a body that isn't JSON, and a body the SDK can't parse as a chat completion. `DriverError.code` carries the error object's numeric code.
+  - **Answers are type-checked**, because the SDK builds its models without validating. `choices` must be a non-empty list of choices, and the first must carry a message. `content`, `model` and `finish_reason` must each be a str or None; None becomes "", so an empty answer cut off at `finish_reason="length"` still reaches the truncation retry. `usage` and its token counts must be the SDK's usage models and integers, or absent. Any other shape raises `DriverError` naming it (for example "unexpected content type list"). List content is not joined.
+  - So `llm.complete` raises only `EngineError`, `EngineSkipped` or `EngineDegraded` (by policy), whatever a provider answers, plus `ValueError` for an unknown or unbound role. The facade also refuses a non-str `text` from any driver, so `strip_reasoning` and `validate` only ever see a str. Tasks 7–9 rely on this when call sites catch only these classes.
 - `src/argus/llm.py`, rewritten as the facade:
   - `complete(role, messages, *, engines, temperature, max_tokens, json_mode, expect_json, validate, item) -> LLMResult`, plus `NOT_VALIDATED`, `CallRecord`, `LLMResult` and `strip_reasoning`.
   - The exceptions `EngineError`, `EngineSkipped` and `EngineDegraded` (which carries `degradation`). `EngineConfigError` is re-exported from the registry.
@@ -84,7 +86,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - `scripts/engines_probe.py` (new):
   - Usage: `[--provider NAME | --all] [--model ID]`.
   - For each provider whose key is set, it lists the models and then makes single direct calls through the driver: `plain` at 20 tokens, `json_mode`, `temperature=0.2`, the `cap16` check, and a 200-token JSON call that must return content. It also reports whether `routed_via` was captured.
-  - It prints a Markdown table and suggested flag changes. It never prints keys: every row's text passes through one redaction step, so a key echoed in an error comes out as `***`.
+  - It prints a Markdown table and suggested flag changes. It never prints keys: every cell a provider controls (the served model, the finish reason, and the detail with any failure text) passes through `Probe.redact` in `Probe.row`. A key echoed in an error or in a model name therefore comes out as `***`. None of the other cells can hold provider text: the provider and check names, the status, the latency, and the token counts (the driver accepts integers only).
   - Every driver failure (`openai.APIError`, `DriverError`, `EngineConfigError`) gives that check a FAIL row. The run continues and the table is printed.
   - It exits 1 when a call failed or a check did not hold. `--all` skips keyless local servers; pass them by name. When nothing can be probed (no key set), it says so and exits 1, with no empty table.
 - Shared-file edits:
@@ -158,6 +160,9 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - Fix round 2:
   - `test_engines_registry.py`: the probe over five unusable answers (a 200 error body, one that echoes the key, empty choices, HTML that echoes the key, a 401 that echoes the key), and a file whose stat raises `PermissionError`.
   - `test_engines_cmd.py`: startup with that `PermissionError`.
+- Fix round 3:
+  - `test_llm_facade.py`: every mistyped shape through the real SDK, for each failure policy; a fallback that answers properly; `strip_reasoning` seeing only a str whatever the driver returns; null content cut off at the limit still retried.
+  - `test_engines_registry.py`: the probe over a string `choices` and list content, and a model or finish field that echoes the key on a successful row.
 
 ### Verification evidence (2026-10-19)
 
@@ -248,3 +253,18 @@ The fix round made no live calls. Logs are in `A:\DS_Vault\caches\tmp\claude\A--
 - **GREEN, focused** (`green_fix2.log`): `test_engines_registry.py`, `test_engines_cmd.py`, `test_llm_facade.py` and `test_llm_retry.py` → `91 passed`.
 - **Full suite, proxy URL on a closed port** (`suite_fix2.log`): `2 failed, 653 passed, 1 skipped, 1 warning, 2 errors`. Only the live tests failed, as by design with no proxy: `test_llm.py` ×2 and the `test_graph.py` fixture ×2.
 - **`probe_crash.py` after the fix** (`probe_crash_after.log`): all four shapes give "probe survived", each with a FAIL row first. The echoed key prints as `bad key ***`.
+
+### Fix round 3 — verification evidence (2026-10-19)
+
+The fix round made no live calls. Logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t4fix3\`. The re-review's harness is `scratchpad\t4-rereview3\shapes.py`.
+
+- **RED** (`red_fix3.log`, `red_fix3_reasons.txt`): the round-3 test files run against `02d9580` (extracted with `git archive`) → `45 failed, 61 passed`.
+  - Raw exceptions escaped `complete()`: `AttributeError` (string `choices`, a string choice or message, string `usage`), `KeyError: 0` (dict `choices`), `TypeError` (numeric `choices`; list, dict or numeric content reaching `strip_reasoning`) and `ValueError` (a non-numeric token count).
+  - A numeric model or finish reason was accepted without error.
+  - The probe crashed on string `choices` and list content, and printed the key in the model cell.
+- **GREEN, focused** (`green_fix3.log`): `test_llm_facade.py`, `test_engines_registry.py`, `test_engines_cmd.py` and `test_llm_retry.py` → `137 passed`.
+- **Full suite, proxy URL on a closed port** (`suite_fix3.log`): `2 failed, 699 passed, 1 skipped, 1 warning, 2 errors`. Only the live tests failed, as by design with no proxy: `test_llm.py` ×2 and the `test_graph.py` fixture ×2.
+- **`shapes.py` after the fix** (`shapes_after.txt`):
+  - no shape escapes the probe any more; string `choices` and list content are FAIL rows with the table printed;
+  - "model field echoes key" no longer shows the key;
+  - the only rows with the key in stdout are the harness's own redaction-off controls.

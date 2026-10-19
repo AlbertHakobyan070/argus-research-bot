@@ -469,6 +469,84 @@ def test_error_bodies_everywhere_raise_by_policy_never_an_empty_success(monkeypa
     assert all(not a.ok and "All models exhausted" in a.error for a in ei.value.attempts)
 
 
+# Shapes the SDK lets through unvalidated (re-review round 3): each must be a
+# failed attempt naming the shape, never an AttributeError or a TypeError.
+def _bad(mutate) -> httpx.Response:
+    body = json.loads(json.dumps(BODY))
+    mutate(body)
+    return httpx.Response(200, json=body)
+
+
+TYPE_SHAPES = {
+    "choices-str": (lambda b: b.update(choices="x"), "unexpected choices type str"),
+    "choices-dict": (lambda b: b.update(choices={"a": 1}), "unexpected choices type dict"),
+    "choices-number": (lambda b: b.update(choices=5), "unexpected choices type int"),
+    "choice-str": (lambda b: b.update(choices=["x"]), "unexpected choice type str"),
+    "message-missing": (lambda b: b["choices"][0].pop("message"), "the response has no message"),
+    "message-str": (lambda b: b["choices"][0].update(message="hi"), "unexpected message type str"),
+    "content-list": (lambda b: b["choices"][0]["message"].update(content=["a", "b"]), "unexpected content type list"),
+    "content-dict": (lambda b: b["choices"][0]["message"].update(content={"x": 1}), "unexpected content type dict"),
+    "content-number": (lambda b: b["choices"][0]["message"].update(content=5), "unexpected content type int"),
+    "model-number": (lambda b: b.update(model=5), "unexpected model type int"),
+    "finish-number": (lambda b: b["choices"][0].update(finish_reason=7), "unexpected finish_reason type int"),
+    "usage-str": (lambda b: b.update(usage="x"), "unexpected usage type str"),
+    "tokens-str": (lambda b: b["usage"].update(prompt_tokens="five"), "unexpected prompt_tokens type str"),  # "5" the SDK coerces
+}
+
+
+@pytest.mark.parametrize("shape", list(TYPE_SHAPES))
+@pytest.mark.parametrize("role, exc_type", [("brief.draft", llm.EngineError),
+                                            ("compose.section", llm.EngineSkipped),
+                                            ("outline.plan", llm.EngineDegraded)])
+def test_a_mistyped_answer_fails_the_engine_and_raises_only_by_policy(monkeypatch, sleeps, shape, role, exc_type):
+    mutate, named = TYPE_SHAPES[shape]
+    sent = _hosts(monkeypatch, p1=[_bad(mutate)], p2=[_bad(mutate)])
+    with pytest.raises(llm.EngineError) as ei:             # an AttributeError / TypeError would escape this
+        llm.complete(role, MSGS, engines=_snap(role))
+    assert type(ei.value) is exc_type
+    assert sent == ["p1", "p2"] and sleeps == [], "not transient: each engine once, then on_exhausted"
+    assert all(not a.ok and a.error.startswith("DriverError") and named in a.error for a in ei.value.attempts)
+
+
+def test_a_mistyped_answer_falls_back_to_an_engine_that_answers_properly(monkeypatch, sleeps):
+    seen: list[type] = []
+    real = llm.strip_reasoning
+    monkeypatch.setattr(llm, "strip_reasoning", lambda text: seen.append(type(text)) or real(text))
+    sent = _hosts(monkeypatch, p1=[_bad(TYPE_SHAPES["content-list"][0])], p2=[_ok()])
+    out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft"))
+    assert out.text == "PONG" and out.record.provider == "p2" and sent == ["p1", "p2"]
+    assert "unexpected content type list" in out.records[0].error
+    assert seen == [str], "strip_reasoning saw the fallback's text only"
+
+
+def test_strip_reasoning_only_ever_sees_a_str_whatever_the_driver_returns(monkeypatch):
+    """The facade refuses non-str text from any driver (Driver is a protocol)."""
+    seen: list[type] = []
+    real = llm.strip_reasoning
+    monkeypatch.setattr(llm, "strip_reasoning", lambda text: seen.append(type(text)) or real(text))
+    _drive(monkeypatch, p1=[_resp(["not", "text"])], p2=[_resp("ok")])
+    out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft"))
+    assert out.text == "ok" and seen == [str]
+    assert out.records[0].error == "DriverError: provider p1: unexpected content type list"
+
+
+def test_null_content_cut_off_at_the_limit_still_gets_the_truncation_retry(monkeypatch):
+    def answer(content, finish):
+        return httpx.Response(200, json={**BODY, "choices": [
+            {"index": 0, "finish_reason": finish, "message": {"role": "assistant", "content": content}}]})
+    answers, budgets = [answer(None, "length"), answer('{"mode": "deep"}', "stop")], []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        budgets.append(json.loads(request.content)["max_tokens"])
+        return answers.pop(0)
+    monkeypatch.setattr(llm_openai, "OpenAI", lambda **kw: openai.OpenAI(
+        **kw, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+    monkeypatch.setattr(llm, "_driver", OpenAICompatDriver())
+    out = llm.complete("intake.classify", MSGS, engines=_snap("intake.classify"), max_tokens=100)
+    assert out.text == '{"mode": "deep"}' and budgets == [100, 200]
+    assert out.records[0].error == "truncated (finish_reason=length)"
+
+
 def test_a_key_in_a_provider_error_is_never_recorded_or_logged(monkeypatch, sleeps, caplog):
     caplog.set_level(logging.WARNING, logger="argus.llm")
     monkeypatch.setenv("T_PK_KEY", "sk-leaky-123")

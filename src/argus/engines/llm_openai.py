@@ -9,8 +9,10 @@ provider's. From the raw response it keeps the served model, ``routed_via``
 (header ``x-routed-via``, else body ``_routed_via`` / ``x_groq``), the finish
 reason, token usage including reasoning tokens, and the rate-limit headers.
 A response that is not a usable completion — an error object in the body
-(often with HTTP 200), no choices, or a body that is not a chat completion —
-raises ``DriverError``; the facade treats it as a failed attempt.
+(often with HTTP 200), no choices, a body that is not a chat completion, or
+a field of the wrong type (the SDK builds its models without validating) —
+raises ``DriverError``; the facade treats it as a failed attempt. So every
+``DriverResponse`` field is of its declared type: ``text`` is always a str.
 
 ``Driver`` is the interface a native driver (``ProviderSpec.kind``) would
 implement later."""
@@ -22,7 +24,10 @@ from typing import Any, Protocol
 
 from langchain_core.messages import BaseMessage
 from openai import OpenAI
-from openai.types.chat import ChatCompletion
+from openai.types import CompletionUsage
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.completion_usage import CompletionTokensDetails
 
 from . import registry
 from .registry import EngineConfigError
@@ -51,6 +56,32 @@ def _body_error(provider: ProviderSpec, error: Any, headers: Any) -> DriverError
         code = None
     return DriverError(f"provider {provider.name}: error in the response body: {message}", code=code,
                        headers=headers)
+
+
+def _typed(provider: ProviderSpec, field: str, value: Any, kind: type, empty: Any) -> Any:
+    """A field the provider controls: of ``kind``, or None (→ ``empty``);
+    any other type is a DriverError naming the shape."""
+    if value is None:
+        return empty
+    if not isinstance(value, kind):
+        raise DriverError(f"provider {provider.name}: unexpected {field} type {type(value).__name__}")
+    return value
+
+
+def _choice_message(provider: ProviderSpec, completion: ChatCompletion) -> tuple[Choice, ChatCompletionMessage]:
+    choices = completion.choices
+    if choices is not None and not isinstance(choices, list):
+        raise DriverError(f"provider {provider.name}: unexpected choices type {type(choices).__name__}")
+    if not choices:
+        raise DriverError(f"provider {provider.name}: the response has no choices")
+    choice = choices[0]
+    if not isinstance(choice, Choice):
+        raise DriverError(f"provider {provider.name}: unexpected choice type {type(choice).__name__}")
+    if choice.message is None:
+        raise DriverError(f"provider {provider.name}: the response has no message")
+    if not isinstance(choice.message, ChatCompletionMessage):
+        raise DriverError(f"provider {provider.name}: unexpected message type {type(choice.message).__name__}")
+    return choice, choice.message
 
 
 @dataclass
@@ -137,19 +168,20 @@ class OpenAICompatDriver:
         error = (completion.model_extra or {}).get("error")
         if error:
             raise _body_error(provider, error, raw.headers)
-        choice = completion.choices[0] if completion.choices else None
-        if choice is None or choice.message is None:
-            raise DriverError(f"provider {provider.name}: the response has no choices", headers=raw.headers)
-        usage = completion.usage
-        details = usage.completion_tokens_details if usage else None
+        choice, message = _choice_message(provider, completion)
+        usage = _typed(provider, "usage", completion.usage, CompletionUsage, None)
+        details = _typed(provider, "completion_tokens_details",
+                         usage.completion_tokens_details if usage else None, CompletionTokensDetails, None)
         return DriverResponse(
-            text=choice.message.content or "",
-            served_model=completion.model or "",
+            text=_typed(provider, "content", message.content, str, ""),       # None → "": still a length cut-off
+            served_model=_typed(provider, "model", completion.model, str, ""),
             routed_via=_routed_via(raw.headers, completion.model_extra or {}),
-            finish_reason=choice.finish_reason or "",
-            usage={"prompt_tokens": (usage.prompt_tokens or 0) if usage else 0,
-                   "completion_tokens": (usage.completion_tokens or 0) if usage else 0,
-                   "reasoning_tokens": (details.reasoning_tokens or 0) if details else 0},
+            finish_reason=_typed(provider, "finish_reason", choice.finish_reason, str, ""),
+            usage={"prompt_tokens": _typed(provider, "prompt_tokens", usage.prompt_tokens if usage else None, int, 0),
+                   "completion_tokens": _typed(provider, "completion_tokens",
+                                               usage.completion_tokens if usage else None, int, 0),
+                   "reasoning_tokens": _typed(provider, "reasoning_tokens",
+                                              details.reasoning_tokens if details else None, int, 0)},
             headers={k: v for k, v in raw.headers.items()
                      if k in _KEPT_HEADERS or k.startswith("x-ratelimit-")},
             raw=completion)

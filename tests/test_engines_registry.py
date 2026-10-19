@@ -528,8 +528,13 @@ CHECKS = ["plain", "json_mode", "temperature", "cap16", "json200"]
     lambda: httpx.Response(200, text="<html>bad gateway sk-leaky-123</html>",
                            headers={"content-type": "text/html"}),
     lambda: httpx.Response(401, json={"error": {"message": "invalid api key sk-leaky-123"}}),
+    lambda: httpx.Response(200, json={"id": "x", "object": "chat.completion", "created": 1, "model": "m",
+                                      "choices": "sk-leaky-123"}),
+    lambda: httpx.Response(200, json={"id": "x", "object": "chat.completion", "created": 1, "model": "m",
+                                      "choices": [{"index": 0, "finish_reason": "stop",
+                                                   "message": {"role": "assistant", "content": ["a", "b"]}}]}),
 ], ids=["200-error-body", "200-error-body-echoing-the-key", "empty-choices", "html-echoing-the-key",
-        "401-echoing-the-key"])
+        "401-echoing-the-key", "choices-a-string", "content-a-list"])
 def test_probe_turns_each_unusable_answer_into_a_fail_row_and_never_prints_the_key(
         probe, monkeypatch, tmp_path, capsys, answer):
     """Re-review N1: the real driver and SDK on a mock transport. Every
@@ -552,3 +557,34 @@ def test_probe_turns_each_unusable_answer_into_a_fail_row_and_never_prints_the_k
     assert [rows.get(check) for check in CHECKS] == ["FAIL"] * len(CHECKS), rows
     assert rows["routed_via"] == "info"
     assert "sk-leaky-123" not in out
+
+
+@pytest.mark.parametrize("field, value, cell", [
+    ("model", "m-sk-leaky-123", 1),                 # the served-model cell
+    ("finish_reason", "stop sk-leaky-123", 4),      # the finish cell
+])
+def test_probe_redacts_the_model_and_finish_cells_of_successful_answers(
+        probe, monkeypatch, tmp_path, capsys, field, value, cell):
+    """Re-review round 3: a provider-controlled cell that echoes the key is
+    printed with the key replaced, on rows that succeeded."""
+    body = {"id": "x", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Paris."}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+    if field == "model":
+        body["model"] = value
+    else:
+        body["choices"][0]["finish_reason"] = value
+    engines = tmp_path / "engines.json"
+    engines.write_text(json.dumps(PROBE_CFG), encoding="utf-8")
+    monkeypatch.setenv("ARGUS_ENGINES_FILE", str(engines))
+    monkeypatch.setenv("T_PK_KEY", "sk-leaky-123")
+    monkeypatch.setattr(llm_openai, "OpenAI", lambda **kw: openai.OpenAI(
+        **kw, http_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body)))))
+    monkeypatch.setattr(probe, "_driver", llm_openai.OpenAICompatDriver())
+    monkeypatch.setattr(sys, "argv", ["engines_probe.py", "--provider", "pk"])
+
+    assert probe.main() == 0, "every check succeeded"
+    out = capsys.readouterr().out
+    assert "sk-leaky-123" not in out
+    plain = next(line.split(" | ") for line in out.splitlines() if line.startswith("| pk | ") and " | plain | " in line)
+    assert plain[cell] == value.replace("sk-leaky-123", "***")
