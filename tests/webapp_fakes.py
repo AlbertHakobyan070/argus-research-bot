@@ -13,6 +13,7 @@ Task 12 reuses it to render-check the console locally::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from argus.bot import runs
 from argus.bot.progress import RunEventBus
 from argus.bot.runs import Outcome
 from argus.webapp import api, server
@@ -56,11 +58,14 @@ class FakeHandle:
 
 
 class FakeRuns:
-    """Stands in for ``bot/runs.py``. Every action is recorded in ``calls``
-    as ``(name, kwargs)`` and answered with ``outcomes[name]`` (default: a
-    success code). ``handles`` are the tracked runs, ``snapshots`` and
-    ``plans`` what ``snapshot()`` / ``plan_payload()`` return; ``bus`` is a
-    real ``RunEventBus``."""
+    """Stands in for ``bot/runs.py``. Every call is bound against the real
+    driver function's signature first (``inspect.signature(...).bind``), so
+    a kwarg the driver does not take fails the test as it would fail live.
+    Each action is recorded in ``calls`` as ``(name, the arguments passed)``
+    and answered with ``outcomes[name]`` (default: a success code).
+    ``handles`` are the tracked runs, ``snapshots`` and ``plans`` what
+    ``snapshot()`` / ``plan_payload()`` return; ``bus`` is a real
+    ``RunEventBus``."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -70,35 +75,44 @@ class FakeRuns:
         self.plans: dict[str, dict] = {}
         self.bus = RunEventBus()
 
-    def _act(self, name: str, kwargs: dict, default: Outcome) -> Outcome:
-        self.calls.append((name, kwargs))
+    @staticmethod
+    def _bind(name: str, args: tuple, kwargs: dict) -> dict:
+        return dict(inspect.signature(getattr(runs, name)).bind(*args, **kwargs).arguments)
+
+    def _act(self, name: str, args: tuple, kwargs: dict, default: Outcome) -> Outcome:
+        self.calls.append((name, self._bind(name, args, kwargs)))
         return self.outcomes.get(name, default)
 
-    def tracked(self, chat_id: int | None = None) -> dict:
+    def tracked(self, *args, **kw) -> dict:
+        self._bind("tracked", args, kw)
         return dict(self.handles)
 
-    async def snapshot(self, run_id: str) -> dict | None:
-        return self.snapshots.get(run_id)
+    async def snapshot(self, *args, **kw) -> dict | None:
+        return self.snapshots.get(self._bind("snapshot", args, kw)["run_id"])
 
-    async def plan_payload(self, run_id: str) -> dict | None:
-        return self.plans.get(run_id)
+    async def plan_payload(self, *args, **kw) -> dict | None:
+        return self.plans.get(self._bind("plan_payload", args, kw)["run_id"])
 
-    async def start_run(self, **kw) -> Outcome:
-        return self._act("start_run", kw, Outcome("started", "", "new00001"))
+    async def start_run(self, *args, **kw) -> Outcome:
+        return self._act("start_run", args, kw, Outcome("started", "", "new00001"))
 
-    async def approve_plan(self, run_id: str, **kw) -> Outcome:
-        return self._act("approve_plan", {"run_id": run_id, **kw}, Outcome("started", "", run_id))
+    async def approve_plan(self, *args, **kw) -> Outcome:
+        out = self._act("approve_plan", args, kw, None)
+        return out or Outcome("started", "", self.calls[-1][1]["run_id"])
 
-    async def edit_plan(self, run_id: str, feedback: str, **kw) -> Outcome:
-        return self._act("edit_plan", {"run_id": run_id, "feedback": feedback, **kw}, Outcome("started", "", run_id))
+    async def edit_plan(self, *args, **kw) -> Outcome:
+        out = self._act("edit_plan", args, kw, None)
+        return out or Outcome("started", "", self.calls[-1][1]["run_id"])
 
-    async def report_action(self, run_id: str, action: str, **kw) -> Outcome:
-        default = Outcome("delivered" if action == "send" else "started", "", run_id)
-        return self._act("report_action", {"run_id": run_id, "action": action, **kw}, default)
+    async def report_action(self, *args, **kw) -> Outcome:
+        out = self._act("report_action", args, kw, None)
+        call = self.calls[-1][1]
+        return out or Outcome("delivered" if call["action"] == "send" else "started", "", call["run_id"])
 
-    async def cancel_run(self, run_id: str, **kw) -> Outcome:
-        return self._act("cancel_run", {"run_id": run_id, **kw}, Outcome("cancelled", f"❌ Cancelled run `{run_id}`.",
-                                                                         run_id))
+    async def cancel_run(self, *args, **kw) -> Outcome:
+        out = self._act("cancel_run", args, kw, None)
+        run_id = self.calls[-1][1]["run_id"]
+        return out or Outcome("cancelled", f"❌ Cancelled run `{run_id}`.", run_id)
 
 
 class FakeLibrary:

@@ -2,16 +2,19 @@
 
 cloudflared prints its ``https://<name>.trycloudflare.com`` URL on stderr.
 A tail task copies every stderr line to ``logs/cloudflared.log``, takes the
-first tunnel URL (within ``URL_TIMEOUT_S``) and keeps draining the pipe.
+first tunnel URL (within ``URL_TIMEOUT_S``) and keeps draining the pipe —
+also when the log cannot be written or a line is over the read limit.
 When the process exits (or prints no URL in time) the supervisor reports
 it and starts a new one after an exponential backoff, capped at 5 min and
-reset once a process ran ``STABLE_S``. The hostname changes on every start:
-``on_url`` gets each new one. The binary is never downloaded here.
+reset once a process ran ``STABLE_S``. An error in the supervision itself
+is reported the same way; only ``stop()`` ends it. The hostname changes on
+every start: ``on_url`` gets each new one. The binary is never downloaded.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import re
 import time
@@ -19,6 +22,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ..config import _PROJECT_ROOT as _ROOT
+
+logger = logging.getLogger("argus.webapp")
 
 URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 _API_URL = "https://api.trycloudflare.com"     # cloudflared's own API, quoted in its failure lines
@@ -71,7 +76,9 @@ async def _terminate(proc) -> None:
 class Supervisor:
     """Runs ``cmd`` until ``stop()``. ``on_url(url)`` on each new tunnel URL;
     ``on_down(reason)`` each time a process is gone, before its backoff
-    (the reason ends "; restarting in <s> s"). Neither may raise."""
+    (the reason ends "; restarting in <s> s"). An error in an iteration
+    (``on_url`` raising, say) is logged with its traceback and reported as
+    "supervisor error: <e>", then the normal backoff follows."""
 
     def __init__(self, cmd: list[str], *, on_url: Callable[[str], Awaitable[None]],
                  on_down: Callable[[str], Awaitable[None]], spawn: Callable | None = None,
@@ -84,17 +91,21 @@ class Supervisor:
         self.url_timeout_s = url_timeout_s
         self.proc = None
         self.task: asyncio.Task | None = None
+        self._warned: set[str] = set()                # the log problems already logged, once each
 
     def start(self) -> None:
         self.task = asyncio.create_task(self._run(), name="cloudflared supervisor")
 
     async def stop(self) -> None:
-        """Idempotent: the loop is cancelled and the running process terminated."""
+        """Idempotent: the loop is cancelled and the running process
+        terminated. A loop that already ended with an error is logged here,
+        never re-raised."""
         task, self.task = self.task, None
         if task is not None:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await asyncio.wait({task})
+            if not task.cancelled() and task.exception() is not None:
+                logger.error("tunnel: the supervisor had stopped with an error", exc_info=task.exception())
         if self.proc is not None:
             await _terminate(self.proc)
 
@@ -102,15 +113,23 @@ class Supervisor:
         delay = BACKOFF_START_S
         while True:
             started = self._clock()
-            reason = await self._once()
+            try:
+                reason = await self._once()
+            except Exception as e:                    # CancelledError (stop) is not one: it ends the loop
+                logger.exception("tunnel: supervisor error")
+                reason = f"supervisor error: {e}"
             if self._clock() - started >= STABLE_S:
                 delay = BACKOFF_START_S
-            await self.on_down(f"{reason}; restarting in {delay:g} s")
+            try:
+                await self.on_down(f"{reason}; restarting in {delay:g} s")
+            except Exception:
+                logger.exception("tunnel: on_down failed")
             await (self._sleep or _sleep)(delay)
             delay = min(delay * 2, BACKOFF_MAX_S)
 
     async def _once(self) -> str:
-        """One process, from its start to its exit: why it is gone."""
+        """One process, from its start to its exit: why it is gone. A process
+        whose iteration fails or is cancelled is terminated first."""
         try:
             self.proc = proc = await (self._spawn or spawn)(self.cmd)
         except OSError as e:
@@ -127,6 +146,9 @@ class Supervisor:
                 return f"cloudflared exited with code {exited.result()} before printing its URL"
             await _terminate(proc)
             return f"cloudflared printed no URL within {self.url_timeout_s:g} s"
+        except BaseException:
+            await _terminate(proc)                    # never a process left running unsupervised
+            raise
         finally:
             exited.cancel()
             if proc.returncode is not None:           # gone: the tail reads its last lines to EOF
@@ -136,12 +158,45 @@ class Supervisor:
             with contextlib.suppress(asyncio.CancelledError):
                 await tail
 
+    def _warn_once(self, key: str, msg: str, *args) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.warning(msg, *args)
+
+    def _open_log(self, path: Path):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return path.open("ab")
+        except OSError as e:
+            self._warn_once("open", "tunnel: cannot open %s (%s); the stderr of cloudflared is read but not "
+                                    "logged", path, e)
+            return None
+
     async def _tail(self, stream: asyncio.StreamReader, url: asyncio.Future) -> None:
+        """stderr to EOF whatever happens to the log: the pipe always drains."""
         path = self.log_path or LOG_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("ab") as log:      # ponytail: sync appends of short lines on the loop; to_thread if it shows
-            while line := await stream.readline():
-                log.write(line)
-                log.flush()
+        log = self._open_log(path)        # ponytail: sync appends of short lines on the loop; to_thread if it shows
+        try:
+            while True:
+                try:
+                    line = await stream.readline()
+                except ValueError:            # over the StreamReader limit: dropped, the reading goes on
+                    self._warn_once("long", "tunnel: dropped a cloudflared stderr line over the read limit")
+                    continue
+                if not line:
+                    return
+                if log is not None:
+                    try:
+                        log.write(line)
+                        log.flush()
+                    except OSError as e:
+                        self._warn_once("write", "tunnel: writing %s failed (%s); the stderr of cloudflared is "
+                                                 "no longer logged", path, e)
+                        with contextlib.suppress(OSError):    # its failure is the one just logged
+                            log.close()
+                        log = None
                 if not url.done() and (found := find_url(line.decode("utf-8", "replace"))):
                     url.set_result(found)
+        finally:
+            if log is not None:
+                log.close()

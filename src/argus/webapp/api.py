@@ -18,6 +18,7 @@ import functools
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,8 @@ _AUTH_MESSAGES = {
     "expired": "session expired — reopen from the menu button",
     "wrong_user": "this console belongs to another Telegram user",
 }
+_FIELD_NAME = re.compile(r"[A-Za-z0-9_]{1,32}")
+_MAX_LOGGED_FIELDS = 10
 _dumps = functools.partial(json.dumps, default=str, ensure_ascii=False)
 
 
@@ -85,6 +88,15 @@ def _error(status: int, code: str, message: str) -> web.Response:
 
 def _ok(data: Any) -> web.Response:
     return web.json_response(data, dumps=_dumps)
+
+
+def _field_names(fields: tuple[str, ...]) -> str:
+    """The initData field names for a log line: only plain names (a key is
+    attacker-chosen, so no newline or other text can forge a line), at
+    most ``_MAX_LOGGED_FIELDS``, the rest counted."""
+    plain = [f for f in fields if _FIELD_NAME.fullmatch(f)][:_MAX_LOGGED_FIELDS]
+    other = len(fields) - len(plain)
+    return (", ".join(plain) + (f" +{other} other" if other else "")).strip() or "none"
 
 
 def _bad(message: str) -> ApiError:
@@ -113,7 +125,7 @@ async def errors(request: web.Request, handler) -> web.StreamResponse:
             raise
         return _error(e.status, e.reason.lower().replace(" ", "_"), e.reason)
     except Exception:
-        logger.exception("webapp: %s %s failed", request.method, request.path)
+        logger.exception("webapp: %s %r failed", request.method, request.path)
         return _error(500, "internal", "internal error — see the bot log")
 
 
@@ -132,8 +144,8 @@ async def auth(request: web.Request, handler) -> web.StreamResponse:
             raise AuthError("missing_field")
         user = validate_init_data(init_data, d.bot_token, d.allowed_user_id, d.max_age_s)
     except AuthError as e:
-        logger.warning("webapp: %s %s refused: %s (fields present: %s)", request.method, request.path, e.code,
-                       ", ".join(e.fields) or "none")
+        logger.warning("webapp: %s %r refused: %s (fields present: %s)", request.method, request.path, e.code,
+                       _field_names(e.fields))
         return _error(e.status, e.code, _AUTH_MESSAGES[e.code])
     request[USER] = user
     return await handler(request)
@@ -198,6 +210,13 @@ def _run_json(row: dict, *, in_flight: bool, stage: str | None, awaiting: str | 
             "in_flight": in_flight}
 
 
+def _checked_path(raw: str, root: Path) -> tuple[Path, bool, bool]:
+    """``raw`` resolved (symlinks and ``..`` included), whether it lies in
+    ``root``, whether it is a file (filesystem calls: run in a thread)."""
+    path = Path(raw).resolve()
+    return path, path.is_relative_to(root.resolve()), path.is_file()
+
+
 async def _report_file(d: Deps, run_id: str, key: str) -> Path:
     """The run's registered ``report_paths[key]``, if it lies in reports_root and exists."""
     snap = await d.runs.snapshot(run_id)
@@ -206,11 +225,11 @@ async def _report_file(d: Deps, run_id: str, key: str) -> Path:
     raw = (snap["values"].get("report_paths") or {}).get(key)
     if not raw:
         raise ApiError(404, "not_found", f"run {run_id} has no {key} file yet")
-    path = Path(raw).resolve()
-    if not path.is_relative_to(d.reports_root.resolve()):
-        logger.warning("webapp: run %s: its %s path is outside reports_root; refused", run_id, key)
+    path, inside, exists = await asyncio.to_thread(_checked_path, raw, d.reports_root)
+    if not inside:
+        logger.warning("webapp: run %r: its %s path is outside reports_root; refused", run_id, key)
         raise ApiError(404, "not_found", f"the {key} file of run {run_id} is outside reports_root")
-    if not path.is_file():
+    if not exists:
         raise ApiError(404, "not_found", f"the {key} file of run {run_id} is missing on disk ({path.name})")
     return path
 
@@ -287,7 +306,8 @@ async def report(request: web.Request) -> web.Response:
     await _row(d, run_id)
     path = await _report_file(d, run_id, "md")
     text = await asyncio.to_thread(path.read_text, encoding="utf-8")
-    return web.Response(text=render.render_report(text), content_type="text/html", charset="utf-8")
+    html = await asyncio.to_thread(render.render_report, text)
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
 async def evidence(request: web.Request) -> web.Response:
@@ -314,7 +334,7 @@ async def send(request: web.Request) -> web.Response:
             await _send_md_doc(d.bot, row["chat_id"], path, caption=f"Argus report {run_id} — {path.name}")
             sent.append(path.name)
     except TelegramError as e:
-        logger.warning("webapp: run %s: send to chat failed after %d file(s): %s", run_id, len(sent), e)
+        logger.warning("webapp: run %r: send to chat failed after %d file(s): %s", run_id, len(sent), e)
         raise ApiError(502, "send_failed", f"⚠️ send failed after {len(sent)} file(s): {e}") from None
     return _ok({"outcome": "sent", "message": f"Sent {', '.join(sent)} to the chat.", "sent": sent})
 
@@ -387,10 +407,10 @@ async def get_engines(request: web.Request) -> web.Response:
 
 async def put_engines(request: web.Request) -> web.Response:
     """Per-profile tier/role overrides, the transcriber, the active profile —
-    each through ``registry.set_*`` (validated before it persists).
-    Provider definitions are file-only: any other key is refused before
-    anything changes. ponytail: the changes apply in order, so a failure in
-    a later one leaves the earlier ones applied; one transaction if needed."""
+    through ``registry.set_*`` (validated before it persists). One change
+    per request (one part, overrides for one profile), so a request is
+    applied whole or not at all. Provider definitions are file-only: any
+    other key is refused before anything changes."""
     d, body = _deps(request), await _body(request)
     extra = sorted(set(body) - _ENGINES_KEYS)
     overrides = _opt(body, "overrides", dict) or {}
@@ -401,14 +421,23 @@ async def put_engines(request: web.Request) -> web.Response:
     if extra:
         raise _bad(f"not editable here: {', '.join(extra)} (provider definitions and pricing are file-only; "
                    "edit argus_engines.json)")
-    parsed = {profile: ProfileOverrides.model_validate(ov) for profile, ov in overrides.items()}
-    transcriber = TranscriberConfig.model_validate(body["transcriber"]) if "transcriber" in body else None
-    active = _opt(body, "active_profile")
-    for profile, ov in parsed.items():
-        await registry.set_overrides(profile, ov)
-    if transcriber is not None:
-        await registry.set_transcriber(transcriber)
-    if active is not None:
+    parts = sorted(k for k in _ENGINES_KEYS if k in body)
+    many_profiles = "overrides" in body and len(overrides) != 1
+    if len(parts) != 1 or many_profiles:
+        got = ", ".join(parts) or "nothing"
+        if many_profiles:
+            got += f" (overrides for {len(overrides)} profiles)"
+        raise _bad("change one thing per request: overrides for one profile, the transcriber, or the "
+                   f"active profile (got {got})")
+    if "overrides" in body:
+        [(profile, ov)] = overrides.items()
+        await registry.set_overrides(profile, ProfileOverrides.model_validate(ov))
+    elif "transcriber" in body:
+        await registry.set_transcriber(TranscriberConfig.model_validate(body["transcriber"]))
+    else:
+        active = _opt(body, "active_profile")
+        if active is None:
+            raise _bad("active_profile must be a string")
         await registry.set_active_profile(active)
     return _ok(await _engines_body(d))
 

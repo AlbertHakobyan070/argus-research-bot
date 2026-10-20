@@ -34,7 +34,7 @@ Spec: `docs/argus-v4-design.md` §2.7 (Mini App API and auth) and the backend ha
     - `GET /api/engines/providers/{name}/models` (`registry.live_models` in a thread) and `GET /api/config/presets` (`PRESETS`, each length's default depth, the Exa prices or null).
     - Middlewares:
       - `errors` turns every failure under `/api` into the error JSON: aiohttp's own 404/405, and a 500 that is logged with its traceback;
-      - `auth` requires `Authorization: tma <initData>` on every `/api*` path. A refusal is logged as `webapp: <method> <path> refused: <code> (fields present: <names>)`. The source IP is never trusted.
+      - `auth` requires `Authorization: tma <initData>` on every `/api*` path. A refusal is logged as `webapp: <method> '<path>' refused: <code> (fields present: <names>)`: the path with `%r`, and only names matching `[A-Za-z0-9_]{1,32}`, at most 10, then "+N other" (fix round 1). The source IP is never trusted.
   - `server.py`:
     - `build_app(deps, static_dir=…)` serves `GET /` (`static/index.html`, a 404 until Task 12 adds it), `/static/*` (registered only when the directory exists; `show_index=False`, `follow_symlinks=False`) and the API. It sets the CSP, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` on every response (`on_response_prepare`). `CSP` is §2.7's string verbatim: `script-src 'self' https://telegram.org`, with no `'unsafe-inline'` anywhere.
     - `start(app)` (POST_INIT, after `runs.init`) and `stop(app)` (POST_SHUTDOWN, idempotent) are described under the behaviour changes below. The access log is off (`access_log=None`).
@@ -54,19 +54,19 @@ Spec: `docs/argus-v4-design.md` §2.7 (Mini App API and auth) and the backend ha
 - **The console's health while the tunnel starts**: `webapp_ok` is False with `webapp_error` "tunnel starting — waiting for the cloudflared URL" (no DM). `/status` then says "Console: down — tunnel starting …" until the URL arrives.
 - **`ARGUS_WEBAPP_TUNNEL=none`** sets `webapp_public_url` to `http://127.0.0.1:<port>`, so `/status` shows where the console listens. No menu button is registered: Telegram needs HTTPS.
 - **`ARGUS_WEBAPP_ENABLED=false`** starts nothing and sets no `bot_data` key, so `/status` says "Console: not running".
-- **Failure DMs are de-duplicated**: one per run of failures (a crash-looping cloudflared does not DM every backoff), and reset by the next good URL. A good URL after the first DMs "🌐 Console tunnel restarted: <url>".
+- **Failure DMs are de-duplicated**: one per run of failures (a crash-looping cloudflared does not DM every backoff), and reset by the next good URL. The first good URL after a "⚠️ Console down" DM sends "🌐 Console back up: <url>" (fix round 1; it replaced "Console tunnel restarted", and it also covers a failure before the first URL).
 - **A menu-button failure** keeps the URL (the console is reachable) and sets `webapp_ok` False with "menu button not registered: …", plus a DM.
 - **A missing cloudflared binary** (checked with `is_file()` before the supervisor starts) is a failure ("cloudflared not found at <path> (set ARGUS_CLOUDFLARED)"), not a retry loop. The local server keeps serving.
 - **An unknown `ARGUS_WEBAPP_TUNNEL`** starts nothing and is reported.
-- **`snapshot.plan` is `runs.plan_payload()`**, which is a view of tracked runs. A run resting at its plan gate but untracked (after a restart) therefore shows `plan: null`, while `awaiting` is `"plan"`. Approve and the other actions still work (they attach the run), and after the attach the payload appears.
-- **`PUT /api/engines` applies its parts in order** (overrides, transcriber, active profile). A failure in a later part leaves the earlier ones applied (a `ponytail:` note in `put_engines`).
+- **`snapshot.plan` is `runs.plan_payload()`**, for a tracked run and (fix round 1) for an untracked one resting at its plan gate after a restart; see the fix-round section.
+- **`PUT /api/engines` makes one change per request** (fix round 1): one part (overrides, the transcriber or the active profile), and overrides for one profile. Anything more is a 400 before anything changes, so a request is applied whole or not at all.
 - **`GET /api/me`'s `active_profile`** is null when no engines config is loaded; `/api/engines` then says why (400 `engine_config`).
 - **The webapp imports nothing from `argus.bot` at module level** (`_send_md_doc`, `_safe_send` and `runs` are imported inside the functions), because `bot.app` imports `webapp.server` at module level.
 
 ### Behaviour changes for handoff.md
 
 - The bot serves the Mini App console on `127.0.0.1:${ARGUS_WEBAPP_PORT:-8787}` and logs `webapp: listening on 127.0.0.1:<port>`. With the default quick tunnel it starts `tools/bin/cloudflared(.exe)` and logs `tunnel: https://<x>.trycloudflare.com`. It sets the chat's `Argus` menu button to that URL and logs `menu button registered for chat <id>`. cloudflared's stderr goes to `logs/cloudflared.log`.
-- The console is optional. If the server cannot start (port taken), cloudflared is missing, the tunnel dies or the menu button fails, the problem is logged, DM'd ("⚠️ Console down — …") and shown in `/status`; media and research in chat are unaffected. A killed cloudflared is restarted with backoff, and the new URL is DM'd and re-registered.
+- The console is optional. If the server cannot start (port taken), cloudflared is missing, the tunnel dies or the menu button fails, the problem is logged, DM'd ("⚠️ Console down — …") and shown in `/status`; media and research in chat are unaffected. A killed cloudflared is restarted with backoff, and the new URL is re-registered and DM'd ("🌐 Console back up: <url>").
 - `/status` prints the console URL and its health (WP-E1 reads the keys this WP sets).
 - At shutdown the console keeps serving while the drives drain (`post_stop`), then closes in `post_shutdown`. A console action in that window gets the driver's shutdown refusal (409 `refused`).
 
@@ -121,3 +121,37 @@ Logs and the probe are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\
 - GREEN: the four focused files pass. The full suite (`suite-final.log`, re-run after the last edits; `suite.log` is the first run) passes except the live-proxy tests in `tests/test_llm.py` and the `tests/test_graph.py` fixture, which fail on the closed port by design. No warnings summary appears.
 - `probe_real_driver.py` / `.log` (hermetic) runs the console on the real `bot/runs.py`, a real `Library` and the real deep graph on a `MemorySaver`, with the tunnel off. It showed 401 without auth, the library-based list, the snapshot view, the driver's `not_found` as 404 for an untracked run with no checkpoint, the CSP on `/`, and an idempotent stop.
 - Not checked live: the real cloudflared, the menu button inside Telegram and the frontend are the orchestrator's checks after Task 12.
+
+### Fix round 1 (Task 11 review)
+
+What changed:
+
+- `webapp/tunnel.py`: the supervisor never dies silently.
+  - `_tail` reads stderr to EOF whatever happens to the log. A log that cannot be opened or written is logged once (per supervisor) and the reading goes on. A line over the `StreamReader` limit is dropped (logged once), and the reading goes on.
+  - `_run`: any exception in an iteration other than `CancelledError` (an `on_url` that raises, say) is logged with its traceback, reported as `on_down("supervisor error: <e>; restarting in <s> s")`, and followed by the normal backoff. The iteration's process is terminated first, so no cloudflared outlives its supervision. An `on_down` that raises is logged.
+  - `stop()` waits for the cancelled loop without re-raising; a loop that had ended with an error is logged.
+- `webapp/api.py`:
+  - No log injection from unauthenticated requests: the path is logged with `%r` (auth refusals, a 500, the containment and send warnings), and the initData field names pass `_field_names` (only `[A-Za-z0-9_]{1,32}`, at most 10, then "+N other").
+  - `PUT /api/engines` is atomic per request (above).
+  - The path checks (`resolve()`, the containment, `is_file()`; `_checked_path`) and `render.render_report` run through `asyncio.to_thread`.
+- `webapp/render.py`: an unclosed `<script>`/`<style>` drops everything after it, as before, and the output now ends with the visible marker `<p>[content removed by the sanitiser]</p>`. The dropped text is never emitted.
+- `webapp/server.py`: the "back up" DM (above). The URL counter is gone: the DM follows from a "Console down" DM having gone out.
+- Approved edit outside WP-E2's files (controller ruling): `src/argus/bot/runs.py` `plan_payload(run_id)` also answers for a run that is not tracked. It reads the library row and the checkpoint through `RunHandle.of(row, row["chat_id"])`, which is not registered. When `next == ("research",)` and the state has a `run_config`, it returns `_payload` with the choices `_attached_choices` gives an attach (the active profile's name from `registry.current_config()`, so nothing validates live). It writes nothing and registers nothing. A quick run, a legacy checkpoint (no `run_config`) or a run not at its plan gate gives None, as before.
+
+Tests:
+
+- `tests/test_tunnel.py`: an unopenable log (the pipe still drains, `on_down` runs, the supervisor restarts, one warning); an `on_url` that raises (reported, its process terminated, restarted; `stop()` does not re-raise); an over-long stderr line; `stop()` after the loop died; the "back up" DM after a failure before the first URL.
+- `tests/test_webapp_auth.py`: a `%0A` field name and a `%0A` path each give exactly one log line, with no forged line; the field-name cap.
+- `tests/test_webapp_api.py`:
+  - one change per request (two parts, overrides for two profiles, nothing). `test_put_engines_switches_profile_and_transcriber` now makes its two switches as two PUTs, as item 4 requires;
+  - the fakes bound to the driver (a wrong kwarg, a keyword-only arg passed positionally);
+  - render and path checks in threads;
+  - on the real driver (the `env` fixture of `test_runs_driver.py`), an untracked plan-gate run's `GET /api/runs/{id}` returns the tracked card's payload with no checkpoint write, no registry entry and no gate edit, then a console Approve attaches and runs it to its report gate; `plan_payload` is None for an untracked run off its plan gate and for an unknown run.
+- `tests/test_webapp_render.py`: an unclosed `<style>` and `<script>` end with the marker and emit none of the dropped text; no marker when everything closed.
+- `tests/webapp_fakes.py`: `FakeRuns` binds every call with `inspect.signature(getattr(runs, name)).bind(...)`.
+
+Evidence (`A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t11-fix1\`, with the same environment and the same rules):
+
+- RED (`red.log`): the new tests fail against 9182fd9. Two held already and fill a gap: the off-gate `plan_payload` test and the no-marker render test.
+- GREEN: the focused files pass (`green.log`). The full suite (`suite-final.log`) passes except the same live-proxy tests, and no warnings summary appears.
+- The reviewer's probes (`…\scratchpad\t11-review\`), re-run on the fixed code (`probe_*.after.log`). With an unopenable log the supervisor stays alive and reports the URL, a raising `on_url` is logged and the supervision goes on, and `stop()` returns cleanly. Every refusal is one log line with a `%r` path, and the injected field name is counted as "+1 other". The unclosed `<style>` renders as the marker.

@@ -71,8 +71,7 @@ class _Console:
         self.bot_data: dict = app.bot_data
         self.runner: web.AppRunner | None = None
         self.supervisor: tunnel.Supervisor | None = None
-        self.urls = 0                     # tunnel URLs seen: the second one on is a restart
-        self.notified = False             # a failure DM went out since the last good URL
+        self.notified = False             # a "Console down" DM went out since the last good URL
 
     def _health(self, url: str | None, ok: bool, error: str | None) -> None:
         self.bot_data.update(webapp_public_url=url, webapp_ok=ok, webapp_error=error)
@@ -101,9 +100,10 @@ class _Console:
         logger.info("webapp: listening on %s:%s", HOST, port)
 
     async def public_url(self, url: str) -> None:
-        """A new public URL: health ok, the menu button re-registered, and (a restart) a DM."""
+        """A new public URL: health ok and the menu button re-registered; the
+        first good URL after a "Console down" DM sends the "back up" DM."""
+        was_down, self.notified = self.notified, False
         self._health(url, True, None)
-        self.notified = False
         try:
             await self.app.bot.set_chat_menu_button(chat_id=self.settings.telegram_allowed_user_id,
                                                     menu_button=MenuButtonWebApp("Argus", WebAppInfo(url)))
@@ -113,13 +113,12 @@ class _Console:
             await self.failed(f"menu button not registered: {e}", url=url)
             return
         logger.info("menu button registered for chat %s", self.settings.telegram_allowed_user_id)
+        if was_down:
+            await self._dm(f"🌐 Console back up: {url}")
 
     async def tunnel_url(self, url: str) -> None:
         logger.info("tunnel: %s", url)
-        self.urls += 1
         await self.public_url(url)
-        if self.urls > 1:
-            await self._dm(f"🌐 Console tunnel restarted: {url}")
 
     async def tunnel_down(self, reason: str) -> None:
         await self.failed(f"tunnel: {reason}")

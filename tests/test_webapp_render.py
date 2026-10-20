@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from argus.webapp import render, server
@@ -86,6 +87,19 @@ def test_entities_and_unclosed_tags_stay_well_formed():
     out = render.render_report("a < b & c > d <b>bold <i>both")
     assert "a &lt; b &amp; c &gt; d" in out
     assert out.count("<b>") == out.count("</b>") and out.count("<i>") == out.count("</i>")
+
+
+@pytest.mark.parametrize("hostile", ["Intro text.\n\n<style>unclosed <p>all gone?\n\nMore [1].",
+                                     "Intro text.\n\n<script>alert(1)\n\n## Later\n\nMore [1]."])
+def test_an_unclosed_script_or_style_cannot_blank_the_report(hostile):
+    out = render.render_report(hostile)
+    assert "Intro text." in out
+    assert out.endswith("<p>[content removed by the sanitiser]</p>")
+    assert "all gone" not in out and "alert" not in out and "More" not in out   # the dropped text stays dropped
+
+
+def test_no_marker_when_nothing_is_left_open():
+    assert "content removed" not in render.render_report("<script>x</script>ok")
 
 
 # --- the CSP backstop ------------------------------------------------------

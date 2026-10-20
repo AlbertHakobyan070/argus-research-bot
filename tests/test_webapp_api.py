@@ -4,18 +4,21 @@ refused, 404 not_found), report-path containment, Send to chat, and the
 engines routes on the real registry (provider definitions are not editable)."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from argus.bot import common, runs
 from argus.bot.runs import Outcome
 from argus.engines import registry
 from argus.graph.run_config import PRESETS
-from argus.webapp import api
+from argus.webapp import api, server
 
-from webapp_fakes import USER_ID, FakeHandle, FakeLibrary, FakeRuns, auth, make_app, seed_run
+from test_runs_driver import CHAT, _at_plan_gate, _snap, env  # noqa: F401  (env: the real driver on a stubbed graph)
+from webapp_fakes import TOKEN, USER_ID, FakeHandle, FakeLibrary, FakeRuns, auth, make_app, seed_run
 
 ENGINES: dict = {
     "active_profile": "main",
@@ -361,11 +364,93 @@ async def test_put_engines_persists_per_profile_overrides(client, engines, lib):
 
 
 async def test_put_engines_switches_profile_and_transcriber(client, engines, lib):
-    body = await _json(await client.put("/api/engines", headers=auth(), json={
-        "active_profile": "other", "transcriber": {"asr_engine": "openai_audio"}}))
+    # fix round 1 (item 4): one change per request, so the two switches are two PUTs
+    body = await _json(await client.put("/api/engines", headers=auth(), json={"active_profile": "other"}))
     assert body["active_profile"] == "other" and body["validation"]["ok"] is True
+    await _json(await client.put("/api/engines", headers=auth(), json={"transcriber": {"asr_engine": "openai_audio"}}))
     assert json.loads(lib.settings["engines.active_profile"]) == "other"
     assert json.loads(lib.settings["engines.transcriber"])["asr_engine"] == "openai_audio"
+
+
+@pytest.mark.parametrize("payload", [
+    {"active_profile": "other", "transcriber": {"asr_engine": "openai_audio"}},
+    {"active_profile": "other", "overrides": {"other": {}}},
+    {"overrides": {"other": {}}, "transcriber": {}},
+    {"overrides": {"main": {}, "other": {}}},
+    {},
+    {"overrides": {}},
+])
+async def test_put_engines_is_one_change_per_request(client, engines, lib, payload):
+    body = await _json(await client.put("/api/engines", headers=auth(), json=payload), 400)
+    assert body["error"]["code"] == "bad_request"
+    assert lib.settings == {} and registry.current_config().active_profile == "main"
+
+
+# --- fix round 1: the fakes are bound to the real driver's signatures ----------
+
+async def test_fake_runs_binds_each_call_against_the_real_driver():
+    fake = FakeRuns()
+    with pytest.raises(TypeError):
+        await fake.approve_plan("run00001", actr="webapp")          # a kwarg the driver does not take
+    with pytest.raises(TypeError):
+        await fake.start_run(chat_id=1, user_id=1, topic="t", recency="m")
+    with pytest.raises(TypeError):
+        await fake.cancel_run("run00001", "webapp")                  # actor is keyword-only
+    assert (await fake.edit_plan("run00001", "x", actor="webapp")).code == "started"
+    assert fake.calls == [("edit_plan", {"run_id": "run00001", "feedback": "x", "actor": "webapp"})]
+
+
+# --- fix round 1: blocking work leaves the event loop --------------------------
+
+async def test_render_and_path_checks_run_in_threads(client, app, fake, monkeypatch):
+    _report(app, fake, md=("report.md", "# R [1]"), evidence=("evidence.json", "{}"))
+    seen = []
+    real = asyncio.to_thread
+
+    async def spy(fn, *a, **kw):
+        seen.append(getattr(fn, "__name__", repr(fn)))
+        return await real(fn, *a, **kw)
+
+    monkeypatch.setattr(api.asyncio, "to_thread", spy)
+    await _json(await client.get("/api/runs/done0001/evidence", headers=auth()))
+    assert (await client.get("/api/runs/done0001/report", headers=auth())).status == 200
+    assert "render_report" in seen
+    assert seen.count(api._checked_path.__name__) == 2               # resolve() / is_file() off the loop
+
+
+# --- fix round 1: the plan of an untracked run resting at its plan gate --------
+
+async def test_untracked_plan_gate_run_shows_its_plan_read_only(env):
+    run_id = await _at_plan_gate(env)
+    tracked_plan = await runs.plan_payload(run_id)
+    common._inflight.clear()                                         # the restart
+    before = await _snap(env, run_id)
+    edits = env.bot.edit_message_text.await_count
+    deps = api.Deps(runs=runs, library=env.lib, bot=env.bot, bot_data={}, bot_token=TOKEN,
+                    allowed_user_id=CHAT, max_age_s=3600, reports_root=env.tmp_path)
+    async with TestClient(TestServer(server.build_app(deps))) as c:
+        body = await _json(await c.get(f"/api/runs/{run_id}", headers=auth(CHAT)))
+        assert body["run"]["awaiting"] == "plan"
+        assert body["snapshot"]["plan"] == json.loads(json.dumps(tracked_plan))   # the card's data, as tracked
+        assert run_id not in common._inflight                        # nothing registered
+        after = await _snap(env, run_id)
+        assert after.config["configurable"]["checkpoint_id"] == before.config["configurable"]["checkpoint_id"]
+        assert env.bot.edit_message_text.await_count == edits             # no gate message touched
+        # a later Approve still attaches the run and acts
+        out = await _json(await c.post(f"/api/runs/{run_id}/plan", headers=auth(CHAT), json={"action": "approve"}))
+        assert out["outcome"] == "started" and run_id in common._inflight
+        await common._inflight[run_id].task
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
+
+
+async def test_plan_payload_is_none_off_the_plan_gate_untracked(env):
+    run_id = await _at_plan_gate(env)
+    assert (await runs.approve_plan(run_id)).code == "started"
+    await common._inflight[run_id].task                              # now at the report gate
+    common._inflight.clear()
+    assert await runs.plan_payload(run_id) is None
+    assert await runs.plan_payload("nope0001") is None
+    assert run_id not in common._inflight
 
 
 async def test_put_engines_failure_is_400_with_the_registry_text(client, engines, lib, monkeypatch):

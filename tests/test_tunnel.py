@@ -153,6 +153,67 @@ async def test_stop_terminates_the_running_process(tmp_path):
     assert proc.terminated and s.downs == []
 
 
+# --- fix round 1: the supervisor never dies silently ---------------------------
+
+async def test_an_unopenable_log_still_drains_and_restarts(tmp_path, caplog):
+    bad_log = tmp_path / "logdir"
+    bad_log.mkdir()                                    # opening a directory for append fails
+    first = FakeProcess(QUICK_TUNNEL_STDERR)
+    s = _Script([first, FakeProcess(QUICK_TUNNEL_STDERR)])
+    sup = tunnel.Supervisor(["cf"], on_url=s.on_url, on_down=s.on_down, spawn=s.spawn, sleep=s.sleep,
+                            clock=lambda: s.now, log_path=bad_log, url_timeout_s=2)
+    sup.start()
+    await _until(lambda: s.ups == [URL])
+    await _until(lambda: len(first.stderr._buffer) == 0)   # every line read: the pipe drains
+    first.exit(1)
+    await _until(lambda: s.ups == [URL, URL])
+    await sup.stop()
+    assert s.downs == ["cloudflared exited with code 1; restarting in 1 s"] and len(s.spawned) == 2
+    warned = [r for r in caplog.records if "logdir" in r.getMessage()]
+    assert len(warned) == 1                             # logged once, not per line or per restart
+
+
+async def test_on_url_raising_is_reported_and_restarted(tmp_path, caplog):
+    first, second = FakeProcess(QUICK_TUNNEL_STDERR), FakeProcess(QUICK_TUNNEL_STDERR)
+    s = _Script([first, second])
+    calls = []
+
+    async def bad_url(url):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("on_url bug")
+
+    sup = tunnel.Supervisor(["cf"], on_url=bad_url, on_down=s.on_down, spawn=s.spawn, sleep=s.sleep,
+                            clock=lambda: s.now, log_path=tmp_path / "cf.log")
+    sup.start()
+    await _until(lambda: len(calls) == 2)
+    await sup.stop()                                    # never re-raises the earlier error
+    assert s.downs == ["supervisor error: on_url bug; restarting in 1 s"]
+    assert first.terminated                             # the old process never outlives its supervision
+    assert "on_url bug" in caplog.text
+
+
+async def test_an_overlong_stderr_line_does_not_kill_the_tail(tmp_path):
+    proc = FakeProcess(["x" * (2 ** 16 + 10), *QUICK_TUNNEL_STDERR])   # over the StreamReader limit
+    s = _Script([proc])
+    sup = s.supervisor(tmp_path, url_timeout_s=2)
+    sup.start()
+    await _until(lambda: s.ups == [URL])
+    await sup.stop()
+    assert s.downs == []
+
+
+async def test_stop_after_the_loop_died_does_not_raise(tmp_path):
+    sup = _Script([]).supervisor(tmp_path)
+
+    async def boom():
+        raise RuntimeError("stale")
+
+    sup.task = asyncio.create_task(boom())
+    await asyncio.sleep(0)
+    await sup.stop()
+
+
 # --- server.start / stop on a fake bot ----------------------------------------
 
 def _free_port() -> int:
@@ -309,6 +370,34 @@ async def test_menu_button_failure_is_visible(ptb, monkeypatch, error):
         assert ptb.bot_data["webapp_ok"] is False and "menu button" in ptb.bot_data["webapp_error"]
         assert ptb.bot_data["webapp_public_url"] == "https://argus.example.org"   # the console itself is up
         assert len(ptb.bot.messages) == 1
+    finally:
+        await server.stop(ptb)
+
+
+async def test_console_back_up_dm_after_an_initial_failure(ptb, monkeypatch, tmp_path):
+    cf = tmp_path / "cloudflared.exe"
+    cf.write_bytes(b"")
+    monkeypatch.setenv("ARGUS_WEBAPP_TUNNEL", "quick")
+    monkeypatch.setenv("ARGUS_CLOUDFLARED", str(cf))
+    procs = [FakeProcess(FAILED_TUNNEL_STDERR, exit_code=1), FakeProcess(QUICK_TUNNEL_STDERR)]
+
+    async def spawn(cmd):
+        if not procs:
+            await asyncio.Event().wait()
+        return procs.pop(0)
+
+    async def no_wait(s):
+        pass
+
+    monkeypatch.setattr(tunnel, "spawn", spawn)
+    monkeypatch.setattr(tunnel, "_sleep", no_wait)
+    await server.start(ptb)
+    try:
+        await _until(lambda: ptb.bot_data.get("webapp_public_url") == URL)
+        await _until(lambda: len(ptb.bot.messages) == 2)
+        down, up = (m["text"] for m in ptb.bot.messages)
+        assert down.startswith("⚠️ Console down") and "before printing its URL" in down
+        assert up == f"🌐 Console back up: {URL}"
     finally:
         await server.stop(ptb)
 

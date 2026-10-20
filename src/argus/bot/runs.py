@@ -917,11 +917,27 @@ async def _payload(h: RunHandle, values: dict) -> dict:
 
 
 async def plan_payload(run_id: str) -> dict | None:
-    """The plan card's data for a tracked run resting at its plan gate, else None."""
+    """The plan card's data for a run resting at its plan gate, else None. An
+    untracked run (after a restart) is read only: its library row and its
+    checkpoint, with the choices an attach would give it (``_attached_choices``);
+    nothing is written or registered. A legacy checkpoint (no ``run_config``)
+    or a run not at the plan gate gives None."""
     h = common._inflight.get(run_id)
-    if h is None or h.live or h.gate_kind != PLAN:
+    if h is not None:
+        if h.live or h.gate_kind != PLAN:
+            return None
+        return await _payload(h, (await h.graph.aget_state(h.cfg)).values or {})
+    lib = _library()
+    row = await lib.get_run(run_id) if lib is not None else None
+    if row is None or row.get("mode") == "quick":
         return None
-    return await _payload(h, (await h.graph.aget_state(h.cfg)).values or {})
+    h = RunHandle.of(row, row["chat_id"])             # a view, not registered
+    snap = await h.graph.aget_state(h.cfg)
+    values = snap.values or {}
+    if tuple(snap.next or ()) != ("research",) or not values.get("run_config"):
+        return None
+    _attached_choices(h, require(values), registry.current_config().active_profile)
+    return await _payload(h, values)
 
 
 async def _present_plan(h: RunHandle, values: dict) -> None:

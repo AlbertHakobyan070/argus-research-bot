@@ -27,6 +27,7 @@ _NO_CITE = frozenset({"code", "pre"})
 _SAFE_HREF = re.compile(r"(?:https?:|mailto:|#)", re.IGNORECASE)
 _INVISIBLE = re.compile(r"[\x00-\x20\x7f]+")      # browsers ignore these inside a URL scheme
 _CITE = '<span class="cite" data-n="{0}">[{0}]</span>'
+REMOVED_MARKER = "<p>[content removed by the sanitiser]</p>"
 
 
 class _Sanitiser(HTMLParser):
@@ -81,8 +82,12 @@ class _Sanitiser(HTMLParser):
         self.out.append(text)
 
     def result(self) -> str:
+        """The output, its open tags closed. A ``<script>``/``<style>`` never
+        closed dropped everything after it: a visible marker says so (the
+        dropped text itself is never emitted)."""
         self.close()
-        return "".join(self.out) + "".join(f"</{t}>" for t in reversed(self.open))
+        out = "".join(self.out) + "".join(f"</{t}>" for t in reversed(self.open))
+        return out + REMOVED_MARKER if self.dropping else out
 
 
 def sanitise(fragment: str) -> str:

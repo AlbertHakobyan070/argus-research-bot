@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 import httpx
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 from argus.webapp.auth import AuthError, AuthUser, sign_init_data, validate_init_data
 
@@ -117,6 +118,36 @@ async def test_api_refusals_carry_the_reason_code(client, caplog, header, status
         assert not any(v in logged for v in values if len(v) > 6)       # the hash, the user JSON, auth_date
         assert "auth_date" in logged and "hash" in logged               # the field names
     assert TOKEN not in logged and TOKEN.split(":")[1] not in logged
+
+
+def _webapp_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "argus.webapp"]
+
+
+async def test_a_newline_in_a_field_name_cannot_forge_a_log_line(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    header = "tma a%0AFAKE%20LOG%20LINE%20INFO%20root%3A%20injected=1&hash=x&auth_date=1"
+    r = await client.get("/api/me", headers={"Authorization": header})
+    assert r.status == 401
+    [line] = _webapp_lines(caplog)
+    assert "\n" not in line and "\r" not in line and "FAKE" not in line
+    assert "hash, auth_date +1 other" in line
+
+
+async def test_field_names_are_capped(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    fields = "&".join(f"f{i}=1" for i in range(14)) + "&" + "x" * 40 + "=1"
+    await client.get("/api/me", headers={"Authorization": f"tma {fields}"})
+    [line] = _webapp_lines(caplog)
+    assert "f0, f1, f2, f3, f4, f5, f6, f7, f8, f9 +5 other" in line and "x" * 33 not in line
+
+
+async def test_a_newline_in_the_path_cannot_forge_a_log_line(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    r = await client.get(URL("/api/%0Aforged-line", encoded=True))
+    assert r.status == 401
+    [line] = _webapp_lines(caplog)
+    assert "\n" not in line and "'/api/\\nforged-line'" in line
 
 
 async def test_valid_header_reaches_the_api(client):
