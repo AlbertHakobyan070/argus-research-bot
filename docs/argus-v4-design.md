@@ -229,7 +229,7 @@ class PanelConfig(BaseModel):   enabled: bool=True; grounding: bool=True; covera
 class RunConfig(BaseModel):
     schema_version: int = 1
     length: Length; depth: Depth; preset_origin: str
-    recency: Literal["d","w","m","y"] | None = None            # None → brief's time-sensitivity hint decides
+    recency: Literal["d","w","m","y","any"] | None = None      # None → brief's time-sensitivity hint decides; "any" → no recency filter, even for a time-sensitive brief
     research: ResearchConfig; search: SearchConfig; fetch: FetchConfig; compose: ComposeConfig; panel: PanelConfig
     engines: EnginesSnapshot
     overrides_applied: dict[str, Any] = {}                     # the dotted overrides from_preset applied (console / bench)
