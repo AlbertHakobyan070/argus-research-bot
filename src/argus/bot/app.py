@@ -37,8 +37,10 @@ logger = logging.getLogger("argus.bot")
 # startup); POST_STOP_HOOKS from post_stop, after Application.stop() has
 # awaited the app.create_task tasks; POST_SHUTDOWN_HOOKS at the start of
 # _post_shutdown, before the library and checkpoint saver close. A failing
-# stop/shutdown hook is logged, the later hooks and the closes still run,
-# and the first failure is re-raised (_run_hooks).
+# stop/shutdown hook is logged and the later hooks and the closes still run.
+# A raising post_stop would make PTB skip shutdown() and post_shutdown, so
+# _post_stop stores its first failure and _post_shutdown re-raises it after
+# the closes (or its own first failure).
 HANDLER_MODULES = [research, media, history, delete]
 HANDLER_MODULES.append(engines_cmd)
 POST_INIT_HOOKS: list = []
@@ -202,10 +204,11 @@ async def _post_init(app: Application) -> None:
 
 
 async def _reconcile_orphaned_runs(app: Application) -> None:
-    """A restart wipes _inflight, so any run left non-terminal is orphaned
-    (its plan/report buttons no longer resolve). For each, inspect the
-    checkpoint: if it's paused at a gate, mark it awaiting_* and DM the
-    user how to resume; otherwise mark it error. Bounded + best-effort."""
+    """A restart wipes _inflight, so any run left non-terminal is orphaned.
+    For each, inspect the checkpoint: paused at a gate → awaiting_* (its
+    buttons attach it on the next tap); interrupted mid-drive → cancelled,
+    resumable from its last saved step; no checkpoint → error. Each user is
+    DM'd how to go on. Bounded + best-effort."""
     lib: Library | None = app.bot_data.get("library")
     graph = app.bot_data.get("graph")
     if lib is None or graph is None:
@@ -236,6 +239,10 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
             msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    f"restart at the report preview.\nSend /continue {run_id} "
                    "to see the report.")
+        elif snap is not None and snap.values:
+            await _set_run_status(app_ctx(app), run_id, "cancelled")
+            msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot restart mid-step. "
+                   f"/continue {run_id} resumes it from its last saved step.")
         else:
             await _set_run_status(app_ctx(app), run_id, "error")
             msg = (f"⚠️ Run `{run_id}` ({topic}) was interrupted by a bot "
@@ -271,12 +278,23 @@ async def _run_hooks(hooks: list, app: Application) -> None:
 
 
 async def _post_stop(app: Application) -> None:
-    await _run_hooks(POST_STOP_HOOKS, app)
+    """Run every stop hook; the first failure is stored, not raised: PTB
+    skips ``shutdown()`` and ``post_shutdown`` when ``post_stop`` raises, and
+    the saver and library would never close. ``_post_shutdown`` re-raises it."""
+    try:
+        await _run_hooks(POST_STOP_HOOKS, app)
+    except Exception as e:
+        app.bot_data["post_stop_error"] = e
 
 
 async def _post_shutdown(app: Application) -> None:
+    """The shutdown hooks, then the library and saver close; then the stored
+    stop-hook failure (or the first shutdown-hook one) is raised."""
+    error = app.bot_data.pop("post_stop_error", None)
     try:
         await _run_hooks(POST_SHUTDOWN_HOOKS, app)
+    except Exception as e:
+        error = error or e
     finally:
         lib = app.bot_data.get("library")
         if lib is not None:
@@ -290,6 +308,8 @@ async def _post_shutdown(app: Application) -> None:
                 await saver_cm.__aexit__(None, None, None)
             except Exception:
                 logger.exception("saver close on shutdown failed")
+    if error is not None:
+        raise error
 
 
 def build_application() -> Application:

@@ -12,8 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 
+from argus.bot import progress
 from argus.bot.progress import RunEventBus, TelegramCard, describe
 
 
@@ -55,6 +56,13 @@ def test_since_keeps_order_and_honours_the_limit():
         bus.publish("a", "digest", "research", {"source_id": i})
     assert [e.seq for e in bus.since("a", 3, limit=4)] == [4, 5, 6, 7]
     assert len(bus.since("a", 0)) == 10                        # default limit 200
+
+
+def test_since_returns_at_most_200_events_by_default():
+    bus = RunEventBus()
+    for i in range(250):
+        bus.publish("a", "fetch", "research", {"i": i})
+    assert [e.seq for e in bus.since("a", 0)] == list(range(1, 201))
 
 
 def test_the_ring_buffer_keeps_the_last_500_events():
@@ -192,3 +200,51 @@ async def test_a_failed_send_is_logged_and_retried_on_the_next_poll(caplog):
     assert card.text == "" and card.message_id is None
     await card.refresh()
     assert card.message_id == 5 and card.text
+
+
+async def _shown_card(bot) -> tuple[RunEventBus, TelegramCard]:
+    bus = RunEventBus()
+    card = TelegramCard(bot, 7, "a", bus, title="t")
+    bus.publish("a", "stage", "research", {"status": "start", "summary": ""})
+    await card.refresh()                                       # the card's message, sent
+    bus.publish("a", "fetch", "research", {"url": "https://example.com/x", "ok": True})
+    return bus, card
+
+
+async def test_an_edit_that_changes_nothing_is_a_success(caplog):
+    bot = _bot()
+    bus, card = await _shown_card(bot)
+    bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified: specified new message "
+                                                             "content and reply markup are exactly the same"))
+    with caplog.at_level("WARNING", logger="argus.bot"):
+        await card.refresh()
+    assert "fetched 1" in card.text and "failed" not in caplog.text
+    await card.refresh()                                       # nothing new: no second edit
+    assert bot.edit_message_text.await_count == 1
+
+
+async def test_a_card_edit_honours_retry_after(monkeypatch):
+    waited: list[float] = []
+
+    async def clock(seconds: float) -> None:
+        waited.append(seconds)
+
+    monkeypatch.setattr(progress, "_sleep", clock, raising=False)
+    bot = _bot()
+    bus, card = await _shown_card(bot)
+    bot.edit_message_text = AsyncMock(side_effect=[RetryAfter(4), None])
+    await card.refresh()
+    assert waited == [4] and bot.edit_message_text.await_count == 2 and "fetched 1" in card.text
+
+
+async def test_a_card_whose_message_is_gone_is_not_edited_again(caplog):
+    bot = _bot()
+    bus, card = await _shown_card(bot)
+    bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message to edit not found"))
+    with caplog.at_level("WARNING", logger="argus.bot"):
+        await card.refresh()
+        bus.publish("a", "fetch", "research", {"url": "https://example.com/y", "ok": True})
+        await card.refresh()
+        await card.stop("✅ Finished.")
+    assert bot.edit_message_text.await_count == 1
+    assert caplog.text.count("no longer exists") == 1

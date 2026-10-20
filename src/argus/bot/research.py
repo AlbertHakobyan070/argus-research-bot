@@ -98,6 +98,9 @@ async def handle_pending_reply(update: Update,
         out = await runs.edit_plan(run_id, text.strip())
     else:
         out = await runs.report_action(run_id, "revise", feedback=text.strip())
+    if out.code != "started":                     # the reply is consumed: say it was not used
+        out = runs.Outcome(out.code, f"{out.text}\n(your reply was not used — tap Edit/Revise and send it again)",
+                           out.run_id)
     await _relay(ctx, chat_id, out)
     return True
 
@@ -106,20 +109,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                           ns: str, action: str, run_id: str) -> None:
     """Run-scoped buttons (``len`` / ``dep`` / ``prof`` / ``rec`` knobs,
     ``plan:*``, ``report:*``), routed here by ``app.on_callback`` for every
-    namespace not handled before the run lookup."""
+    namespace not handled before the run lookup. The tapped message becomes
+    the gate message of a run the action attaches (one untracked after a
+    restart)."""
     q = update.callback_query
+    mid = q.message.message_id if q.message is not None else None
     if ns in _KNOBS:
-        out = await runs.set_plan_choice(run_id, _KNOBS[ns], action)
+        out = await runs.set_plan_choice(run_id, _KNOBS[ns], action, message_id=mid)
     elif ns == "plan" and action == "approve":
-        out = await runs.approve_plan(run_id)
+        out = await runs.approve_plan(run_id, message_id=mid)
     elif ns == "plan" and action == "edit":
-        out = await runs.await_reply(run_id, "plan_edit")
+        out = await runs.await_reply(run_id, "plan_edit", message_id=mid)
     elif ns == "plan" and action == "cancel":
-        out = await runs.cancel_run(run_id)
+        out = await runs.cancel_run(run_id, message_id=mid)
     elif ns == "report" and action == "revise":
-        out = await runs.await_reply(run_id, "revise_feedback")
+        out = await runs.await_reply(run_id, "revise_feedback", message_id=mid)
     elif ns == "report":
-        out = await runs.report_action(run_id, action)
+        out = await runs.report_action(run_id, action, message_id=mid)
     else:
         return
     if out.code == "not_found":
@@ -213,13 +219,15 @@ def _format_plan(p: dict) -> str:
 
 
 def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
-    """The plan-gate keyboard: lengths (tldr→lecture), depths, the engines
-    profile and recency (each tap cycles), Approve / Edit / Cancel. The ✅
-    marks the current length and depth. Callback data is run-scoped
+    """The plan-gate keyboard: lengths (tldr→lecture), depths and Auto (the
+    length's own), the engines profile and recency (each tap cycles),
+    Approve / Edit / Cancel. The ✅ marks the current length and depth (Auto
+    while the depth follows the length). Callback data is run-scoped
     (``len:long:<run8>``) so an old card never acts on a newer run."""
     rid = p.get("run_id") or ""
     sfx = f":{rid}" if rid else ""
     length = p.get("length") or DEFAULT_LENGTH
+    auto = bool(p.get("depth_auto"))
 
     def button(label: str, data: str, on: bool = False) -> InlineKeyboardButton:
         return InlineKeyboardButton(label + (" ✅" if on else ""), callback_data=data + sfx)
@@ -228,7 +236,8 @@ def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [button(_LENGTH_LABELS[m], f"len:{m}", m == length) for m in ("tldr", "short", "medium")],
         [button(_LENGTH_LABELS[m], f"len:{m}", m == length) for m in ("long", "lecture")],
-        [button(d.capitalize(), f"dep:{d}", d == p.get("depth")) for d in runs.DEPTHS],
+        [*(button(d.capitalize(), f"dep:{d}", not auto and d == p.get("depth")) for d in runs.DEPTHS),
+         button("Auto", "dep:auto", auto)],
         [button(f"⚙ {profile}", "prof:next"),
          button(f"🕒 {_RECENCY_LABELS.get(p.get('recency'), p.get('recency'))}", "rec:next")],
         [button("✅ Approve", "plan:approve"), button("✏️ Edit", "plan:edit"), button("❌ Cancel", "plan:cancel")],
@@ -250,12 +259,17 @@ def _report_keyboard(run_id: str = "") -> InlineKeyboardMarkup:
 
 
 def _quality_lines(values: dict, md_text: str) -> list[str]:
-    """The preview's quality line, the report's "⚠" banners and this round's
-    degradation notes (as the report shows them)."""
+    """The preview's quality line, the report's "⚠" banners (its title block:
+    the lines before the first ``## `` heading) and this round's degradation
+    notes (as the report shows them)."""
     pv = values.get("panel_verdict") or {}
     cut = sum(1 for f in values.get("findings") or [] if f.get("status") == "cut")
     lines = [f"🧪 Quality: judged {int(pv.get('judged') or 0)}/{int(pv.get('total') or 0)} · {cut} cut"]
-    lines += [line[2:] for line in md_text.splitlines() if line.startswith("> ⚠ ")]
+    for line in md_text.splitlines():
+        if line.startswith("## "):
+            break
+        if line.startswith("> ⚠ "):
+            lines.append(line[2:])
     rnd = 1 + int(values.get("revise_rounds") or 0) + int(values.get("extend_rounds") or 0)
     notes = render_degradation_notes(list(values.get("errors") or []), rnd).splitlines()[2:]
     if notes:
@@ -268,11 +282,38 @@ def _quality_lines(values: dict, md_text: str) -> list[str]:
 async def _send_report_preview(bot, chat_id: int, run_id: str, values: dict) -> tuple[Any, str, str | None]:
     """Send the report preview + keyboard for a run at its report gate;
     returns ``(message | None, text, parse mode)`` for later edits."""
+    if not (values.get("report_paths") or {}).get("md"):
+        text = "(no report_paths found)"
+        return await _safe_send(bot, chat_id, text, parse_mode=None), text, None
+    html_body, plain_body = _preview_bodies(values)
+    # HTML primary (tolerates arbitrary content), plain-text fallback —
+    # legacy-markdown crashed on ``_ * [ &`` in excerpts (2026-07-08 bug).
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=html_body,
+                                     reply_markup=_report_keyboard(run_id), parse_mode=ParseMode.HTML)
+        return msg, html_body, ParseMode.HTML
+    except Exception as send_err:
+        logger.warning(
+            "report preview HTML send failed (%s); falling back to plain text",
+            send_err,
+        )
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=plain_body, reply_markup=_report_keyboard(run_id))
+        return msg, plain_body, None
+    except Exception as plain_err:
+        logger.exception("report preview plain-text send also failed")
+        text = f"⚠️ report preview unavailable: {plain_err}"
+        return await _safe_send(bot, chat_id, text, parse_mode=None), text, None
+
+
+def _preview_bodies(values: dict) -> tuple[str, str]:
+    """The report preview as ``(HTML body, plain body)`` (also the text of a
+    preview message attached from a tap, re-rendered)."""
     paths = values.get("report_paths") or {}
     length = values.get("length") or DEFAULT_LENGTH
     if not paths.get("md"):
         text = "(no report_paths found)"
-        return await _safe_send(bot, chat_id, text, parse_mode=None), text, None
+        return text, text
     md = Path(paths["md"])
     try:
         full_text = md.read_text(encoding="utf-8", errors="replace")
@@ -293,8 +334,6 @@ async def _send_report_preview(bot, chat_id: int, run_id: str, values: dict) -> 
         + f"\n\n{tail_note}"
     )
 
-    # HTML primary (tolerates arbitrary content), plain-text fallback —
-    # legacy-markdown crashed on ``_ * [ &`` in excerpts (2026-07-08 bug).
     # HTML-escaping expands text (& → &amp;), so shrink the excerpt until
     # the whole message fits Telegram's 4096-char cap.
     def _fit(exc: str) -> str:
@@ -307,23 +346,7 @@ async def _send_report_preview(bot, chat_id: int, run_id: str, values: dict) -> 
         html_body = _fit(excerpt)
     plain_body = (text + ("\n\n```\n" + excerpt + "\n```"
                           if excerpt else ""))[:4000]
-
-    try:
-        msg = await bot.send_message(chat_id=chat_id, text=html_body,
-                                     reply_markup=_report_keyboard(run_id), parse_mode=ParseMode.HTML)
-        return msg, html_body, ParseMode.HTML
-    except Exception as send_err:
-        logger.warning(
-            "report preview HTML send failed (%s); falling back to plain text",
-            send_err,
-        )
-    try:
-        msg = await bot.send_message(chat_id=chat_id, text=plain_body, reply_markup=_report_keyboard(run_id))
-        return msg, plain_body, None
-    except Exception as plain_err:
-        logger.exception("report preview plain-text send also failed")
-        text = f"⚠️ report preview unavailable: {plain_err}"
-        return await _safe_send(bot, chat_id, text, parse_mode=None), text, None
+    return html_body, plain_body
 
 
 def register(app: Application) -> None:

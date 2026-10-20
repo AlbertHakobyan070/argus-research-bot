@@ -233,12 +233,18 @@ def _continue(ctx):
 RESUME_PATHS = [
     ("approve", "plan", True, _approve, ("deliver",)),
     ("plan_edit", "plan", True, _reply("plan_edit", "focus on security"), ("research",)),
-    ("report_send", "report", True, _report("send"), ("deliver",)),
+    ("report_send", "report", True, _report("send"), ()),         # Send ends the run (Task 10 ruling)
     ("report_extend", "report", True, _report("extend"), ("deliver",)),
     ("report_revise", "report", True, _reply("revise_feedback", "tighten it"), ("deliver",)),
     ("continue_plan_gate", "plan", False, _continue, ("research",)),
     ("continue_report_gate", "report", False, _continue, ("deliver",)),
     ("continue_extend_fork", "end", False, _continue, ("deliver",)),
+    # untracked at its gate, as after a restart: the action attaches the run first (§2.5, R-a)
+    ("approve_untracked", "plan", False, _approve, ("deliver",)),
+    ("plan_edit_untracked", "plan", False, _reply("plan_edit", "focus on security"), ("research",)),
+    ("report_send_untracked", "report", False, _report("send"), ()),
+    ("report_extend_untracked", "report", False, _report("extend"), ("deliver",)),
+    ("report_revise_untracked", "report", False, _reply("revise_feedback", "tighten it"), ("deliver",)),
 ]
 
 
@@ -310,10 +316,14 @@ async def test_approve_rebuilds_the_config_keeping_console_overrides(graph, lib)
 # Ordering: resolve + ensure before any mutation (Task 4 review finding)
 # ---------------------------------------------------------------------------
 
-# entry → (where the run waits, attached in flight?, callback data or None for /continue)
+# entry → (where the run waits, attached in flight?, callback data, a (kind, text) reply, or None for /continue)
 _FAIL_ENTRIES = {"approve": ("plan", True, "plan:approve"),
+                 "plan_edit": ("plan", True, ("plan_edit", "focus on security")),
                  "report_extend": ("report", True, "report:extend"),
                  "report_send": ("report", True, "report:send"),
+                 "report_revise": ("report", True, ("revise_feedback", "tighten it")),
+                 "continue_plan_gate": ("plan", False, None),
+                 "continue_report_gate": ("report", False, None),
                  "continue_extend_fork": ("end", False, None)}
 
 
@@ -339,9 +349,9 @@ async def test_a_failed_resolution_leaves_the_run_unchanged(graph, lib, monkeypa
     before = await graph.aget_state(CFG)
     status = (await lib.get_run(RUN_ID))["status"]
     ctx = await _ctx(graph, lib)
-    upd = _callback(f"{data}:{RUN_ID}") if data else None
+    upd = _callback(f"{data}:{RUN_ID}") if isinstance(data, str) else None
 
-    await (bot_app.on_callback(upd, ctx) if upd else _continue(ctx))
+    await (bot_app.on_callback(upd, ctx) if upd else _reply(*data)(ctx) if data else _continue(ctx))
 
     assert ("cannot list models" if failure == "engines" else "has no length") in _refusal(ctx)
     after = await graph.aget_state(CFG)

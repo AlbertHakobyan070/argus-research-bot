@@ -3,8 +3,9 @@
 A bot restart wipes the in-memory _inflight registry, so any run left in
 a non-terminal status has dead inline buttons — the user is left staring
 at a frozen chat. _reconcile_orphaned_runs inspects each orphan's
-checkpoint and either marks it recoverable (awaiting_*) with a /continue
-nudge, or errors it, and DMs the user either way.
+checkpoint and marks it recoverable — awaiting_* at a gate, cancelled
+mid-drive (Task 10 ruling) — with a /continue nudge, or errors it when it
+has no checkpoint, and DMs the user either way.
 """
 from __future__ import annotations
 
@@ -35,12 +36,15 @@ def _app(lib, graph):
     return app
 
 
-def _graph_with_next(next_map: dict[str, tuple]):
-    """Fake graph whose aget_state returns snap.next based on thread_id."""
+def _graph_with_next(next_map: dict[str, tuple], *, no_checkpoint: tuple[str, ...] = ()):
+    """Fake graph whose aget_state returns snap.next based on thread_id (a
+    thread in ``no_checkpoint`` has none: empty values, as LangGraph reports)."""
     g = MagicMock()
 
     async def aget_state(cfg):
         tid = cfg["configurable"]["thread_id"]
+        if tid in no_checkpoint:
+            return SimpleNamespace(values={}, next=())
         return SimpleNamespace(values={"plan": {}},
                                next=next_map.get(tid, ()))
     g.aget_state = aget_state
@@ -79,15 +83,30 @@ async def test_orphan_at_report_gate_becomes_awaiting_report(lib):
     assert "/continue bbbb2222" in app.bot.send_message.await_args.kwargs["text"]
 
 
-async def test_orphan_mid_pipeline_is_errored(lib):
-    # Frozen at a non-gate node (e.g. synthesizer) — not resumable in place.
-    await _seed(lib, "cccc3333", 7, "running")
-    graph = _graph_with_next({"tg:7:cccc3333": ("synthesizer",)})
+async def test_orphan_mid_drive_is_cancelled_and_resumable(lib):
+    """Task 10 ruling: a run interrupted mid-drive (its checkpoint's next is
+    not a gate) is cancelled — /continue resumes it from its last saved step."""
+    await _seed(lib, "cccc3333", 7, "running", "langchain vs langgraph")
+    graph = _graph_with_next({"tg:7:cccc3333": ("compose",)})
     app = _app(lib, graph)
 
     await _reconcile_orphaned_runs(app)
 
-    assert (await lib.get_run("cccc3333"))["status"] == "error"
+    assert (await lib.get_run("cccc3333"))["status"] == "cancelled"
+    assert app.bot.send_message.await_args.kwargs["text"] == (
+        "♻️ Run `cccc3333` (langchain vs langgraph) was interrupted by a bot restart mid-step. "
+        "/continue cccc3333 resumes it from its last saved step.")
+
+
+async def test_orphan_without_a_checkpoint_is_errored(lib):
+    # No checkpoint to resume from — the run cannot be resumed at all.
+    await _seed(lib, "ffff6666", 7, "planning")
+    graph = _graph_with_next({}, no_checkpoint=("tg:7:ffff6666",))
+    app = _app(lib, graph)
+
+    await _reconcile_orphaned_runs(app)
+
+    assert (await lib.get_run("ffff6666"))["status"] == "error"
     assert "research it again" in app.bot.send_message.await_args.kwargs["text"].lower()
 
 

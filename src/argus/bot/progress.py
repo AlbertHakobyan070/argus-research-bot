@@ -14,15 +14,46 @@ import time
 from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from urllib.parse import urlsplit
 
-from telegram.error import TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 
 logger = logging.getLogger("argus.bot")
 
 _MAXLEN = 500        # events kept per run
 _KEEP_S = 3600.0     # a finished run's buffer is dropped this long after finish()
 _COUNTED = {"fetch": "fetched", "digest": "digested", "section": "sections", "judge": "judge batches"}
+_sleep = asyncio.sleep   # the RetryAfter wait (tests patch it)
+
+
+async def edit_text(bot, *, chat_id: int, message_id: int, text: str, reply_markup=None,
+                    parse_mode=None) -> bool:
+    """editMessageText, Telegram's answers sorted: True when the message shows
+    ``text`` ("message is not modified" included), False when the message no
+    longer exists. A ``RetryAfter`` waits its ``retry_after``, then tries once
+    more; any other Telegram error propagates."""
+    edit = dict(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup,
+                parse_mode=parse_mode)
+    try:
+        return await _edit_once(bot, edit)
+    except RetryAfter as e:
+        wait = e.retry_after                     # int, or a timedelta under PTB_TIMEDELTA
+        await _sleep(wait.total_seconds() if isinstance(wait, timedelta) else wait)
+    return await _edit_once(bot, edit)           # a second RetryAfter propagates
+
+
+async def _edit_once(bot, edit: dict) -> bool:
+    try:
+        await bot.edit_message_text(**edit)
+    except BadRequest as e:
+        reason = str(e).lower()
+        if "message is not modified" in reason:
+            return True
+        if "message to edit not found" in reason or "message can't be edited" in reason:
+            return False
+        raise
+    return True
 
 
 @dataclass(frozen=True)
@@ -119,6 +150,7 @@ class TelegramCard:
         self.counts: Counter = Counter()
         self.failed: Counter = Counter()
         self.message_id: int | None = None
+        self.gone = False                        # the message no longer exists: never edited again
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -170,15 +202,20 @@ class TelegramCard:
         return "\n".join(lines)
 
     async def _show(self, text: str) -> None:
+        if self.gone:
+            return
         try:
             if self.message_id is None:
                 self.message_id = (await self.bot.send_message(chat_id=self.chat_id, text=text)).message_id
-            else:
-                await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+            elif not await edit_text(self.bot, chat_id=self.chat_id, message_id=self.message_id, text=text):
+                self.gone = True
+                logger.warning("run %s: the progress card message no longer exists; it is not edited again",
+                               self.run_id)
+                return
         except TelegramError as e:              # retried on the next poll; the run goes on
             logger.warning("run %s: progress card update failed (%s)", self.run_id, e)
             return
         self.text = text
 
 
-__all__ = ["RunEvent", "RunEventBus", "TelegramCard", "describe"]
+__all__ = ["RunEvent", "RunEventBus", "TelegramCard", "describe", "edit_text"]

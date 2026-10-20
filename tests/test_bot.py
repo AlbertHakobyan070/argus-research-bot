@@ -246,7 +246,8 @@ def test_plan_keyboard_rows_and_run_scoping():
     assert [d for _, d in rows[0] + rows[1]] == [f"len:{m}:ab12cd34" for m in
                                                 ("tldr", "short", "medium", "long", "lecture")]
     assert [t for t, _ in rows[0] + rows[1] if "✅" in t] == ["Long ✅"]
-    assert [d for _, d in rows[2]] == [f"dep:{d}:ab12cd34" for d in ("quick", "standard", "deep", "exhaustive")]
+    assert [d for _, d in rows[2]] == [f"dep:{d}:ab12cd34" for d in ("quick", "standard", "deep", "exhaustive",
+                                                                     "auto")]      # Task 10 review: an Auto button
     assert [t for t, _ in rows[2] if "✅" in t] == ["Exhaustive ✅"]
     assert rows[3] == [("⚙ max-quality ⚠", "prof:next:ab12cd34"), ("🕒 past week", "rec:next:ab12cd34")]
     assert [d for _, d in rows[4]] == ["plan:approve:ab12cd34", "plan:edit:ab12cd34", "plan:cancel:ab12cd34"]
@@ -278,9 +279,76 @@ def test_format_plan_shows_archetype_recency_depth_and_profile(recency, window, 
     assert "Archetype: forecast" in text and shown in text and "Engines: free-proxy" in text
 
 
+def test_the_auto_depth_button_carries_the_check_while_depth_follows_the_length():
+    rows = _plan_keyboard({"run_id": "ab12cd34", "length": "long", "depth": "deep", "depth_auto": True}).inline_keyboard
+    assert [b.text for b in rows[2] if "✅" in b.text] == ["Auto ✅"]
+
+
+def test_banners_are_read_only_from_the_title_block():
+    from argus.bot.research import _quality_lines
+    md = ("# topic\n\n> ⚠ Degraded run — 3 of 9 sources could not be digested (429)\n\n## Findings\n\n"
+          "> ⚠ a quoted warning inside the body\n")
+    lines = _quality_lines({}, md)
+    assert [line for line in lines if line.startswith("⚠")] == [
+        "⚠ Degraded run — 3 of 9 sources could not be digested (429)"]
+
+
+async def test_the_preview_quality_line_is_html_escaped(tmp_path):
+    """A banner or a degradation note holding ``<`` or ``&`` reaches the HTML
+    preview escaped (the head is HTML, not raw text)."""
+    from argus.bot.research import _send_report_preview
+    md = tmp_path / "report.md"
+    md.write_text("# t\n\n> ⚠ Degraded run — 3 < 5 sources & the rest skipped\n\n## Findings\n\nx\n",
+                  encoding="utf-8")
+    bot = _FakeBot()
+    values = {"report_paths": {"md": str(md), "folder": str(tmp_path)},
+              "errors": ["[r1] skip: research.digest https://w.example/y?a=1&b=<2> (429)"]}
+    msg, text, mode = await _send_report_preview(bot, 5, "ab12cd34", values)
+    head = text.split("<pre>")[0]
+    assert mode == ParseMode.HTML
+    assert "⚠ Degraded run — 3 &lt; 5 sources &amp; the rest skipped" in head
+    assert "https://w.example/y?a=1&amp;b=&lt;2&gt; (429)" in head
+    assert "3 < 5" not in head and "<2>" not in head
+
+
+async def test_a_raising_stop_hook_still_closes_the_saver_and_library():
+    """PTB skips ``shutdown()`` and ``post_shutdown`` when ``post_stop``
+    raises (pointer 1, the POST_STOP half): ``_post_stop`` runs every hook,
+    logs each failure and stores the first; ``_post_shutdown`` closes the
+    library and the saver, then re-raises it."""
+    from unittest.mock import AsyncMock, MagicMock
+    from argus.bot import app as bot_app
+
+    ran: list[str] = []
+
+    async def bad(app):
+        ran.append("bad")
+        raise RuntimeError("drain failed")
+
+    async def good(app):
+        ran.append("good")
+
+    app = SimpleNamespace(bot_data={"library": MagicMock(close=AsyncMock()),
+                                    "saver_cm": MagicMock(__aexit__=AsyncMock())})
+    stop, shutdown = bot_app.POST_STOP_HOOKS[:], bot_app.POST_SHUTDOWN_HOOKS[:]
+    bot_app.POST_STOP_HOOKS[:], bot_app.POST_SHUTDOWN_HOOKS[:] = [bad, good], [good]
+    try:
+        await bot_app._post_stop(app)                          # returns: PTB goes on to shutdown()
+        assert ran == ["bad", "good"]
+        with pytest.raises(RuntimeError, match="drain failed"):
+            await bot_app._post_shutdown(app)
+    finally:
+        bot_app.POST_STOP_HOOKS[:], bot_app.POST_SHUTDOWN_HOOKS[:] = stop, shutdown
+    assert ran == ["bad", "good", "good"]
+    app.bot_data["library"].close.assert_awaited_once()
+    app.bot_data["saver_cm"].__aexit__.assert_awaited_once()
+
+
 async def test_hook_runner_runs_every_hook_and_reraises_the_first_failure():
-    """Pointer 1: a raising stop/shutdown hook never skips the later hooks
-    or the library and saver close; the first error is re-raised."""
+    """Pointer 1: ``_run_hooks`` runs every hook even when one raises and
+    re-raises the first failure; a raising shutdown hook never skips the
+    library and saver close. (A raising *stop* hook would skip PTB's
+    ``shutdown()`` — that path is the test above.)"""
     from unittest.mock import AsyncMock, MagicMock
     from argus.bot import app as bot_app
 

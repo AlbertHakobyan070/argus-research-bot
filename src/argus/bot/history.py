@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -71,9 +72,13 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"    `{r['report_dir']}`")
     if not lines:
         lines.append("No runs recorded for this chat yet.")
-    url = runs.console_url()
-    lines.append(f"Console: {url} ({'ok' if _bot_data_get(ctx, 'webapp_ok') else 'down'})" if url
-                 else "Console: not running")
+    # WP-E2 sets webapp_public_url, webapp_ok and webapp_error (spec §2.7)
+    url, ok, err = runs.console_url(), _bot_data_get(ctx, "webapp_ok"), _bot_data_get(ctx, "webapp_error")
+    down = "down" + (f" — {err}" if err else "")
+    if url:
+        lines.append(f"Console: {url} ({'ok' if ok else down})")
+    else:
+        lines.append(f"Console: {down}" if ok is False else "Console: not running")
     text = "\n".join(lines)
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -88,7 +93,8 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     otherwise lists the candidates (never guesses which one you meant).
     A running drive drains — it finishes its current step, then stops
     with its checkpoint saved (/continue resumes it); a run waiting at a
-    gate is cancelled at once.
+    gate is cancelled at once. A run id that is not tracked (a restart
+    empties the registry) is looked up in the library, as /continue does.
     """
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
@@ -97,18 +103,22 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = (ctx.args[0].lower().strip() if ctx.args else "")
     entries = runs.tracked(chat_id)
-    if not entries:
-        await update.message.reply_text("No in-flight runs for this chat.")
-        return
-    if target == "all":
-        picked = list(entries)
-    elif target:
+    if target and target != "all":
         picked = [rid for rid in entries if rid.startswith(target)]
         if not picked:
-            await update.message.reply_text(
-                f"No in-flight run matches '{target}'. "
-                "In flight: " + ", ".join(entries))
-            return
+            lib = _get_library(ctx)
+            run = await lib.resolve_run(chat_id, target) if lib is not None else None
+            if run is None:
+                await update.message.reply_text(
+                    f"No run matches '{target}' — see /runs."
+                    + (" In flight: " + ", ".join(entries) if entries else ""))
+                return
+            picked = [run["run_id"]]
+    elif not entries:
+        await update.message.reply_text("No in-flight runs for this chat.")
+        return
+    elif target == "all":
+        picked = list(entries)
     elif len(entries) == 1:
         picked = list(entries)
     else:
@@ -219,6 +229,28 @@ async def _mark_appended(lib: Library, graph, cfg: dict, run_id: str,
     return lines
 
 
+async def pending_appends(lib: Library, run_id: str) -> tuple[list[dict], list[dict]]:
+    """A run's pending /append rows and the sources they become (§2.4:
+    pinned appends are always ingested — by the /continue fork or an Extend)."""
+    pending = await lib.pending_sources(run_id)
+    return pending, await _sources_from_refs(lib, pending)
+
+
+def appends_marker(lib: Library, graph, cfg: dict, run_id: str, pending: list[dict], appended: list[dict],
+                   reply: Callable[[str], Awaitable[Any]]) -> Callable[[], Awaitable[None]]:
+    """The callback the next report gate runs after a pass that ingested the
+    appends: each one is marked ingested or failed, the failures named with
+    ``reply``."""
+    async def on_report() -> None:
+        if not pending:
+            return
+        lines = await _mark_appended(lib, graph, cfg, run_id, pending, appended)
+        if lines:
+            await reply(f"⚠️ {len(lines)} appended source(s) could not be ingested "
+                        "(marked failed — /append them again to retry):\n" + "\n".join(lines))
+    return on_report
+
+
 async def append_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/append <run-id> <url…|asset:N…> — queue sources for a run.
 
@@ -287,18 +319,8 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = {"configurable": {"thread_id": run["thread_id"]}}
     # A finished run's Extend fork ingests the pending appended sources;
     # after its report gate each one is marked ingested or failed.
-    pending = await lib.pending_sources(run_id)
-    appended = await _sources_from_refs(lib, pending)
-
-    async def on_report() -> None:
-        if not pending:
-            return
-        lines = await _mark_appended(lib, graph, cfg, run_id, pending, appended)
-        if lines:
-            await update.message.reply_text(
-                f"⚠️ {len(lines)} appended source(s) could not be ingested "
-                "(marked failed — /append them again to retry):\n" + "\n".join(lines))
-
+    pending, appended = await pending_appends(lib, run_id)
+    on_report = appends_marker(lib, graph, cfg, run_id, pending, appended, update.message.reply_text)
     out = await runs.continue_run(run, chat_id=chat_id, appended=appended, on_report=on_report)
     if out.text:
         await _safe_send(ctx.application.bot, chat_id, out.text)
