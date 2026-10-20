@@ -470,15 +470,22 @@ def _json_object(text: str) -> bool:
         return False
 
 
+_JSON_FENCE = re.compile(r"```json[ \t\r]*\n", re.IGNORECASE)            # a leading ```json fence line
+
+
 def _flat_body(text: str) -> tuple[str, list[int]]:
     """``compose.flat``'s validate hook: the reply as a body without its
     footnote definitions (and their ids), at least as long as a section's and
-    no JSON object (either is retried, then the role raises)."""
+    no JSON object — bare, or behind a leading ```json fence line, closed or
+    not (either is retried, then the role raises)."""
     md, defs = strip_footnote_definitions(normalize_cite_markers(strip_fences(text)))
     md = md.strip()
     if len(md) < _MIN_CHARS:
         raise ValueError(f"a {len(md)}-char reply is no report body (at least {_MIN_CHARS})")
-    if md.startswith("{") and _json_object(md):
+    obj = md
+    if fence := _JSON_FENCE.match(md):          # strip_fences keeps a fence it finds no match for
+        obj = re.sub(r"\n[ \t]*```[ \t]*\Z", "", md[fence.end():]).strip()
+    if obj.startswith("{") and _json_object(obj):
         raise ValueError("a JSON object is no report body")
     return md, defs
 

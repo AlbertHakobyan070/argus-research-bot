@@ -706,3 +706,34 @@ def test_cite_lines_are_recorded_only_for_a_written_section(monkeypatch):       
     out = compose_node(_state())
     assert "[r1] skip: compose.section A (empty reply)" in out["errors"]
     assert not [e for e in out["errors"] if " cite: " in e], "a skipped reply removed nothing from the report"
+
+# ---------------------------------------------------------------------------
+# Fix round 5: a ```json fence left unclosed in the flat writer's guard (round 4's matched fences keep it)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("fence", ["```json", "```JSON"])
+def test_an_unclosed_fenced_json_reply_is_never_the_flat_body(monkeypatch, fence):
+    unclosed = f'{fence}\n{{"report": "X is true, as the source states it plainly [1]. More text here."}}'
+    seen = fake_llm(monkeypatch, lambda system, human: unclosed if system.startswith(FLAT_SYSTEM)
+                    else pytest.fail("no extraction without a body"))
+    with pytest.raises(llm.EngineError, match="unparseable"):
+        compose_node(_state(length="short", run_config=make_run_config("short"),
+                            outline={"sections": [], "changed_sections": []}))
+    assert len(seen) == 2, "the unclosed fence fails the validate hook as the closed one does: then the role raises"
+
+
+@pytest.mark.parametrize("block", ['```json\n{"a": 1}\n```', '```json\n{"a": 1}'])
+def test_a_flat_body_holding_a_json_block_later_on_is_the_body(monkeypatch, block):
+    body = f"X is true, as the source states it plainly [1]. More text here.\n\n{block}"
+
+    def reply(system, human):
+        if system.startswith(FLAT_SYSTEM):
+            return body
+        return json.dumps({"findings": [{"claim": "X is true", "sentence": "X is true, as the source states it "
+                                         "plainly [1].", "source_ids": [1]}]})
+
+    seen = fake_llm(monkeypatch, reply)
+    out = compose_node(_state(length="short", run_config=make_run_config("short"),
+                              outline={"sections": [], "changed_sections": []}))
+    assert out["sections"][0]["md"] == body
+    assert len([m for m in seen if m[0].startswith(FLAT_SYSTEM)]) == 1, "the first reply is the body"
