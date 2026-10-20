@@ -1275,7 +1275,8 @@ async def test_an_approve_preparing_at_the_shutdown_start_ends_drained(env, monk
     assert h.control.drain_reason == "shutdown"
     assert (await env.lib.get_run(run_id))["status"] == "cancelled"
     assert tuple((await _snap(env, run_id)).next) == ("research",)
-    assert h.card.final.startswith("⏹ Cancelled after research")
+    assert h.card.final == (f"⏹ Cancelled before it started — /continue {run_id} re-attaches the plan card — "
+                            "repeat the action there.")
 
 
 async def test_a_start_preparing_at_the_shutdown_start_never_launches(env, monkeypatch):
@@ -1542,3 +1543,251 @@ async def test_a_reattached_run_keeps_its_engines_profile(env, monkeypatch, entr
     assert (await runs.approve_plan(out.run_id)).code == "started"
     await common._inflight[out.run_id].task
     assert require((await _snap(env, out.run_id)).values).engines.profile == "hybrid-local"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 3: the cancel note keeps next (I-1), drained-run hints (M-1), a
+# missing profile (M-2), quick not-found (9a), /continue's retry (9b),
+# idempotent appends
+# ---------------------------------------------------------------------------
+
+_FIRST_NODE = {"approve": "research", "re-plan": "brief", "extend": "deliver", "revise": "deliver",
+               "resume": "outline", "fork": "extend_prep"}
+
+
+class _Hold:
+    """Holds one graph node while ``armed`` (its thread ignores any drain)."""
+
+    def __init__(self) -> None:
+        self.armed, self.started, self.release = False, threading.Event(), threading.Event()
+
+    def __call__(self, fn):
+        def node(s):
+            if self.armed:
+                self.started.set()
+                assert self.release.wait(10), "the test never released the node"
+            return fn(s)
+        return node
+
+
+async def _at_launch(env, kind: str):
+    """The run where a ``kind`` drive launches from, and the action that launches it."""
+    if kind in ("approve", "re-plan"):
+        run_id = await _at_plan_gate(env)
+        return run_id, ((lambda: runs.approve_plan(run_id)) if kind == "approve"
+                        else (lambda: runs.edit_plan(run_id, "focus on security")))
+    if kind in ("extend", "revise"):
+        run_id = await _at_report_gate(env)
+        return run_id, ((lambda: runs.report_action(run_id, "extend")) if kind == "extend"
+                        else (lambda: runs.report_action(run_id, "revise", feedback="tighten it")))
+    if kind == "fork":                                         # a sent run: /continue forks an Extend
+        run_id = await _at_report_gate(env)
+        assert (await runs.report_action(run_id, "send")).code == "delivered"
+    else:                                                      # resume: cancelled after research, at ("outline",)
+        research = _blocking(env, reads_runtime=True)
+        run_id = await _executing(env, research)
+        await runs.cancel_run(run_id)
+        research.release.set()
+        await common._inflight[run_id].task
+
+    async def resume() -> runs.Outcome:
+        return await runs.continue_run(await env.lib.get_run(run_id), chat_id=CHAT)
+    return run_id, resume
+
+
+@pytest.mark.parametrize("ending", ["drained_at_launch", "force_cancelled_in_its_first_node"])
+@pytest.mark.parametrize("kind", list(_FIRST_NODE))
+async def test_the_cancel_note_never_moves_next(env, monkeypatch, kind, ending):
+    """I-1: the note is written as the last node the drive finished, else as the
+    node the launching action wrote as — LangGraph's own guess re-runs the
+    edges of the last node that ran, which moved a re-plan or a fork drained
+    (or force-cancelled) before its first node finished back to its old gate."""
+    first, hold = _FIRST_NODE[kind], _Hold()
+    if first != "research":                                    # research is held by _blocking
+        monkeypatch.setattr(graph_mod, f"{first}_node", hold(getattr(graph_mod, f"{first}_node")))
+        env.graph = env.app.bot_data["graph"] = graph_mod.build_graph(checkpointer=env.graph.checkpointer)
+    run_id, launch = await _at_launch(env, kind)
+    writes, update_state = [], env.graph.aupdate_state
+
+    async def recording(cfg, values, *a, **kw):
+        if "cancel_note" not in values:
+            return await update_state(cfg, values, *a, **kw)
+        before = tuple((await env.graph.aget_state(cfg)).next)
+        out = await update_state(cfg, values, *a, **kw)
+        writes.append((before, tuple((await env.graph.aget_state(cfg)).next)))
+        return out
+
+    monkeypatch.setattr(env.graph, "aupdate_state", recording)
+    if ending == "drained_at_launch":
+        assert (await _prepared_across_the_shutdown_start(env, monkeypatch, launch)).code == "started"
+    else:
+        async def past(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(runs, "_sleep", past)
+        if first == "research":
+            hold = _blocking(env)
+        hold.armed = True
+        assert (await launch()).code == "started"
+        h = common._inflight[run_id]
+        assert await asyncio.to_thread(hold.started.wait, 5)
+        assert (await runs.cancel_run(run_id)).code == "draining"
+        await asyncio.wait([h.task], timeout=10)
+        hold.release.set()
+        assert h.task.cancelled()
+    assert len(writes) == 1 and writes[0][0] == writes[0][1], writes
+
+
+async def test_a_drained_replan_resumes_its_redraft(env, monkeypatch):
+    """I-1: a re-plan drained at its launch rests at ("brief",), so /continue
+    redrafts the plan with the user's edit."""
+    feedback, brief = [], graph_mod.brief_node
+
+    def recording_brief(s):
+        feedback.append(s.get("plan_feedback"))
+        return brief(s)
+
+    monkeypatch.setattr(graph_mod, "brief_node", recording_brief)
+    env.graph = env.app.bot_data["graph"] = graph_mod.build_graph(checkpointer=env.graph.checkpointer)
+    run_id = await _at_plan_gate(env)
+    out = await _prepared_across_the_shutdown_start(env, monkeypatch,
+                                                    lambda: runs.edit_plan(run_id, "focus on security"))
+    assert out.code == "started"
+    assert tuple((await _snap(env, run_id)).next) == ("brief",)
+    _restart(monkeypatch)
+    out = await runs.continue_run(await env.lib.get_run(run_id), chat_id=CHAT)
+    assert out.code == "started" and "from `brief`" in out.text
+    await common._inflight[run_id].task
+    assert feedback[-1] == "focus on security"                 # the redraft saw the edit
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_plan"
+
+
+async def test_a_drained_fork_resumes_its_own_append_pass(env, monkeypatch):
+    """I-1: a /continue fork drained at its launch rests at ("extend_prep",);
+    its resumed drive runs its own append-only pass with the appends (once)
+    and marks them, leaving no append_only behind."""
+    run_id = await _at_report_gate(env)
+    assert (await runs.report_action(run_id, "send")).code == "delivered"
+    env.state.research = research = FetchAll()
+    ref = "https://a.example/p"
+    await history.append_cmd(_update(), _ctx(env, [run_id, ref]))
+    await _prepared_across_the_shutdown_start(env, monkeypatch,
+                                              lambda: history.continue_cmd(_update(), _ctx(env, [run_id])))
+    snap = await _snap(env, run_id)
+    assert tuple(snap.next) == ("extend_prep",) and snap.values["append_only"] is True
+    assert await _source_statuses(env, run_id) == {ref: "pending"}
+    _restart(monkeypatch)
+    await history.continue_cmd(_update(), _ctx(env, [run_id]))
+    await settle_runs()
+    ((append_only, urls),) = research.seen
+    assert append_only is True and urls.count(ref) == 1
+    assert await _source_statuses(env, run_id) == {ref: "ingested"}
+    snap = await _snap(env, run_id)
+    assert tuple(snap.next) == ("deliver",) and not snap.values.get("append_only")
+
+
+async def test_a_drained_runs_card_words_its_hint_from_next(env, monkeypatch):
+    """M-1: away from a gate the drive resumes from ``next``; at a gate its card
+    is re-attached, where the action is repeated; a drive drained before any
+    node ran says it never started."""
+    research = _blocking(env, reads_runtime=True)
+    run_id = await _executing(env, research)
+    h = common._inflight[run_id]
+    await runs.cancel_run(run_id)
+    research.release.set()
+    await h.task
+    assert h.card.final == f"⏹ Cancelled after research — /continue {run_id} resumes it from outline."
+    other = await _at_report_gate(env, "another run")
+    h = common._inflight[other]
+    await _prepared_across_the_shutdown_start(env, monkeypatch, lambda: runs.report_action(other, "extend"))
+    assert h.card.final == (f"⏹ Cancelled before it started — /continue {other} re-attaches the report card — "
+                            "repeat the action there.")
+    assert (await _snap(env, other)).values["cancel_note"] == "cancelled before it started (shutdown)"
+
+
+async def test_a_reattached_runs_profile_gone_from_the_engines_file(env, monkeypatch):
+    """M-2: after a restart whose engines file dropped the run's profile, the
+    card shows the problem, the profile knob cycles from the first profile,
+    and Approve refuses until a profile that exists is chosen."""
+    async def resolve(cfg, name):
+        registry.bindings(cfg, name)                           # an unknown profile raises, as the real one
+        return env.active.model_copy(update={"profile": name})
+
+    monkeypatch.setattr(registry, "resolve_snapshot", resolve)
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="topic", length="short",
+                               engines_profile="hybrid-local")
+    run_id = out.run_id
+    await common._inflight[run_id].task
+    common._inflight.clear()                                   # the restart, with an edited engines file
+    cfg = registry.current_config()
+    monkeypatch.setattr(registry._state, "cfg", cfg.model_copy(update={
+        "profiles": {k: v for k, v in cfg.profiles.items() if k != "hybrid-local"}}))
+    names = list(registry.current_config().profiles)
+    problem = f"unknown profile 'hybrid-local' (known: {', '.join(names)})"
+    await _tap(env, f"len:short:{run_id}")                     # attached by a knob tap
+    p = await runs.plan_payload(run_id)
+    assert (p["profile"], p["profile_problem"]) == ("hybrid-local", problem)
+    out = await runs.approve_plan(run_id)
+    assert (out.code, out.text) == ("refused", f"⚠️ Could not approve run `{run_id}`: {problem}")
+    sent = len(_sent(env))
+    await _tap(env, f"prof:next:{run_id}")
+    assert _sent(env)[sent:] == []                             # no "is not in list" refusal
+    assert (await runs.plan_payload(run_id))["profile"] == names[0]
+    assert (await runs.approve_plan(run_id)).code == "started"
+
+
+async def test_cancel_on_a_finished_ask_names_no_continue(env, monkeypatch):
+    """9a: /cancel <id> on a finished /ask: nothing to cancel or continue."""
+    monkeypatch.setattr(graph_mod, "quick_answer_node", lambda s: {"quick_answer": "42"})
+    env.app.bot_data["quick_graph"] = graph_mod.quick_answer_graph(checkpointer=MemorySaver())
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="what is x?", quick=True)
+    await common._inflight[out.run_id].task
+    await history.cancel_cmd(_update(), _ctx(env, [out.run_id]))
+    assert _sent(env)[-1] == f"(run {out.run_id} was a quick /ask — nothing to cancel or continue)"
+
+
+async def test_continue_behind_a_failed_attach_gets_its_own_outcome(env, monkeypatch):
+    """9b: /continue waiting on a handle the console's failed attach forgets
+    registers the run again, once, and gets its own outcome."""
+    run_id = await _at_plan_gate(env)
+    common._inflight.clear()                                   # the restart
+    row, fail = await env.lib.get_run(run_id), asyncio.Event()
+
+    async def down():
+        await fail.wait()                                      # a live validation suspends, then fails
+        raise EngineConfigError("proxy down")
+
+    monkeypatch.setattr(registry, "active_snapshot", down)
+    console = asyncio.ensure_future(runs.approve_plan(run_id, actor="webapp"))
+    for _ in range(100):
+        if run_id in common._inflight:
+            break
+        await asyncio.sleep(0.01)
+    assert run_id in common._inflight                          # the console's handle, attaching
+    cont = asyncio.ensure_future(runs.continue_run(row, chat_id=CHAT))
+    await asyncio.sleep(0.05)
+    assert not cont.done()                                     # it waits for that handle's lock
+    fail.set()
+    assert (await console).code == "refused"
+    out = await cont
+    assert (out.code, out.text) == ("refused", f"⚠️ Could not continue run `{run_id}`: proxy down")
+
+
+async def test_a_drained_extends_appends_are_merged_once_and_marked_by_the_next(env, monkeypatch):
+    """Idempotent appends: an Extend drained at its launch leaves its appends
+    pending (merged into sources); the next Extend merges none twice, and its
+    report gate marks them."""
+    run_id = await _at_report_gate(env)
+    env.state.research = research = FetchAll()
+    ref = "https://a.example/p"
+    await history.append_cmd(_update(), _ctx(env, [run_id, ref]))
+    out = await _prepared_across_the_shutdown_start(env, monkeypatch, lambda: runs.report_action(run_id, "extend"))
+    assert out.code == "started"
+    assert await _source_statuses(env, run_id) == {ref: "pending"}
+    _restart(monkeypatch)
+    assert (await runs.report_action(run_id, "extend")).code == "started"
+    await settle_runs()
+    assert [s["url"] for s in (await _snap(env, run_id)).values["sources"]].count(ref) == 1
+    ((append_only, urls),) = research.seen
+    assert not append_only and urls.count(ref) == 1
+    assert await _source_statuses(env, run_id) == {ref: "ingested"}

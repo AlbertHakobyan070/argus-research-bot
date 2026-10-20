@@ -236,6 +236,38 @@ async def pending_appends(lib: Library, run_id: str) -> tuple[list[dict], list[d
     return pending, await _sources_from_refs(lib, pending)
 
 
+def _append_key(src: dict) -> str:
+    """A source as research dedupes it (``_source_key``: the canonical URL);
+    a malformed URL, which research drops, as given."""
+    try:
+        return _source_key(src)
+    except ValueError:
+        return src.get("url") or ""
+
+
+def merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dict]:
+    """``sources`` plus each appended source it does not carry yet: an Extend
+    or a fork drained or refused after its merge never duplicates them."""
+    out = list(sources or [])
+    keys = {_append_key(s) for s in out}
+    for src in appended:
+        if _append_key(src) not in keys:
+            keys.add(_append_key(src))
+            out.append(src)
+    return out
+
+
+def carried_appends(sources: list[dict] | None, pending: list[dict],
+                    appended: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The pending /append rows, and their sources, that ``sources`` already
+    carries — merged by an Extend or a fork whose pass was drained: resuming
+    that pass ingests them."""
+    keys = {_append_key(s) for s in sources or []}
+    carried = [s for s in appended if _append_key(s) in keys]
+    refs = {s["ref"] for s in carried}
+    return [p for p in pending if p["ref"] in refs], carried
+
+
 def appends_marker(lib: Library, graph, cfg: dict, run_id: str, pending: list[dict], appended: list[dict],
                    reply: Callable[[str], Awaitable[Any]]) -> Callable[[], Awaitable[None]]:
     """The callback the next report gate runs after a pass that ingested the

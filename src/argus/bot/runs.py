@@ -122,6 +122,7 @@ class RunHandle:
     announced: set[tuple[str, str]] = field(default_factory=set)   # (node, status) this drive's tasks published
     cancelled_by: str | None = None  # the actor of a cancel accepted while this drive was live
     attaching: bool = False          # registered by an action on an untracked run; attached under the lock
+    route: str | None = None         # the node this drive's launching action wrote as (re-plan, fork)
 
     @classmethod
     def of(cls, row: dict, chat_id: int) -> RunHandle:
@@ -177,7 +178,9 @@ async def _say(chat_id: int, text: str, *, mode: str | None = None, markup=None)
     return await _safe_send(_app.bot, chat_id, text, reply_markup=markup, parse_mode=mode)
 
 
-def _not_found(run_id: str) -> Outcome:
+def _not_found(run_id: str, *, quick: bool = False) -> Outcome:
+    if quick:                                       # continue_run refuses a quick /ask: never point at /continue
+        return Outcome("not_found", f"(run {run_id} was a quick /ask — nothing to cancel or continue)", run_id)
     return Outcome("not_found", f"(run {run_id} is not in flight — it may have finished, been cancelled, or "
                                 f"been lost in a bot restart; /continue {run_id} re-attaches it)", run_id)
 
@@ -223,42 +226,45 @@ def _claim(h: RunHandle) -> Outcome | None:
 
 @contextlib.asynccontextmanager
 async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: str | None = None,
-                attach: bool = True):
+                row: dict | None = None, chat_id: int | None = None):
     """The run's handle with its lock held. An untracked run resting at a
     gate is attached first (§2.5: buttons minted before a restart keep
     working); the tapped message (``message_id``) becomes its gate message
     when it is that gate's card (``card``: the gate the tapped button
-    belongs to). An actor that waited for the lock of a handle another actor
-    then forgot (a failed attach, say) looks the run up and attaches it
-    again, once. Yields an ``Outcome`` instead when there is nothing to act
-    on: ``not_found`` (no library row, not resting at a gate, or forgotten
-    again while this actor waited), or the attach's refusal (``what`` names
-    the action)."""
+    belongs to). With ``row`` (``continue_run``) an untracked run is
+    registered from it as it is: the caller re-attaches or resumes it. An
+    actor that waited for the lock of a handle another actor then forgot (a
+    failed attach, say) looks the run up again, once. Yields an ``Outcome``
+    instead when there is nothing to act on: ``not_found`` (no library row,
+    not resting at a gate, or forgotten again while this actor waited), or
+    the attach's refusal (``what`` names the action)."""
     for again in (False, True):
         h = common._inflight.get(run_id)
-        if h is None and attach:
+        if h is None and row is not None:
+            h = common._inflight[run_id] = RunHandle.of(row, chat_id)
+        elif h is None:
             lib = _library()
             try:
-                row = await lib.get_run(run_id) if lib is not None else None
+                found = await lib.get_run(run_id) if lib is not None else None
             except Exception as e:
                 yield _refused(run_id, what, e)
                 return
             h = common._inflight.get(run_id)      # another actor may have registered it meanwhile
-            if h is None and row is not None:
-                h = common._inflight[run_id] = RunHandle.of(row, row["chat_id"])
+            if h is None and found is not None:
+                h = common._inflight[run_id] = RunHandle.of(found, found["chat_id"])
                 h.attaching = True
         if h is None:
             yield _not_found(run_id)
             return
         async with h.lock:
             if common._inflight.get(run_id) is not h:
-                if attach and not again:
+                if not again:
                     continue                      # forgotten while this actor waited: look it up again
-                yield _not_found(run_id)
+                yield _not_found(run_id, quick=h.quick)
                 return
             if h.attaching:
                 h.attaching = False
-                if attach:
+                if row is None:
                     try:
                         kind = await _attach(h, message_id, card)
                     except Exception as e:
@@ -267,7 +273,7 @@ async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: 
                         return
                     if kind is None:
                         _forget(h)
-                        yield _not_found(run_id)
+                        yield _not_found(run_id, quick=h.quick)
                         return
             yield h
             return
@@ -286,7 +292,7 @@ async def _attach(h: RunHandle, message_id: int | None, card: str | None) -> str
     active = await registry.active_snapshot()
     rc = await ensure_in_checkpoint(h.graph, h.cfg, engines=active)
     if kind == PLAN:
-        h.choices = _default_choices(rc, active.profile)
+        _attached_choices(h, rc, active.profile)
     h.gate_kind = kind
     if message_id is not None and card == kind:     # its text is rendered from the payload at the first edit
         h.gate_msg = (message_id, None, ParseMode.MARKDOWN if kind == PLAN else ParseMode.HTML)
@@ -377,29 +383,45 @@ def _appends_marker(h: RunHandle, pending: list[dict], appended: list[dict]):
                                   lambda text: _say(h.chat_id, text))
 
 
-async def _appends_notice(h: RunHandle, *, sent: bool = False) -> str:
+def _merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dict]:
+    """``sources`` plus the appended sources it does not carry yet."""
+    from . import history                           # lazy: history imports this module
+    return history.merged_sources(sources, appended)
+
+
+async def _carried_appends(h: RunHandle, values: dict) -> tuple[list[dict], list[dict]]:
+    """The pending /append rows (and their sources) the checkpoint already
+    carries: an Extend or a fork merged them, then its pass was drained."""
+    from . import history                           # lazy: history imports this module
+    return history.carried_appends(values.get("sources"), *await _pending_appends(h))
+
+
+async def _appends_notice(h: RunHandle, *, sent: bool = False, carried: int = 0) -> str:
     """The chat line for a resume or re-attach that leaves the run's pending
     /append sources unused: their count and the path that ingests them
-    ("" when none are pending). Read while the action resolves."""
+    ("" when none are pending). ``carried``: the pending ones this resume
+    ingests (its checkpoint carries them). Read while the action resolves."""
     lib = _library()
     pending = await lib.pending_sources(h.run_id) if lib is not None else []
-    if not pending:
+    if len(pending) <= carried:
         return ""
     how = (f"/continue {h.run_id} ingests them" if sent
            else f"🔎 Extend at the report preview ingests them, or /continue {h.run_id} once the report is sent")
-    return f"📎 Run `{h.run_id}` has {len(pending)} pending appended source(s): {how}."
+    return f"📎 Run `{h.run_id}` has {len(pending) - carried} pending appended source(s): {how}."
 
 
 # ---------------------------------------------------------------------------
 # drives
 # ---------------------------------------------------------------------------
 
-def _launch(h: RunHandle, resume_input: Any, *, stage: str) -> Outcome | None:
+def _launch(h: RunHandle, resume_input: Any, *, stage: str, route: str | None = None) -> Outcome | None:
     """Start the run's next drive (None). Every caller claimed the run, and a
     claim is refused once the shutdown began, so a claim made before it
     launches — its drive drains at once — unless ``drain_all`` stopped
     waiting for it (refused then). ``start_run`` never calls it once the
-    shutdown began."""
+    shutdown began. ``route``: the node the action's state write ran as
+    (the re-plan's ``intake``, the fork's ``deliver``) — the cancel note's
+    node while no node of this drive has finished."""
     h.starting = False
     if _launch_closed:
         # ponytail: a preparation that outlasts ARGUS_SHUTDOWN_DRAIN_S keeps its writes and never
@@ -408,7 +430,7 @@ def _launch(h: RunHandle, resume_input: Any, *, stage: str) -> Outcome | None:
     if h.deadline is not None:
         h.deadline.cancel()                         # an earlier drive's deadline never outlives it
     h.control, h.deadline, h.gate_kind, h.cancelled_by = RunControl(), None, None, None
-    h.stage, h.done_node, h.started_at, h.announced = stage, "", time.time(), set()
+    h.stage, h.done_node, h.started_at, h.announced, h.route = stage, "", time.time(), set(), route
     pending = common._pending_reply.get(h.chat_id)
     if pending is not None and pending[1] == h.run_id:
         del common._pending_reply[h.chat_id]        # an Edit / Revise prompt this drive made moot
@@ -522,7 +544,7 @@ async def _at_rest(h: RunHandle) -> None:
             raise RuntimeError("the brief produced no plan")
         await h.card.stop("📋 Plan ready — review it below.")
         if h.choices is None:
-            h.choices = _default_choices(require(values), (await registry.active_snapshot()).profile)
+            _attached_choices(h, require(values), (await registry.active_snapshot()).profile)
         await _present_plan(h, values)
     elif kind == REPORT:
         await h.card.stop("📝 Report ready — preview below.")
@@ -548,28 +570,48 @@ async def _at_rest(h: RunHandle) -> None:
 
 
 async def _drained(h: RunHandle, reason: str) -> None:
-    node = h.done_node or h.stage
-    note = f"cancelled after node {node} ({reason})"
-    await h.graph.aupdate_state(h.cfg, {"cancel_note": note})
+    """The drive drained (``GraphDrained``, or a drain that won over a gate).
+    The note never moves ``next``: it is written as the last node this drive
+    finished, else as the node its launching action wrote as (``route``),
+    else as LangGraph infers it — for a plain resume, the last node that ran.
+    LangGraph's guess re-runs that node's edges, which took a re-plan or a
+    fork drained before its first node back to its old gate. The card's hint
+    follows ``next``."""
+    done = h.done_node
+    note = f"cancelled after node {done} ({reason})" if done else f"cancelled before it started ({reason})"
+    await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=done or h.route)
+    nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
-    bus.publish(h.run_id, "stage", node, {"status": "cancelled", "summary": note})
+    bus.publish(h.run_id, "stage", done or h.stage, {"status": "cancelled", "summary": note})
+    head = f"⏹ Cancelled after {done}" if done else "⏹ Cancelled before it started"
     # a quick /ask is never told to /continue: continue_run refuses it
-    await h.card.stop(f"⏹ Cancelled after {node}" + ("." if h.quick else f" — /continue {h.run_id} resumes it."))
+    await h.card.stop(head + ("." if h.quick else f" — {_drained_hint(h.run_id, nxt)}."))
+
+
+def _drained_hint(run_id: str, nxt: tuple) -> str:
+    """What /continue does for a drained run resting at ``nxt`` (never empty:
+    a drain leaves a task): a gate's card is re-attached, where the action is
+    repeated; elsewhere the drive resumes."""
+    kind = _GATES.get(nxt)
+    if kind is not None:
+        return f"/continue {run_id} re-attaches the {kind} card — repeat the action there"
+    return f"/continue {run_id} resumes it from {nxt[0]}"
 
 
 async def _abandoned(h: RunHandle) -> None:
     """``task.cancel()`` after the drain bound or the shutdown bound: the
     node's thread may still run and the node never wrote, so the checkpoint
     is the one before it (``next`` names that node). The note names the
-    forced cancel; the card says what /continue then does. A failure to
-    record the note is logged and said in the chat — the run still ends
-    cancelled and ``_drive`` re-raises the ``CancelledError``."""
+    forced cancel and, written as ``_drained`` writes it, keeps ``next``;
+    the card says what /continue then does. A failure to record the note is
+    logged and said in the chat — the run still ends cancelled and
+    ``_drive`` re-raises the ``CancelledError``."""
     node = h.stage
     note = f"force-cancelled during node {node} ({h.control.drain_reason or 'cancel'}); the node was abandoned"
     nxt = None
     try:
-        await h.graph.aupdate_state(h.cfg, {"cancel_note": note})
+        await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=h.done_node or h.route)
         nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
     except Exception as e:
         logger.error("run %s: could not record the cancel note", h.run_id, exc_info=e)
@@ -781,6 +823,21 @@ def _default_choices(rc: RunConfig, active: str) -> Choices:
                    profile=None if rc.engines.profile == active else rc.engines.profile, recency=rc.recency)
 
 
+def _attached_choices(h: RunHandle, rc: RunConfig, active: str) -> None:
+    """The knobs of a run attached at its plan gate (a tap or ``/continue``
+    after a restart, a resume reaching the gate): those it was built with.
+    Its own profile gone from the engines file is cached as its problem, as
+    a cycled profile's would be (a static check): the card shows it, and
+    Approve's live check refuses it until another profile is chosen."""
+    h.choices = _default_choices(rc, active)
+    name = h.choices.profile
+    if name is not None and name not in h.profile_checks:
+        try:
+            registry.bindings(registry.current_config(), name)
+        except EngineConfigError as e:
+            h.profile_checks[name] = str(e)
+
+
 def _rebuilt(c: Choices, rc: RunConfig, engines) -> RunConfig:
     """``rc`` for the plan-gate choices ``c``, through ``rebuild`` (console
     overrides survive); the recency knob is the ``recency`` override."""
@@ -896,8 +953,9 @@ async def _choose(h: RunHandle, c: Choices, knob: str, value: str) -> None:
     elif knob == "profile":
         cfg = registry.current_config()
         names = list(cfg.profiles)
-        if value == "next":
-            value = names[(names.index(c.profile or cfg.active_profile) + 1) % len(names)]
+        if value == "next":                         # a profile gone from the engines file: from the first
+            current = c.profile or cfg.active_profile
+            value = names[(names.index(current) + 1) % len(names)] if current in names else names[0]
         elif value not in names:
             raise ValueError(f"unknown engines profile {value!r}")
         if value != cfg.active_profile and value not in h.profile_checks:
@@ -997,7 +1055,7 @@ async def edit_plan(run_id: str, feedback: str, *, actor: str = "telegram") -> O
             bus.publish(run_id, "gate", "", {"kind": PLAN, "actor": actor})
             await _edit_gate(h, "_✏️ Redrafting the plan with your changes…_")
             await _status(run_id, "planning")
-            return _launch(h, None, stage="brief") or Outcome("started", notice, run_id)
+            return _launch(h, None, stage="brief", route="intake") or Outcome("started", notice, run_id)
         except Exception as e:
             return _refused(run_id, "re-plan", e)
         finally:
@@ -1077,7 +1135,7 @@ async def report_action(run_id: str, action: str, *, feedback: str | None = None
                 update: dict[str, Any] = {"extend_requested": True, "revision_requested": False}   # see _deliver
                 pending, appended = await _pending_appends(h)
                 if appended:                               # last-value channel: the full list
-                    update["sources"] = [*(values.get("sources") or []), *appended]
+                    update["sources"] = _merged_sources(values.get("sources"), appended)
             else:
                 if int(values.get("revise_rounds") or 0) >= MAX_REVISE_ROUNDS:
                     raise ValueError(f"it already used its {MAX_REVISE_ROUNDS} Revise rounds")
@@ -1165,17 +1223,16 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
     a finished run is forked into an Extend (with ``appended`` sources, if
     any, and no new searches); ``on_report`` runs at the next report gate. A
     ``done`` run still resting at its report gate (sent by an older bot) is
-    first moved past it, then forked. A re-attach or resume that leaves
-    ``appended`` unused says so."""
+    first moved past it, then forked. A resume ingests the appends its
+    checkpoint already carries (an Extend or a fork drained after its merge)
+    and marks them at its report gate. A re-attach or resume that leaves
+    appends unused says so."""
     run_id = row["run_id"]
     if row.get("mode") == "quick":
         return Outcome("refused", f"Run `{run_id}` was a quick /ask — nothing to continue.", run_id)
-    h = common._inflight.get(run_id)
-    if h is None:
-        h = common._inflight[run_id] = RunHandle.of(row, chat_id)
-    async with _hold(run_id, "continue", attach=False) as held:
-        if held is not h:
-            return held if isinstance(held, Outcome) else _not_found(run_id)
+    async with _hold(run_id, "continue", row=row, chat_id=chat_id) as h:
+        if isinstance(h, Outcome):
+            return h
         if h.live:
             return _running(h)
         try:
@@ -1193,18 +1250,23 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                         _forget(h)
                     return refused
                 values = await _resumable(h)
-                notice = await _appends_notice(h) if nxt and not sent else ""     # a fork ingests them
+                notice = ""                                                       # a fork ingests them
+                if nxt and not sent:
+                    carried_pending, carried = await _carried_appends(h, values)
+                    if carried_pending:
+                        h.on_report = _appends_marker(h, carried_pending, carried)
+                    notice = await _appends_notice(h, carried=len(carried_pending))
                 if sent:
                     await h.graph.aupdate_state(h.cfg, {}, as_node="deliver")    # finished, as Send now does
                     nxt, kind = (), None
                 if not nxt:
-                    merged = [*(values.get("sources") or []), *(appended or [])]   # last-value channel: the full list
+                    merged = _merged_sources(values.get("sources"), appended or [])   # last-value channel
                     await h.graph.aupdate_state(h.cfg, {"sources": merged, "extend_requested": True,
                                                         "extend_rounds": 0, "revision_rounds": 0,
                                                         "append_only": bool(appended)}, as_node="deliver")
                     h.on_report = on_report
                 await _status(run_id, "running")
-                refused = _launch(h, None, stage=nxt[0] if nxt else "extend_prep")
+                refused = _launch(h, None, stage=nxt[0] if nxt else "extend_prep", route=None if nxt else "deliver")
                 if refused is not None:
                     _forget(h)
                     return refused
@@ -1215,7 +1277,7 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                 notice = await _appends_notice(h)
                 if kind == PLAN:
                     if h.choices is None:
-                        h.choices = _default_choices(rc, active.profile)
+                        _attached_choices(h, rc, active.profile)
                     await _present_plan(h, values)
                 else:
                     await _present_report(h, values)
