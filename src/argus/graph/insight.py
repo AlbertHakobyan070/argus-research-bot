@@ -6,7 +6,8 @@ the per-section findings (claim, [ids], section), the deterministic
 ``stance_map``, the coverage and an index of the cited sources (title,
 registrable domain, authority, published) — never the section bodies — and
 writes the archetype's analysis headings (``archetypes``). Post-processing is
-deterministic: text before the first fixed heading is dropped (recorded), a
+deterministic: footnote definitions are removed (a ``cite:`` line each, as
+compose does), text before the first fixed heading is dropped (recorded), a
 reply with none of them — or with nothing under them — is the
 ``omit_analysis`` degradation, takeaway bullets
 without a citation move to the open questions as "(uncited)", the ``short``
@@ -31,8 +32,9 @@ from ..engines.roles import DEGRADABLE_ROLES
 from ..engines.urls import registrable_domain
 from . import run_config
 from .archetypes import AGREEMENT, IMPLICATIONS, OPEN_QUESTIONS, SCENARIOS, TAKEAWAYS, TEMPLATES
-from .assemble import ANALYSIS_SECTION, CITE_RE, assemble_draft, normalize_cite_markers, strip_fences
-from .compose import extract_findings
+from .assemble import (ANALYSIS_SECTION, CITE_RE, assemble_draft, normalize_cite_markers, strip_fences,
+                       strip_footnote_definitions)
+from .compose import _footnote_lines, extract_findings
 from .research import _round
 from .state import ResearchBrief
 
@@ -364,14 +366,14 @@ def analyst_node(state, runtime: Runtime | None = None) -> dict:
     except llm.EngineDegraded as e:
         return degraded(str(e), [a.model_dump() for a in e.attempts])
     calls = [r.model_dump() for r in res.records]
-    text = normalize_cite_markers(strip_fences(res.text))
+    text, defs = strip_footnote_definitions(normalize_cite_markers(strip_fences(res.text)))
     if not text.strip():
         return degraded("empty reply", calls)
     before, parts = _split(text)
     if not parts:
         return degraded("no analysis headings", calls)
 
-    errors: list[str] = []
+    errors: list[str] = _footnote_lines(_round(state), ANALYSIS_SECTION, defs)     # as compose records them
     if "\n".join(before).strip():
         errors.append("analysis: dropped text before the first heading")
     bullets: list[str] = []

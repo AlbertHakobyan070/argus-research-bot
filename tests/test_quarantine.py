@@ -11,6 +11,10 @@ Run with:
 """
 from __future__ import annotations
 
+import re
+from decimal import Decimal
+from difflib import SequenceMatcher
+
 import pytest
 
 from argus import quarantine
@@ -207,7 +211,8 @@ def test_twins_share_compose_dedupe_normalisation():
     assert [f["status"] for f in findings] == ["cut", "cut"], "NFKC and casefold: the full-width claim is the same"
     assert not hasattr(compose_mod, "_norm"), "one normalisation, quarantine.claim_norm"
     assert quarantine.claim_norm("ＱＩＳＡ Grew [3] 2.6x") == "qisa grew 2 6x"
-    assert quarantine._TOKEN.pattern == research._TOKEN.pattern, "the quote-verification tokens, copied verbatim"
+    assert quarantine._FOLD == research._QUOTE_FOLD, "quote verification's fold, copied verbatim"
+    assert quarantine._NEGATORS == research._NEGATORS, "quote verification's negators, copied verbatim"
 
 
 TAKEAWAY_MD = ("_Analysis — label._\n\n### Key takeaways\n\n"
@@ -240,3 +245,46 @@ def test_a_takeaway_enters_the_tldr_only_when_its_analysis_finding_is_kept():   
     statuses, tldr = _tldr([_f("f1", "QISA needs 2.6x longer inference [1]", [1], section="Analysis")], {}, {})
     assert statuses == ["kept"] and tldr == (["QISA needs 2.6x longer inference [1] — confidence **high**"],
                                              "takeaways")
+
+# ---------------------------------------------------------------------------
+# Fix round 3: twins by numeric value and a shared source, the negation guard (spec R1 at 9b7e012)
+# ---------------------------------------------------------------------------
+
+# The re-review's probes (probe_misc.py; its first six are twin_formats.py's reformatted restatements)
+PROBE_PAIRS = [
+    ("Revenue grew 30% in 2024 across the group [1]", "Revenue grew 30 percent in 2024 across the group [1]", True),
+    ("QISA improves the character error rate by 15.5x [4]", "QISA improves the character error rate by 15.5× [4]",
+     True),
+    ("The model has 70B parameters and ships in 2025 [2]", "The model has 70 billion parameters and ships in 2025 [2]",
+     True),
+    ("QISA needs 2.6x longer inference than GPT-4 [1]", "QISA needs 2.6x longer inference [1]", True),
+    ("The service costs $1,200 per month for teams [3]", "The service costs $1200 per month for teams [3]", True),
+    ("Latency fell from 120 ms to 80 ms after the upgrade [1]", "Latency fell from 120ms to 80ms after the upgrade [1]",
+     True),
+    ("Revenue grew 30 percent in 2024 across the group [1]", "Revenue grew 31 percent in 2024 across the group [2]",
+     False),
+    ("QISA needs 2.6x longer inference [1].", "QISA needs 2.7x longer inference [3].", False),
+    ("Accuracy rose to 0.5% on the test [1]", "Accuracy rose to 5% on the test [1]", False),
+]
+
+
+def _ids(text: str) -> list[int]:
+    return [int(i) for i in re.findall(r"\[(\d+)\]", text)]
+
+
+@pytest.mark.parametrize("a,b,twin", PROBE_PAIRS)
+def test_twins_compare_numeric_values_not_their_format(a, b, twin):                  # re-review 2, probes
+    assert quarantine.twins(a, b, _ids(a), _ids(b)) is twin
+
+
+def test_a_number_attached_to_a_name_is_no_value():
+    assert quarantine._values("GPT-4, H2 and v0.2 cost $1,200 or 1,200.50 at 2.50x [3]") == {
+        Decimal("1200"), Decimal("1200.5"), Decimal("2.5")}, "names out, thousands separators out, by value"
+
+
+def test_a_claim_and_its_negation_are_never_twins():                                 # re-review 2
+    a, b = "GPT-5 is not open source under any license [3]", "GPT-5 is open source under any license [3]"
+    assert SequenceMatcher(None, quarantine.claim_norm(a), quarantine.claim_norm(b), autojunk=False).ratio() >= 0.85
+    assert not quarantine.twins(a, b, [3], [3])
+    assert not quarantine.twins("QISA doesn’t need 2.6x longer inference [1]", "QISA needs 2.6x longer inference [1]",
+                                [1], [1]), "the fold deletes the apostrophe: doesn’t → doesnt, a negator"

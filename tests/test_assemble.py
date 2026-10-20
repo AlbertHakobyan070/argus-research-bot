@@ -163,3 +163,9 @@ def test_footnote_definitions_are_stripped_outside_code():                      
     assert strip_footnote_definitions(md) == (
         "Claim [2] and more [1].\n\n\n```\n[^4]: code, not a definition\n```", [2, 13])
     assert strip_footnote_definitions("Untouched [^2] reference.") == ("Untouched [^2] reference.", [])
+
+
+def test_a_footnote_definitions_indented_continuation_lines_go_with_it():               # re-review N4
+    md = ("- Item [1]\n  continued.\n\n[^1]: Smith et al.\n    https://example.com/paper\n\tp. 4\n[^2]: Jones\n"
+          "  2025\n\nNext para [2].")
+    assert strip_footnote_definitions(md) == ("- Item [1]\n  continued.\n\n\nNext para [2].", [1, 2])

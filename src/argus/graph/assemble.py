@@ -23,7 +23,7 @@ ANALYSIS_SECTION = "Analysis"
 
 def strip_fences(text: str) -> str:
     t = (text or "").strip()
-    t = re.sub(r"^```(?:markdown|md)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^```(?:markdown|md|json)?\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*```$", "", t)
     return t
 
@@ -196,15 +196,21 @@ _DEFINITION = re.compile(r" {0,3}\[\^(\d{1,3})\]:.*")
 
 def strip_footnote_definitions(md: str) -> tuple[str, list[int]]:
     """``md`` without its footnote-definition lines (``[^n]: …``, outside
-    code) and their ids in order — spec B1: compose removes them from writer
-    output (a ``cite:`` line each); the references became ``[n]``."""
+    code, with the indented continuation lines right below) and their ids in
+    order — spec B1: compose removes them from writer output (a ``cite:``
+    line each); the references became ``[n]``."""
     lines = md.splitlines(keepends=True)
     out, ids = [], []
+    inside = False                              # below a definition: its indented continuation lines go too
     for line, is_code in zip(lines, _code_lines(lines)):
         m = None if is_code else _DEFINITION.fullmatch(line.rstrip("\r\n"))
         if m:
             ids.append(int(m.group(1)))
+            inside = True
+        elif inside and not is_code and line[:1] in (" ", "\t") and line.strip():
+            continue
         else:
+            inside = False
             out.append(line)
     return "".join(out), ids
 

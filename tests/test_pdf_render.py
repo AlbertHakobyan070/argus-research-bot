@@ -28,7 +28,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pypdf
 import pytest
+import reportlab.platypus
 
 from argus.tools import _register_report_fonts, _strip_emoji, markdown_to_pdf
 from helpers import make_run_config
@@ -248,3 +250,24 @@ def test_report_builder_returns_pdf_path_on_success(tmp_path, monkeypatch):
     assert pdf.exists() and pdf.stat().st_size > 5_000
     assert out["hitl"]["ctx"]["paths"]["pdf"] == str(pdf)
     assert "errors" not in out
+
+
+def test_the_pdf_prints_escaped_brackets_as_report_md_renders_them(tmp_path, monkeypatch):   # re-review (d)
+    marks: list[str] = []
+
+    class Spy(reportlab.platypus.Paragraph):                    # the markup handed to ReportLab
+        def __init__(self, text, *args, **kwargs):
+            marks.append(text)
+            super().__init__(text, *args, **kwargs)
+
+    monkeypatch.setattr(reportlab.platypus, "Paragraph", Spy)
+    out = tmp_path / "report.pdf"
+    markdown_to_pdf("## ⚠ Flagged claims (removed from the body)\n\n"
+                    r"- **Report:** It holds [1]. — the source prints the pair as (\[42, 42\]), not a checkpoint"
+                    "\n\n"
+                    r"A reason quoting \[3\] is no citation [2]."
+                    "\n", str(out), title="Escapes")
+    text = "".join(page.extract_text() for page in pypdf.PdfReader(out).pages)
+    assert "the pair as ([42, 42]), not a checkpoint" in text and "\\" not in text
+    assert 'A reason quoting [3] is no citation <font color="#6E2A34"><b>[2]</b></font>.' in marks, (
+        "unescaped after the [n] styling: an escaped [3] is no citation")

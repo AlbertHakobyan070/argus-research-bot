@@ -366,11 +366,10 @@ def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
     md, defs = strip_footnote_definitions(normalize_cite_markers(strip_duplicate_heading(strip_fences(res.text),
                                                                                           title)))
     md = md.strip()
-    lines += _footnote_lines(ctx.rnd, title, defs)
     if len(md) < _MIN_CHARS:
         records[-1].update(ok=False, error="empty reply")
         return None, records, [*lines, f"[r{ctx.rnd}] skip: compose.section {title} (empty reply)"]
-    return md, records, lines
+    return md, records, [*lines, *_footnote_lines(ctx.rnd, title, defs)]      # a written reply's repairs only
 
 
 # ---------------------------------------------------------------------------
@@ -570,10 +569,12 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     if renamed:                 # "Analysis" is the analyst's title (§2.8 Allocation): the section is renamed
         for s in renamed:
             s.title = EVIDENCE_ANALYSIS
-        outline = _merge_repeated(outline)      # into an "Evidence analysis" it would repeat
-        if changed is not None:
-            changed = list(dict.fromkeys(EVIDENCE_ANALYSIS if _title_key(t) == _title_key(ANALYSIS_SECTION) else t
-                                         for t in changed))
+        outline = _merge_repeated(outline)      # into an "Evidence analysis" (any case) it would repeat
+        if changed is not None:                 # each changed title as the title that survives the merge
+            alive = {_title_key(s.title): s.title for s in outline}
+            keys = (_title_key(EVIDENCE_ANALYSIS) if _title_key(t) == _title_key(ANALYSIS_SECTION) else _title_key(t)
+                    for t in changed)
+            changed = list(dict.fromkeys(alive[k] for k in keys if k in alive))
     ctx = _Ctx(state, rc, brief, notes, revision_notes, len(outline))
     if not outline:
         return _flat(state, ctx, pv, runtime)

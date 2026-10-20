@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +25,7 @@ import pytest
 from argus import config as config_mod
 from argus.graph import nodes as nodes_mod
 from argus.graph.insight import ANALYSIS_LABEL
-from argus.quarantine import cut, locate, sentences
+from argus.quarantine import claim_norm, cut, locate, sentences, twins
 from bench import metrics
 from helpers import make_run_config
 
@@ -411,8 +412,7 @@ def test_a_cut_claim_never_reaches_the_tldr_through_its_kept_analysis_twin(monke
     body = "QISA has a 2.6x longer inference time than GPT-4 [1]. Teams use it for approvals [2]."
     state = _state(run_config=make_run_config("medium"), analysis=analysis,
                    sections=[{"title": "Report", "md": body, "note_ids": [1, 2, 3]}],
-                   findings=[_f("f0", "Report", "QISA has a 2.6x longer inference time than GPT-4 [1].", [1],
-                                claim="QISA has a 2.6x longer inference time"),     # the same numbers as its twin
+                   findings=[_f("f0", "Report", "QISA has a 2.6x longer inference time than GPT-4 [1].", [1]),
                              _f("f1", "Report", "Teams use it for approvals [2].", [2]),
                              _f("f2", "Analysis", "QISA has a 2.6x longer inference time [1]", [1]),
                              _f("f3", "Analysis", "It resumes with a command [3]", [3])],
@@ -504,6 +504,85 @@ def test_an_analysis_left_with_its_label_only_is_dropped(monkeypatch, tmp_path):
     out, md, *_ = _report(monkeypatch, tmp_path, state)
     assert "## Analysis" not in md and ANALYSIS_LABEL not in md
     assert "analysis: every takeaway cut — section dropped" in out["errors"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 3: the live q013 pair (twins by shared values and source, R1); the TL;DR's sections fallback (R2)
+# ---------------------------------------------------------------------------
+
+# Live q013 (bd84e94 run, accept-t9-q013): the cut Report f4 and the kept Analysis f8 restate one claim at
+# similarity 0.68 — the same values {15.5, 4.7, 13, 2.6}, the same source [4]. Verbatim from its evidence.json.
+Q013_TAKEAWAYS = [
+    ('No verifiable primary source for a "Quantum Lattice Transformer" from Nebulon AI appears in the evidence; '
+     "the two retrieved sources describe differently named models with no stated link to Nebulon AI, so existence "
+     "and attribution remain unconfirmed [4][9].", [4, 9], "high", "2 independent sources"),
+    ("The only quantitative results found belong to other models: the Quantum-Inspired Self-Attention (QISA) paper "
+     "reports 15.5x on character error rate, 4.7x on word error rate and 13x on cross-entropy loss over standard "
+     "self-attention, at 2.6x longer inference time, but only as relative ratios, and these must not be attributed "
+     "to Nebulon AI [4].", [4], "medium", "1 independent source")]
+Q013_F4 = _f("f4", "Report", "It reports improvements over standard self-attention of 15.5x on character error rate, "
+             "4.7x on word error rate and 13x on cross-entropy loss, with 2.6x longer inference time [4].", [4],
+             claim="The QISA paper reports improvements over standard self-attention of 15.5x on character error "
+                   "rate, 4.7x on word error rate and 13x on cross-entropy loss, with 2.6x longer inference time.")
+Q013_F8 = _f("f8", "Analysis", Q013_TAKEAWAYS[1][0], [4],
+             claim="The Quantum-Inspired Self-Attention (QISA) paper reports 15.5x improvement on character error "
+                   "rate, 4.7x on word error rate, and 13x on cross-entropy loss over standard self-attention, at "
+                   "2.6x longer inference time, as relative ratios only.")
+
+
+def test_the_live_q013_twins_share_their_values_and_a_source(monkeypatch, tmp_path):              # live q013
+    report = ("3. A second, also unrelated, source is a paper on Quantum-Inspired Self-Attention (QISA) in a GPT-1 "
+              f"model [4]. {Q013_F4['sentence']} The notes give these results only as relative ratios, not "
+              "absolute values [4].")
+    analysis_md = f"{ANALYSIS_LABEL}\n\n### Key takeaways\n\n" + "\n".join(
+        f"- {text} — confidence **{label}** ({why}, quote verified, authority 3/3)"
+        for text, _, label, why in Q013_TAKEAWAYS)
+    analysis = {**ANALYSIS, "md": analysis_md, "takeaways": [
+        {"text": text, "source_ids": ids, "confidence": label, "reasons": [why, "quote verified", "authority 3/3"]}
+        for text, ids, label, why in Q013_TAKEAWAYS]}
+    reason = ("The 15.5x/4.7x/13x figures are supported, but '2.6x longer inference time' appears nowhere in "
+              "source [4]'s claims or quotes.")
+    state = _state(
+        length="short", run_config=make_run_config("short"), analysis=analysis,
+        fetched=[{"url": f"https://s{i}.example/p", "title": f"Source {i}"} for i in range(1, 11)],
+        outline={"sections": [], "changed_sections": []},
+        sections=[{"title": "Report", "md": report, "note_ids": [4, 9]}],
+        findings=[_f("f3", "Report", "A second, also unrelated, source is a paper on Quantum-Inspired "
+                     "Self-Attention (QISA) in a GPT-1 model [4].", [4],
+                     claim="Source [4] is a paper on Quantum-Inspired Self-Attention (QISA) in a GPT-1 model, and "
+                           "it is unrelated to Nebulon AI."),
+                  dict(Q013_F4),
+                  _f("f6", "Report", "The notes give these results only as relative ratios, not absolute values "
+                     "[4].", [4], claim="The QISA results are given only as relative ratios, not absolute values."),
+                  _f("f7", "Analysis", Q013_TAKEAWAYS[0][0], [4, 9],
+                     claim='No verifiable primary source for a "Quantum Lattice Transformer" from Nebulon AI appears '
+                           "in the evidence, and the two retrieved sources describe differently named models with "
+                           "no stated link to Nebulon AI."),
+                  dict(Q013_F8)],
+        panel_verdict={"verdict": "revise", "flagged_finding_ids": ["f4"], "judged": 5, "total": 5,
+                       "judge_verdicts": {"grounding": "revise", "flag_reasons": {"f4": reason}}})
+    out, md, _, evidence, _ = _report(monkeypatch, tmp_path, state)
+    assert {f["id"]: f["status"] for f in evidence["findings"]} == {
+        "f3": "kept", "f4": "cut", "f6": "kept", "f7": "kept", "f8": "cut"}
+    assert "2.6x" not in out["tldr_md"] and "2.6x" not in md.split("## ⚠ Flagged claims")[0]
+    assert evidence["tldr"] == {"source": "takeaways", "items": [f"{Q013_TAKEAWAYS[0][0]} — confidence **high**"]}
+    assert next(line for line in md.splitlines() if line.startswith("- **Analysis:**")).endswith(
+        "— near-duplicate of cut f4")
+    a, b = Q013_F4["claim"], Q013_F8["claim"]
+    assert SequenceMatcher(None, claim_norm(a), claim_norm(b), autojunk=False).ratio() < 0.85
+    assert twins(a, b, [4], [4]) and not twins(a, b, [4], [9]), "rule (ii): >= 2 values and a shared source"
+
+
+def test_the_tldr_falls_back_to_the_sections_when_no_takeaway_is_kept(monkeypatch, tmp_path):   # R2, point (f)
+    skip = ("[r1] skip: compose.findings_extract Analysis (role compose.findings_extract: every engine failed after "
+            "3 attempts (last: DriverError: provider fake: 429 Too Many Requests))")
+    state = _state(run_config=make_run_config("medium"), analysis=ANALYSIS, errors=[skip])   # no analysis finding
+    out, md, _, evidence, _ = _report(monkeypatch, tmp_path, state)
+    assert evidence["tldr"] == {"source": "sections", "items": ["LangGraph pauses a run at an interrupt [1].",
+                                                                "Teams use it for approvals [1]."]}
+    assert out["tldr_md"].endswith("- LangGraph pauses a run at an interrupt [1].\n- Teams use it for approvals [1].")
+    assert '> ⚠ Not fact-checked — section "Analysis" was not fact-checked (429)' in md, "still named, unjudged"
+    assert "\n## Analysis\n" in md and "tldr: omitted" not in md
 
 
 # ---------------------------------------------------------------------------

@@ -497,3 +497,14 @@ def test_the_analysis_event(monkeypatch, extracted):
     analyst_node(_state(), Runtime(stream_writer=events.append))
     assert events == [{"kind": "analysis", "node": "analyst",
                        "data": {"takeaways": 2, "has_disagreement": True, "has_scenarios": False}}]
+
+
+def test_the_analysts_footnote_definitions_are_removed_and_recorded(monkeypatch, extracted):   # re-review (e)
+    reply = REPLY.replace("reasoning tasks [1][3]", "reasoning tasks [^1][3]") + "\n[^1]: https://docs.alpha.com/a\n"
+    fake_llm(monkeypatch, lambda system, human: reply)
+    out = analyst_node(_state())
+    md = out["analysis"]["md"]
+    assert "[^1]" not in md and "https://docs.alpha.com/a" not in md
+    assert out["analysis"]["takeaways"][0]["text"] == (
+        "Model X reaches about 90 percent accuracy on reasoning tasks [1][3]")
+    assert out["errors"] == ['[r1] cite: removed footnote definition [^1] in section "Analysis"'], "as compose does"

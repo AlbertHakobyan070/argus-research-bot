@@ -12,8 +12,9 @@ needs the window: 0.94 over two sentences, 0.68 over either alone);
 removes whole sentences, drops a paragraph or item left empty and a
 sub-heading left without content; an untouched body is returned
 byte-identical. ``apply_cuts`` turns the panel's flags, the unknown-id rule
-and the stricter verdict for near-duplicates (``twins``: compose's dedupe
-normalisation ``claim_norm`` and the same number tokens) into finding
+and the stricter verdict for twins (``twins``, spec R1: no negation between
+them and the same numeric values, then compose's dedupe ratio on
+``claim_norm``, or ≥ 2 values and a shared source) into finding
 statuses (kept / cut / unlocated) — a finding stated in a cut sentence goes
 with it unless the cut body still states it — the cut bodies and the two
 appendix listings (judge reasons with their square brackets escaped);
@@ -30,14 +31,22 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from difflib import SequenceMatcher
 
 # = graph.assemble.CITE_RE; not imported: the graph package imports this module.
 _CITE = re.compile(r"\[(\d{1,3})\]")
-# = graph.research._TOKEN, quote verification's tokens ("0.5%" ≠ "5%", "-5%" ≠ "5%", "50m" one
-# token), and its fold of dashes and "_"; not imported, as _CITE.
-_TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?(?!\w)|[<>≤≥≠±=]|\w+")
-_FOLD = str.maketrans({**dict.fromkeys("–—‐‑−", "-"), "_": " "})
+# = graph.research._QUOTE_FOLD and _NEGATORS: quote verification's fold (quote marks and "*" out, dashes
+# unified, "_" a space) and its negator tokens (the fold deletes apostrophes: don't → dont); not imported, as _CITE.
+_FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»‹›*"), **dict.fromkeys("–—‐‑−", "-"), "_": " "})
+_NEGATORS = frozenset("not never cannot cant dont doesnt isnt arent wasnt werent wont wouldnt shouldnt "
+                      "couldnt didnt hasnt havent hadnt aint mustnt neednt mightnt shant oughtnt without"
+                      .split())
+# a numeric value (spec R1): digits not attached to a name ("GPT-4", "H2", "v0.2" are names), "." and ","
+# only between digits; its unit never counts ("30%" = "30 percent", "70B" = "70 billion", "120 ms" = "120ms")
+_VALUE = re.compile(r"(?<![\w.])(?<!\w-)\d+(?:[.,]\d+)*")
+_THOUSANDS = re.compile(r",(?=\d{3}(?!\d))")          # a comma before exactly three digits
+_DECIMAL = re.compile(r"\d+(?:\.\d+)?")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _HEADING = re.compile(r"^\s{0,3}(#{1,6})\s")
 _ITEM = re.compile(r"^(\s*(?:[-*+•]|\d+[.)])\s+)")
@@ -255,24 +264,42 @@ def claim_norm(text: str) -> str:
     return " ".join(re.findall(r"\w+", text))
 
 
-def _numbers(text: str) -> set[str]:
-    """The number tokens of ``text``: quote verification's tokens that carry a digit."""
-    text = _CITE.sub(" ", unicodedata.normalize("NFKC", text)).translate(_FOLD).lower()
-    return {t for t in _TOKEN.findall(text) if any(c.isdigit() for c in t)}
+def _values(text: str) -> set[Decimal | str]:
+    """The numeric values of ``text`` (spec R1), ``[n]`` markers aside:
+    thousands separators out, compared by value ("$1,200" = "$1200", "2.50x"
+    = "2.5x"); a run that is no decimal ("3.10.2", "2,5") compares as written."""
+    text = _CITE.sub(" ", unicodedata.normalize("NFKC", text)).translate(_FOLD)
+    runs = (_THOUSANDS.sub("", v) for v in _VALUE.findall(text))
+    return {Decimal(v) if _DECIMAL.fullmatch(v) else v for v in runs}
 
 
-def twins(a: str, b: str) -> bool:
-    """``a`` and ``b`` state one claim (spec R1): their ``claim_norm`` ratio is
-    ≥ 0.85 (the dedupe rule) and they carry the same number tokens — a
-    different number makes a different claim."""
+def _negated(text: str) -> bool:
+    """``text`` holds one of quote verification's negator tokens."""
+    words = re.findall(r"\w+", unicodedata.normalize("NFKC", text).translate(_FOLD).casefold())
+    return not _NEGATORS.isdisjoint(words)
+
+
+def twins(a: str, b: str, a_ids: Iterable[int], b_ids: Iterable[int]) -> bool:
+    """``a`` and ``b`` state one claim (spec R1): neither negates what the
+    other asserts (exactly one holding a negator token: never twins) and
+    either (i) their ``claim_norm`` ratio is ≥ 0.85 (the dedupe rule) with the
+    same numeric values, or (ii) they carry the same set of ≥ 2 distinct
+    numeric values and share a cited source (``a_ids`` / ``b_ids``). A
+    different value makes a different claim."""
+    values = _values(a)
+    if _negated(a) != _negated(b) or values != _values(b):
+        return False
     x, y = claim_norm(a), claim_norm(b)
-    return (bool(x and y) and _numbers(a) == _numbers(b)
-            and SequenceMatcher(None, x, y, autojunk=False).ratio() >= _TWIN_RATIO)
+    if x and y and SequenceMatcher(None, x, y, autojunk=False).ratio() >= _TWIN_RATIO:
+        return True
+    return len(values) >= 2 and not {int(i) for i in a_ids}.isdisjoint(int(i) for i in b_ids)
 
 
-def _twin(claim: str, cut_claims: list[tuple[str, str]]) -> str | None:
-    """The id of a cut finding whose claim this one ``twins``."""
-    return next((fid for fid, cc in cut_claims if twins(claim, cc)), None)
+def _twin(f: dict, cut_findings: list[dict]) -> str | None:
+    """The id of a cut finding whose claim this one's ``twins`` (by their ``source_ids``)."""
+    return next((str(c.get("id")) for c in cut_findings
+                 if twins(f.get("claim") or "", c.get("claim") or "", f.get("source_ids") or (),
+                          c.get("source_ids") or ())), None)
 
 
 def apply_cuts(findings: list[dict], mds: Mapping[str, str], flagged: Mapping[str, str], n_sources: int
@@ -281,9 +308,8 @@ def apply_cuts(findings: list[dict], mds: Mapping[str, str], flagged: Mapping[st
     included); ``flagged``: the panel's flagged finding id → reason. A finding
     whose ``source_ids`` all fall outside 1..``n_sources`` is cut too, reason
     "unknown source id" (no judge needed); so is a kept finding whose claim
-    ``twins`` one of those cut ones (ratio ≥ 0.85, the dedupe rule, and the
-    same number tokens) — the stricter verdict, reason "near-duplicate of cut
-    f<n>" (spec R1). Each cut finding is located by its ``sentence`` (its claim
+    ``twins`` one of those cut ones — the stricter verdict, reason "near-duplicate
+    of cut f<n>" (spec R1). Each cut finding is located by its ``sentence`` (its claim
     for a legacy finding without one): status ``cut`` when found, else
     ``unlocated`` (still in the body); then a kept finding whose sentence lies
     inside a cut span and no longer occurs in the cut body is cut with it,
@@ -300,11 +326,11 @@ def apply_cuts(findings: list[dict], mds: Mapping[str, str], flagged: Mapping[st
             reasons[k] = f"unknown source id (cites {', '.join(map(str, ids))})"
         elif f.get("id") in flagged:
             reasons[k] = flagged[f["id"]]
-    cut_claims = [(str(out[k].get("id")), out[k].get("claim") or "") for k in reasons]
+    cut_findings = [out[k] for k in reasons]
     # ponytail: every kept claim against every cut one through difflib, O(findings × cuts) over one
     # report (tens to a few hundred findings); an index if reports grow far past that.
     for k, f in enumerate(out):
-        if k not in reasons and (twin := _twin(f.get("claim") or "", cut_claims)):
+        if k not in reasons and (twin := _twin(f, cut_findings)):
             reasons[k] = f"near-duplicate of cut {twin}"
 
     def where(f: dict) -> list[int] | None:

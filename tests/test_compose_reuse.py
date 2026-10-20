@@ -666,3 +666,43 @@ def test_a_json_reply_is_never_the_flat_body(monkeypatch):                      
         compose_node(_state(length="short", run_config=make_run_config("short"),
                             outline={"sections": [], "changed_sections": []}))
     assert len(seen) == 2, "the JSON object fails the validate hook as the empty reply did: then the role raises"
+
+# ---------------------------------------------------------------------------
+# Fix round 3: the rename into an existing "Evidence analysis" of any case, a fenced JSON flat reply,
+# cite: lines for written sections only
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("existing", ["Evidence analysis", "Evidence Analysis", "EVIDENCE  ANALYSIS"])
+def test_a_renamed_analysis_merged_into_an_existing_evidence_analysis_is_written(monkeypatch, existing):  # N2
+    seen = _llm(monkeypatch)
+    prior = [{"title": "A", "md": _sentence(1), "note_ids": [1]}, {"title": existing, "md": _sentence(2),
+                                                                   "note_ids": [2]},
+             {"title": "C", "md": _sentence(6), "note_ids": [6]}]
+    outline = {"sections": [{"title": "A", "focus": "", "sub_qs": [0], "note_ids": [1]},
+                            {"title": existing, "focus": "", "sub_qs": [0], "note_ids": [2]},
+                            {"title": "C", "focus": "", "sub_qs": [2], "note_ids": [6]},
+                            {"title": "Analysis", "focus": "extend's new section", "sub_qs": [1], "note_ids": [3]}],
+               "changed_sections": ["Analysis"]}                         # an extend wave: the new section only
+    out = compose_node(_state(sections=prior, findings=[_finding("f0", "A", 1), _finding("f1", existing, 2),
+                                                        _finding("f2", "C", 6)], compose_runs=1, outline=outline))
+    assert [t for t, _ in _writes(seen)] == [existing], "the section the new notes merged into is rewritten"
+    assert _sentence(3) in out["draft_md"]
+    assert out["outline"]["changed_sections"] == [existing], "changed_sections names only existing titles"
+    assert [s["note_ids"] for s in out["outline"]["sections"] if s["title"] == existing] == [[2, 3]]
+
+
+def test_a_fenced_json_reply_is_never_the_flat_body(monkeypatch):                     # re-review N3
+    fenced = '```json\n{"report": "X is true, as the source states it plainly [1]. More text here."}\n```'
+    seen = fake_llm(monkeypatch, lambda system, human: fenced if system.startswith(FLAT_SYSTEM)
+                    else pytest.fail("no extraction without a body"))
+    with pytest.raises(llm.EngineError, match="unparseable"):
+        compose_node(_state(length="short", run_config=make_run_config("short"),
+                            outline={"sections": [], "changed_sections": []}))
+    assert len(seen) == 2, "the fenced object fails the validate hook, as a bare one does: then the role raises"
+
+
+def test_cite_lines_are_recorded_only_for_a_written_section(monkeypatch):            # re-review N5
+    _llm(monkeypatch, write={"A": "Graphs pause [^1].\n\n[^1]: https://s1.example/p"})
+    out = compose_node(_state())
+    assert "[r1] skip: compose.section A (empty reply)" in out["errors"]
+    assert not [e for e in out["errors"] if " cite: " in e], "a skipped reply removed nothing from the report"

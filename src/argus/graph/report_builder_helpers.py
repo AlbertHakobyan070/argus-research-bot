@@ -362,24 +362,28 @@ def build_tldr(*, analysis: dict | None, analysis_md: str, sections: list[dict],
     ≤ 4 kept takeaways with their labels: still in the (cut) analysis, and
     stated by analysis findings that are all ``kept`` — a finding whose
     sentence is in the takeaway (or the takeaway in it), or whose claim
-    ``twins`` it; never one ``cut`` or ``unlocated``, nor a takeaway no
-    finding states. Without one, the first kept finding sentence still in
-    each section (≤ 4). Both by normalised containment in the cut markdown,
-    never a fuzzy match; else none ("omitted")."""
+    ``twins`` it (by their source ids); never one ``cut`` or ``unlocated``,
+    nor a takeaway no finding states. Without one, or with no takeaway kept,
+    the first kept finding sentence still in each section (≤ 4). Both by
+    normalised containment in the cut markdown, never a fuzzy match; else
+    none ("omitted")."""
     if analysis:
         mine = [f for f in findings if f.get("section") == ANALYSIS_SECTION]
 
-        def states(f: dict, text: str) -> bool:
-            s, claim = f.get("sentence") or "", f.get("claim") or ""
-            return quarantine.contains(s, text) or quarantine.contains(text, s) or quarantine.twins(claim, text)
+        def states(f: dict, t: dict) -> bool:
+            s, text = f.get("sentence") or "", t["text"]
+            return (quarantine.contains(s, text) or quarantine.contains(text, s)
+                    or quarantine.twins(f.get("claim") or "", text, f.get("source_ids") or (),
+                                        t.get("source_ids") or ()))
 
-        def kept(text: str) -> bool:
-            own = [f for f in mine if states(f, text)]
+        def kept(t: dict) -> bool:
+            own = [f for f in mine if states(f, t)]
             return bool(own) and all(f.get("status") == "kept" for f in own)
 
         items = [f"{t['text']} — confidence **{t['confidence']}**" for t in analysis.get("takeaways") or []
-                 if quarantine.contains(t["text"], analysis_md) and kept(t["text"])][:_TLDR_ITEMS]
-        return items, "takeaways" if items else "omitted"
+                 if quarantine.contains(t["text"], analysis_md) and kept(t)][:_TLDR_ITEMS]
+        if items:
+            return items, "takeaways"
     items = []
     for s in sections:
         first = next((f.get("sentence") or f.get("claim") for f in findings

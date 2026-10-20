@@ -534,7 +534,9 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
         s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", s)
         s = re.sub(r"\[(\d+)\]",
                    r'<font color="#6E2A34"><b>[\1]</b></font>', s)
-        return s
+        # markdown's escaped brackets print bare, as report.md renders them;
+        # after the [n] styling, so an escaped "\[3\]" is no citation
+        return s.replace("\\[", "[").replace("\\]", "]")
 
     class _OrnamentalRule(Flowable):
         """A slender hairline-gap-hairline rule with a small centred
