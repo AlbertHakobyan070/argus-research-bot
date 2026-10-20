@@ -8,8 +8,10 @@ an LLM: report_builder builds it after the cuts and passes it in.
 ``normalize_cite_markers`` rewrites the citation forms models emit (CJK
 brackets, lists, ranges, footnotes, ``[Source n]``) to ``[n][m]…`` and never
 touches code, links or URLs; compose applies it to every writer reply before
-extraction and assembly. ``ANALYSIS_SECTION`` names the analysis: its heading
-and its findings' section.
+extraction and assembly, and removes the reply's footnote definitions
+(``strip_footnote_definitions``). ``prose_text`` is the text the normaliser
+reads (the bench counts raw markers there). ``ANALYSIS_SECTION`` names the
+analysis: its heading and its findings' section.
 """
 from __future__ import annotations
 
@@ -111,12 +113,28 @@ def _ids(m: re.Match) -> str:
     return "".join(f"[{i}]" for i in ids)
 
 
-def _normalize_prose(text: str) -> str:
-    out, last = [], 0
+def _kept_spans(text: str):
+    last = 0
     for m in _KEEP.finditer(text):
-        out += [_normalize_markers(text[last:m.start()]), m.group(0)]
+        yield text[last:m.start()], True
+        yield m.group(0), False
         last = m.end()
-    return "".join(out) + _normalize_markers(text[last:])
+    yield text[last:], True
+
+
+def _pieces(md: str):
+    """``md`` as ``(text, is_prose)`` pieces, in order: code lines and the
+    ``_KEEP`` spans are not prose."""
+    lines = md.splitlines(keepends=True)
+    prose: list[str] = []
+    for line, is_code in zip(lines, _code_lines(lines)):
+        if is_code:
+            yield from _kept_spans("".join(prose))
+            yield line, False
+            prose = []
+        else:
+            prose.append(line)
+    yield from _kept_spans("".join(prose))
 
 
 def _normalize_markers(text: str) -> str:
@@ -163,15 +181,32 @@ def normalize_cite_markers(md: str) -> str:
     blocks, spans), link and image destinations and their bracketed text, bare
     URLs, footnote definitions, and an id list holding a 0; ``[n]`` already is
     the form."""
+    return "".join(_normalize_markers(text) if prose else text for text, prose in _pieces(md))
+
+
+def prose_text(md: str) -> str:
+    """``md`` with each piece ``normalize_cite_markers`` never touches (code,
+    link and image destinations, bare URLs, footnote definitions) replaced by
+    a space: where a citation marker can stand (bench.metrics counts there)."""
+    return "".join(text if prose else " " for text, prose in _pieces(md))
+
+
+_DEFINITION = re.compile(r" {0,3}\[\^(\d{1,3})\]:.*")
+
+
+def strip_footnote_definitions(md: str) -> tuple[str, list[int]]:
+    """``md`` without its footnote-definition lines (``[^n]: …``, outside
+    code) and their ids in order — spec B1: compose removes them from writer
+    output (a ``cite:`` line each); the references became ``[n]``."""
     lines = md.splitlines(keepends=True)
-    out, prose = [], []
+    out, ids = [], []
     for line, is_code in zip(lines, _code_lines(lines)):
-        if is_code:
-            out += [_normalize_prose("".join(prose)), line]
-            prose = []
+        m = None if is_code else _DEFINITION.fullmatch(line.rstrip("\r\n"))
+        if m:
+            ids.append(int(m.group(1)))
         else:
-            prose.append(line)
-    return "".join(out) + _normalize_prose("".join(prose))
+            out.append(line)
+    return "".join(out), ids
 
 
 def assemble_draft(*, tldr: str | None, sections: list[dict], analysis_md: str | None,

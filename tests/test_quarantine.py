@@ -11,6 +11,11 @@ Run with:
 """
 from __future__ import annotations
 
+import pytest
+
+from argus import quarantine
+from argus.graph import compose as compose_mod
+from argus.graph import research
 from argus.graph.report_builder_helpers import build_tldr
 from argus.quarantine import (apply_cuts, cut, locate, render_cut_appendix, render_unlocated_appendix,
                               sentences, strip_unknown_ids)
@@ -158,3 +163,80 @@ def test_the_appendices():
     loose = render_unlocated_appendix([{"section": "S", "text": "Nowhere", "reason": "invented"}])
     assert loose.startswith("## ⚠ Flagged but not located (still in body)\n\n_")
     assert loose.endswith("\n\n- **S:** Nowhere — invented")
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: the re-review's probes O2–O7
+# ---------------------------------------------------------------------------
+
+def test_a_finding_still_stated_after_the_cut_stays_kept():                           # re-review O2
+    md = "Model X tops the board on MMLU, analysts say [1]. In May, Model X tops the board on MMLU again [2]."
+    findings, mds, rows, _ = apply_cuts([_f("f1", "Model X tops the board on MMLU, analysts say [1].", [1]),
+                                         _f("f2", "Model X tops the board on MMLU", [2], claim="Model X leads MMLU")],
+                                        {"S": md}, {"f1": "no such analysts"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "kept"], "f2's text is still in the body"
+    assert mds["S"] == "In May, Model X tops the board on MMLU again [2]."
+    assert rows == [{"section": "S", "text": "Model X tops the board on MMLU, analysts say [1].",
+                     "reason": "no such analysts"}]
+
+
+@pytest.mark.parametrize("copy", ["| Alpha holds [2][9]. |\n|---|", "### Alpha holds [2][9].",
+                                  "```\nAlpha holds [2][9].\n```"])
+def test_the_unknown_id_strip_edits_the_sentence_where_it_stands(copy):              # re-review O5
+    assert strip_unknown_ids(f"{copy}\n\nAlpha holds [2][9].", 3) == (f"{copy}\n\nAlpha holds [2].", [9])
+
+
+def test_a_twin_carries_the_same_number_tokens():                                     # re-review O7
+    findings, mds, _, _ = apply_cuts(
+        [_f("f1", "Revenue grew 30 percent in 2024 across the group [1].", [1]),
+         _f("f2", "Revenue grew 31 percent in 2024 across the group [2].", [2], section="T"),
+         _f("f3", "QISA needs 2.6x longer inference [1].", [1], section="U"),
+         _f("f4", "QISA needs 2.7x longer inference [3].", [3], section="T")],
+        {"S": "Revenue grew 30 percent in 2024 across the group [1].",
+         "T": "Revenue grew 31 percent in 2024 across the group [2]. QISA needs 2.7x longer inference [3].",
+         "U": "QISA needs 2.6x longer inference [1]."}, {"f1": "the source says 3", "f3": "no such model"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "kept", "cut", "kept"], "a different number, a different claim"
+    assert mds["T"] == "Revenue grew 31 percent in 2024 across the group [2]. QISA needs 2.7x longer inference [3]."
+
+
+def test_twins_share_compose_dedupe_normalisation():
+    findings, *_ = apply_cuts([_f("f1", "QISA needs 2.6x longer inference [1].", [1]),
+                               _f("f2", "ＱＩＳＡ needs ２.６x longer inference [2].", [2], section="T")],
+                              {"S": "QISA needs 2.6x longer inference [1].",
+                               "T": "ＱＩＳＡ needs ２.６x longer inference [2]."}, {"f1": "no such model"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "cut"], "NFKC and casefold: the full-width claim is the same"
+    assert not hasattr(compose_mod, "_norm"), "one normalisation, quarantine.claim_norm"
+    assert quarantine.claim_norm("ＱＩＳＡ Grew [3] 2.6x") == "qisa grew 2 6x"
+    assert quarantine._TOKEN.pattern == research._TOKEN.pattern, "the quote-verification tokens, copied verbatim"
+
+
+TAKEAWAY_MD = ("_Analysis — label._\n\n### Key takeaways\n\n"
+               "- QISA needs 2.6x longer inference [1] — confidence **high** (2 independent sources)")
+
+
+def _tldr(findings, mds, flagged):
+    out, cut_mds, _, _ = apply_cuts(findings, {"Analysis": TAKEAWAY_MD, **mds}, flagged, 5)
+    analysis = {"takeaways": [{"text": "QISA needs 2.6x longer inference [1]", "confidence": "high"}]}
+    return ([f["status"] for f in out],
+            build_tldr(analysis=analysis, analysis_md=cut_mds["Analysis"], sections=[], findings=out))
+
+
+def test_a_takeaway_enters_the_tldr_only_when_its_analysis_finding_is_kept():        # re-review O3, O4
+    # O3: the analysis twin of a cut finding, its sentence a paraphrase found nowhere: unlocated
+    statuses, tldr = _tldr([_f("f0", "QISA needs 2.6x longer inference than GPT-4 [1].", [1], section="Report",
+                               claim="QISA needs 2.6x longer inference"),
+                            _f("f1", "QISA is said to need 2.6 times the inference time", [1], section="Analysis",
+                               claim="QISA needs 2.6x longer inference")],
+                           {"Report": "QISA needs 2.6x longer inference than GPT-4 [1]. Other [2]."},
+                           {"f0": "no such model"})
+    assert statuses == ["cut", "unlocated"] and tldr == ([], "omitted")
+    # O4: the flagged takeaway finding itself, unlocated
+    statuses, tldr = _tldr([_f("f1", "A paraphrase nobody wrote", [1], section="Analysis",
+                               claim="QISA needs 2.6x longer inference")], {}, {"f1": "unsupported"})
+    assert statuses == ["unlocated"] and tldr == ([], "omitted")
+    # no analysis finding at all: nothing judged it
+    assert _tldr([], {}, {})[1] == ([], "omitted")
+    # kept: its finding states the takeaway
+    statuses, tldr = _tldr([_f("f1", "QISA needs 2.6x longer inference [1]", [1], section="Analysis")], {}, {})
+    assert statuses == ["kept"] and tldr == (["QISA needs 2.6x longer inference [1] — confidence **high**"],
+                                             "takeaways")

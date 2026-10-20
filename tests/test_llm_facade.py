@@ -124,6 +124,20 @@ def test_untagged_reasoning_on_json_role_retries_then_falls_back(monkeypatch, sl
     assert sleeps == [], "an unparseable reply is not a transient error"
 
 
+def test_a_markdown_roles_validate_retry_asks_for_the_markdown_text(monkeypatch, sleeps):
+    def body(text: str) -> str:                     # compose.flat's rule: a body of at least 40 chars
+        if len(text) < 40:
+            raise ValueError("too short")
+        return text
+
+    d = _drive(monkeypatch, p1=[_resp("short"), _resp("A grounded body that is long enough to ship [1].")])
+    out = llm.complete("compose.flat", MSGS, engines=_snap("compose.flat", fallbacks=()), validate=body)
+    assert out.parsed == "A grounded body that is long enough to ship [1]."
+    nudge = d.calls[1].messages[-1]
+    assert isinstance(nudge, HumanMessage) and nudge.content == "Reply with only the complete markdown text."
+    assert "JSON" not in nudge.content, "a markdown role is never asked for a JSON object"
+
+
 def test_untagged_reasoning_everywhere_degrades_never_anything_else(monkeypatch):
     _drive(monkeypatch, p1=[_resp(REASONING)] * 2, p2=[_resp(REASONING)] * 2)
     with pytest.raises(llm.EngineDegraded) as ei:

@@ -60,7 +60,7 @@ index of the evidence notes. Produce a section outline:
   it covers, and the ids of the notes its writer should use.
 - Allocate every note; a note goes in ONE section, at most two when it
   truly serves both.
-- Do NOT create sections for TL;DR or Sources — those are added
+- Do NOT title a section TL;DR, Sources or Analysis — those are added
   automatically.
 - Prefer thematic titles over restating sub-questions.
 

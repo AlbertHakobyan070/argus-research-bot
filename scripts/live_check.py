@@ -21,7 +21,10 @@ Usage (from the repo root; one live run against the proxy's quota):
 text; ``--expect-banner`` (nonexistent-entity queries, q013/q014) expects the
 grounding banner — with ``judged == total`` and no flagged claim in the body,
 like every run; no findings count (spec WP-C acceptance: the orchestrator
-reads the report for claims about the entity). Every run expects the v4 banners
+reads the report for claims about the entity). When search found only
+off-topic pages, the classified ``synthesis_no_evidence`` report with the
+banner is the honest outcome: its Sources and failure-text rows read n/a,
+the banner stays required. Every run expects the v4 banners
 ("⚠ Not fact-checked", "⚠ Degraded run") absent and report.pdf on disk; the
 evidence.json check validates it with ``graph.evidence_export.Evidence``.
 Then compare with the v3 baseline:
@@ -55,6 +58,7 @@ BANNER = "Limited direct evidence"                       # graph/grounding.py gr
 NOT_FACT_CHECKED = "⚠ Not fact-checked"                   # report_builder's banners (spec §2.8)
 DEGRADED = "⚠ Degraded run"
 FAILURE_TEXTS = ("synthesis_no_evidence", "report suppressed")
+NO_EVIDENCE = "**Class:** `synthesis_no_evidence`"        # graph/compose.py _no_evidence_md(): the classified report
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -67,7 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="run_config.recency (default: the brief's time-sensitivity decides)")
     p.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "argus_live_check")
     p.add_argument("--expect-banner", action="store_true",
-                   help="expect the grounding banner (a nonexistent entity)")
+                   help="expect the grounding banner (a nonexistent entity; the classified no-evidence report passes)")
     return p.parse_args(argv)
 
 
@@ -230,7 +234,16 @@ check_not_fact_checked_absent = _absent(NOT_FACT_CHECKED)
 check_degraded_absent = _absent(DEGRADED)
 
 
+def _unless_no_evidence(check):
+    """--expect-banner: n/a on the classified no-evidence report (search found only off-topic pages)."""
+    def wrapped(run, m):
+        md = run["report"]
+        return (NA, "no-evidence report") if md is not None and NO_EVIDENCE in md else check(run, m)
+    return wrapped
+
+
 def checks(expect_banner: bool) -> list[tuple[str, object]]:
+    honest = _unless_no_evidence if expect_banner else (lambda check: check)
     return [
         ("run completed", check_run_completed),
         ("fetched > 0", check_fetched),
@@ -238,14 +251,14 @@ def checks(expect_banner: bool) -> list[tuple[str, object]]:
         *([] if expect_banner else [("findings with citations > 0", check_cited_findings)]),
         ("report.md > 1000 chars", check_report_size),
         ("report.pdf exists", check_pdf_exists),
-        ("sources_block_present", check_sources_block),
+        ("sources_block_present", honest(check_sources_block)),
         ("cite_markers_unresolved == 0", check_cite_markers),
         ("flagged_claims_in_body == 0", check_flagged_in_body),
         ("judged == total", check_judged),
         ("compose_budget_ok", check_compose_budget),
         ("evidence.json valid", check_evidence_json),
         ("metadata.json has engines", check_metadata_engines),
-        ("no synthesis_no_evidence / report suppressed text", check_no_failure_text),
+        ("no synthesis_no_evidence / report suppressed text", honest(check_no_failure_text)),
         ("grounding banner present", check_banner_present) if expect_banner
         else ("grounding banner absent", check_banner_absent),
         ("⚠ Not fact-checked banner absent", check_not_fact_checked_absent),

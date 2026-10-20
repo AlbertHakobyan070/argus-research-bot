@@ -224,6 +224,23 @@ def test_the_check_list_follows_expect_banner():
     assert not hasattr(LC, "check_few_findings")
 
 
+NO_EVIDENCE_REPORT = ("# t\n\n> WARNING: **Limited direct evidence:** only off-topic pages\n\n"
+                      "⚠️ **Synthesis could not produce findings.**\n\n- **Class:** `synthesis_no_evidence`\n")
+
+
+def test_expect_banner_takes_the_classified_no_evidence_report():                  # live q013 on 9142fe5
+    banner, plain = dict(LC.checks(expect_banner=True)), dict(LC.checks(expect_banner=False))
+    run, no_sources = _r(report=NO_EVIDENCE_REPORT), {"sources_block_present": False}
+    assert banner["sources_block_present"](run, no_sources) == (NA, "no-evidence report")
+    assert banner["no synthesis_no_evidence / report suppressed text"](run, {}) == (NA, "no-evidence report")
+    assert banner["grounding banner present"](run, {})[0] == PASS
+    assert banner["grounding banner present"](_r(report=NO_EVIDENCE_REPORT.replace("Limited direct", "Some")),
+                                              {})[0] == FAIL, "the banner stays required"
+    assert banner["sources_block_present"](_r(report=PASSING_REPORT), no_sources)[0] == FAIL, "only that report"
+    assert plain["sources_block_present"](run, no_sources)[0] == FAIL, "without --expect-banner it still fails"
+    assert plain["no synthesis_no_evidence / report suppressed text"](run, {})[0] == FAIL
+
+
 def test_render_and_exit_code():
     rows = [("fetched > 0", PASS, "28"), ("compose_budget_ok", NA, "field not in this run")]
     assert LC.exit_code(rows) == 0

@@ -34,7 +34,7 @@ from datetime import datetime
 from typing import Any
 
 from .. import quarantine
-from .assemble import CITE_RE
+from .assemble import ANALYSIS_SECTION, CITE_RE
 from .panel import failure_reason
 
 TLDR_LABEL = "_TL;DR — compiled from the report's own cited, judged findings_"
@@ -49,8 +49,9 @@ _ITEM_ROLES = {
     "panel.grounding": "grounding batches could not be judged",
 }
 _SKIP_LINE = re.compile(r"^(?:\[r\d+\]\s*)?skip:\s*([a-z0-9_.]+)\s")
-# The degradation notes: the bench's skip / degrade / legacy lines, plus the other visible losses.
-_NOTE_LINE = re.compile(r"^(?:\[r(\d+)\]\s*)?(?:skip|degrade|legacy|pdf|tldr|cancelled|compose):")
+# The degradation notes: the bench's skip / degrade / legacy lines, plus the other visible losses and
+# the cite: repairs (spec B1; notes, never counted as degradations).
+_NOTE_LINE = re.compile(r"^(?:\[r(\d+)\]\s*)?(?:skip|degrade|legacy|pdf|tldr|cancelled|compose|cite):")
 _RECENCY = {"d": "past day", "w": "past week", "m": "past month", "y": "past year"}
 
 
@@ -358,13 +359,26 @@ def degraded_run(model_calls: list[dict], errors: list[str], panel: dict) -> str
 def build_tldr(*, analysis: dict | None, analysis_md: str, sections: list[dict], findings: list[dict]
                ) -> tuple[list[str], str]:
     """R2, after the cuts: ``(items, source)``. With an analysis, its first
-    ≤ 4 takeaways still in the (cut) analysis, with their labels; without
-    one, the first kept finding sentence still in each section (≤ 4) — by
-    normalised containment in the cut markdown, never a fuzzy match; else
-    none ("omitted")."""
+    ≤ 4 kept takeaways with their labels: still in the (cut) analysis, and
+    stated by analysis findings that are all ``kept`` — a finding whose
+    sentence is in the takeaway (or the takeaway in it), or whose claim
+    ``twins`` it; never one ``cut`` or ``unlocated``, nor a takeaway no
+    finding states. Without one, the first kept finding sentence still in
+    each section (≤ 4). Both by normalised containment in the cut markdown,
+    never a fuzzy match; else none ("omitted")."""
     if analysis:
+        mine = [f for f in findings if f.get("section") == ANALYSIS_SECTION]
+
+        def states(f: dict, text: str) -> bool:
+            s, claim = f.get("sentence") or "", f.get("claim") or ""
+            return quarantine.contains(s, text) or quarantine.contains(text, s) or quarantine.twins(claim, text)
+
+        def kept(text: str) -> bool:
+            own = [f for f in mine if states(f, text)]
+            return bool(own) and all(f.get("status") == "kept" for f in own)
+
         items = [f"{t['text']} — confidence **{t['confidence']}**" for t in analysis.get("takeaways") or []
-                 if quarantine.contains(t["text"], analysis_md)][:_TLDR_ITEMS]
+                 if quarantine.contains(t["text"], analysis_md) and kept(t["text"])][:_TLDR_ITEMS]
         return items, "takeaways" if items else "omitted"
     items = []
     for s in sections:

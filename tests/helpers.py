@@ -48,7 +48,7 @@ def fake_llm(monkeypatch, reply):
     """The real ``llm.complete`` on a fake driver (no network): every attempt
     answers ``reply(system, human)`` — the text of its first two messages — and
     the returned list records each attempt's message texts (a validate retry
-    adds the "Reply with only the JSON object." nudge as a third)."""
+    adds the role's nudge as a third: the JSON object, or the markdown text)."""
     from argus import llm
     from argus.engines import registry
     from argus.engines.llm_openai import DriverResponse

@@ -423,6 +423,19 @@ def test_canonical_markers_resolve_against_the_sources_entries():
     assert _markers("【注】 is not a citation.") == 0
 
 
+@pytest.mark.parametrize("body", [
+    "See [the guide](https://ex.com/a?ids[1,2]=x) for details [1].",
+    "See https://ex.com/a?ids[1,2]=x now [1].",
+    "~~~\nx = [1, 2]\n~~~",
+    "Use ``a [1, 2] b`` here.",
+    "```python\nx = [1, 2]\n",
+    "Code:\n\n    x = [1, 2]\n",
+    "Claim [1].\n\n[^2]: https://example.com/paper",
+])
+def test_markers_where_the_normaliser_never_looks_are_not_counted(body):
+    assert _markers(body) == 0, "assemble.normalize_cite_markers leaves these: the bench skips them the same way"
+
+
 def test_without_a_sources_heading_every_marker_is_unresolved():
     m = metrics.compute(_run({}, report="# t\n\nA [1]. B【2】.\n"))
     assert (m["cite_markers_unresolved"], m["sources_block_present"]) == (2, False)

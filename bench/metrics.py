@@ -40,7 +40,8 @@ alike:
                         revision_rounds ≤ max_compose_revisions, gap_waves ≤ gap_waves_max
   quote_verified_ratio  claims with quote_verified True / claims checked (not None)
   claims_per_primary_source  claims per evidence note from a primary domain (scorer.PRIMARY_DOMAINS)
-  cite_markers_unresolved  markers above the last ``## Sources`` heading (code excluded) that do
+  cite_markers_unresolved  markers above the last ``## Sources`` heading (outside what the normaliser
+                        never reads: code, URLs, link destinations, footnote definitions) that do
                         not resolve: every unnormalised form (``【n】`` ``［n］`` ``〔n〕`` ``【n†…】``
                         ``[n, m]`` ``[1-3]`` ``[^n]`` ``[Source n]``) plus each ``[n]`` without an entry
   sources_block_present a ``## Sources`` / ``## References`` heading with at least one entry
@@ -84,7 +85,7 @@ from pathlib import Path
 
 from argus.engines import registry
 from argus.engines.urls import canonical_url
-from argus.graph.assemble import CITE_RE
+from argus.graph.assemble import CITE_RE, prose_text
 
 from .scorer import PRIMARY_DOMAINS
 
@@ -277,7 +278,6 @@ def compose_budget_ok(run):
 _SOURCES_HEADING = re.compile(r"^[ \t]*##[ \t]+(?:Sources|References)[ \t]*$", re.M)
 _BLOCK_END = re.compile(r"^[ \t]*(?:##[ \t]+\S|---[ \t]*$)", re.M)
 _ENTRY = re.compile(r"^[ \t]*(?:\[(\d+)\]|(\d+)\.)[ \t]+\S", re.M)
-_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 _RAW_MARKERS = re.compile(                           # the forms normalize_cite_markers rewrites (§2.8)
     r"【\s*\d[^】]*】|［\s*\d+\s*］|〔\s*\d+\s*〕"
     r"|\[\s*\d+\s*(?:[,;]\s*\d+\s*)+\]|\[\s*\d+\s*[-–]\s*\d+\s*\]"
@@ -302,7 +302,7 @@ def cite_markers_unresolved(run):
     if md is None:
         return NA
     body, ids = _split_report(md)
-    body = _CODE.sub(" ", body)
+    body = prose_text(body)             # as normalize_cite_markers reads it: no code, URL, link target, definition
     plain = sum(1 for n in CITE_RE.findall(body) if ids is None or int(n) not in ids)
     return len(_RAW_MARKERS.findall(body)) + plain
 

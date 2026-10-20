@@ -12,7 +12,10 @@ one citing ``[n]`` without findings is extracted again. A pre-v4 outline is
 allocated first. A first write that is skipped merges into its neighbour (the
 previous section, else the next: sub-questions, notes, focus), written once
 more, and the merge sticks for the round; a skipped re-write keeps the
-previous version; every section skipped raises.
+previous version; every section skipped raises. A section titled "Analysis"
+is renamed "Evidence analysis" (the title is the analyst's); a section the
+dedupe pass empties merges into its neighbour in the outline; footnote
+definitions in writer output are removed (a ``cite:`` line).
 """
 from __future__ import annotations
 
@@ -28,8 +31,8 @@ from argus import config as config_mod
 from argus import llm
 from argus.engines.llm_openai import DriverError
 from argus.graph import nodes as nodes_mod
-from argus.graph.compose import (EXTRACT_SYSTEM, FLAT_SYSTEM, SECTION_SYSTEM, compose_node, extract_findings,
-                                 render_notes)
+from argus.graph.compose import (EXTRACT_SYSTEM, FLAT_SYSTEM, OUTLINE_SYSTEM, SECTION_SYSTEM, compose_node,
+                                 extract_findings, render_notes)
 from argus.graph.nodes import revise_prep_node
 from argus.graph.run_config import RunConfig
 from helpers import fake_llm, make_run_config
@@ -536,3 +539,130 @@ def test_section_events(monkeypatch):
     assert rows["C"] == {"title": "C", "ok": False, "chars": len(PRIOR_SECTIONS[2]["md"]), "reused": True}, (
         "a skipped re-write: the write failed, the previous version stays")
     assert all(e["node"] == "compose" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: the reserved "Analysis" title, a section the dedupe empties,
+# footnote definitions, the flat writer's markdown nudge
+# ---------------------------------------------------------------------------
+
+def test_a_section_titled_analysis_is_renamed_evidence_analysis(monkeypatch):
+    assert "Do NOT title a section TL;DR, Sources or Analysis" in " ".join(OUTLINE_SYSTEM.split())
+    outline = {"sections": [OUTLINE["sections"][0], {**OUTLINE["sections"][1], "title": " analysis "},
+                            OUTLINE["sections"][2]], "changed_sections": ["A", " analysis ", "C"]}
+    seen = _llm(monkeypatch)
+    out = compose_node(_state(outline=outline))
+    assert sorted(t for t, _ in _writes(seen)) == ["A", "C", "Evidence analysis"]
+    assert [s["title"] for s in out["sections"]] == ["A", "Evidence analysis", "C"]
+    assert "Evidence analysis" in {f["section"] for f in out["findings"]} and "## Analysis" not in out["draft_md"]
+    assert out["outline"] == {"sections": [OUTLINE["sections"][0],
+                                           {**OUTLINE["sections"][1], "title": "Evidence analysis"},
+                                           OUTLINE["sections"][2]],
+                              "changed_sections": ["A", "Evidence analysis", "C"]}, (
+        "compose returns the renamed outline, as the merge does")
+
+
+ANALYST = {"md": "_Analysis — interpretation by Argus._\n\n### Key takeaways\n\n"
+                 "- Graphs pause at interrupts [1] — confidence **high** (2 independent sources)",
+           "takeaways": [{"text": "Graphs pause at interrupts [1]", "source_ids": [1], "confidence": "high",
+                          "reasons": ["2 independent sources"]}],
+           "stance_map": {}, "has_disagreement_section": False, "has_scenarios": False, "archetype": "explainer"}
+ANALYST_FINDING = {"claim": "Graphs pause at interrupts", "citation_urls": [], "confidence": "high",
+                   "section": "Analysis", "source_ids": [1], "sentence": "Graphs pause at interrupts [1]",
+                   "status": "kept"}
+
+
+def _with_analysis(state: dict, out: dict, flagged=()) -> dict:
+    findings = [*out["findings"], {**ANALYST_FINDING, "id": f"f{len(out['findings'])}"}]
+    return {**_judged(state, out), "analysis": ANALYST, "findings": findings,
+            "panel_verdict": {"verdict": "pass", "judged": len(findings), "total": len(findings),
+                              "flagged_finding_ids": [f["id"] for f in findings if flagged and flagged(f)]}}
+
+
+def test_the_renamed_section_is_judged_cut_and_stripped_like_any_other(monkeypatch, tmp_path):
+    outline = {"sections": [OUTLINE["sections"][0], {**OUTLINE["sections"][1], "title": "Analysis"},
+                            OUTLINE["sections"][2]], "changed_sections": None}
+    state = _state(outline=outline)
+    body = "Resume takes a command [3]. The user clip mentions approvals [4][9]."
+    _llm(monkeypatch, write={"Evidence analysis": body})
+    out = compose_node(state)
+    md, _ = _report_md(monkeypatch, tmp_path, _with_analysis(
+        state, out, flagged=lambda f: f["section"] == "Evidence analysis" and "[3]" in f["sentence"]))
+    shown = md.split("## ⚠ Flagged claims")[0]
+    assert shown.count("\n## Analysis\n") == 1 and "\n## Evidence analysis\n" in shown, "one Analysis: the analyst's"
+    assert "Resume takes a command" not in shown, "its flagged sentence is cut, as in any section"
+    assert "The user clip mentions approvals [4]." in shown and "[9]" not in shown, "its unknown id is stripped"
+
+    _llm(monkeypatch, write={"Evidence analysis": body}, extract={"Evidence analysis": "no json at all"})
+    out = compose_node(state)
+    md, meta = _report_md(monkeypatch, tmp_path / "unjudged", _with_analysis(state, out))
+    assert 'section "Evidence analysis" was not fact-checked (unparseable)' in md and meta["degraded"] is True, (
+        "the analyst's own findings no longer hide the section's")
+
+
+def test_a_section_the_dedupe_empties_leaves_the_outline(monkeypatch):               # re-review open point (d)
+    twice = "Graphs pause at interrupts here [1]. Checkpoints persist the state here [2]."     # A's two findings
+    seen = _llm(monkeypatch, write={"B": twice})
+    first = compose_node(_later(panel_verdict={"next": "compose", "revise_sections": ["B"], "notes": []}))
+    assert [t for t, _ in _writes(seen)] == ["B"], "merged into A in the outline only: A is not written again"
+    assert first["outline"] == {"sections": [
+        {"title": "A", "focus": "", "sub_qs": [0, 1], "note_ids": [1, 2, 5, 3]},
+        {"title": "C", "focus": "", "sub_qs": [2], "note_ids": [6]}], "changed_sections": []}
+    seen.clear()
+    out = compose_node(_next(_later(), first,
+                             panel_verdict={"next": "compose", "revise_sections": ["C"], "notes": []}))
+    assert [t for t, _ in _writes(seen)] == ["C"], "a later compose of the round does not write B again"
+    assert [s["title"] for s in out["sections"]] == ["A", "C"]
+
+
+def test_footnote_definitions_in_a_sections_reply_are_removed_and_recorded(monkeypatch):
+    _llm(monkeypatch, write={"A": "Graphs pause at interrupts [^1]. Checkpoints persist the state [2].\n\n"
+                                  "[^1]: https://s1.example/p\n[^2]: The second source"})
+    out = compose_node(_state())
+    assert next(s for s in out["sections"] if s["title"] == "A")["md"] == (
+        "Graphs pause at interrupts [1]. Checkpoints persist the state [2].")
+    assert [e for e in out["errors"] if " cite: " in e] == [
+        '[r1] cite: removed footnote definition [^1] in section "A"',
+        '[r1] cite: removed footnote definition [^2] in section "A"']
+
+
+def test_footnote_definitions_in_the_flat_reply_are_removed_and_recorded(monkeypatch):
+    body = "Graphs pause at interrupts [^1], and resume takes a command [3]."
+    fake_llm(monkeypatch, lambda system, human: (
+        f"{body}\n\n[^1]: https://s1.example/p" if system.startswith(FLAT_SYSTEM)
+        else json.dumps({"findings": [{"claim": "Graphs pause", "sentence": "Graphs pause at interrupts [1], and "
+                                       "resume takes a command [3].", "source_ids": [1, 3]}]})))
+    out = compose_node(_state(length="short", run_config=make_run_config("short"),
+                              outline={"sections": [], "changed_sections": []}))
+    assert out["sections"][0]["md"] == "Graphs pause at interrupts [1], and resume takes a command [3]."
+    assert '[r1] cite: removed footnote definition [^1] in section "Report"' in out["errors"]
+
+
+def test_a_too_short_flat_reply_is_retried_for_markdown_never_json(monkeypatch):     # re-review probe (item 20)
+    body = "X is true, as the source states it plainly [1]. More text here."
+
+    def reply(system, human):
+        if not system.startswith(FLAT_SYSTEM):
+            return json.dumps({"findings": [{"claim": "X is true", "sentence": "X is true, as the source states "
+                                             "it plainly [1].", "source_ids": [1]}]})
+        nudge = seen[-1][2:]                        # this attempt's retry message, if any
+        if not nudge:
+            return ""                               # too short: the validate hook's retry follows
+        return json.dumps({"report": body}) if "JSON" in nudge[0] else body     # a model does as it is told
+
+    seen = fake_llm(monkeypatch, reply)
+    out = compose_node(_state(length="short", run_config=make_run_config("short"),
+                              outline={"sections": [], "changed_sections": []}))
+    retry = [m for m in seen if m[0].startswith(FLAT_SYSTEM)][1]
+    assert retry[-1] == "Reply with only the complete markdown text."
+    assert out["sections"][0]["md"] == body, "the body is the markdown, never a JSON object"
+
+
+def test_a_json_reply_is_never_the_flat_body(monkeypatch):                          # re-review probe (item 20)
+    replies = iter(["", '{"report": "X is true, as the source states it plainly [1]. More text here."}'])
+    seen = fake_llm(monkeypatch, lambda system, human: next(replies) if system.startswith(FLAT_SYSTEM)
+                    else pytest.fail("no extraction without a body"))
+    with pytest.raises(llm.EngineError, match="unparseable"):
+        compose_node(_state(length="short", run_config=make_run_config("short"),
+                            outline={"sections": [], "changed_sections": []}))
+    assert len(seen) == 2, "the JSON object fails the validate hook as the empty reply did: then the role raises"

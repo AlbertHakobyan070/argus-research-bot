@@ -9,7 +9,8 @@ times; any other error fails that engine (the SDK itself never retries).
 Then tagged reasoning blocks are stripped; a JSON role cut off at the token
 limit gets one retry with double the budget (4096 when it had none); a
 reply the ``validate`` hook rejects gets one retry with "Reply with only the
-JSON object.". Then the next fallback, then the binding's ``on_exhausted``:
+JSON object." (a JSON role) or "Reply with only the complete markdown text."
+(a markdown role). Then the next fallback, then the binding's ``on_exhausted``:
 ``raise`` → ``EngineError``, ``skip_item`` → ``EngineSkipped``, ``degrade`` →
 ``EngineDegraded``, each with the message "role <id>: every engine failed
 after <n> attempts (last: …)". Every attempt is a ``CallRecord``; recorded
@@ -122,6 +123,7 @@ def strip_reasoning(text: str) -> str:
 _TRANSIENT_TRIES = 3
 _TRUNCATION_CAP = 4096
 _NUDGE = "Reply with only the JSON object."
+_MD_NUDGE = "Reply with only the complete markdown text."      # a markdown role's validate retry
 _driver = OpenAICompatDriver()
 _sleep = time.sleep
 
@@ -264,7 +266,7 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
             if nudged:
                 return None
             nudged, reason = True, "unparseable"
-            msgs = [*messages, HumanMessage(content=_NUDGE)]
+            msgs = [*messages, HumanMessage(content=_NUDGE if expect_json else _MD_NUDGE)]
             continue
         return LLMResult(text=text, parsed=parsed, record=rec, records=list(records))
 

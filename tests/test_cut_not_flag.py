@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import markdown
 import pytest
 
 from argus import config as config_mod
@@ -224,9 +225,10 @@ ANALYSIS = {"md": ANALYSIS_MD, "stance_map": {}, "has_disagreement_section": Fal
 
 def test_the_tldr_takes_the_kept_takeaways_when_the_analyst_ran(monkeypatch, tmp_path):
     findings = [dict(FINDINGS[0]), _f("f1", "Analysis", "It was built in 1999 [2]", [2]),
-                _f("f2", "Analysis", "It pauses at interrupts [1]", [1])]
+                _f("f2", "Analysis", "It pauses at interrupts [1]", [1]),
+                _f("f3", "Analysis", "It resumes with a command [3]", [3])]
     state = _state(run_config=make_run_config("medium"), analysis=ANALYSIS, findings=findings,
-                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f1"], "judged": 3, "total": 3})
+                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f1"], "judged": 4, "total": 4})
     out, md, _, evidence, _ = _report(monkeypatch, tmp_path, state)
     assert ("- It pauses at interrupts [1] — confidence **high**\n"
             "- It resumes with a command [3] — confidence **medium**") in out["tldr_md"]
@@ -409,7 +411,8 @@ def test_a_cut_claim_never_reaches_the_tldr_through_its_kept_analysis_twin(monke
     body = "QISA has a 2.6x longer inference time than GPT-4 [1]. Teams use it for approvals [2]."
     state = _state(run_config=make_run_config("medium"), analysis=analysis,
                    sections=[{"title": "Report", "md": body, "note_ids": [1, 2, 3]}],
-                   findings=[_f("f0", "Report", "QISA has a 2.6x longer inference time than GPT-4 [1].", [1]),
+                   findings=[_f("f0", "Report", "QISA has a 2.6x longer inference time than GPT-4 [1].", [1],
+                                claim="QISA has a 2.6x longer inference time"),     # the same numbers as its twin
                              _f("f1", "Report", "Teams use it for approvals [2].", [2]),
                              _f("f2", "Analysis", "QISA has a 2.6x longer inference time [1]", [1]),
                              _f("f3", "Analysis", "It resumes with a command [3]", [3])],
@@ -430,10 +433,28 @@ def test_an_unknown_id_beside_known_ones_is_stripped_and_recorded(monkeypatch, t
     usage = USAGE.replace("approvals [1].", "approvals [1][9].")
     state = _state(sections=[{"title": "Mechanism", "md": MECHANISM, "note_ids": [1, 2, 3]},
                              {"title": "Usage", "md": usage, "note_ids": [1, 2, 3]}], findings=findings)
-    out, md, _, _, run = _report(monkeypatch, tmp_path, state)
+    out, md, meta, evidence, run = _report(monkeypatch, tmp_path, state)
     assert "- Teams use it for approvals [1]." in md and "approvals [1][9]" not in md
     assert '[r1] cite: dropped unknown source id [9] in section "Usage"' in out["errors"]
     assert metrics.cite_markers_unresolved(run) == 0
+    # a degradation note (spec B1), never a degradation
+    assert '- [r1] cite: dropped unknown source id [9] in section "Usage"' in md.split("## Degradation notes")[1]
+    assert evidence["degradations"] == [] and meta["degradations"] == [] and metrics.degradations_count(run) == 0
+
+
+def test_a_judge_reason_quoting_a_printed_list_is_no_citation(monkeypatch, tmp_path):            # live q010
+    reasons = {i: f"reason {i}" for i in FLAGGED}
+    reasons["f1"] = "the source prints the pair as ([42, 42]), not a checkpoint"
+    reasons["f5"] = "it lists [1, 2] and never states this"                       # f5 is the unlocated one
+    pv = {**_state()["panel_verdict"], "judge_verdicts": {"grounding": "revise", "flag_reasons": reasons}}
+    _, md, _, _, run = _report(monkeypatch, tmp_path, _state(panel_verdict=pv))
+    assert metrics.cite_markers_unresolved(run) == 0
+    cut_line = next(line for line in md.splitlines() if "not a checkpoint" in line)
+    loose = next(line for line in md.splitlines() if "never states this" in line)
+    assert cut_line.endswith(r"— the source prints the pair as (\[42, 42\]), not a checkpoint")
+    assert loose.endswith(r"— it lists \[1, 2\] and never states this")
+    assert "the pair as ([42, 42]), not a checkpoint" in markdown.markdown(cut_line), "rendered, it reads [42, 42]"
+    assert "it lists [1, 2] and never states this" in markdown.markdown(loose)
 
 
 def test_sections_citing_sources_without_findings_are_named_not_fact_checked(monkeypatch, tmp_path):
@@ -466,8 +487,9 @@ def test_an_outline_section_titled_analysis_keeps_its_own_body(monkeypatch, tmp_
     assert md.count(f"## Analysis\n\n{own}") == 1, "no analyst ran: the section is not repeated as the analysis"
     _, md, *_ = _report(monkeypatch, tmp_path / "analyst", _state(
         sections=sections, run_config=make_run_config("medium"), analysis=ANALYSIS,
-        findings=[dict(FINDINGS[0]), _f("f1", "Analysis", "It pauses at interrupts [1]", [1])],
-        panel_verdict={"verdict": "pass", "judged": 2, "total": 2}))
+        findings=[dict(FINDINGS[0]), _f("f1", "Analysis", "It pauses at interrupts [1]", [1]),
+                  _f("f2", "Analysis", "It resumes with a command [3]", [3])],
+        panel_verdict={"verdict": "pass", "judged": 3, "total": 3}))
     assert md.count(own) == 1 and md.count("It resumes with a command [3]") == 2, (
         "the section keeps its body; the analysis is rendered once (and in the TL;DR)")
 

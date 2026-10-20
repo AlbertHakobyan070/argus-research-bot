@@ -7,7 +7,7 @@ real sectioned path with the writer/TL;DR/extraction LLM calls stubbed.
 import pytest
 
 from argus.graph.assemble import (
-    assemble_draft, normalize_cite_markers, strip_fences)
+    assemble_draft, normalize_cite_markers, strip_fences, strip_footnote_definitions)
 
 SECTIONS = [
     {"title": "Background",
@@ -155,3 +155,11 @@ def test_normalize_cite_markers_table(raw, clean):
 ])
 def test_normalize_cite_markers_leaves_the_rest(md):
     assert normalize_cite_markers(md) == md
+
+
+def test_footnote_definitions_are_stripped_outside_code():                        # spec B1
+    md = ("Claim [2] and more [1].\n\n[^2]: https://example.com/paper\n   [^13]: Another source\n\n"
+          "```\n[^4]: code, not a definition\n```")
+    assert strip_footnote_definitions(md) == (
+        "Claim [2] and more [1].\n\n\n```\n[^4]: code, not a definition\n```", [2, 13])
+    assert strip_footnote_definitions("Untouched [^2] reference.") == ("Untouched [^2] reference.", [])

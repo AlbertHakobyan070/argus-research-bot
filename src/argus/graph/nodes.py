@@ -165,7 +165,7 @@ def report_builder_node(state: ArgusState) -> dict:
     tldr = {"source": "omitted", "items": []}
     unjudged: list[str] = []
     if sections:
-        def body(s: dict) -> str:       # an outline section titled "Analysis" keeps its own body
+        def body(s: dict) -> str:       # a section titled "Analysis" composed before compose renamed it keeps its body
             return s["md"] if analysis and s["title"] == ANALYSIS_SECTION else cut_mds[s["title"]]
         kept_sections = [{**s, "md": body(s)} for s in sections if body(s).strip()]
         analysis_md = cut_mds[ANALYSIS_SECTION] if analysis else ""

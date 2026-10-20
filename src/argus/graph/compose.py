@@ -19,24 +19,30 @@ focus, R11's rule), which is written once more with them; the merge sticks
 for the round (compose returns the outline without the merged-away section).
 When that re-write is skipped too, the neighbour keeps its version and the
 notes are reported as unwritten. A skipped re-write keeps the previous
-version; every section skipped raises. Flat lengths: one ``compose.flat``
-call (``raise``; a reply under 40 chars fails its validate hook) writes the
-body that ``assemble_draft`` puts under ``## Findings``.
+version; every section skipped raises. A section titled "Analysis" (casefold,
+whitespace aside — the analyst's title, reserved) is renamed "Evidence
+analysis", and compose returns the renamed outline. Flat lengths: one
+``compose.flat`` call (``raise``; a reply under 40 chars or a JSON object
+fails its validate hook and is retried for the markdown text) writes the body
+that ``assemble_draft`` puts under ``## Findings``.
 
-Every writer reply goes through ``normalize_cite_markers`` before the
+Every writer reply goes through ``normalize_cite_markers`` and loses its
+footnote definitions (a ``cite:`` line each) before the
 ``compose.findings_extract`` pass (one call per written section; each finding
 carries its verbatim ``sentence``) and the assembly. The dedupe pass cuts a
 later near-duplicate of an earlier section's finding (citing no other
-source) from a section written in this run, and drops a section it empties.
+source; quarantine's ``claim_norm``) from a section written in this run, and
+drops a section it empties — merged into its neighbour in the returned
+outline, not written again.
 No TL;DR here: report_builder builds it after the cuts. User revision notes
 reach the writers newest first, then the panel's notes on a panel rewrite
 (8 at most).
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 
@@ -45,11 +51,12 @@ from langgraph.runtime import Runtime
 
 from .. import llm, quarantine
 from . import run_config
-from .assemble import CITE_RE, assemble_draft, normalize_cite_markers, strip_duplicate_heading, strip_fences
+from .assemble import (ANALYSIS_SECTION, CITE_RE, assemble_draft, normalize_cite_markers, strip_duplicate_heading,
+                       strip_fences, strip_footnote_definitions)
 from .grounding import check_grounding, grounding_warning_prompt
 from .jsonx import parse_json_obj
-from .outline import (OUTLINE_SYSTEM, _allocate, _ints, _keep_known, _merge_into, default_outline,  # noqa: F401
-                      outline_node, usable_notes)                     # (re-export: moved to outline.py, WP-I)
+from .outline import (OUTLINE_SYSTEM, _allocate, _ints, _keep_known, _merge_into, _merge_repeated,  # noqa: F401
+                      _title_key, default_outline, outline_node, usable_notes)  # (re-export: moved to outline.py)
 from .research import _round
 from .state import OutlineSection, ResearchBrief
 from .synthesis_modes import get_mode
@@ -61,6 +68,7 @@ _MIN_CHARS = 40                 # a shorter writer reply is an empty write (a sk
 _MAX_REVISION_NOTES = 8
 _DUP_RATIO = 0.85               # = bench.metrics.cross_section_duplicate_ratio's threshold
 WRITER_NOTES_CHARS = 24_000     # chars of notes per writer prompt (spec §3 WP-C)
+EVIDENCE_ANALYSIS = "Evidence analysis"     # an outline section titled "Analysis" (a reserved title, §2.8)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +178,10 @@ def _notes_within(evidence: list[dict], note_ids, *, max_chars: int = WRITER_NOT
 def _budget_lines(rnd: int, title: str, dropped: list[int]) -> list[str]:
     return ([f'[r{rnd}] compose: section "{title}" — notes [{", ".join(map(str, dropped))}] over the writer budget']
             if dropped else [])
+
+
+def _footnote_lines(rnd: int, title: str, ids: list[int]) -> list[str]:
+    return [f'[r{rnd}] cite: removed footnote definition [^{i}] in section "{title}"' for i in ids]
 
 
 def _pinned_ids(notes: list[dict], fetched: list[dict]) -> frozenset[int]:
@@ -351,7 +363,10 @@ def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
         logger.warning("compose.section skipped for %r (%s)", title, e)
         return None, [a.model_dump() for a in e.attempts], [*lines, f"[r{ctx.rnd}] skip: compose.section {title} ({e})"]
     records = [r.model_dump() for r in res.records]
-    md = normalize_cite_markers(strip_duplicate_heading(strip_fences(res.text), title)).strip()
+    md, defs = strip_footnote_definitions(normalize_cite_markers(strip_duplicate_heading(strip_fences(res.text),
+                                                                                          title)))
+    md = md.strip()
+    lines += _footnote_lines(ctx.rnd, title, defs)
     if len(md) < _MIN_CHARS:
         records[-1].update(ok=False, error="empty reply")
         return None, records, [*lines, f"[r{ctx.rnd}] skip: compose.section {title} (empty reply)"]
@@ -361,12 +376,6 @@ def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
 # ---------------------------------------------------------------------------
 # The dedupe pass
 # ---------------------------------------------------------------------------
-
-def _norm(text: str) -> str:
-    """= bench.metrics._norm: NFKC, casefold, [n] markers out, word tokens."""
-    text = CITE_RE.sub(" ", unicodedata.normalize("NFKC", text).casefold())
-    return " ".join(re.findall(r"\w+", text))
-
 
 def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]], written: set[str]
             ) -> list[str]:
@@ -381,7 +390,7 @@ def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]],
     for title in order:
         mine = found.get(title) or []
         if title in written:
-            claims = [_norm(f["claim"]) for f in mine]
+            claims = [quarantine.claim_norm(f["claim"]) for f in mine]
             # ponytail: every claim against every earlier one through difflib, O(n²) over one
             # report's findings (tens to a few hundred); an index if reports grow far past that.
             dup = [any(set(f.get("source_ids") or []) <= ids
@@ -395,7 +404,8 @@ def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]],
                 found[title] = [f for k, f in enumerate(mine) if k not in gone]
                 if not mds[title].strip():
                     emptied.append(title)
-        seen.extend((_norm(f["claim"]), set(f.get("source_ids") or [])) for f in found.get(title) or [])
+        seen.extend((quarantine.claim_norm(f["claim"]), set(f.get("source_ids") or []))
+                    for f in found.get(title) or [])
     return emptied
 
 
@@ -454,13 +464,24 @@ def _extract_all(ctx: _Ctx, written: dict[str, str], pool_size: int
     return found, calls, errors, bool(written) and skipped == len(written)
 
 
-def _flat_body(text: str) -> str:
-    """``compose.flat``'s validate hook: the reply as a body, at least as long
-    as a section's (a shorter one is retried, then the role raises)."""
-    md = normalize_cite_markers(strip_fences(text)).strip()
+def _json_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:                          # not JSON: a markdown body
+        return False
+
+
+def _flat_body(text: str) -> tuple[str, list[int]]:
+    """``compose.flat``'s validate hook: the reply as a body without its
+    footnote definitions (and their ids), at least as long as a section's and
+    no JSON object (either is retried, then the role raises)."""
+    md, defs = strip_footnote_definitions(normalize_cite_markers(strip_fences(text)))
+    md = md.strip()
     if len(md) < _MIN_CHARS:
         raise ValueError(f"a {len(md)}-char reply is no report body (at least {_MIN_CHARS})")
-    return md
+    if md.startswith("{") and _json_object(md):
+        raise ValueError("a JSON object is no report body")
+    return md, defs
 
 
 def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
@@ -484,11 +505,11 @@ def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
                            engines=rc.engines, temperature=mode.temperature, max_tokens=mode.max_tokens,
                            validate=_flat_body)
         calls = [r.model_dump() for r in res.records]
-        md = res.parsed
+        md, defs = res.parsed
         section = {"title": "Report", "md": md, "note_ids": [int(n["source_id"]) for n in ctx.notes]}
         found, ecalls, eerrors, all_skipped = _extract_all(ctx, {"Report": md}, 1)
         calls.extend(ecalls)
-        errors = [*_budget_lines(ctx.rnd, "Report", dropped), *eerrors]
+        errors = [*_budget_lines(ctx.rnd, "Report", dropped), *_footnote_lines(ctx.rnd, "Report", defs), *eerrors]
         findings = found["Report"]
         if all_skipped:
             raise llm.EngineError(f"compose: the findings extraction was skipped ({eerrors[0]})",
@@ -544,6 +565,15 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     revision_notes = [*reversed(state.get("revision_notes") or []),
                       *((pv.get("notes") or []) if panel_rewrite else [])][:_MAX_REVISION_NOTES]
     outline = [OutlineSection.model_validate(s) for s in (state.get("outline") or {}).get("sections") or []]
+    changed = (state.get("outline") or {}).get("changed_sections")
+    renamed = [s for s in outline if _title_key(s.title) == _title_key(ANALYSIS_SECTION)]
+    if renamed:                 # "Analysis" is the analyst's title (§2.8 Allocation): the section is renamed
+        for s in renamed:
+            s.title = EVIDENCE_ANALYSIS
+        outline = _merge_repeated(outline)      # into an "Evidence analysis" it would repeat
+        if changed is not None:
+            changed = list(dict.fromkeys(EVIDENCE_ANALYSIS if _title_key(t) == _title_key(ANALYSIS_SECTION) else t
+                                         for t in changed))
     ctx = _Ctx(state, rc, brief, notes, revision_notes, len(outline))
     if not outline:
         return _flat(state, ctx, pv, runtime)
@@ -556,7 +586,6 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     if panel_rewrite:
         targets = set(pv.get("revise_sections") or [])
     else:
-        changed = (state.get("outline") or {}).get("changed_sections")
         targets = {s.title for s in outline} if changed is None else set(changed)
     order = [s.title for s in outline]
     to_write = [s for s in outline if s.title in targets or s.title not in prior]
@@ -619,8 +648,10 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     if all_skipped and not any(found.values()):
         raise llm.EngineError(f"compose: every findings extraction was skipped ({eerrors[0]})",
                               role="compose.findings_extract", attempts=_records(ecalls))
+    emptied: list[str] = []
     if rc.compose.dedupe_pass:
-        for title in _dedupe(order, mds, found, written):
+        emptied = _dedupe(order, mds, found, written)
+        for title in emptied:
             errors.append(f'[r{ctx.rnd}] compose: section "{title}" dropped — the dedupe pass cut every sentence '
                           "(each repeats an earlier section)")
             del mds[title]
@@ -644,11 +675,14 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
                                   f"{len(findings)} findings ({mode.label}).")}],
         **_extras(state, brief, rc, sections, findings, draft),
     }
-    if plan or legacy:          # the merge sticks for the round; an allocated legacy outline is kept
-        changed = (state.get("outline") or {}).get("changed_sections")
-        out["outline"] = {"sections": [plan[s.title][0].model_dump() if s.title in plan else s.model_dump()
-                                       for s in outline if s.title not in lost],
-                          "changed_sections": None if changed is None else [t for t in changed if t not in lost]}
+    final = [plan[s.title][0] if s.title in plan else s for s in outline if s.title not in lost]
+    if emptied:                 # each merges into its neighbour as a skipped first write does, with no re-write
+        merges = _merge_skipped(final, emptied, set(mds))
+        final = [merges[s.title][0] if s.title in merges else s for s in final if s.title not in emptied]
+    if plan or legacy or renamed or emptied:     # the outline as it stands for the rest of the round
+        gone = {*lost, *emptied}
+        out["outline"] = {"sections": [s.model_dump() for s in final],
+                          "changed_sections": None if changed is None else [t for t in changed if t not in gone]}
     return out
 
 
