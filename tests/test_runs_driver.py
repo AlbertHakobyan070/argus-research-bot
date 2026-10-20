@@ -321,6 +321,36 @@ async def test_two_approvals_produce_one_drive(env):
     assert gates == [{"kind": "plan", "actor": "telegram"}]   # the second actor changed nothing
 
 
+async def test_status_and_cancel_commands_read_the_driver(env, monkeypatch):
+    """/status: stage, elapsed, the last event, the console URL and its health;
+    /cancel drains the live drive (spec §3 WP-E1)."""
+    from argus.bot import history
+    monkeypatch.setattr(history, "get_settings", lambda: env.settings)
+    monkeypatch.setattr(history, "_allowed", lambda _s, _u: True)
+    research = _blocking(env)
+    run_id = await _executing(env, research)
+    env.app.bot_data.update(webapp_public_url="https://x.trycloudflare.com", webapp_ok=True)
+    ctx = SimpleNamespace(application=env.app, args=[])
+    update = MagicMock()
+    update.effective_user.id = update.effective_chat.id = CHAT
+    update.message.reply_text = AsyncMock()
+
+    await history.status_cmd(update, ctx)
+    text = update.message.reply_text.await_args.args[0]
+    assert f"- `{run_id}` · stage `research` · 0:" in text
+    assert "    last: research start" in text      # the driver's task start, or the node's own after it
+    assert text.splitlines()[-1] == "Console: https://x.trycloudflare.com (ok)"
+
+    await history.cancel_cmd(update, ctx)
+    assert common._inflight[run_id].control.drain_requested
+    assert _sent(env)[-1].startswith(f"⏹ Cancelling run `{run_id}`")
+    research.release.set()
+    await common._inflight[run_id].task
+    env.app.bot_data["webapp_public_url"] = None
+    await history.status_cmd(update, ctx)
+    assert update.message.reply_text.await_args.args[0].splitlines()[-1] == "Console: not running"
+
+
 async def test_shutdown_drains_then_cancels(env, caplog):
     env.settings = dataclasses.replace(env.settings, shutdown_drain_s=0.2)
     env.monkeypatch.setattr(runs, "get_settings", lambda: env.settings)
@@ -579,6 +609,16 @@ async def test_the_plan_card_shows_the_exa_estimate_only_for_an_enabled_exa(env,
     card = next(t for t in _sent(env) if t.startswith("📋"))
     assert shown in card and "Archetype: comparison" in card
     assert ("≈ $" in card) is exa_on
+
+
+async def test_exa_left_out_of_the_providers_shows_no_estimate(env):
+    """Exa disabled in the run's own search config (a console override) is off too."""
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="topic", length="short",
+                               overrides={"search.providers_enabled": ["ddgs", "arxiv"]})
+    await common._inflight[out.run_id].task
+    payload = await runs.plan_payload(out.run_id)
+    assert (payload["exa_enabled"], payload["exa_estimate_usd"]) == (False, None)
+    assert "Exa: off" in next(t for t in _sent(env) if t.startswith("📋"))
 
 
 async def test_a_console_approve_syncs_the_telegram_plan_card(env):

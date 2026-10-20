@@ -340,7 +340,8 @@ async def _stop_deadline(h: RunHandle) -> None:
 
 
 async def _at_rest(h: RunHandle) -> None:
-    """The drive stopped without a drain: a gate, or the end."""
+    """The drive stopped without ``GraphDrained``: at a gate (where a requested
+    drain still wins) or at the end."""
     snap = await h.graph.aget_state(h.cfg)
     values, nxt = snap.values or {}, tuple(snap.next or ())
     kind = _GATES.get(nxt)
@@ -569,13 +570,14 @@ async def _payload(h: RunHandle, values: dict) -> dict:
     else:
         check = h.profile_checks[profile]
         problem = check if isinstance(check, str) else None
-    error = estimate = None
+    error = None
     try:
         preview = _rebuilt(h, rc, rc.engines)
-        if exa_enabled():
-            estimate = preview.exa_cost_estimate_usd(cfg.pricing.exa)
     except ValueError as e:
-        error = str(e)
+        preview, error = rc, str(e)
+    # pointer 9: the estimate prices searches even with Exa off — show it only for an enabled Exa
+    exa_on = exa_enabled() and "exa" in preview.search.providers_enabled
+    estimate = preview.exa_cost_estimate_usd(cfg.pricing.exa) if exa_on and error is None else None
     return {
         "run_id": h.run_id, "topic": h.topic, "plan": values.get("plan") or {},
         "sources": list(values.get("sources") or []),
@@ -584,7 +586,7 @@ async def _payload(h: RunHandle, values: dict) -> dict:
         "profile": profile, "profile_problem": problem, "profiles": list(cfg.profiles),
         "recency": c.recency,
         "recency_window": resolve_recency(rc.model_copy(update={"recency": c.recency}), brief)[0],
-        "exa_enabled": exa_enabled(), "exa_estimate_usd": estimate, "error": error,
+        "exa_enabled": exa_on, "exa_estimate_usd": estimate, "error": error,
     }
 
 
