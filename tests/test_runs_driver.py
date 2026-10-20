@@ -140,6 +140,7 @@ async def env(monkeypatch, tmp_path):
         monkeypatch.setattr(mod, "_allowed", lambda _s, _u: True)
     monkeypatch.setattr(runs, "_app", None)                      # restored after the test
     monkeypatch.setattr(runs, "_shutting_down", False, raising=False)
+    monkeypatch.setattr(runs, "_launch_closed", False, raising=False)
     common._inflight.clear()
     common._pending_reply.clear()
     await runs.init(app)
@@ -1220,9 +1221,9 @@ async def test_shutdown_refuses_new_drives(env):
     assert (await env.lib.get_run(waiting))["status"] == "awaiting_plan"
 
 
-async def test_a_drive_prepared_across_the_shutdown_start_never_launches(env, monkeypatch):
-    run_id = await _at_plan_gate(env)
-    plan_drive = common._inflight[run_id].task
+async def _prepared_across_the_shutdown_start(env, monkeypatch, action) -> runs.Outcome:
+    """``action`` claims its run, then prepares while ``drain_all`` starts: the
+    shutdown waits for the claim made before it began."""
     gate, resumable = asyncio.Event(), runs._resumable
 
     async def slow_resumable(h, engines=None):
@@ -1230,14 +1231,93 @@ async def test_a_drive_prepared_across_the_shutdown_start_never_launches(env, mo
         return await resumable(h, engines)
 
     monkeypatch.setattr(runs, "_resumable", slow_resumable)
-    approve = asyncio.ensure_future(runs.approve_plan(run_id))
+    acting = asyncio.ensure_future(action())
     await asyncio.sleep(0.05)
-    await runs.drain_all(env.app)                              # the shutdown starts while it prepares
+    drain = asyncio.ensure_future(runs.drain_all(env.app))
+    await asyncio.sleep(0.05)
+    assert not drain.done()                                    # it waits for the claim still preparing
     gate.set()
-    out = await approve
+    out = await acting
+    await asyncio.wait_for(drain, timeout=5)
+    monkeypatch.setattr(runs, "_resumable", resumable)
+    return out
+
+
+def _restart(monkeypatch) -> None:
+    monkeypatch.setattr(runs, "_shutting_down", False)
+    monkeypatch.setattr(runs, "_launch_closed", False)
+    common._inflight.clear()
+
+
+async def test_an_extend_preparing_at_the_shutdown_start_launches_then_drains(env, monkeypatch):
+    """C4: the Extend claimed before drain_all began launches, and its drive is
+    drained; its flag never outlives it — after a restart, Send ends the run."""
+    run_id = await _at_report_gate(env)
+    out = await _prepared_across_the_shutdown_start(
+        env, monkeypatch, lambda: runs.report_action(run_id, "extend", actor="webapp"))
+    assert out.code == "started"
+    assert (await env.lib.get_run(run_id))["status"] == "cancelled"
+    snap = await _snap(env, run_id)
+    assert tuple(snap.next) == ("deliver",) and snap.values["cancel_note"].endswith("(shutdown)")
+    _restart(monkeypatch)
+    assert (await runs.report_action(run_id, "send")).code == "delivered"
+    assert tuple((await _snap(env, run_id)).next) == ()
+
+
+async def test_an_approve_preparing_at_the_shutdown_start_ends_drained(env, monkeypatch):
+    """C4: the Approve claimed before drain_all began launches and is drained:
+    it ends cancelled with its drive's card, never ``running`` without a drive."""
+    run_id = await _at_plan_gate(env)
+    h, plan_drive = common._inflight[run_id], common._inflight[run_id].task
+    out = await _prepared_across_the_shutdown_start(env, monkeypatch, lambda: runs.approve_plan(run_id))
+    assert out.code == "started"
+    assert h.task is not plan_drive and h.task.done() and not h.task.cancelled()
+    assert h.control.drain_reason == "shutdown"
+    assert (await env.lib.get_run(run_id))["status"] == "cancelled"
+    assert tuple((await _snap(env, run_id)).next) == ("research",)
+    assert h.card.final.startswith("⏹ Cancelled after research")
+
+
+async def test_a_start_preparing_at_the_shutdown_start_never_launches(env, monkeypatch):
+    """A fresh thread drained before its first node keeps no input and cannot be
+    resumed, so a start claimed before drain_all began is refused before its
+    launch; its library row is marked cancelled."""
+    gate, active = asyncio.Event(), runs.registry.active_snapshot
+
+    async def slow_active():
+        await gate.wait()
+        return await active()
+
+    monkeypatch.setattr(registry, "active_snapshot", slow_active)
+    starting = asyncio.ensure_future(runs.start_run(chat_id=CHAT, user_id=CHAT, topic="topic", length="short"))
+    await asyncio.sleep(0.05)
+    drain = asyncio.ensure_future(runs.drain_all(env.app))
+    await asyncio.sleep(0.05)
+    assert not drain.done()                                    # it waits for the start still preparing
+    gate.set()
+    out = await starting
+    await asyncio.wait_for(drain, timeout=5)
     assert (out.code, out.text) == ("refused", _SHUTTING_DOWN)
-    h = common._inflight[run_id]
-    assert not h.live and h.task is plan_drive                 # no new drive was launched
+    assert (await env.lib.get_run(out.run_id))["status"] == "cancelled"
+    assert out.run_id not in common._inflight
+    assert not any(t.startswith("🔄") or t.startswith("⚠️") for t in _sent(env))   # no card, no failure
+
+
+async def test_an_action_claimed_after_the_shutdown_start_is_refused_before_any_write(env):
+    at_plan = await _at_plan_gate(env, "a run at its plan gate")
+    at_report = await _at_report_gate(env, "a run at its report gate")
+
+    async def state() -> dict:
+        return {rid: ((await env.lib.get_run(rid))["status"], (await _snap(env, rid)).values,
+                      _edits(env, common._inflight[rid].gate_msg[0])) for rid in (at_plan, at_report)}
+
+    before = await state()
+    await runs.drain_all(env.app)
+    for out in (await runs.approve_plan(at_plan, actor="webapp"),
+                await runs.report_action(at_report, "extend", actor="webapp"),
+                await runs.report_action(at_report, "revise", feedback="tighten it", actor="webapp")):
+        assert (out.code, out.text) == ("refused", _SHUTTING_DOWN)
+    assert await state() == before                             # status, checkpoint and card unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -1332,3 +1412,133 @@ async def test_the_plan_knobs_through_on_callback(env, monkeypatch):
     assert (await runs.plan_payload(run_id))["recency"] == "d"
     rows = [[(b.text, b.callback_data) for b in row] for row in _edits(env, card)[-1]["reply_markup"].inline_keyboard]
     assert rows[2][-1] == ("Auto ✅", f"dep:auto:{run_id}")
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: the guarded cancel note, quick runs, the attach race,
+# gate-matched cards, the profile on re-attach
+# ---------------------------------------------------------------------------
+
+async def test_a_failing_cancel_note_write_still_ends_the_forced_cancel(env, monkeypatch, caplog):
+    """C5: the forced cancel's note write fails — it is logged and said in the
+    chat; the run still ends cancelled, its card stopped, its task cancelled."""
+    async def past(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runs, "_sleep", past)
+    research = _blocking(env)                                  # never reads runtime: the deadline fires
+    run_id = await _executing(env, research)
+    h = common._inflight[run_id]
+    update_state = env.graph.aupdate_state
+
+    async def failing(cfg, values, *a, **kw):
+        if "cancel_note" in values:
+            raise RuntimeError("database is locked")
+        return await update_state(cfg, values, *a, **kw)
+
+    monkeypatch.setattr(env.graph, "aupdate_state", failing)
+    with caplog.at_level("ERROR", logger="argus.bot"):
+        await runs.cancel_run(run_id)
+        await asyncio.wait([h.task], timeout=10)
+    assert h.task.cancelled()
+    assert (await env.lib.get_run(run_id))["status"] == "cancelled"
+    assert h.card.final == f"⏹ Force-cancelled during research — /continue {run_id} resumes it."
+    assert f"⚠️ Run {run_id}: could not record the cancel note: database is locked" in _sent(env)
+    assert any(r.exc_info and r.getMessage() == f"run {run_id}: could not record the cancel note"
+               for r in caplog.records)
+    research.release.set()
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["drained", "force_cancelled"])
+async def test_a_cancelled_ask_is_never_told_to_continue(env, monkeypatch, forced):
+    """continue_run refuses quick runs: a cancelled /ask's card and chat lines
+    name no /continue, whether it drained or its drain timed out."""
+    started, release = threading.Event(), threading.Event()
+
+    def quick_answer(s):
+        started.set()
+        assert release.wait(10), "the test never released the node"
+        return {"quick_answer": "42"}
+
+    async def past(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(graph_mod, "quick_answer_node", quick_answer)
+    env.app.bot_data["quick_graph"] = graph_mod.quick_answer_graph(checkpointer=MemorySaver())
+    if forced:
+        monkeypatch.setattr(runs, "_sleep", past)
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="what is x?", quick=True)
+    h = common._inflight[out.run_id]
+    assert await asyncio.to_thread(started.wait, 5)
+    await history.cancel_cmd(_update(), _ctx(env, [out.run_id]))
+    if not forced:
+        release.set()
+    await asyncio.wait([h.task], timeout=10)
+    release.set()
+    assert (await env.lib.get_run(out.run_id))["status"] == "cancelled"
+    assert h.card.final == ("⏹ Force-cancelled during quick_answer." if forced
+                            else "⏹ Cancelled after quick_answer.")
+    assert not [t for t in _sent(env) + _edited(env) if "/continue" in t]
+
+
+async def test_an_actor_waiting_on_a_failed_attach_attaches_again(env, monkeypatch):
+    """R-a race: the console's approve attaches the untracked run and fails; the
+    tap that waited on that handle looks the run up again and attaches itself.
+    It gets the same refusal — never the not-in-flight notice over its card,
+    since the run still rests at its plan gate."""
+    run_id = await _at_plan_gate(env)
+    common._inflight.clear()                                   # the restart
+
+    async def down():
+        await asyncio.sleep(0.01)                              # a live validation suspends, then fails
+        raise EngineConfigError("proxy down")
+
+    monkeypatch.setattr(registry, "active_snapshot", down)
+    console = asyncio.ensure_future(runs.approve_plan(run_id, actor="webapp"))
+    await asyncio.sleep(0)
+    tap = await _tap(env, f"plan:approve:{run_id}")
+    refusal = f"⚠️ Could not approve run `{run_id}`: proxy down"
+    first = await console
+    assert (first.code, first.text) == ("refused", refusal)
+    tap.callback_query.edit_message_text.assert_not_awaited()
+    assert _sent(env)[-1] == refusal                           # the tap's own outcome
+    assert (await runs.snapshot(run_id))["awaiting"] == "plan"
+
+
+async def test_a_tapped_card_of_the_other_gate_is_never_adopted(env):
+    """R-a: a tapped card becomes the gate message only for its own gate. An old
+    plan card tapped while the run rests at its report gate gets the plan
+    buttons' refusal and is never adopted, so a later console Cancel leaves it."""
+    run_id = await _at_plan_gate(env)
+    plan_card = common._inflight[run_id].gate_msg[0]
+    assert (await runs.approve_plan(run_id)).code == "started"
+    await common._inflight[run_id].task                        # at its report gate
+    common._inflight.clear()                                   # the restart
+    edits = _edits(env, plan_card)
+    for data in (f"plan:approve:{run_id}", f"plan:cancel:{run_id}"):
+        sent = len(_sent(env))
+        tap = await _tap(env, data, plan_card)
+        tap.callback_query.edit_message_text.assert_not_awaited()
+        assert _sent(env)[sent:] == [f"Run `{run_id}` is not at its plan gate."]
+    assert common._inflight[run_id].gate_msg is None           # attached at its report gate, no card adopted
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
+    assert (await runs.cancel_run(run_id, actor="webapp")).code == "cancelled"
+    assert _edits(env, plan_card) == edits                     # the old plan card was never touched
+
+
+@pytest.mark.parametrize("entry", ["tap", "continue"])
+async def test_a_reattached_run_keeps_its_engines_profile(env, monkeypatch, entry):
+    monkeypatch.setattr(registry, "resolve_snapshot",
+                        AsyncMock(side_effect=lambda cfg, name: env.active.model_copy(update={"profile": name})))
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="topic", length="short",
+                               engines_profile="hybrid-local")
+    await common._inflight[out.run_id].task
+    common._inflight.clear()                                   # the restart
+    if entry == "tap":
+        await _tap(env, f"len:short:{out.run_id}")             # attached by a knob tap
+    else:
+        assert (await runs.continue_run(await env.lib.get_run(out.run_id), chat_id=CHAT)).code == "attached"
+    assert (await runs.plan_payload(out.run_id))["profile"] == "hybrid-local"
+    assert (await runs.approve_plan(out.run_id)).code == "started"
+    await common._inflight[out.run_id].task
+    assert require((await _snap(env, out.run_id)).values).engines.profile == "hybrid-local"

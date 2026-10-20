@@ -111,7 +111,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     ``plan:*``, ``report:*``), routed here by ``app.on_callback`` for every
     namespace not handled before the run lookup. The tapped message becomes
     the gate message of a run the action attaches (one untracked after a
-    restart)."""
+    restart) when its button belongs to that gate: the knobs and ``plan:*``
+    to the plan gate, ``report:*`` to the report gate."""
     q = update.callback_query
     mid = q.message.message_id if q.message is not None else None
     if ns in _KNOBS:
@@ -120,8 +121,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         out = await runs.approve_plan(run_id, message_id=mid)
     elif ns == "plan" and action == "edit":
         out = await runs.await_reply(run_id, "plan_edit", message_id=mid)
-    elif ns == "plan" and action == "cancel":
-        out = await runs.cancel_run(run_id, message_id=mid)
+    elif ns in ("plan", "report") and action == "cancel":
+        out = await runs.cancel_run(run_id, message_id=mid, card=runs.PLAN if ns == "plan" else runs.REPORT)
     elif ns == "report" and action == "revise":
         out = await runs.await_reply(run_id, "revise_feedback", message_id=mid)
     elif ns == "report":

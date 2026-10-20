@@ -1,11 +1,13 @@
 """Startup reconciliation of runs orphaned by a crash/restart (2026-07-12).
 
 A bot restart wipes the in-memory _inflight registry, so any run left in
-a non-terminal status has dead inline buttons — the user is left staring
-at a frozen chat. _reconcile_orphaned_runs inspects each orphan's
+a non-terminal status has no drive behind it — the user is left staring
+at a frozen chat (its buttons attach a run resting at a gate on the next
+tap). _reconcile_orphaned_runs inspects each orphan's
 checkpoint and marks it recoverable — awaiting_* at a gate, cancelled
 mid-drive (Task 10 ruling) — with a /continue nudge, or errors it when it
-has no checkpoint, and DMs the user either way.
+has no checkpoint, and DMs the user either way. A quick /ask (which
+/continue refuses) is cancelled and told to ask again.
 """
 from __future__ import annotations
 
@@ -51,10 +53,10 @@ def _graph_with_next(next_map: dict[str, tuple], *, no_checkpoint: tuple[str, ..
     return g
 
 
-async def _seed(lib, run_id, chat_id, status, topic="t"):
+async def _seed(lib, run_id, chat_id, status, topic="t", mode="deep"):
     return await lib.create_run(
         run_id=run_id, thread_id=f"tg:{chat_id}:{run_id}", chat_id=chat_id,
-        topic=topic, status=status, config_json="{}", depth="quick", origin="telegram")
+        topic=topic, mode=mode, status=status, config_json="{}", depth="quick", origin="telegram")
 
 
 async def test_orphan_at_plan_gate_becomes_awaiting_plan_and_notifies(lib):
@@ -96,6 +98,22 @@ async def test_orphan_mid_drive_is_cancelled_and_resumable(lib):
     assert app.bot.send_message.await_args.kwargs["text"] == (
         "♻️ Run `cccc3333` (langchain vs langgraph) was interrupted by a bot restart mid-step. "
         "/continue cccc3333 resumes it from its last saved step.")
+
+
+@pytest.mark.parametrize("nxt", [(), ("deliver",)], ids=["mid_drive", "at_its_deliver_step"])
+async def test_a_quick_orphan_is_cancelled_and_told_to_ask_again(lib, nxt):
+    """continue_run refuses quick runs: a quick /ask orphan is cancelled with
+    its own DM — also when its thread, read through the deep graph, rests at
+    ("deliver",) (the quick graph's own deliver step)."""
+    await _seed(lib, "qqqq1111", 7, "running", "what is x?", mode="quick")
+    graph = _graph_with_next({"tg:7:qqqq1111": nxt})
+    app = _app(lib, graph)
+
+    await _reconcile_orphaned_runs(app)
+
+    assert (await lib.get_run("qqqq1111"))["status"] == "cancelled"
+    assert app.bot.send_message.await_args.kwargs["text"] == (
+        "♻️ /ask `qqqq1111` (what is x?) was interrupted by a bot restart — ask again with /ask.")
 
 
 async def test_orphan_without_a_checkpoint_is_errored(lib):

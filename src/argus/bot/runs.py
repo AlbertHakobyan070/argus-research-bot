@@ -17,8 +17,10 @@
 - **Cancel = drain**: ``request_drain``; LangGraph raises ``GraphDrained``
   at the next superstep boundary with the checkpoint saved. ``task.cancel()``
   only after ``ARGUS_CANCEL_DRAIN_TIMEOUT_S`` (it cannot stop a node's
-  running thread, only the wait for it); shutdown refuses new drives, drains
-  every live drive for at most ``ARGUS_SHUTDOWN_DRAIN_S``, then cancels.
+  running thread, only the wait for it); shutdown refuses new claims, lets
+  the resumes claimed before it launch (their drives drain at once; a start
+  is refused), drains every live drive — all within
+  ``ARGUS_SHUTDOWN_DRAIN_S`` — then cancels.
 
 Handlers (``research.py``, ``history.py``) and the console call these
 functions and relay ``Outcome.text``; the gate messages (plan card, report
@@ -62,7 +64,8 @@ logger = logging.getLogger("argus.bot")
 bus = RunEventBus()
 _app: Any = None                  # the Application (bot, graphs, library), set by init()
 _sleep = asyncio.sleep            # the cancel deadline's clock (tests patch it)
-_shutting_down = False            # drain_all began: no new drive launches
+_shutting_down = False            # drain_all began: no new claim (a claim made before may still launch)
+_launch_closed = False            # drain_all stopped waiting for the claims made before it: nothing launches
 
 PLAN, REPORT = "plan", "report"
 _GATES = {("research",): PLAN, ("fetcher",): PLAN, ("deliver",): REPORT}   # ("fetcher",): pre-v3 plan gate
@@ -219,62 +222,73 @@ def _claim(h: RunHandle) -> Outcome | None:
 
 
 @contextlib.asynccontextmanager
-async def _hold(run_id: str, what: str, *, message_id: int | None = None, attach: bool = True):
+async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: str | None = None,
+                attach: bool = True):
     """The run's handle with its lock held. An untracked run resting at a
     gate is attached first (§2.5: buttons minted before a restart keep
-    working), the tapped message (``message_id``) becoming its gate message.
-    Yields an ``Outcome`` instead when there is nothing to act on:
-    ``not_found`` (no library row, not resting at a gate, or forgotten while
-    this actor waited for the lock), or the attach's refusal (``what`` names
+    working); the tapped message (``message_id``) becomes its gate message
+    when it is that gate's card (``card``: the gate the tapped button
+    belongs to). An actor that waited for the lock of a handle another actor
+    then forgot (a failed attach, say) looks the run up and attaches it
+    again, once. Yields an ``Outcome`` instead when there is nothing to act
+    on: ``not_found`` (no library row, not resting at a gate, or forgotten
+    again while this actor waited), or the attach's refusal (``what`` names
     the action)."""
-    h = common._inflight.get(run_id)
-    if h is None and attach:
-        lib = _library()
-        try:
-            row = await lib.get_run(run_id) if lib is not None else None
-        except Exception as e:
-            yield _refused(run_id, what, e)
-            return
-        h = common._inflight.get(run_id)          # another actor may have registered it meanwhile
-        if h is None and row is not None:
-            h = common._inflight[run_id] = RunHandle.of(row, row["chat_id"])
-            h.attaching = True
-    if h is None:
-        yield _not_found(run_id)
-        return
-    async with h.lock:
-        if common._inflight.get(run_id) is not h:
+    for again in (False, True):
+        h = common._inflight.get(run_id)
+        if h is None and attach:
+            lib = _library()
+            try:
+                row = await lib.get_run(run_id) if lib is not None else None
+            except Exception as e:
+                yield _refused(run_id, what, e)
+                return
+            h = common._inflight.get(run_id)      # another actor may have registered it meanwhile
+            if h is None and row is not None:
+                h = common._inflight[run_id] = RunHandle.of(row, row["chat_id"])
+                h.attaching = True
+        if h is None:
             yield _not_found(run_id)
             return
-        if h.attaching:
-            h.attaching = False
-            if attach:
-                try:
-                    kind = await _attach(h, message_id)
-                except Exception as e:
-                    _forget(h)
-                    yield _refused(run_id, what, e)
-                    return
-                if kind is None:
-                    _forget(h)
-                    yield _not_found(run_id)
-                    return
-        yield h
+        async with h.lock:
+            if common._inflight.get(run_id) is not h:
+                if attach and not again:
+                    continue                      # forgotten while this actor waited: look it up again
+                yield _not_found(run_id)
+                return
+            if h.attaching:
+                h.attaching = False
+                if attach:
+                    try:
+                        kind = await _attach(h, message_id, card)
+                    except Exception as e:
+                        _forget(h)
+                        yield _refused(run_id, what, e)
+                        return
+                    if kind is None:
+                        _forget(h)
+                        yield _not_found(run_id)
+                        return
+            yield h
+            return
 
 
-async def _attach(h: RunHandle, message_id: int | None) -> str | None:
+async def _attach(h: RunHandle, message_id: int | None, card: str | None) -> str | None:
     """An untracked run resting at its gate: the checkpoint's gate, its
-    RunConfig (``ensure_in_checkpoint``) and the default plan choices; None
-    when the run does not rest at a gate (nothing is written then)."""
+    RunConfig (``ensure_in_checkpoint``) and the default plan choices (the
+    run's own engines profile among them); None when the run does not rest
+    at a gate (nothing is written then). The tapped message becomes the gate
+    message only when its button belongs to this gate (``card``)."""
     snap = await h.graph.aget_state(h.cfg)
     kind = _GATES.get(tuple(snap.next or ())) if snap.values else None
     if kind is None:
         return None
-    rc = await ensure_in_checkpoint(h.graph, h.cfg, engines=await registry.active_snapshot())
+    active = await registry.active_snapshot()
+    rc = await ensure_in_checkpoint(h.graph, h.cfg, engines=active)
     if kind == PLAN:
-        h.choices = _default_choices(rc)
+        h.choices = _default_choices(rc, active.profile)
     h.gate_kind = kind
-    if message_id is not None:                      # its text is rendered from the payload at the first edit
+    if message_id is not None and card == kind:     # its text is rendered from the payload at the first edit
         h.gate_msg = (message_id, None, ParseMode.MARKDOWN if kind == PLAN else ParseMode.HTML)
     logger.info("run %s: attached at its %s gate", h.run_id, kind)
     return kind
@@ -381,10 +395,15 @@ async def _appends_notice(h: RunHandle, *, sent: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _launch(h: RunHandle, resume_input: Any, *, stage: str) -> Outcome | None:
-    """Start the run's next drive (None), or refuse it once ``drain_all``
-    began: no drive launches after the shutdown started."""
+    """Start the run's next drive (None). Every caller claimed the run, and a
+    claim is refused once the shutdown began, so a claim made before it
+    launches — its drive drains at once — unless ``drain_all`` stopped
+    waiting for it (refused then). ``start_run`` never calls it once the
+    shutdown began."""
     h.starting = False
-    if _shutting_down:
+    if _launch_closed:
+        # ponytail: a preparation that outlasts ARGUS_SHUTDOWN_DRAIN_S keeps its writes and never
+        # launches; roll them back here if that bound is ever too short
         return _shutdown(h.run_id)
     if h.deadline is not None:
         h.deadline.cancel()                         # an earlier drive's deadline never outlives it
@@ -397,6 +416,8 @@ def _launch(h: RunHandle, resume_input: Any, *, stage: str) -> Outcome | None:
                           title=f"🔄 Run {h.run_id} — {_cut(h.topic, 60)}")
     h.task = asyncio.create_task(_drive(h, resume_input), name=f"run {h.run_id}")
     logger.info("run %s: task started (%s)", h.run_id, stage)
+    if _shutting_down:                              # claimed before drain_all began, which drains it
+        _drain(h, "shutdown")
     return None
 
 
@@ -501,7 +522,7 @@ async def _at_rest(h: RunHandle) -> None:
             raise RuntimeError("the brief produced no plan")
         await h.card.stop("📋 Plan ready — review it below.")
         if h.choices is None:
-            h.choices = _default_choices(require(values))
+            h.choices = _default_choices(require(values), (await registry.active_snapshot()).profile)
         await _present_plan(h, values)
     elif kind == REPORT:
         await h.card.stop("📝 Report ready — preview below.")
@@ -533,26 +554,37 @@ async def _drained(h: RunHandle, reason: str) -> None:
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", node, {"status": "cancelled", "summary": note})
-    await h.card.stop(f"⏹ Cancelled after {node} — /continue {h.run_id} resumes it.")
+    # a quick /ask is never told to /continue: continue_run refuses it
+    await h.card.stop(f"⏹ Cancelled after {node}" + ("." if h.quick else f" — /continue {h.run_id} resumes it."))
 
 
 async def _abandoned(h: RunHandle) -> None:
     """``task.cancel()`` after the drain bound or the shutdown bound: the
     node's thread may still run and the node never wrote, so the checkpoint
     is the one before it (``next`` names that node). The note names the
-    forced cancel; the card says what /continue then does."""
+    forced cancel; the card says what /continue then does. A failure to
+    record the note is logged and said in the chat — the run still ends
+    cancelled and ``_drive`` re-raises the ``CancelledError``."""
     node = h.stage
     note = f"force-cancelled during node {node} ({h.control.drain_reason or 'cancel'}); the node was abandoned"
-    await h.graph.aupdate_state(h.cfg, {"cancel_note": note})
+    nxt = None
+    try:
+        await h.graph.aupdate_state(h.cfg, {"cancel_note": note})
+        nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
+    except Exception as e:
+        logger.error("run %s: could not record the cancel note", h.run_id, exc_info=e)
+        await _say(h.chat_id, f"⚠️ Run {h.run_id}: could not record the cancel note: {e}")
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", node, {"status": "cancelled", "summary": note})
-    nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
-    await h.card.stop(f"⏹ Force-cancelled during {node} — {_continue_hint(h.run_id, nxt)}.")
+    hint = "" if h.quick else f" — {_continue_hint(h.run_id, nxt)}"     # continue_run refuses a quick /ask
+    await h.card.stop(f"⏹ Force-cancelled during {node}{hint}.")
 
 
-def _continue_hint(run_id: str, nxt: tuple) -> str:
-    """What /continue does for a run resting at ``nxt``."""
+def _continue_hint(run_id: str, nxt: tuple | None) -> str:
+    """What /continue does for a run resting at ``nxt`` (None: unread)."""
+    if nxt is None:
+        return f"/continue {run_id} resumes it"
     kind = _GATES.get(nxt)
     if kind == PLAN:
         return f"/continue {run_id} re-attaches the plan; ✅ Approve reruns {nxt[0]}"
@@ -616,12 +648,17 @@ async def _cancel_at_gate(h: RunHandle, actor: str) -> None:
     _forget(h)
 
 
-async def cancel_run(run_id: str, *, actor: str = "telegram", message_id: int | None = None) -> Outcome:
+async def cancel_run(run_id: str, *, actor: str = "telegram", message_id: int | None = None,
+                     card: str | None = None) -> Outcome:
     """A live drive drains (finishes its current step); a run at a gate is
-    cancelled now."""
-    async with _hold(run_id, "cancel", message_id=message_id) as h:
+    cancelled now. ``card``: the gate of the tapped card's button — a stale
+    card of the other gate is refused, as its other buttons are."""
+    async with _hold(run_id, "cancel", message_id=message_id, card=card) as h:
         if isinstance(h, Outcome):
             return h
+        if card is not None and not h.live and h.gate_kind != card:
+            return Outcome("refused", f"Run `{run_id}` is not at its "
+                                      f"{'plan gate' if card == PLAN else 'report preview'}.", run_id)
         if h.live:
             if h.control.drain_requested:
                 return Outcome("draining", f"⏹ Run `{run_id}` is already cancelling — finishing `{h.stage}`.", run_id)
@@ -636,18 +673,31 @@ async def cancel_run(run_id: str, *, actor: str = "telegram", message_id: int | 
 
 
 async def drain_all(app) -> None:
-    """POST_STOP hook: refuse new drives from now on, drain every live
-    drive, wait up to ``ARGUS_SHUTDOWN_DRAIN_S``, then cancel what still runs."""
-    global _shutting_down
+    """POST_STOP hook: refuse new claims from now on; wait for the actions
+    claimed before, which still prepare (each resume launches its drive,
+    which drains at once; a start is refused at its launch), then drain
+    every live drive — all within ``ARGUS_SHUTDOWN_DRAIN_S`` — then cancel
+    what still runs. No action ends with its writes and no drive (a
+    preparation past the bound aside)."""
+    global _shutting_down, _launch_closed
     _shutting_down = True
+    loop = asyncio.get_running_loop()
+    bound = get_settings().shutdown_drain_s
+    deadline = loop.time() + bound
+    while any(h.starting for h in common._inflight.values()) and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    _launch_closed = True
+    for h in common._inflight.values():
+        if h.starting:
+            logger.warning("run %s: still preparing %g s after the shutdown began; it will not launch",
+                           h.run_id, bound)
     live = [h for h in list(common._inflight.values()) if h.task is not None and not h.task.done()]
     if not live:
         return
-    bound = get_settings().shutdown_drain_s
     for h in live:
         if not h.control.drain_requested:
             _drain(h, "shutdown")
-    _, pending = await asyncio.wait([h.task for h in live], timeout=bound)
+    _, pending = await asyncio.wait([h.task for h in live], timeout=max(deadline - loop.time(), 0))
     for h in live:
         if h.task in pending:
             logger.warning("run %s: still running %g s after the shutdown drain; cancelling it", h.run_id, bound)
@@ -690,8 +740,7 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
                     engines = await _resolve_profile(h, engines_profile)
             rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, overrides=overrides,
                                        origin=origin)
-            h.choices = dataclasses.replace(_default_choices(rc),
-                                            profile=None if engines is active else engines_profile)
+            h.choices = _default_choices(rc, active.profile)
             lib = _library()
             if lib is not None:
                 await lib.create_run(run_id=run_id, thread_id=h.thread_id, chat_id=chat_id, topic=topic,
@@ -704,7 +753,9 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
                 "findings": [], "draft_md": "", "revision_notes": [], "revision_rounds": 0, "model_calls": [],
                 "hitl": {"pending": False},
             }
-            refused = _launch(h, state_in, stage="intake")
+            # a start never launches into the shutdown: a fresh thread drained before its first node
+            # keeps no input and could not be resumed (the refusal below marks the row cancelled)
+            refused = _shutdown(run_id) if _shutting_down else _launch(h, state_in, stage="intake")
         except Exception as e:
             _forget(h)
             if not isinstance(e, (EngineConfigError, ValueError)):
@@ -712,7 +763,7 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
             return Outcome("refused", f"⚠️ Could not start the research: {e}")
         finally:
             h.starting = False
-        if refused is not None:                        # the shutdown began while it started: never driven
+        if refused is not None:                        # the shutdown began while it prepared: never driven
             await _status(run_id, "cancelled")
             _forget(h)
             return refused
@@ -723,9 +774,11 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
 # the plan gate
 # ---------------------------------------------------------------------------
 
-def _default_choices(rc: RunConfig) -> Choices:
+def _default_choices(rc: RunConfig, active: str) -> Choices:
+    """The plan-gate knobs ``rc`` was built with; its engines profile is None
+    when it is ``active`` (the active profile's name)."""
     return Choices(length=rc.length, depth=None if rc.depth == RunConfig.default_depth(rc.length) else rc.depth,
-                   recency=rc.recency)
+                   profile=None if rc.engines.profile == active else rc.engines.profile, recency=rc.recency)
 
 
 def _rebuilt(c: Choices, rc: RunConfig, engines) -> RunConfig:
@@ -761,7 +814,8 @@ async def _chosen_engines(h: RunHandle, c: Choices):
 async def _payload(h: RunHandle, values: dict) -> dict:
     """The plan card's data (also the console's): plan, sources, knobs, Exa
     estimate. A render never validates live: the active profile's state is
-    the cached snapshot, another profile's the result cached on the handle."""
+    the cached snapshot, another profile's the result cached on the handle
+    (none yet for a re-attached run's own profile: no problem shown)."""
     c, rc = h.choices, require(values)
     brief = ResearchBrief.model_validate(values.get("brief") or {})
     cfg = registry.current_config()
@@ -773,7 +827,7 @@ async def _payload(h: RunHandle, values: dict) -> dict:
         except EngineConfigError as e:
             problem = str(e)
     else:
-        check = h.profile_checks[profile]
+        check = h.profile_checks.get(profile)
         problem = check if isinstance(check, str) else None
     error = None
     try:
@@ -859,7 +913,7 @@ async def _choose(h: RunHandle, c: Choices, knob: str, value: str) -> None:
 async def set_plan_choice(run_id: str, knob: str, value: str, *, message_id: int | None = None) -> Outcome:
     """A plan-card knob (length, depth, profile, recency; "next" cycles the
     last two): the card is re-rendered; nothing resumes."""
-    async with _hold(run_id, "update", message_id=message_id) as h:
+    async with _hold(run_id, "update", message_id=message_id, card=PLAN) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -881,7 +935,7 @@ async def approve_plan(run_id: str, *, actor: str = "telegram", length: str | No
     checkpoint and the library row — everything resolved first (the console's
     knobs reach the choices only then), so a refusal leaves the run at its
     gate as it was — then the research drive."""
-    async with _hold(run_id, "approve", message_id=message_id) as h:
+    async with _hold(run_id, "approve", message_id=message_id, card=PLAN) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -957,7 +1011,7 @@ async def await_reply(run_id: str, kind: str, *, message_id: int | None = None) 
     before it is armed."""
     from . import research                          # lazy: research imports this module
     gate, prompt = _REPLY_PROMPTS[kind]
-    async with _hold(run_id, "edit" if gate == PLAN else "revise", message_id=message_id) as h:
+    async with _hold(run_id, "edit" if gate == PLAN else "revise", message_id=message_id, card=gate) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -996,7 +1050,7 @@ async def report_action(run_id: str, action: str, *, feedback: str | None = None
     in as pinned sources; the next report gate marks them."""
     if action == "cancel":
         return await cancel_run(run_id, actor=actor, message_id=message_id)
-    async with _hold(run_id, action, message_id=message_id) as h:
+    async with _hold(run_id, action, message_id=message_id, card=REPORT) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -1020,7 +1074,7 @@ async def report_action(run_id: str, action: str, *, feedback: str | None = None
             if action == "extend":
                 if int(values.get("extend_rounds") or 0) >= MAX_EXTEND_ROUNDS:
                     raise ValueError(f"it already used its {MAX_EXTEND_ROUNDS} Extend rounds")
-                update: dict[str, Any] = {"extend_requested": True}
+                update: dict[str, Any] = {"extend_requested": True, "revision_requested": False}   # see _deliver
                 pending, appended = await _pending_appends(h)
                 if appended:                               # last-value channel: the full list
                     update["sources"] = [*(values.get("sources") or []), *appended]
@@ -1029,7 +1083,8 @@ async def report_action(run_id: str, action: str, *, feedback: str | None = None
                     raise ValueError(f"it already used its {MAX_REVISE_ROUNDS} Revise rounds")
                 notice = await _appends_notice(h)
                 notes = [*(values.get("revision_notes") or []), f"USER REVISION REQUEST: {feedback.strip()}"]
-                update = {"revision_requested": True, "revision_notes": notes}   # last-value channel: the full list
+                update = {"revision_requested": True, "extend_requested": False,   # see _deliver
+                          "revision_notes": notes}                                 # last-value channel: the full list
             await h.graph.aupdate_state(h.cfg, update)
             if pending:
                 h.on_report = _appends_marker(h, pending, appended)
@@ -1048,7 +1103,9 @@ async def _deliver(h: RunHandle, actor: str) -> Outcome:
     """Send: the report files to the chat, then the run is finished — the
     checkpoint moves past the report gate (``as_node="deliver"`` → END), so a
     sent run never awaits and /continue extends it. The engines snapshot must
-    resolve first (pointer 6)."""
+    resolve first (pointer 6). Every report-gate action writes both request
+    flags: a flag left by a drive drained before ``deliver`` ran (a
+    shutdown) never routes a later Send, Extend or Revise astray."""
     try:
         await ensure_in_checkpoint(h.graph, h.cfg, engines=await registry.active_snapshot())
         values = (await h.graph.aget_state(h.cfg)).values or {}
@@ -1068,7 +1125,8 @@ async def _deliver(h: RunHandle, actor: str) -> Outcome:
         logger.exception("run %s: sending the report failed", h.run_id)
         await _say(h.chat_id, f"⚠️ send failed: {e}")
     try:
-        await h.graph.aupdate_state(h.cfg, {}, as_node="deliver")    # Send ends the run: next == ()
+        await h.graph.aupdate_state(h.cfg, {"extend_requested": False, "revision_requested": False},
+                                    as_node="deliver")              # Send ends the run: next == ()
     except Exception as e:
         return _refused(h.run_id, "finish", e)                       # it still rests at its report gate
     bus.finish(h.run_id)                            # after the gate event, so the buffer still expires
@@ -1151,12 +1209,13 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                     _forget(h)
                     return refused
             else:
-                rc = await ensure_in_checkpoint(h.graph, h.cfg, engines=await registry.active_snapshot())
+                active = await registry.active_snapshot()
+                rc = await ensure_in_checkpoint(h.graph, h.cfg, engines=active)
                 values = (await h.graph.aget_state(h.cfg)).values or {}
                 notice = await _appends_notice(h)
                 if kind == PLAN:
                     if h.choices is None:
-                        h.choices = _default_choices(rc)
+                        h.choices = _default_choices(rc, active.profile)
                     await _present_plan(h, values)
                 else:
                     await _present_report(h, values)

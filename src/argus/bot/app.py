@@ -102,9 +102,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await media.handle_callback(update, ctx, ns, action, run_id)
         return
 
-    # Everything else is run-scoped: the run lookup and its not-in-flight
-    # notice, then len:* / plan:* / report:* (other namespaces stop at the
-    # lookup or fall through doing nothing, as before the split).
+    # Everything else is run-scoped (len / dep / prof / rec / plan / report):
+    # the driver acts on the run, attaching one that rests at its gate (also
+    # untracked after a restart); the not-in-flight notice replaces the card
+    # only when there is nothing to act on. Other namespaces do nothing.
     await research.handle_callback(update, ctx, ns, action, run_id)
 
 
@@ -193,8 +194,9 @@ async def _post_init(app: Application) -> None:
         if knob in os.environ:
             logger.warning("%s is set but no longer read; replaced by %s", knob, replacement)
     # Reconcile runs orphaned by the previous process (crash / restart):
-    # their in-memory _inflight is gone, so their inline buttons are dead.
-    # Recover what we can from checkpoints and tell each user.
+    # their in-memory _inflight is gone, but their inline buttons still work
+    # (an action attaches a run resting at its gate). Mark each from its
+    # checkpoint and tell each user how to go on.
     try:
         await _reconcile_orphaned_runs(app)
     except Exception:
@@ -207,8 +209,10 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
     """A restart wipes _inflight, so any run left non-terminal is orphaned.
     For each, inspect the checkpoint: paused at a gate → awaiting_* (its
     buttons attach it on the next tap); interrupted mid-drive → cancelled,
-    resumable from its last saved step; no checkpoint → error. Each user is
-    DM'd how to go on. Bounded + best-effort."""
+    resumable from its last saved step; no checkpoint → error. A quick /ask
+    (which /continue refuses) is cancelled and told to ask again — its own
+    graph's deliver step reads as ("deliver",) through the deep graph. Each
+    user is DM'd how to go on. Bounded + best-effort."""
     lib: Library | None = app.bot_data.get("library")
     graph = app.bot_data.get("graph")
     if lib is None or graph is None:
@@ -229,7 +233,10 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
             snap = None
         nxt = tuple(snap.next) if (snap and snap.next) else ()
         topic = (run.get("topic") or "")[:48]
-        if nxt in (("research",), ("fetcher",)):
+        if run.get("mode") == "quick":
+            await _set_run_status(app_ctx(app), run_id, "cancelled")
+            msg = f"♻️ /ask `{run_id}` ({topic}) was interrupted by a bot restart — ask again with /ask."
+        elif nxt in (("research",), ("fetcher",)):
             await _set_run_status(app_ctx(app), run_id, "awaiting_plan")
             msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    f"restart at the plan step.\nSend /continue {run_id} to "
