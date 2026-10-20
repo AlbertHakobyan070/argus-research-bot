@@ -288,3 +288,46 @@ def test_a_claim_and_its_negation_are_never_twins():                            
     assert not quarantine.twins(a, b, [3], [3])
     assert not quarantine.twins("QISA doesn’t need 2.6x longer inference [1]", "QISA needs 2.6x longer inference [1]",
                                 [1], [1]), "the fold deletes the apostrophe: doesn’t → doesnt, a negator"
+
+# ---------------------------------------------------------------------------
+# Fix round 4: the negation guard on rule (i) only; a hyphenated range read as both its bounds (spec R1 at c9804ad)
+# ---------------------------------------------------------------------------
+
+# Live q013 (69a2a4b run, accept-t9f2-q013): the Report f0 and its Analysis restatement f8, which adds a caveat with a
+# negator — the same values {78.3, 45.7, 11.5}, the same source [2], similarity 0.57. Verbatim from its evidence.json.
+CAVEATED_F0 = "QiT-B reports 78.3% ImageNet-1K top-1 accuracy with 45.7M parameters and 11.5 GFLOPs."
+CAVEATED_F8 = ("The only exact figures found belong to QiT-B, a Quantum-Inspired Transformer, which reports 78.3% "
+               "ImageNet-1K top-1 accuracy with 45.7M parameters and 11.5 GFLOPs, and these should not be attributed "
+               "to Nebulon AI.")
+
+
+def test_a_caveated_restatement_twins_by_its_values_and_source():                      # re-review 3, live q013
+    assert SequenceMatcher(None, quarantine.claim_norm(CAVEATED_F0), quarantine.claim_norm(CAVEATED_F8),
+                           autojunk=False).ratio() < 0.85
+    assert quarantine._negated(CAVEATED_F8) and not quarantine._negated(CAVEATED_F0)
+    assert quarantine.twins(CAVEATED_F0, CAVEATED_F8, [2], [2]), "rule (ii) ignores negators"
+    assert not quarantine.twins(CAVEATED_F0, CAVEATED_F8, [2], [9]), "rule (ii) needs a shared source"
+
+
+@pytest.mark.parametrize("text,values", [
+    ("10-20%", {10, 20}),
+    ("2019-2023", {2019, 2023}),
+    ("750–1,000", {750, 1000}),
+    ("$4,217–4,235", {4217, 4235}),
+])
+def test_a_hyphenated_range_carries_both_its_bounds(text, values):                     # re-review 3
+    assert quarantine._values(text) == {Decimal(v) for v in values}
+
+
+# The re-review's range and name probes (candidate_b_refined.py): a different bound makes a different claim; a
+# number after a name's hyphen is still no value
+RANGE_PAIRS = [
+    ("The method gives a 10-20% gain on retrieval [2]", "The method gives a 10-25% gain on retrieval [2]", False),
+    ("Qwen2.5-72B scores 86% on MMLU [3]", "Qwen2.5 scores 86% on MMLU [3]", True),
+    ("Llama-3-70B scores 82% on MMLU [2]", "Llama-3 scores 82% on MMLU [2]", True),
+]
+
+
+@pytest.mark.parametrize("a,b,twin", RANGE_PAIRS)
+def test_twins_read_range_bounds_but_never_a_names_number(a, b, twin):                 # re-review 3
+    assert quarantine.twins(a, b, _ids(a), _ids(b)) is twin

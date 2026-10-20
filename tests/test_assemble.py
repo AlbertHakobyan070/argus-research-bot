@@ -100,6 +100,14 @@ def test_flat_renders_findings_heading():
     ("```markdown\nHello [1]\n```", "Hello [1]"),
     ("```MD\nHello\n```  ", "Hello"),
     ("  plain text ", "plain text"),
+    # fix round 4: a leading fence goes only with its matching closing fence; what follows is kept as written
+    ("```markdown\n## Scope\n\nBody [1].\n```\n\nMore prose after the block [2].",
+     "## Scope\n\nBody [1].\n\nMore prose after the block [2]."),
+    ("```md\n## Scope\n\nBody [1].\n\n- Item [2].\n```", "## Scope\n\nBody [1].\n\n- Item [2]."),
+    ("```markdown\n## Scope\n\nBody [1].", "```markdown\n## Scope\n\nBody [1]."),            # unclosed: unchanged
+    ("```markdown\nIntro [1].\n\n```python\nx = 1\n```\n\nOutro [2].\n```",              # a block inside the fence
+     "Intro [1].\n\n```python\nx = 1\n```\n\nOutro [2]."),
+    ("Prose [1].\n\n```python\nx = 1\n```", "Prose [1].\n\n```python\nx = 1\n```"),          # no leading fence
 ])
 def test_strip_fences(raw, clean):
     assert strip_fences(raw) == clean

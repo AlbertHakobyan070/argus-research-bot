@@ -12,9 +12,9 @@ needs the window: 0.94 over two sentences, 0.68 over either alone);
 removes whole sentences, drops a paragraph or item left empty and a
 sub-heading left without content; an untouched body is returned
 byte-identical. ``apply_cuts`` turns the panel's flags, the unknown-id rule
-and the stricter verdict for twins (``twins``, spec R1: no negation between
-them and the same numeric values, then compose's dedupe ratio on
-``claim_norm``, or ≥ 2 values and a shared source) into finding
+and the stricter verdict for twins (``twins``, spec R1: the same numeric
+values, then compose's dedupe ratio on ``claim_norm`` with no negation
+between them, or ≥ 2 values and a shared source) into finding
 statuses (kept / cut / unlocated) — a finding stated in a cut sentence goes
 with it unless the cut body still states it — the cut bodies and the two
 appendix listings (judge reasons with their square brackets escaped);
@@ -42,9 +42,10 @@ _FOLD = str.maketrans({**dict.fromkeys("\"'`“”„‟‘’‚‛«»‹›*"
 _NEGATORS = frozenset("not never cannot cant dont doesnt isnt arent wasnt werent wont wouldnt shouldnt "
                       "couldnt didnt hasnt havent hadnt aint mustnt neednt mightnt shant oughtnt without"
                       .split())
-# a numeric value (spec R1): digits not attached to a name ("GPT-4", "H2", "v0.2" are names), "." and ","
-# only between digits; its unit never counts ("30%" = "30 percent", "70B" = "70 billion", "120 ms" = "120ms")
-_VALUE = re.compile(r"(?<![\w.])(?<!\w-)\d+(?:[.,]\d+)*")
+# a numeric value (spec R1): digits not attached to a name ("GPT-4", "H2", "v0.2", "Qwen2.5-72B" are names), "."
+# and "," only between digits, a hyphenated range ("10-20", after the fold "750–1,000" too) one match read as its two
+# bounds; its unit never counts ("30%" = "30 percent", "70B" = "70 billion", "120 ms" = "120ms")
+_VALUE = re.compile(r"(?<![\w.])(?<!\w-)\d+(?:[.,]\d+)*(?:-\d+(?:[.,]\d+)*)?")
 _THOUSANDS = re.compile(r",(?=\d{3}(?!\d))")          # a comma before exactly three digits
 _DECIMAL = re.compile(r"\d+(?:\.\d+)?")
 _FENCE = re.compile(r"^\s*(```|~~~)")
@@ -265,12 +266,14 @@ def claim_norm(text: str) -> str:
 
 
 def _values(text: str) -> set[Decimal | str]:
-    """The numeric values of ``text`` (spec R1), ``[n]`` markers aside:
-    thousands separators out, compared by value ("$1,200" = "$1200", "2.50x"
-    = "2.5x"); a run that is no decimal ("3.10.2", "2,5") compares as written."""
+    """The numeric values of ``text`` (spec R1), ``[n]`` markers aside: a
+    hyphenated range as both its bounds ("10-20%" → 10 and 20), each with its
+    thousands separators out and compared by value ("$1,200" = "$1200",
+    "2.50x" = "2.5x"); a bound that is no decimal ("3.10.2", "2,5") compares as
+    written."""
     text = _CITE.sub(" ", unicodedata.normalize("NFKC", text)).translate(_FOLD)
-    runs = (_THOUSANDS.sub("", v) for v in _VALUE.findall(text))
-    return {Decimal(v) if _DECIMAL.fullmatch(v) else v for v in runs}
+    bounds = (_THOUSANDS.sub("", b) for v in _VALUE.findall(text) for b in v.split("-"))
+    return {Decimal(b) if _DECIMAL.fullmatch(b) else b for b in bounds}
 
 
 def _negated(text: str) -> bool:
@@ -280,17 +283,18 @@ def _negated(text: str) -> bool:
 
 
 def twins(a: str, b: str, a_ids: Iterable[int], b_ids: Iterable[int]) -> bool:
-    """``a`` and ``b`` state one claim (spec R1): neither negates what the
-    other asserts (exactly one holding a negator token: never twins) and
-    either (i) their ``claim_norm`` ratio is ≥ 0.85 (the dedupe rule) with the
-    same numeric values, or (ii) they carry the same set of ≥ 2 distinct
-    numeric values and share a cited source (``a_ids`` / ``b_ids``). A
-    different value makes a different claim."""
+    """``a`` and ``b`` state one claim (spec R1): either (i) their
+    ``claim_norm`` ratio is ≥ 0.85 (the dedupe rule) with the same numeric
+    values and neither negates what the other asserts (exactly one holding a
+    negator token: not twins by (i)), or (ii) they carry the same set of ≥ 2
+    distinct numeric values and share a cited source (``a_ids`` / ``b_ids``) —
+    negators ignored, as a restatement adds caveats ("… should not be
+    attributed to …", live q013). A different value makes a different claim."""
     values = _values(a)
-    if _negated(a) != _negated(b) or values != _values(b):
+    if values != _values(b):
         return False
     x, y = claim_norm(a), claim_norm(b)
-    if x and y and SequenceMatcher(None, x, y, autojunk=False).ratio() >= _TWIN_RATIO:
+    if _negated(a) == _negated(b) and x and y and SequenceMatcher(None, x, y, autojunk=False).ratio() >= _TWIN_RATIO:
         return True
     return len(values) >= 2 and not {int(i) for i in a_ids}.isdisjoint(int(i) for i in b_ids)
 

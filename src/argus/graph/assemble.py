@@ -19,12 +19,24 @@ import re
 
 CITE_RE = re.compile(r"\[(\d{1,3})\]")
 ANALYSIS_SECTION = "Analysis"
+_WRAPPER = re.compile(r"```(?:markdown|md|json)?\s*", re.IGNORECASE)        # a reply's leading fence line
 
 
 def strip_fences(text: str) -> str:
+    """``text`` stripped and, when its first line is a fence of three
+    backticks (bare, or with ``markdown``, ``md`` or ``json``, in any case),
+    without that line and its matching closing fence line — the first bare
+    backtick fence outside every block opened inside it — the text after that
+    fence kept as written. With no matching closing fence nothing is removed:
+    never an unmatched fence left behind."""
     t = (text or "").strip()
-    t = re.sub(r"^```(?:markdown|md|json)?\s*", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s*```$", "", t)
+    lines = t.split("\n")
+    if _WRAPPER.fullmatch(lines[0]):
+        for k in range(1, len(lines)):
+            m = _FENCE.fullmatch(lines[k])
+            # a blank line after lines[1:k] is code only inside a block opened there and still open
+            if m and m.group(1)[0] == "`" and not m.group(2).strip() and not _code_lines([*lines[1:k], ""])[-1]:
+                return "\n".join([*lines[1:k], *lines[k + 1:]]).strip()
     return t
 
 
