@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
 from ..engines.urls import canonical_url
-from ..graph.research import _source_key
+from ..graph.research import _is_pinned, _source_key
 from ..library import Library
 from ..media import extract_urls
 from . import runs
@@ -246,10 +246,13 @@ def _append_key(src: dict) -> str:
 
 
 def merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dict]:
-    """``sources`` plus each appended source it does not carry yet: an Extend
-    or a fork drained or refused after its merge never duplicates them."""
+    """``sources`` plus each appended source it carries no pinned copy of yet
+    (research's ``_is_pinned``): an Extend or a fork drained or refused after
+    its merge never duplicates them. An unpinned copy (the scout found the
+    URL) is no merged append: the pinned copy goes in, wins research's
+    dedupe and is ingested (§2.4)."""
     out = list(sources or [])
-    keys = {_append_key(s) for s in out}
+    keys = {_append_key(s) for s in out if _is_pinned(s)}
     for src in appended:
         if _append_key(src) not in keys:
             keys.add(_append_key(src))
@@ -260,9 +263,10 @@ def merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dic
 def carried_appends(sources: list[dict] | None, pending: list[dict],
                     appended: list[dict]) -> tuple[list[dict], list[dict]]:
     """The pending /append rows, and their sources, that ``sources`` already
-    carries — merged by an Extend or a fork whose pass was drained: resuming
-    that pass ingests them."""
-    keys = {_append_key(s) for s in sources or []}
+    carries as pinned copies — merged by an Extend or a fork whose pass was
+    drained: resuming that pass ingests them. An unpinned copy (the scout
+    found the URL) is not one, so a resume leaves that append pending."""
+    keys = {_append_key(s) for s in sources or [] if _is_pinned(s)}
     carried = [s for s in appended if _append_key(s) in keys]
     refs = {s["ref"] for s in carried}
     return [p for p in pending if p["ref"] in refs], carried

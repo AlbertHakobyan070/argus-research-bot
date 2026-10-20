@@ -69,6 +69,11 @@ _launch_closed = False            # drain_all stopped waiting for the claims mad
 
 PLAN, REPORT = "plan", "report"
 _GATES = {("research",): PLAN, ("fetcher",): PLAN, ("deliver",): REPORT}   # ("fetcher",): pre-v3 plan gate
+# A state write without as_node runs as the last node that ran (LangGraph reads versions_seen, which
+# an as_node write never updates) and re-runs that node's edges. Each resting state the driver's
+# as_node writes leave (the re-plan's intake; Send, the fork and an older bot's advance as deliver)
+# → the one node that leads there: a later write on a run resting there passes it, so next stays.
+_ROUTES = {("brief",): "intake", ("extend_prep",): "deliver", ("revise_prep",): "deliver", (): "deliver"}
 DEPTHS = tuple(PRESETS)
 RECENCY_CYCLE = (None, "d", "w", "m", "y", "any")      # None: the brief's time-sensitivity hint decides
 _REPLY_PROMPTS = {
@@ -122,7 +127,7 @@ class RunHandle:
     announced: set[tuple[str, str]] = field(default_factory=set)   # (node, status) this drive's tasks published
     cancelled_by: str | None = None  # the actor of a cancel accepted while this drive was live
     attaching: bool = False          # registered by an action on an untracked run; attached under the lock
-    route: str | None = None         # the node this drive's launching action wrote as (re-plan, fork)
+    route: str | None = None         # the node its launching action wrote as (re-plan, fork); a resume's: _ROUTES
 
     @classmethod
     def of(cls, row: dict, chat_id: int) -> RunHandle:
@@ -354,9 +359,11 @@ async def _foreign_nodes(h: RunHandle) -> list[str]:
 async def _resumable(h: RunHandle, engines=None) -> dict:
     """Resume entries, before anything changes: the engines snapshot resolves
     (``engines``, else the active one), the checkpoint carries its RunConfig
-    (legacy injection) and this graph has its nodes. Returns the checkpoint's
+    (legacy injection, written as ``_ROUTES`` routes where the run rests, so
+    it keeps ``next``) and this graph has its nodes. Returns the checkpoint's
     values; raises otherwise."""
-    await ensure_in_checkpoint(h.graph, h.cfg, engines=engines or await registry.active_snapshot())
+    route = _ROUTES.get(tuple((await h.graph.aget_state(h.cfg)).next or ()))
+    await ensure_in_checkpoint(h.graph, h.cfg, engines=engines or await registry.active_snapshot(), as_node=route)
     foreign = await _foreign_nodes(h)
     if foreign:
         raise ValueError(f"it was made by an older Argus graph (its checkpoint names {', '.join(foreign)}, "
@@ -384,14 +391,15 @@ def _appends_marker(h: RunHandle, pending: list[dict], appended: list[dict]):
 
 
 def _merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dict]:
-    """``sources`` plus the appended sources it does not carry yet."""
+    """``sources`` plus the appended sources it carries no pinned copy of yet."""
     from . import history                           # lazy: history imports this module
     return history.merged_sources(sources, appended)
 
 
 async def _carried_appends(h: RunHandle, values: dict) -> tuple[list[dict], list[dict]]:
     """The pending /append rows (and their sources) the checkpoint already
-    carries: an Extend or a fork merged them, then its pass was drained."""
+    carries as pinned copies: an Extend or a fork merged them, then its pass
+    was drained."""
     from . import history                           # lazy: history imports this module
     return history.carried_appends(values.get("sources"), *await _pending_appends(h))
 
@@ -420,7 +428,8 @@ def _launch(h: RunHandle, resume_input: Any, *, stage: str, route: str | None = 
     launches — its drive drains at once — unless ``drain_all`` stopped
     waiting for it (refused then). ``start_run`` never calls it once the
     shutdown began. ``route``: the node the action's state write ran as
-    (the re-plan's ``intake``, the fork's ``deliver``) — the cancel note's
+    (the re-plan's ``intake``, the fork's ``deliver``), or for a plain
+    resume the one ``_ROUTES`` gives for where it rests — the cancel note's
     node while no node of this drive has finished."""
     h.starting = False
     if _launch_closed:
@@ -572,11 +581,12 @@ async def _at_rest(h: RunHandle) -> None:
 async def _drained(h: RunHandle, reason: str) -> None:
     """The drive drained (``GraphDrained``, or a drain that won over a gate).
     The note never moves ``next``: it is written as the last node this drive
-    finished, else as the node its launching action wrote as (``route``),
-    else as LangGraph infers it — for a plain resume, the last node that ran.
-    LangGraph's guess re-runs that node's edges, which took a re-plan or a
-    fork drained before its first node back to its old gate. The card's hint
-    follows ``next``."""
+    finished, else as ``route`` (the node its launching action wrote as; a
+    plain resume's from where it rested), else as LangGraph infers it — the
+    last node that ran, right for a resting state a real node produced.
+    LangGraph's guess re-runs that node's edges, which took a re-plan, a fork
+    or a resume of either, drained before its first node, back to its old
+    gate. The card's hint follows ``next``."""
     done = h.done_node
     note = f"cancelled after node {done} ({reason})" if done else f"cancelled before it started ({reason})"
     await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=done or h.route)
@@ -1266,7 +1276,8 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                                                         "append_only": bool(appended)}, as_node="deliver")
                     h.on_report = on_report
                 await _status(run_id, "running")
-                refused = _launch(h, None, stage=nxt[0] if nxt else "extend_prep", route=None if nxt else "deliver")
+                refused = _launch(h, None, stage=nxt[0] if nxt else "extend_prep",
+                                  route=_ROUTES.get(nxt) if nxt else "deliver")    # a resume: from where it rests
                 if refused is not None:
                     _forget(h)
                     return refused

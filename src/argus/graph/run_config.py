@@ -290,11 +290,13 @@ def require(state: Mapping) -> RunConfig:
     return rc
 
 
-async def ensure_in_checkpoint(graph, cfg: dict, *, engines: EnginesSnapshot) -> RunConfig:
+async def ensure_in_checkpoint(graph, cfg: dict, *, engines: EnginesSnapshot,
+                               as_node: str | None = None) -> RunConfig:
     """Resume paths: the thread's RunConfig. A pre-v4 checkpoint (no ``run_config``)
-    gets ``for_legacy_checkpoint`` for its own length, recorded in ``errors``. A thread
-    with no checkpoint, or a checkpoint without ``length``, raises ValueError and
-    nothing is written."""
+    gets ``for_legacy_checkpoint`` for its own length, recorded in ``errors`` and
+    written ``as_node`` when given (the caller's node that keeps ``next``; None lets
+    LangGraph infer it, the last node that ran). A thread with no checkpoint, or a
+    checkpoint without ``length``, raises ValueError and nothing is written."""
     snap = await graph.aget_state(cfg)
     thread_id = cfg["configurable"]["thread_id"]
     if snap.created_at is None:
@@ -306,5 +308,6 @@ async def ensure_in_checkpoint(graph, cfg: dict, *, engines: EnginesSnapshot) ->
         raise ValueError(f"checkpoint for thread {thread_id!r} has no length — cannot build its legacy run_config")
     rc = RunConfig.for_legacy_checkpoint(engines=engines, length=length)
     await graph.aupdate_state(cfg, {"run_config": rc.model_dump(),
-                                    "errors": ["legacy: run_config defaults applied (pre-v4 checkpoint)"]})
+                                    "errors": ["legacy: run_config defaults applied (pre-v4 checkpoint)"]},
+                              as_node=as_node)
     return rc

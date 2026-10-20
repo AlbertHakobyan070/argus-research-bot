@@ -283,6 +283,41 @@ async def test_require_rejects_a_checkpoint_whose_length_disagrees_with_its_conf
     assert (await graph.aget_state(CFG)).config == before
 
 
+async def test_a_pre_v4_checkpoint_resting_at_brief_keeps_next_through_the_injection(graph, lib, monkeypatch):
+    """A v3 re-plan wrote its feedback as intake and stopped before brief ran:
+    the checkpoint rests at ("brief",) with no run_config, and LangGraph would
+    take an unattributed write for scout's, the last node that ran. The legacy
+    injection is written as intake, so next stays at brief: /continue redrafts
+    the plan with the edit and stops at the plan gate — research never runs
+    without an Approve."""
+    feedback, brief = [], graph_mod.brief_node
+    monkeypatch.setattr(graph_mod, "brief_node", lambda s: feedback.append(s.get("plan_feedback")) or brief(s))
+    graph = graph_mod.build_graph(checkpointer=graph.checkpointer)
+    await _run_at(graph, lib, "plan")
+    await graph.aupdate_state(CFG, {"plan_feedback": "focus on security"}, as_node="intake")
+    await lib.set_run_status(RUN_ID, "cancelled")              # the restart reconcile's mark
+    writes, update_state = [], graph.aupdate_state
+
+    async def recording(cfg, values, *a, **kw):
+        before = tuple((await graph.aget_state(cfg)).next)
+        out = await update_state(cfg, values, *a, **kw)
+        writes.append((sorted(values), before, tuple((await graph.aget_state(cfg)).next)))
+        return out
+
+    monkeypatch.setattr(graph, "aupdate_state", recording)
+    ctx = await _ctx(graph, lib)
+    await _continue(ctx)
+    await settle_runs()
+
+    assert writes == [(["errors", "run_config"], ("brief",), ("brief",))]     # the injection keeps next
+    snap = await graph.aget_state(CFG)
+    assert require(snap.values).legacy and snap.values["errors"].count(LEGACY) == 1
+    assert feedback[1:] == ["focus on security"]               # the redraft saw the edit
+    assert (tuple(snap.next), snap.values["fetched"]) == (("research",), [])  # at the plan gate, nothing fetched
+    assert (await lib.get_run(RUN_ID))["status"] == "awaiting_plan"
+    assert f"▶️ Resuming run `{RUN_ID}` from `brief`…" in _sent(ctx)
+
+
 # ---------------------------------------------------------------------------
 # Approve: rc.rebuild for the chosen length, written to checkpoint and library
 # ---------------------------------------------------------------------------

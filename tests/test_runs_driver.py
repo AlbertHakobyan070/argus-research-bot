@@ -32,6 +32,7 @@ from argus.config import Settings
 from argus.engines import registry, search
 from argus.engines.registry import EngineConfigError
 from argus.graph import graph as graph_mod
+from argus.graph import research as research_mod
 from argus.graph.nodes import MAX_REVISE_ROUNDS
 from argus.graph.run_config import RunConfig, require
 from argus.graph.state import ArgusState, ResearchBrief
@@ -1791,3 +1792,198 @@ async def test_a_drained_extends_appends_are_merged_once_and_marked_by_the_next(
     ((append_only, urls),) = research.seen
     assert not append_only and urls.count(ref) == 1
     assert await _source_statuses(env, run_id) == {ref: "ingested"}
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4: a resume takes its route from where it rests, pinned appends
+# keep their pin
+# ---------------------------------------------------------------------------
+
+_ROUTE_RESTS = {"replan_drained": "brief", "replan_failed": "brief", "fork_drained": "extend_prep"}
+_APPENDED = "https://a.example/p"
+
+
+@pytest.mark.parametrize("stop", ["drained_at_launch", "force_cancelled_in_its_first_node"])
+@pytest.mark.parametrize("rest", list(_ROUTE_RESTS))
+async def test_a_resume_from_a_route_written_rest_keeps_next(env, monkeypatch, rest, stop):
+    """A re-plan (its write runs as intake) or a /continue fork (as deliver)
+    that stopped before its first node finished — drained, or failed in brief
+    — rests at ("brief",) / ("extend_prep",). Its /continue resume, stopped
+    again before that node finishes, takes its route from where it rests:
+    every cancel note keeps next (LangGraph's guess, the last node that ran,
+    moved it back to the old gate). The next /continue redrafts the plan with
+    the edit, or runs the fork's own append pass: neither is lost or left for
+    a later Extend."""
+    first, hold, feedback, fail = _ROUTE_RESTS[rest], _Hold(), [], []
+    brief = hold(graph_mod.brief_node) if first == "brief" else graph_mod.brief_node
+
+    def recording_brief(s):                                    # records before the hold
+        feedback.append(s.get("plan_feedback"))
+        if fail:
+            fail.pop()
+            raise RuntimeError("LLM down")
+        return brief(s)
+
+    monkeypatch.setattr(graph_mod, "brief_node", recording_brief)
+    if first == "extend_prep":
+        monkeypatch.setattr(graph_mod, "extend_prep_node", hold(graph_mod.extend_prep_node))
+    env.graph = env.app.bot_data["graph"] = graph_mod.build_graph(checkpointer=env.graph.checkpointer)
+    env.state.gates.append(hold)
+    notes, update_state = [], env.graph.aupdate_state
+
+    async def recording(cfg, values, *a, **kw):
+        if "cancel_note" not in values:
+            return await update_state(cfg, values, *a, **kw)
+        before = tuple((await env.graph.aget_state(cfg)).next)
+        out = await update_state(cfg, values, *a, **kw)
+        notes.append((before, tuple((await env.graph.aget_state(cfg)).next)))
+        return out
+
+    monkeypatch.setattr(env.graph, "aupdate_state", recording)
+
+    # the first stop: the route write, then no node of its drive finishes
+    if first == "extend_prep":
+        run_id = await _at_report_gate(env)
+        assert (await runs.report_action(run_id, "send")).code == "delivered"
+        env.state.research = research = FetchAll()
+        await history.append_cmd(_update(), _ctx(env, [run_id, _APPENDED]))
+        await _prepared_across_the_shutdown_start(env, monkeypatch,
+                                                  lambda: history.continue_cmd(_update(), _ctx(env, [run_id])))
+    elif rest == "replan_drained":
+        run_id = await _at_plan_gate(env)
+        await _prepared_across_the_shutdown_start(env, monkeypatch,
+                                                  lambda: runs.edit_plan(run_id, "focus on security"))
+    else:
+        run_id = await _at_plan_gate(env)
+        fail.append(True)
+        assert (await runs.edit_plan(run_id, "focus on security")).code == "started"
+        await common._inflight[run_id].task
+        assert (await env.lib.get_run(run_id))["status"] == "error"
+    assert tuple((await _snap(env, run_id)).next) == (first,)
+    _restart(monkeypatch)
+
+    # the second stop: its /continue resume, stopped before that node finishes
+    launched, launch = [], runs._launch
+
+    def recording_launch(h, *a, **kw):
+        launched.append(h)
+        return launch(h, *a, **kw)
+
+    monkeypatch.setattr(runs, "_launch", recording_launch)
+
+    async def resume() -> runs.Outcome:
+        return await runs.continue_run(await env.lib.get_run(run_id), chat_id=CHAT)
+
+    if stop == "drained_at_launch":
+        out = await _prepared_across_the_shutdown_start(env, monkeypatch, resume)
+        card = f"⏹ Cancelled before it started — /continue {run_id} resumes it from {first}."
+    else:
+        async def past(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(runs, "_sleep", past)
+        hold.armed = True
+        out = await resume()
+        assert await asyncio.to_thread(hold.started.wait, 5)
+        assert (await runs.cancel_run(run_id)).code == "draining"
+        await asyncio.wait([launched[-1].task], timeout=10)
+        hold.release.set()
+        hold.armed = False
+        assert launched[-1].task.cancelled()
+        card = f"⏹ Force-cancelled during {first} — /continue {run_id} reruns {first}."
+    assert (out.code, out.text) == ("started", f"▶️ Resuming run `{run_id}` from `{first}`…")
+    assert launched[-1].card.final == card
+    assert len(notes) == (1 if rest == "replan_failed" else 2) and all(b == a for b, a in notes), notes
+    assert tuple((await _snap(env, run_id)).next) == (first,)
+
+    # the next /continue: the redraft with the edit, or the fork's own append pass
+    _restart(monkeypatch)
+    seen = len(feedback)
+    await history.continue_cmd(_update(), _ctx(env, [run_id]))
+    await settle_runs()
+    snap = await _snap(env, run_id)
+    if first == "brief":
+        assert feedback[seen:] == ["focus on security"]
+        assert (tuple(snap.next), (await env.lib.get_run(run_id))["status"]) == (("research",), "awaiting_plan")
+        assert env.state.research.calls == 0                   # no research without an Approve
+    else:
+        ((append_only, urls),) = research.seen
+        assert append_only is True and urls.count(_APPENDED) == 1
+        assert await _source_statuses(env, run_id) == {_APPENDED: "ingested"}
+        assert tuple(snap.next) == ("deliver",) and not snap.values.get("append_only")
+
+
+_SCOUTED = "https://u.example/unread"         # the scout finds it; research never fetches it
+
+
+def _scout_finds_an_unread_url(env, monkeypatch) -> None:
+    monkeypatch.setattr(graph_mod, "scout_node", lambda s: {
+        "sources": [{"kind": "web", "title": "W", "url": "https://w.example/x"},
+                    {"kind": "web", "title": "U", "url": _SCOUTED}],
+        "search_spend": {"exa_usd": 0.007, "recency": dict(WINDOW)}})
+    env.graph = env.app.bot_data["graph"] = graph_mod.build_graph(checkpointer=env.graph.checkpointer)
+
+
+class PinnedPick:
+    """A research node whose append-only pass is research's own (``_Pass.append_pass``:
+    the pinned sources, a pinned copy winning the dedupe), its fetch stubbed;
+    any other pass fetches w.example/x only."""
+
+    def __init__(self) -> None:
+        self.picked: list[list[str]] = []
+
+    def __call__(self, state, runtime: Runtime) -> dict:
+        if not state.get("append_only"):
+            return {"fetched": [{"url": "https://w.example/x", "title": "W", "excerpt": "x"}], "evidence": []}
+        p = research_mod._Pass(state, require(state), ResearchBrief.model_validate(state.get("brief") or {}), None)
+        picked: list[str] = []
+        p.wave = lambda sources, **kw: picked.extend(s["url"] for s in sources)
+        p.append_pass()
+        self.picked.append(picked)
+        return {"fetched": [*(state.get("fetched") or []), *({"url": u, "title": "", "excerpt": "x"} for u in picked)],
+                "evidence": [], "append_only": False}
+
+
+async def test_an_append_of_a_url_the_scout_found_is_merged_pinned_and_ingested(env, monkeypatch):
+    """§2.4 (pinned appends are always ingested): an /append of a URL the scout
+    found but research never fetched gets its pinned copy merged — the scout's
+    unpinned copy is no merged append — so research's append-only pass picks
+    and fetches it, and the report gate marks it ingested. The pass used to
+    pick nothing and mark it failed "not fetched" on every retry."""
+    _scout_finds_an_unread_url(env, monkeypatch)
+    env.state.research = research = PinnedPick()
+    run_id = await _at_report_gate(env)
+    assert (await runs.report_action(run_id, "send")).code == "delivered"
+    await history.append_cmd(_update(), _ctx(env, [run_id, _SCOUTED]))
+    u = _update()
+    await history.continue_cmd(u, _ctx(env, [run_id]))
+    await settle_runs()
+    copies = [s for s in (await _snap(env, run_id)).values["sources"] if s["url"] == _SCOUTED]
+    assert [research_mod._is_pinned(s) for s in copies] == [False, True]     # the scout's, then the append's
+    assert research.picked == [[_SCOUTED]]
+    assert await _source_statuses(env, run_id) == {_SCOUTED: "ingested"}
+    u.message.reply_text.assert_not_awaited()                  # no "could not be ingested" line
+
+
+async def test_a_resume_that_runs_no_research_leaves_a_never_merged_append_pending(env, monkeypatch):
+    """A run cancelled after research rests at ("outline",). An /append of a URL
+    its scout found (an unpinned copy, never fetched) is no append its
+    checkpoint carries, so the /continue resume, which runs no research,
+    leaves it pending and names it; it used to be marked failed."""
+    _scout_finds_an_unread_url(env, monkeypatch)
+    research = _blocking(env, reads_runtime=True)
+    run_id = await _executing(env, research)
+    await runs.cancel_run(run_id)
+    research.release.set()
+    await common._inflight[run_id].task
+    assert tuple((await _snap(env, run_id)).next) == ("outline",)
+    await history.append_cmd(_update(), _ctx(env, [run_id, _SCOUTED]))
+    u = _update()
+    await history.continue_cmd(u, _ctx(env, [run_id]))
+    await settle_runs()
+    assert (f"▶️ Resuming run `{run_id}` from `outline`…\n📎 Run `{run_id}` has 1 pending appended source(s): "
+            f"🔎 Extend at the report preview ingests them, or /continue {run_id} once the report is sent."
+            in _sent(env))
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
+    assert await _source_statuses(env, run_id) == {_SCOUTED: "pending"}
+    u.message.reply_text.assert_not_awaited()                  # nothing marked failed
