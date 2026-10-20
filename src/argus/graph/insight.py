@@ -31,14 +31,13 @@ from ..engines.roles import DEGRADABLE_ROLES
 from ..engines.urls import registrable_domain
 from . import run_config
 from .archetypes import AGREEMENT, IMPLICATIONS, OPEN_QUESTIONS, SCENARIOS, TAKEAWAYS, TEMPLATES
-from .assemble import CITE_RE, assemble_draft, normalize_cite_markers, strip_fences
+from .assemble import ANALYSIS_SECTION, CITE_RE, assemble_draft, normalize_cite_markers, strip_fences
 from .compose import extract_findings
 from .research import _round
 from .state import ResearchBrief
 
 logger = logging.getLogger("argus.insight")
 
-ANALYSIS_SECTION = "Analysis"
 ANALYSIS_LABEL = ("_Analysis — interpretation by Argus from the cited evidence; confidence labels are "
                   "computed from source independence, quote verification and source authority._")
 _STANCES = ("supports", "contradicts", "mixed", "background")

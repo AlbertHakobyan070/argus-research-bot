@@ -19,7 +19,9 @@ Usage (from the repo root; one live run against the proxy's quota):
 
 ``--query`` takes a bench query id (``bench/queries.jsonl``) or the query
 text; ``--expect-banner`` (nonexistent-entity queries, q013/q014) expects the
-grounding banner and at most 3 findings. Every run expects the v4 banners
+grounding banner — with ``judged == total`` and no flagged claim in the body,
+like every run; no findings count (spec WP-C acceptance: the orchestrator
+reads the report for claims about the entity). Every run expects the v4 banners
 ("⚠ Not fact-checked", "⚠ Degraded run") absent and report.pdf on disk; the
 evidence.json check validates it with ``graph.evidence_export.Evidence``.
 Then compare with the v3 baseline:
@@ -65,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="run_config.recency (default: the brief's time-sensitivity decides)")
     p.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "argus_live_check")
     p.add_argument("--expect-banner", action="store_true",
-                   help="expect the grounding banner and <= 3 findings (nonexistent entity)")
+                   help="expect the grounding banner (a nonexistent entity)")
     return p.parse_args(argv)
 
 
@@ -126,11 +128,6 @@ def check_cited_findings(run, m):
     kept = _kept(run)
     n = sum(1 for f in kept if f.get("citation_urls") or f.get("source_ids"))
     return _verdict(n > 0, f"{n} of {len(kept)} kept")
-
-
-def check_few_findings(run, m):
-    n = len(_kept(run))
-    return _verdict(n <= 3, f"{n} kept")
 
 
 def check_report_size(run, m):
@@ -238,8 +235,7 @@ def checks(expect_banner: bool) -> list[tuple[str, object]]:
         ("run completed", check_run_completed),
         ("fetched > 0", check_fetched),
         ("evidence > 0", check_evidence),
-        ("findings <= 3", check_few_findings) if expect_banner
-        else ("findings with citations > 0", check_cited_findings),
+        *([] if expect_banner else [("findings with citations > 0", check_cited_findings)]),
         ("report.md > 1000 chars", check_report_size),
         ("report.pdf exists", check_pdf_exists),
         ("sources_block_present", check_sources_block),

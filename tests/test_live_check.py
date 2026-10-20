@@ -119,10 +119,6 @@ EVIDENCE = Evidence.model_validate({
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "kept"}]}), {}, PASS),
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "cut"}]}), {}, FAIL),
     (LC.check_cited_findings, _r({"findings": [{"citation_urls": ["u"], "status": "unlocated"}]}), {}, FAIL),
-    (LC.check_few_findings, _r({"findings": [{}] * 3}), {}, PASS),
-    (LC.check_few_findings, _r({"findings": [{}] * 4}), {}, FAIL),
-    (LC.check_few_findings, _r({"findings": [{"status": "kept"}] * 3 + [{"status": "cut"}] * 5}), {}, PASS),
-    (LC.check_few_findings, _r({"findings": [{"status": "kept"}] * 4 + [{"status": "cut"}]}), {}, FAIL),
     (LC.check_report_size, _r(report="x" * 1001), {}, PASS),
     (LC.check_report_size, _r(report="x" * 1000), {}, FAIL),
     (LC.check_report_size, _r(), {}, FAIL),
@@ -201,11 +197,11 @@ def test_check_details_name_what_was_measured():
     # the kept findings come from evidence.json when it has them (as in the bench metrics)
     ev = {**EVIDENCE, "findings": [{"id": "f0", "claim": "c", "sentence": "c [1].", "source_ids": [1],
                                     "section": "A", "status": "cut"}]}
-    assert LC.check_few_findings(_r({"findings": [{"status": "kept"}] * 4}, evidence=ev), {}) == (PASS, "0 kept")
+    assert LC.check_cited_findings(_r({"findings": [{"citation_urls": ["u"], "status": "kept"}] * 4}, evidence=ev),
+                                   {}) == (FAIL, "0 of 0 kept")
     findings = [{"citation_urls": ["u"], "status": "kept"}, {"citation_urls": [], "status": "kept"},
                 {"citation_urls": ["u"], "status": "cut"}]
     assert LC.check_cited_findings(_r({"findings": findings}), {}) == (PASS, "1 of 2 kept")
-    assert LC.check_few_findings(_r({"findings": findings}), {}) == (PASS, "2 kept")
 
 
 def test_the_check_list_follows_expect_banner():
@@ -217,9 +213,15 @@ def test_the_check_list_follows_expect_banner():
                      "no synthesis_no_evidence / report suppressed text", "grounding banner absent",
                      "⚠ Not fact-checked banner absent", "⚠ Degraded run banner absent"]
     banner = dict(LC.checks(expect_banner=True))
-    assert banner["findings <= 3"] is LC.check_few_findings
+    assert list(banner) == ["run completed", "fetched > 0", "evidence > 0", "report.md > 1000 chars",
+                            "report.pdf exists", "sources_block_present", "cite_markers_unresolved == 0",
+                            "flagged_claims_in_body == 0", "judged == total", "compose_budget_ok",
+                            "evidence.json valid", "metadata.json has engines",
+                            "no synthesis_no_evidence / report suppressed text", "grounding banner present",
+                            "⚠ Not fact-checked banner absent", "⚠ Degraded run banner absent"], (
+        "q013 is judged by the banner, judged == total and no flagged claim in the body — no findings count")
     assert banner["grounding banner present"] is LC.check_banner_present
-    assert "findings with citations > 0" not in banner and "grounding banner absent" not in banner
+    assert not hasattr(LC, "check_few_findings")
 
 
 def test_render_and_exit_code():

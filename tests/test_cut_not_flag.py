@@ -12,6 +12,7 @@ the degradation notes by round and ``metadata.json``.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from argus import config as config_mod
 from argus.graph import nodes as nodes_mod
+from argus.graph.insight import ANALYSIS_LABEL
 from argus.quarantine import cut, locate, sentences
 from bench import metrics
 from helpers import make_run_config
@@ -326,8 +328,11 @@ def test_degradation_notes_show_this_round_and_count_the_earlier_ones(monkeypatc
     assert "- [r2] skip: compose.section Usage" in notes
     assert "- earlier rounds: r1 — 2 notes" in notes
     assert "outline.plan" not in notes and "fetch:" not in notes and "analysis:" not in notes
-    assert evidence["degradations"] == [{"round": 1, "text": errors[0]}, {"round": 1, "text": errors[1]},
-                                        {"round": 2, "text": errors[3]}, {"round": 2, "text": errors[5]}]
+    assert evidence["degradations"] == [{"round": 1, "text": errors[0].removeprefix("[r1] ")},
+                                        {"round": 1, "text": errors[1].removeprefix("[r1] ")},
+                                        {"round": 2, "text": errors[3]},
+                                        {"round": 2, "text": errors[5].removeprefix("[r2] ")}], (
+        "the round lives in round, the text without its [r<k>] tag")
     assert metrics.degradations_count(run) == 4 == metrics.degradations_count({**run, "evidence": None})
 
 
@@ -342,11 +347,179 @@ def test_a_pdf_failure_is_an_error_line_and_a_degradation_note(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize("pv,banner", [
-    ({"judged": 0, "total": 8, "skipped_judges": ["grounding batch 1: 429"]},
+    ({"judged": 0, "total": 8, "skipped_judges": ["grounding batch 1: 429"],
+      "judge_verdicts": {"grounding": "unjudged", "grounding_batches": 1}},
      "> ⚠ Not fact-checked — the grounding judge failed (429)"),
-    ({"judged": 5, "total": 8, "skipped_judges": ["grounding batch 2: unparseable"]},
+    ({"judged": 5, "total": 8, "skipped_judges": ["grounding batch 2: unparseable"],
+      "judge_verdicts": {"grounding": "pass", "grounding_batches": 2}},
      "> ⚠ Not fact-checked — 3 of 8 findings were not judged (unparseable)"),
 ])
 def test_the_not_fact_checked_banner(monkeypatch, tmp_path, pv, banner):
     _, md, meta, *_ = _report(monkeypatch, tmp_path, _state(panel_verdict={"verdict": "pass", **pv}))
     assert banner in md and meta["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: location, collateral and twin cuts, unknown ids, unjudged
+# sections, per-item roles, the Analysis
+# ---------------------------------------------------------------------------
+
+def test_a_flagged_sentence_stated_twice_leaves_the_body(monkeypatch, tmp_path):            # reviewer B's P2
+    twice = "LangGraph pauses a run at an interrupt [1]. It powers review loops [2]. " \
+            "LangGraph pauses a run at an interrupt [1]."
+    state = _state(sections=[{"title": "Mechanism", "md": twice, "note_ids": [1, 2]}],
+                   findings=[_f("f0", "Mechanism", "LangGraph pauses a run at an interrupt [1].", [1]),
+                             _f("f1", "Mechanism", "It powers review loops [2].", [2])],
+                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f0"], "judged": 2, "total": 2})
+    _, md, _, _, run = _report(monkeypatch, tmp_path, state)
+    assert "LangGraph pauses a run" not in md.split("## ⚠ Flagged claims")[0]
+    assert metrics.flagged_claims_in_body(run) == 0
+
+
+_spec = importlib.util.spec_from_file_location("live_check", Path(__file__).resolve().parents[1] / "scripts"
+                                               / "live_check.py")
+live_check = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(live_check)
+
+
+def test_a_finding_stated_in_a_cut_sentence_is_cut_everywhere(monkeypatch, tmp_path):     # reviewer B's P4
+    s = "Model A has 70B parameters and was released in May [1]."
+    state = _state(sections=[{"title": "Mechanism", "md": f"{s} It is open weights [2].", "note_ids": [1, 2]}],
+                   findings=[_f("f0", "Mechanism", s, [1], claim="Model A has 70B parameters"),
+                             _f("f1", "Mechanism", s, [1], claim="Model A came out in May"),
+                             _f("f2", "Mechanism", "It is open weights [2].", [2])],
+                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f0"], "judged": 3, "total": 3,
+                                  "judge_verdicts": {"grounding": "revise", "flag_reasons": {"f0": "no such size"}}})
+    out, md, meta, evidence, run = _report(monkeypatch, tmp_path, state)
+    assert [f["status"] for f in evidence["findings"]] == ["cut", "cut", "kept"]
+    assert "• findings: 1 •" in md and meta["n_findings"] == 1 and len(live_check._kept(run)) == 1
+    assert "- **Mechanism:** Model A has 70B parameters and was released in May [1]. — no such size; stated in a " \
+           "cut sentence (f0)" in md
+
+
+def test_a_cut_claim_never_reaches_the_tldr_through_its_kept_analysis_twin(monkeypatch, tmp_path):   # live q013
+    analysis_md = ("_Analysis — interpretation by Argus._\n\n### Key takeaways\n\n"
+                   "- QISA has a 2.6x longer inference time [1] — confidence **high** (2 independent sources)\n"
+                   "- It resumes with a command [3] — confidence **medium** (1 independent source)")
+    analysis = {**ANALYSIS, "md": analysis_md, "takeaways": [
+        {"text": "QISA has a 2.6x longer inference time [1]", "source_ids": [1], "confidence": "high",
+         "reasons": ["2 independent sources"]},
+        {"text": "It resumes with a command [3]", "source_ids": [3], "confidence": "medium",
+         "reasons": ["1 independent source"]}]}
+    body = "QISA has a 2.6x longer inference time than GPT-4 [1]. Teams use it for approvals [2]."
+    state = _state(run_config=make_run_config("medium"), analysis=analysis,
+                   sections=[{"title": "Report", "md": body, "note_ids": [1, 2, 3]}],
+                   findings=[_f("f0", "Report", "QISA has a 2.6x longer inference time than GPT-4 [1].", [1]),
+                             _f("f1", "Report", "Teams use it for approvals [2].", [2]),
+                             _f("f2", "Analysis", "QISA has a 2.6x longer inference time [1]", [1]),
+                             _f("f3", "Analysis", "It resumes with a command [3]", [3])],
+                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f0"], "judged": 4, "total": 4,
+                                  "judge_verdicts": {"grounding": "revise",
+                                                     "flag_reasons": {"f0": "no such model"}}})
+    out, md, _, evidence, _ = _report(monkeypatch, tmp_path, state)
+    assert [f["status"] for f in evidence["findings"]] == ["cut", "kept", "cut", "kept"]
+    assert "2.6x" not in out["tldr_md"] and "It resumes with a command [3]" in out["tldr_md"]
+    assert "2.6x" not in md.split("## ⚠ Flagged claims")[0]
+    assert "- **Analysis:** QISA has a 2.6x longer inference time [1] — confidence **high** (2 independent " \
+           "sources) — near-duplicate of cut f0" in md
+
+
+def test_an_unknown_id_beside_known_ones_is_stripped_and_recorded(monkeypatch, tmp_path):
+    findings = [dict(f) for f in FINDINGS]
+    findings[7] = _f("f7", "Usage", "Teams use it for approvals [1][9].", [1, 9])
+    usage = USAGE.replace("approvals [1].", "approvals [1][9].")
+    state = _state(sections=[{"title": "Mechanism", "md": MECHANISM, "note_ids": [1, 2, 3]},
+                             {"title": "Usage", "md": usage, "note_ids": [1, 2, 3]}], findings=findings)
+    out, md, _, _, run = _report(monkeypatch, tmp_path, state)
+    assert "- Teams use it for approvals [1]." in md and "approvals [1][9]" not in md
+    assert '[r1] cite: dropped unknown source id [9] in section "Usage"' in out["errors"]
+    assert metrics.cite_markers_unresolved(run) == 0
+
+
+def test_sections_citing_sources_without_findings_are_named_not_fact_checked(monkeypatch, tmp_path):
+    skip = ("[r1] skip: compose.findings_extract Usage (role compose.findings_extract: every engine failed after "
+            "3 attempts (last: DriverError: provider fake: 429 Too Many Requests))")
+    state = _state(run_config=make_run_config("medium"), analysis=ANALYSIS, findings=[], errors=[skip],
+                   panel_verdict={"verdict": "pass", "judged": 0, "total": 0})
+    _, md, meta, evidence, _ = _report(monkeypatch, tmp_path, state)
+    assert ('> ⚠ Not fact-checked — section "Mechanism" was not fact-checked (no findings extracted); '
+            'section "Usage" was not fact-checked (429); '
+            'section "Analysis" was not fact-checked (no findings extracted)') in md
+    assert meta["degraded"] is True and evidence["degraded"] is True
+
+
+def test_one_skipped_coverage_review_is_a_note_not_a_degraded_run(monkeypatch, tmp_path):
+    line = ("[r1] skip: panel.coverage report (role panel.coverage: every engine failed after 3 attempts "
+            "(last: DriverError: provider fake: 429 Too Many Requests))")
+    _, md, meta, evidence, _ = _report(monkeypatch, tmp_path, _state(errors=[line]))
+    assert "⚠ Degraded run" not in md and meta["degraded"] is False and evidence["degraded"] is False
+    assert f"- {line}" in md.split("## Degradation notes")[1]
+
+
+def test_an_outline_section_titled_analysis_keeps_its_own_body(monkeypatch, tmp_path):
+    own = "The section's own reading of the usage [2]."
+    sections = [{"title": "Mechanism", "md": MECHANISM, "note_ids": [1, 2, 3]},
+                {"title": "Analysis", "md": own, "note_ids": [2]}]
+    _, md, *_ = _report(monkeypatch, tmp_path, _state(sections=sections, findings=[
+        dict(FINDINGS[0]), _f("f1", "Analysis", own, [2])], panel_verdict={"verdict": "pass", "judged": 2,
+                                                                              "total": 2}))
+    assert md.count(f"## Analysis\n\n{own}") == 1, "no analyst ran: the section is not repeated as the analysis"
+    _, md, *_ = _report(monkeypatch, tmp_path / "analyst", _state(
+        sections=sections, run_config=make_run_config("medium"), analysis=ANALYSIS,
+        findings=[dict(FINDINGS[0]), _f("f1", "Analysis", "It pauses at interrupts [1]", [1])],
+        panel_verdict={"verdict": "pass", "judged": 2, "total": 2}))
+    assert md.count(own) == 1 and md.count("It resumes with a command [3]") == 2, (
+        "the section keeps its body; the analysis is rendered once (and in the TL;DR)")
+
+
+def test_an_analysis_left_with_its_label_only_is_dropped(monkeypatch, tmp_path):
+    analysis = {**ANALYSIS, "takeaways": [ANALYSIS["takeaways"][1]],
+                "md": f"{ANALYSIS_LABEL}\n\n### Key takeaways\n\n"
+                      "- It was built in 1999 [2] — confidence **low** (1 independent source)"}
+    state = _state(run_config=make_run_config("medium"), analysis=analysis,
+                   findings=[dict(FINDINGS[0]), _f("f1", "Analysis", "It was built in 1999 [2]", [2])],
+                   panel_verdict={"verdict": "pass", "flagged_finding_ids": ["f1"], "judged": 2, "total": 2})
+    out, md, *_ = _report(monkeypatch, tmp_path, state)
+    assert "## Analysis" not in md and ANALYSIS_LABEL not in md
+    assert "analysis: every takeaway cut — section dropped" in out["errors"]
+
+
+# ---------------------------------------------------------------------------
+# The run driver: runs.exa_usd after the report preview (spec §2.4)
+# ---------------------------------------------------------------------------
+
+async def test_the_run_driver_writes_runs_exa_usd_after_the_preview(monkeypatch, caplog):
+    from argus.bot import research as bot_research
+    order: list[str] = []
+
+    class Graph:
+        def astream(self, inp, config=None, stream_mode=None):
+            async def gen():
+                yield {"report_builder": {"report_paths": {"folder": "f", "md": "f/report.md"}}}
+            return gen()
+
+        async def aget_state(self, cfg):
+            return SimpleNamespace(values={"report_paths": {"folder": "f", "md": "f/report.md"},
+                                           "search_spend": {"exa_usd": 0.042}})
+
+    async def update_run(run_id, **cols):
+        order.append(f"update_run {run_id} {cols}")
+        return False                                             # no library row
+
+    async def preview(ctx, info):
+        order.append("preview")
+
+    async def nothing(*a, **k):
+        return {}
+
+    lib = SimpleNamespace(update_run=update_run)
+    monkeypatch.setattr(bot_research, "_ensure_run_config", nothing)
+    monkeypatch.setattr(bot_research, "_stream_progress", nothing)
+    monkeypatch.setattr(bot_research, "_set_run_status", nothing)
+    monkeypatch.setattr(bot_research, "_send_report_preview", preview)
+    monkeypatch.setattr(bot_research, "_get_library", lambda ctx: lib)
+    info = {"run_id": "ab12cd34", "chat_id": 5, "graph": Graph(), "cfg": {}, "length": "medium"}
+    with caplog.at_level("WARNING", logger="argus.bot"):
+        await bot_research._resume_after_plan(SimpleNamespace(application=SimpleNamespace(bot=None)), info)
+    assert order == ["preview", "update_run ab12cd34 {'exa_usd': 0.042}"]
+    assert "run ab12cd34 has no library row; its exa_usd is in the checkpoint only" in caplog.text

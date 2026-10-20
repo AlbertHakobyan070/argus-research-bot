@@ -5,25 +5,32 @@ the findings extractor.
 Sectioned lengths: one ``compose.section`` call per section, which sees only
 the notes the outline allocated to it (``note_ids``) plus the pinned ones,
 filtered by ``writer_min_relevance`` and ``quote_verified is not False``
-(``outline.usable_notes``) — never the whole evidence. Compose writes
+(``outline.usable_notes``) — never the whole evidence — and at most 24 000
+chars of them (pinned first, then by relevance; the rest is recorded as a
+``compose:`` line). An outline whose sections carry no ``note_ids`` (a pre-v4
+checkpoint) is allocated first, by outline's repair rules. Compose writes
 ``panel_verdict.revise_sections`` on a panel rewrite (``next == "compose"``),
 else ``outline.changed_sections`` (fresh, gap wave, extend, user revise), and
 always a section not written before; every other section is reused as it was
-(md, ``note_ids``, findings, re-ided in outline order). A skipped first write
-merges its notes into its neighbour (the previous section, else the next),
-which is written once more with them; when that re-write is skipped too, the
-neighbour keeps its version and the notes are reported as unwritten. A
-skipped re-write keeps the previous version; every section skipped raises.
-Flat lengths: one ``compose.flat`` call (``raise``) writes the body that
-``assemble_draft`` puts under ``## Findings``.
+(md, ``note_ids``, findings, re-ided in outline order) — re-extracted when it
+cites ``[n]`` but has no findings. A skipped first write merges into its
+neighbour (the previous section, else the next: sub-questions, notes and
+focus, R11's rule), which is written once more with them; the merge sticks
+for the round (compose returns the outline without the merged-away section).
+When that re-write is skipped too, the neighbour keeps its version and the
+notes are reported as unwritten. A skipped re-write keeps the previous
+version; every section skipped raises. Flat lengths: one ``compose.flat``
+call (``raise``; a reply under 40 chars fails its validate hook) writes the
+body that ``assemble_draft`` puts under ``## Findings``.
 
 Every writer reply goes through ``normalize_cite_markers`` before the
 ``compose.findings_extract`` pass (one call per written section; each finding
 carries its verbatim ``sentence``) and the assembly. The dedupe pass cuts a
-later near-duplicate of an earlier section's finding from a section written
-in this run. No TL;DR here: report_builder builds it after the cuts.
-User revision notes reach the writers newest first, then the panel's notes
-on a panel rewrite (8 at most).
+later near-duplicate of an earlier section's finding (citing no other
+source) from a section written in this run, and drops a section it empties.
+No TL;DR here: report_builder builds it after the cuts. User revision notes
+reach the writers newest first, then the panel's notes on a panel rewrite
+(8 at most).
 """
 from __future__ import annotations
 
@@ -41,7 +48,8 @@ from . import run_config
 from .assemble import CITE_RE, assemble_draft, normalize_cite_markers, strip_duplicate_heading, strip_fences
 from .grounding import check_grounding, grounding_warning_prompt
 from .jsonx import parse_json_obj
-from .outline import OUTLINE_SYSTEM, _ints, default_outline, outline_node, usable_notes  # noqa: F401  (re-export: moved to outline.py, WP-I)
+from .outline import (OUTLINE_SYSTEM, _allocate, _ints, _keep_known, _merge_into, default_outline,  # noqa: F401
+                      outline_node, usable_notes)                     # (re-export: moved to outline.py, WP-I)
 from .research import _round
 from .state import OutlineSection, ResearchBrief
 from .synthesis_modes import get_mode
@@ -49,10 +57,10 @@ from .synthesis_modes import get_mode
 logger = logging.getLogger("argus.compose")
 
 _MODE_SECTION_TOKENS = {"medium": 1200, "long": 1800, "lecture": 2200}
-_MIN_CHARS = 40                 # a shorter section reply is an empty write (a skip)
+_MIN_CHARS = 40                 # a shorter writer reply is an empty write (a skip; the flat writer: a raise)
 _MAX_REVISION_NOTES = 8
 _DUP_RATIO = 0.85               # = bench.metrics.cross_section_duplicate_ratio's threshold
-_ANALYSIS = "Analysis"          # = insight.ANALYSIS_SECTION (insight imports this module)
+WRITER_NOTES_CHARS = 24_000     # chars of notes per writer prompt (spec §3 WP-C)
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +130,19 @@ def _is_local_note(n: dict) -> bool:
     return str(n.get("source_url") or "").startswith("file:///")
 
 
-def render_notes(evidence: list[dict], note_ids, *, max_chars: int = 7000,
+def render_notes(evidence: list[dict], note_ids, *, max_chars: int = WRITER_NOTES_CHARS,
                  pinned: frozenset[int] = frozenset()) -> str:
-    """The notes with a source id in ``note_ids`` (None: every note), plus
-    the local and ``pinned`` ones, as ``[n]``-labelled blocks for a writer
-    prompt: pinned first, then by relevance; a claim whose quote failed
-    verification is left out. Stops at ``max_chars``."""
+    """The notes with a source id in ``note_ids`` (None: every note), plus the
+    local and ``pinned`` ones, as ``[n]``-labelled blocks for a writer prompt
+    — pinned first, then by relevance; a claim whose quote failed
+    verification is left out — within ``max_chars`` of notes: the ones past
+    it (the lowest relevance) are dropped (``_notes_within`` names them)."""
+    return _notes_within(evidence, note_ids, max_chars=max_chars, pinned=pinned)[0]
+
+
+def _notes_within(evidence: list[dict], note_ids, *, max_chars: int = WRITER_NOTES_CHARS,
+                  pinned: frozenset[int] = frozenset()) -> tuple[str, list[int]]:
+    """``render_notes``' block and the ids of the notes it dropped over ``max_chars``."""
     def is_pinned(n: dict) -> bool:
         return _is_local_note(n) or int(n.get("source_id") or 0) in pinned
 
@@ -135,6 +150,7 @@ def render_notes(evidence: list[dict], note_ids, *, max_chars: int = 7000,
     picked = [n for n in evidence if wanted is None or int(n.get("source_id") or 0) in wanted or is_pinned(n)]
     picked.sort(key=lambda n: (is_pinned(n), int(n.get("relevance") or 0)), reverse=True)
     blocks: list[str] = []
+    dropped: list[int] = []
     total = 0
     for n in picked:
         claims = "\n".join(
@@ -143,11 +159,17 @@ def render_notes(evidence: list[dict], note_ids, *, max_chars: int = 7000,
             for c in n.get("claims") or [] if c.get("quote_verified") is not False)
         block = (f"[{n.get('source_id')}] {n.get('title') or '(untitled)'} — {n.get('source_url')}\n"
                  f"   relevance {n.get('relevance')}/5, stance: {n.get('stance')}\n{claims}")
-        if total + len(block) > max_chars:
-            break
+        if dropped or total + len(block) > max_chars:
+            dropped.append(int(n.get("source_id") or 0))
+            continue
         blocks.append(block)
         total += len(block)
-    return "\n\n".join(blocks) or "(no evidence notes)"
+    return "\n\n".join(blocks) or "(no evidence notes)", dropped
+
+
+def _budget_lines(rnd: int, title: str, dropped: list[int]) -> list[str]:
+    return ([f'[r{rnd}] compose: section "{title}" — notes [{", ".join(map(str, dropped))}] over the writer budget']
+            if dropped else [])
 
 
 def _pinned_ids(notes: list[dict], fetched: list[dict]) -> frozenset[int]:
@@ -182,10 +204,11 @@ def extract_findings(title: str, md: str, fetched: list[dict], *, engines, rnd: 
     """The findings of one section (or of the analysis): ``(findings, model
     call records, errors)``. One ``compose.findings_extract`` call; each
     finding keeps the verbatim ``sentence`` (markers normalised) and cites
-    the ids in it — the model's ``source_ids`` only when the sentence has
-    none. A finding citing nothing is left out; one citing only unknown ids
-    is kept (report_builder cuts it). A skipped call is the declared
-    ``[r<k>] skip: compose.findings_extract <title> (…)`` line."""
+    the ids in it that the model's ``source_ids`` name — every id in it when
+    the model names none of them, the model's when the sentence has none. A
+    finding citing nothing is left out; one citing only unknown ids is kept
+    (report_builder cuts it). A skipped call is the declared ``[r<k>] skip:
+    compose.findings_extract <title> (…)`` line."""
     by_id = {i + 1: f.get("url") or "" for i, f in enumerate(fetched)}
     try:
         res = llm.complete("compose.findings_extract", [
@@ -201,7 +224,8 @@ def extract_findings(title: str, md: str, fetched: list[dict], *, engines, rnd: 
         if not claim:
             continue
         sentence = normalize_cite_markers(str(fd.get("sentence") or "")).strip()
-        ids = list(dict.fromkeys(int(i) for i in CITE_RE.findall(sentence))) or _ints(fd.get("source_ids"))
+        marked, named = list(dict.fromkeys(int(i) for i in CITE_RE.findall(sentence))), _ints(fd.get("source_ids"))
+        ids = [i for i in marked if i in named] or marked or named
         if not ids:
             continue
         confidence = fd.get("confidence") if fd.get("confidence") in ("high", "medium", "low") else "medium"
@@ -300,12 +324,14 @@ class _Ctx:
 
 
 def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
-                   ) -> tuple[str | None, list[dict], str | None]:
-    """One ``compose.section`` write: ``(md | None, records, skip line | None)``."""
+                   ) -> tuple[str | None, list[dict], list[str]]:
+    """One ``compose.section`` write: ``(md | None, records, error lines)``."""
     mode = get_mode(ctx.rc.length)
     title = section.title
     covered = "\n".join(f"- {ctx.brief.sub_questions[i].q}" for i in section.sub_qs
                         if i < len(ctx.brief.sub_questions))
+    notes, dropped = _notes_within(ctx.notes, note_ids, pinned=ctx.pinned)
+    lines = _budget_lines(ctx.rnd, title, dropped)
     human = (
         f"Report topic: {ctx.state.get('user_request')}\n"
         f"Section: {title}\n"
@@ -313,7 +339,7 @@ def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
         f"Sub-questions to answer here:\n{covered or '- (general coverage)'}\n"
         f"Target: ~{max(400, mode.target_chars_max // max(1, ctx.n_sections))} chars."
         f"{_revision_block(ctx.revision_notes)}\n\n"
-        f"EVIDENCE NOTES:\n{render_notes(ctx.notes, note_ids, pinned=ctx.pinned)}\n\n"
+        f"EVIDENCE NOTES:\n{notes}\n\n"
         "Write the section body markdown now."
     )
     try:
@@ -323,13 +349,13 @@ def _write_section(ctx: _Ctx, section: OutlineSection, note_ids: list[int]
                            max_tokens=_MODE_SECTION_TOKENS.get(ctx.rc.length, 1200), item=title)
     except llm.EngineSkipped as e:
         logger.warning("compose.section skipped for %r (%s)", title, e)
-        return None, [a.model_dump() for a in e.attempts], f"[r{ctx.rnd}] skip: compose.section {title} ({e})"
+        return None, [a.model_dump() for a in e.attempts], [*lines, f"[r{ctx.rnd}] skip: compose.section {title} ({e})"]
     records = [r.model_dump() for r in res.records]
     md = normalize_cite_markers(strip_duplicate_heading(strip_fences(res.text), title)).strip()
     if len(md) < _MIN_CHARS:
         records[-1].update(ok=False, error="empty reply")
-        return None, records, f"[r{ctx.rnd}] skip: compose.section {title} (empty reply)"
-    return md, records, None
+        return None, records, [*lines, f"[r{ctx.rnd}] skip: compose.section {title} (empty reply)"]
+    return md, records, lines
 
 
 # ---------------------------------------------------------------------------
@@ -342,27 +368,35 @@ def _norm(text: str) -> str:
     return " ".join(re.findall(r"\w+", text))
 
 
-def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]], written: set[str]) -> None:
+def _dedupe(order: list[str], mds: dict[str, str], found: dict[str, list[dict]], written: set[str]
+            ) -> list[str]:
     """In place: a finding of a section written in this run whose claim
-    nearly repeats (ratio ≥ 0.85) a finding of an earlier section is cut from
-    that section's md (its whole sentences) and dropped — unless its
-    sentences also state another finding of that section, or cannot be
-    located. The first occurrence wins; a reused section is never touched."""
-    seen: list[str] = []
+    nearly repeats (ratio ≥ 0.85) a finding of an earlier section, citing no
+    source that one does not, is cut from that section's md (its whole
+    sentences) and dropped — unless its sentences also state another finding
+    of that section, or cannot be located. The first occurrence wins; a reused
+    section is never touched. Returns the written sections it emptied."""
+    seen: list[tuple[str, set[int]]] = []
+    emptied: list[str] = []
     for title in order:
         mine = found.get(title) or []
         if title in written:
+            claims = [_norm(f["claim"]) for f in mine]
             # ponytail: every claim against every earlier one through difflib, O(n²) over one
             # report's findings (tens to a few hundred); an index if reports grow far past that.
-            dup = [any(SequenceMatcher(None, _norm(f["claim"]), s, autojunk=False).ratio() >= _DUP_RATIO
-                       for s in seen) for f in mine]
+            dup = [any(set(f.get("source_ids") or []) <= ids
+                       and SequenceMatcher(None, claim, s, autojunk=False).ratio() >= _DUP_RATIO for s, ids in seen)
+                   for f, claim in zip(mine, claims)]
             where = [quarantine.locate(f.get("sentence") or f["claim"], mds[title]) or [] for f in mine]
             keep_at = {i for k, idx in enumerate(where) if not dup[k] for i in idx}
             gone = {k for k, idx in enumerate(where) if dup[k] and idx and not set(idx) & keep_at}
             if gone:
                 mds[title] = quarantine.cut(mds[title], {i for k in gone for i in where[k]})
                 found[title] = [f for k, f in enumerate(mine) if k not in gone]
-        seen.extend(_norm(f["claim"]) for f in found.get(title) or [])
+                if not mds[title].strip():
+                    emptied.append(title)
+        seen.extend((_norm(f["claim"]), set(f.get("source_ids") or [])) for f in found.get(title) or [])
+    return emptied
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +436,7 @@ def _records(calls: list[dict]) -> list[llm.CallRecord]:
 
 def _extract_all(ctx: _Ctx, written: dict[str, str], pool_size: int
                  ) -> tuple[dict[str, list[dict]], list[dict], list[str], bool]:
-    """Extraction over every written section, on the pool: (findings by
+    """Extraction over every given section, on the pool: (findings by
     section, records, errors, every attempted extraction skipped)."""
     found: dict[str, list[dict]] = {}
     calls: list[dict] = []
@@ -420,6 +454,15 @@ def _extract_all(ctx: _Ctx, written: dict[str, str], pool_size: int
     return found, calls, errors, bool(written) and skipped == len(written)
 
 
+def _flat_body(text: str) -> str:
+    """``compose.flat``'s validate hook: the reply as a body, at least as long
+    as a section's (a shorter one is retried, then the role raises)."""
+    md = normalize_cite_markers(strip_fences(text)).strip()
+    if len(md) < _MIN_CHARS:
+        raise ValueError(f"a {len(md)}-char reply is no report body (at least {_MIN_CHARS})")
+    return md
+
+
 def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
     rc = ctx.rc
     prior = [s for s in state.get("sections") or [] if s.get("title") == "Report"]
@@ -431,23 +474,24 @@ def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
     else:
         mode = get_mode(rc.length)
         system = (TLDR_SYSTEM if rc.length == "tldr" else FLAT_SYSTEM) + ctx.grounding_warn
+        notes, dropped = _notes_within(ctx.notes, None, pinned=ctx.pinned)
         human = (f"Question: {state.get('user_request')}\n"
                  f"Target length: {mode.target_chars_min}-{mode.target_chars_max} chars."
                  f"{_revision_block(ctx.revision_notes)}\n\n"
-                 f"EVIDENCE NOTES:\n{render_notes(ctx.notes, None, max_chars=8000, pinned=ctx.pinned)}\n\n"
+                 f"EVIDENCE NOTES:\n{notes}\n\n"
                  "Write the markdown now.")
         res = llm.complete("compose.flat", [SystemMessage(content=system), HumanMessage(content=human)],
-                           engines=rc.engines, temperature=mode.temperature, max_tokens=mode.max_tokens)
+                           engines=rc.engines, temperature=mode.temperature, max_tokens=mode.max_tokens,
+                           validate=_flat_body)
         calls = [r.model_dump() for r in res.records]
-        md = normalize_cite_markers(strip_fences(res.text)).strip()
-        if not md:
-            raise llm.EngineError("role compose.flat: empty reply", role="compose.flat", attempts=res.records)
+        md = res.parsed
         section = {"title": "Report", "md": md, "note_ids": [int(n["source_id"]) for n in ctx.notes]}
-        found, ecalls, errors, all_skipped = _extract_all(ctx, {"Report": md}, 1)
+        found, ecalls, eerrors, all_skipped = _extract_all(ctx, {"Report": md}, 1)
         calls.extend(ecalls)
+        errors = [*_budget_lines(ctx.rnd, "Report", dropped), *eerrors]
         findings = found["Report"]
         if all_skipped:
-            raise llm.EngineError(f"compose: the findings extraction was skipped ({errors[0]})",
+            raise llm.EngineError(f"compose: the findings extraction was skipped ({eerrors[0]})",
                                   role="compose.findings_extract", attempts=_records(ecalls))
         _emit(runtime, "section", {"title": "Report", "ok": True, "chars": len(md), "reused": False})
     findings = [{**f, "id": f"f{i}"} for i, f in enumerate(findings)]
@@ -459,6 +503,25 @@ def _flat(state, ctx: _Ctx, pv: dict, runtime: Runtime | None) -> dict:
         "messages": [{"role": "assistant", "content": f"🧠 Composed flat report, {len(findings)} findings."}],
         **_extras(state, ctx.brief, rc, [section], findings, draft),
     }
+
+
+def _merge_skipped(outline: list[OutlineSection], lost: list[str], alive: set[str]
+                   ) -> dict[str, tuple[OutlineSection, list[str]]]:
+    """R11: each skipped first write merges into its neighbour — the previous
+    section still alive, else the next one — as outline's ``_merge_into`` does
+    (sub-questions, notes, focus): ``{neighbour: (its merged copy, the
+    merged-away titles)}``."""
+    order = [s.title for s in outline]
+    by_title = {s.title: s for s in outline}
+    plan: dict[str, tuple[OutlineSection, list[str]]] = {}
+    for title in lost:
+        k = order.index(title)
+        before = [t for t in order[:k] if t in alive]
+        into = before[-1] if before else next(t for t in order[k + 1:] if t in alive)
+        merged, srcs = plan.setdefault(into, (by_title[into].model_copy(deep=True), []))
+        _merge_into(merged, by_title[title])
+        srcs.append(title)
+    return plan
 
 
 def compose_node(state, runtime: Runtime | None = None) -> dict:
@@ -484,6 +547,10 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     ctx = _Ctx(state, rc, brief, notes, revision_notes, len(outline))
     if not outline:
         return _flat(state, ctx, pv, runtime)
+    legacy = not any(s.note_ids for s in outline)           # a pre-v4 checkpoint's outline: allocate first
+    if legacy:
+        _keep_known(outline, {int(n["source_id"]) for n in notes})
+        _allocate(outline, notes)
 
     prior = {s["title"]: s for s in state.get("sections") or []}
     if panel_rewrite:
@@ -492,7 +559,6 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
         changed = (state.get("outline") or {}).get("changed_sections")
         targets = {s.title for s in outline} if changed is None else set(changed)
     order = [s.title for s in outline]
-    by_title = {s.title: s for s in outline}
     to_write = [s for s in outline if s.title in targets or s.title not in prior]
     pool_size = max(1, min(rc.compose.concurrency, len(outline)))
 
@@ -506,10 +572,9 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     def run(batch: list[tuple[OutlineSection, list[int]]]) -> dict[str, str | None]:
         out: dict[str, str | None] = {}
         with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="argus-compose") as ex:
-            for (section, _), (md, recs, err) in zip(batch, ex.map(lambda b: _write_section(ctx, *b), batch)):
+            for (section, _), (md, recs, lines) in zip(batch, ex.map(lambda b: _write_section(ctx, *b), batch)):
                 calls.extend(recs)
-                if err:
-                    errors.append(err)
+                errors.extend(lines)
                 out[section.title] = md
         return out
 
@@ -523,43 +588,43 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
         if title in prior and title not in mds:
             mds[title] = prior[title]["md"]
             note_ids[title] = list(prior[title].get("note_ids") or [])
-    # R11: a skipped first write merges into its neighbour (previous, else next), written once more.
     lost = [s.title for s in to_write if s.title not in mds]
     if lost and not mds:
         raise llm.EngineError("compose: every section was skipped", role="compose.section", attempts=_records(calls))
-    merged: dict[str, list[str]] = {}
-    for title in lost:
-        k = order.index(title)
-        alive = [t for t in order if t in mds]
-        before = [t for t in alive if order.index(t) < k]
-        merged.setdefault(before[-1] if before else alive[0], []).append(title)
-    if merged:
-        batch = [(by_title[t], list(dict.fromkeys([*note_ids[t], *(i for s in src for i in note_ids[s])])))
-                 for t, src in merged.items()]
-        for (section, ids), md in zip(batch, run(batch).values()):
-            title = section.title
+    plan = _merge_skipped(outline, lost, set(mds))
+    if plan:
+        batch = [(merged, list(merged.note_ids)) for merged, _ in plan.values()]
+        for (merged, ids), md in zip(batch, run(batch).values()):
+            title = merged.title
             if md is not None:
                 mds[title], note_ids[title] = md, ids
                 written.add(title)
                 failed.discard(title)
             else:
-                for src in merged[title]:
+                for src in plan[title][1]:
                     errors.append(f'[r{ctx.rnd}] compose: section "{src}" dropped — notes '
                                   f'{", ".join(map(str, note_ids[src])) or "none"} not written '
                                   f'(its merge into "{title}" was skipped)')
     order = [t for t in order if t in mds]
 
-    found, ecalls, eerrors, all_skipped = _extract_all(ctx, {t: mds[t] for t in order if t in written}, pool_size)
+    # A reused section that cites [n] but has no findings is extracted again (its md stays as it is).
+    had = {f.get("section") for f in state.get("findings") or []}
+    extract = {t: mds[t] for t in order if t in written or (t not in had and CITE_RE.search(mds[t]))}
+    found, ecalls, eerrors, all_skipped = _extract_all(ctx, extract, pool_size)
     calls.extend(ecalls)
     errors.extend(eerrors)
     for title in order:
-        if title not in written:
+        if title not in extract:
             found[title] = [{**f, "status": "kept"} for f in state.get("findings") or [] if f.get("section") == title]
     if all_skipped and not any(found.values()):
         raise llm.EngineError(f"compose: every findings extraction was skipped ({eerrors[0]})",
                               role="compose.findings_extract", attempts=_records(ecalls))
     if rc.compose.dedupe_pass:
-        _dedupe(order, mds, found, written)
+        for title in _dedupe(order, mds, found, written):
+            errors.append(f'[r{ctx.rnd}] compose: section "{title}" dropped — the dedupe pass cut every sentence '
+                          "(each repeats an earlier section)")
+            del mds[title]
+        order = [t for t in order if t in mds]
 
     sections = [{"title": t, "md": mds[t], "note_ids": note_ids[t]} for t in order]
     findings = [{**f, "id": f"f{i}"} for i, f in enumerate(f for t in order for f in found[t])]
@@ -571,7 +636,7 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
             _emit(runtime, "section", {"title": title, "ok": False, "chars": 0, "reused": False})
     draft = assemble_draft(tldr=None, sections=sections, analysis_md=None, fetched=fetched, flat=False)
     mode = get_mode(rc.length)
-    return {
+    out = {
         "draft_md": draft, "sections": sections, "findings": findings, "compose_runs": runs,
         "model_calls": calls, "errors": errors,
         "messages": [{"role": "assistant",
@@ -579,6 +644,12 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
                                   f"{len(findings)} findings ({mode.label}).")}],
         **_extras(state, brief, rc, sections, findings, draft),
     }
+    if plan or legacy:          # the merge sticks for the round; an allocated legacy outline is kept
+        changed = (state.get("outline") or {}).get("changed_sections")
+        out["outline"] = {"sections": [plan[s.title][0].model_dump() if s.title in plan else s.model_dump()
+                                       for s in outline if s.title not in lost],
+                          "changed_sections": None if changed is None else [t for t in changed if t not in lost]}
+    return out
 
 
 __all__ = ["outline_node", "compose_node", "render_notes", "extract_findings", "build_assessment",

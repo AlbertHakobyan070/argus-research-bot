@@ -109,8 +109,10 @@ def test_the_document_follows_section_2_6_and_validates(tmp_path):
 
 def test_degradations_are_the_lines_the_bench_counts(tmp_path):
     doc = _write(tmp_path)
-    assert doc["degradations"] == [{"round": 1, "text": ERRORS[0]}, {"round": 2, "text": ERRORS[2]},
-                                   {"round": 2, "text": ERRORS[3]}]
+    assert doc["degradations"] == [{"round": 1, "text": ERRORS[0].removeprefix("[r1] ")},
+                                   {"round": 2, "text": ERRORS[2]},
+                                   {"round": 2, "text": ERRORS[3].removeprefix("[r2] ")}], (
+        "the round lives in round (§2.6), the text without its tag")
     run = {"state": {"errors": ERRORS, "model_calls": [{"role": "compose.section"}]}, "evidence": doc}
     assert metrics.degradations_count(run) == metrics.degradations_count({**run, "evidence": None}) == 3
     assert metrics._findings(run) == doc["findings"]

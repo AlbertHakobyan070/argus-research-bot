@@ -4,14 +4,18 @@ and the whole-sentence cutter behind report_builder's cuts.
 A markdown body is read as blocks: paragraphs and list items (with their
 continuation lines) hold the cuttable sentences; headings, code fences,
 tables, block quotes and rules are never cut. ``locate(text, md)`` finds a
-finding's verbatim ``sentence`` by normalised containment, else by the best
-``difflib`` ratio ≥ 0.85 over a window of 1–3 adjacent sentences (the probe's
-condensed f6 needs the window: 0.94 over two sentences, 0.68 over either
-alone). ``cut(md, indices)`` removes whole sentences, drops a paragraph or
-item left empty and a sub-heading left without content; an untouched body is
-returned byte-identical. ``apply_cuts`` turns the panel's flags and the
-unknown-id rule into finding statuses (kept / cut / unlocated), the cut
-bodies and the two appendix listings.
+finding's verbatim ``sentence`` as whole normalised sentences (every
+occurrence), else by normalised containment, else by the best ``difflib``
+ratio ≥ 0.85 over a window of 1–3 adjacent sentences (the probe's condensed f6
+needs the window: 0.94 over two sentences, 0.68 over either alone);
+``contains`` is the containment alone (the TL;DR's rule). ``cut(md, indices)``
+removes whole sentences, drops a paragraph or item left empty and a
+sub-heading left without content; an untouched body is returned
+byte-identical. ``apply_cuts`` turns the panel's flags, the unknown-id rule
+and the stricter verdict for near-duplicates into finding statuses (kept /
+cut / unlocated) — a finding stated in a cut sentence goes with it — the cut
+bodies and the two appendix listings; ``strip_unknown_ids`` drops an unknown
+id cited beside known ones.
 
 The v3 string quarantine is gone with report_builder's legacy branch: it cut
 by substring, left orphan fragments (baseline b3r) and cut the TL;DR
@@ -38,6 +42,7 @@ _OPENERS = "\"'“‘([*_`"
 _ABBREV = frozenset("e.g i.e vs al fig figs no nos dr mr mrs ms prof st jr sr approx cf eq u.s u.k".split())
 _WINDOW = 3
 _MIN_RATIO = 0.85
+_TWIN_RATIO = 0.85             # = compose._DUP_RATIO: the dedupe rule's near-duplicate
 
 
 @dataclass
@@ -114,32 +119,54 @@ def _norm(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", text).split())
 
 
-def locate(text: str, md: str) -> list[int] | None:
-    """Indices into ``sentences(md)`` of the whole sentences that state
-    ``text``: normalised containment (spanning sentences if it must), else
-    the best window of 1–3 adjacent sentences at a ``difflib`` ratio ≥ 0.85
-    (the smaller window on a tie); None when neither finds it."""
-    needle = _norm(text)
-    if not needle:
-        return None
-    sents = [_norm(s) for s in sentences(md)]
+def _contained(needle: str, sents: list[str]) -> list[int] | None:
+    """The sentences the first occurrence of ``needle`` spans in the joined ``sents``."""
     hay, starts = "", []
     for s in sents:
         starts.append(len(hay) + 1)
         hay += " " + s
     at = (hay + " ").find(f" {needle} ")
-    if at >= 0:
-        lo, hi = at + 1, at + 1 + len(needle)
-        return [i for i, (st, s) in enumerate(zip(starts, sents)) if st < hi and st + len(s) > lo]
+    if at < 0:
+        return None
+    lo, hi = at + 1, at + 1 + len(needle)
+    return [i for i, (st, s) in enumerate(zip(starts, sents)) if st < hi and st + len(s) > lo]
+
+
+def locate(text: str, md: str) -> list[int] | None:
+    """Indices into ``sentences(md)`` of the whole sentences that state
+    ``text``: every run of whole sentences equal to ``text``'s once
+    normalised, else normalised containment (its first occurrence, spanning
+    sentences if it must), else the best window of 1–3 adjacent sentences at a
+    ``difflib`` ratio ≥ 0.85 (the smaller window on a tie); None when none
+    finds it."""
+    needle = _norm(text)
+    if not needle:
+        return None
+    sents = [_norm(s) for s in sentences(md)]
+    parts = [p for p in (_norm(s) for s in sentences(text)) if p]
+    exact = [j for i in range(len(sents) - len(parts) + 1) if sents[i:i + len(parts)] == parts
+             for j in range(i, i + len(parts))]
+    if exact:
+        return sorted(set(exact))
+    where = _contained(needle, sents)
+    if where is not None:
+        return where
     # ponytail: every window of every flagged finding through difflib — O(sentences × flags);
     # an index of candidate windows if reports grow far past a few hundred sentences.
-    best, where = 0.0, None
+    best = 0.0
     for size in range(1, _WINDOW + 1):
         for i in range(len(sents) - size + 1):
             ratio = SequenceMatcher(None, needle, " ".join(sents[i:i + size]), autojunk=False).ratio()
             if ratio > best:
                 best, where = ratio, list(range(i, i + size))
     return where if best >= _MIN_RATIO else None
+
+
+def contains(text: str, md: str) -> bool:
+    """``text`` is in ``md`` by normalised containment — the locator without
+    its fuzzy window (the TL;DR's rule, spec R2)."""
+    needle = _norm(text)
+    return bool(needle) and _contained(needle, [_norm(s) for s in sentences(md)]) is not None
 
 
 def cut(md: str, indices: Iterable[int]) -> str:
@@ -190,34 +217,73 @@ def _strip_unknown(text: str, n_sources: int) -> str:
     return re.sub(r"\s*\[(\d{1,3})\]", lambda m: m.group(0) if 0 < int(m.group(1)) <= n_sources else "", text)
 
 
+def strip_unknown_ids(md: str, n_sources: int) -> tuple[str, list[int]]:
+    """``md`` with every unknown ``[n]`` (outside 1..``n_sources``) stripped
+    from each sentence that also cites a known id (spec B1), and the ids
+    dropped; a sentence citing unknown ids only is left as it is."""
+    dropped: list[int] = []
+    pos = 0
+    for s in sentences(md):
+        ids = [int(i) for i in _CITE.findall(s)]
+        unknown = [i for i in ids if not 0 < i <= n_sources]
+        if not unknown or len(unknown) == len(ids):
+            continue
+        at = md.index(s, pos)                       # a sentence is a substring of its block, in order
+        new = _strip_unknown(s, n_sources)
+        md, pos = md[:at] + new + md[at + len(s):], at + len(new)
+        dropped += [i for i in unknown if i not in dropped]
+    return md, dropped
+
+
+def _twin(claim: str, cut_claims: list[tuple[str, str]]) -> str | None:
+    """The id of a cut finding whose claim this one nearly repeats (the dedupe rule)."""
+    c = _norm(claim)
+    return next((fid for fid, cc in cut_claims
+                 if c and cc and SequenceMatcher(None, c, cc, autojunk=False).ratio() >= _TWIN_RATIO), None)
+
+
 def apply_cuts(findings: list[dict], mds: Mapping[str, str], flagged: Mapping[str, str], n_sources: int
                ) -> tuple[list[dict], dict[str, str], list[dict], list[dict]]:
     """The cuts of one report. ``mds``: section title → markdown ("Analysis"
     included); ``flagged``: the panel's flagged finding id → reason. A finding
     whose ``source_ids`` all fall outside 1..``n_sources`` is cut too, reason
-    "unknown source id" (no judge needed). Each cut finding is located by its
-    ``sentence`` (its claim for a legacy finding without one): status ``cut``
-    when found, else ``unlocated`` (still in the body). Returns (findings with
-    their status, the cut bodies, the cut rows, the unlocated rows); a row is
-    ``{section, text, reason}`` with unknown ``[n]`` markers stripped, and one
-    cut span is one row whatever the number of findings behind it."""
-    out: list[dict] = []
-    plan: dict[str, set[int]] = {}
-    spans: dict[tuple[str, tuple[int, ...]], list[str]] = {}
-    unlocated: list[dict] = []
-    for finding in findings:
-        f = {**finding, "status": "kept"}
-        out.append(f)
+    "unknown source id" (no judge needed); so is a kept finding whose claim
+    nearly repeats (ratio ≥ 0.85, the dedupe rule) one of those cut ones —
+    the stricter verdict, reason "near-duplicate of cut f<n>" (spec R1). Each
+    cut finding is located by its ``sentence`` (its claim for a legacy
+    finding without one): status ``cut`` when found, else ``unlocated`` (still
+    in the body); then a kept finding whose sentence lies inside a cut span is
+    cut with it, reason "stated in a cut sentence (f<n>)" (on that span's row).
+    Returns (findings with their status, the cut bodies, the cut rows, the
+    unlocated rows); a row is ``{section, text, reason}`` with unknown ``[n]``
+    markers stripped, one row per section and text whatever the number of
+    findings behind it."""
+    out = [{**f, "status": "kept"} for f in findings]
+    reasons: dict[int, str] = {}
+    for k, f in enumerate(out):
         ids = [int(i) for i in f.get("source_ids") or []]
         if ids and all(not 0 < i <= n_sources for i in ids):
-            reason = f"unknown source id (cites {', '.join(map(str, ids))})"
+            reasons[k] = f"unknown source id (cites {', '.join(map(str, ids))})"
         elif f.get("id") in flagged:
-            reason = flagged[f["id"]]
-        else:
-            continue
-        section = f.get("section") or ""
-        md = mds.get(section)
-        idx = locate(f.get("sentence") or f.get("claim") or "", md) if md else None
+            reasons[k] = flagged[f["id"]]
+    cut_claims = [(str(out[k].get("id")), _norm(out[k].get("claim") or "")) for k in reasons]
+    # ponytail: every kept claim against every cut one through difflib, O(findings × cuts) over one
+    # report (tens to a few hundred findings); an index if reports grow far past that.
+    for k, f in enumerate(out):
+        if k not in reasons and (twin := _twin(f.get("claim") or "", cut_claims)):
+            reasons[k] = f"near-duplicate of cut {twin}"
+
+    def where(f: dict) -> list[int] | None:
+        md = mds.get(f.get("section") or "")
+        return locate(f.get("sentence") or f.get("claim") or "", md) if md else None
+
+    plan: dict[str, set[int]] = {}
+    spans: dict[tuple[str, str], list[str]] = {}            # (section, row text) → reasons
+    owner: dict[tuple[str, int], tuple[str, tuple[str, str]]] = {}    # a cut sentence → (finding id, its row)
+    unlocated: list[dict] = []
+    for k, reason in sorted(reasons.items()):
+        f, section = out[k], out[k].get("section") or ""
+        idx = where(f)
         if idx is None:
             f["status"] = "unlocated"
             unlocated.append({"section": section, "reason": reason,
@@ -225,14 +291,30 @@ def apply_cuts(findings: list[dict], mds: Mapping[str, str], flagged: Mapping[st
             continue
         f["status"] = "cut"
         plan.setdefault(section, set()).update(idx)
-        reasons = spans.setdefault((section, tuple(idx)), [])
-        if reason not in reasons:
-            reasons.append(reason)
-    rows = []
-    for (section, idx), reasons in spans.items():
+        first = [idx[0]]                        # its first run of sentences: one occurrence's text
+        for i in idx[1:]:
+            if i != first[-1] + 1:
+                break
+            first.append(i)
         texts = sentences(mds[section])
-        rows.append({"section": section, "text": _strip_unknown(" ".join(texts[i] for i in idx), n_sources),
-                     "reason": "; ".join(reasons)})
+        key = (section, _strip_unknown(" ".join(texts[i] for i in first), n_sources))
+        rows = spans.setdefault(key, [])
+        if reason not in rows:
+            rows.append(reason)
+        for i in idx:
+            owner.setdefault((section, i), (str(f.get("id")), key))
+    for k, f in enumerate(out):
+        section = f.get("section") or ""
+        if k in reasons or not plan.get(section):
+            continue
+        idx = where(f)
+        if idx and set(idx) <= plan[section]:
+            fid, key = owner[(section, idx[0])]
+            f["status"] = "cut"
+            reason = f"stated in a cut sentence ({fid})"
+            if reason not in spans[key]:
+                spans[key].append(reason)
+    rows = [{"section": s, "text": text, "reason": "; ".join(r)} for (s, text), r in spans.items()]
     return out, {t: cut(md, plan.get(t, ())) for t, md in mds.items()}, rows, unlocated
 
 
@@ -258,4 +340,5 @@ def render_unlocated_appendix(rows: list[dict]) -> str:
         "\n".join(f"- **{r['section']}:** {' '.join(r['text'].split())} — {r['reason']}" for r in rows)])
 
 
-__all__ = ["sentences", "locate", "cut", "apply_cuts", "render_cut_appendix", "render_unlocated_appendix"]
+__all__ = ["sentences", "locate", "contains", "cut", "apply_cuts", "strip_unknown_ids", "render_cut_appendix",
+           "render_unlocated_appendix"]

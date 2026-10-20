@@ -652,8 +652,6 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
 
         snap = await graph.aget_state(cfg)
         cur = snap.values if snap else {}
-        if (lib := _get_library(ctx)) is not None:      # v4: runs.exa_usd, the run's Exa spend so far (§2.4)
-            await lib.update_run(run_id, exa_usd=(cur.get("search_spend") or {}).get("exa_usd"))
         paths = cur.get("report_paths") or info.get("report_paths") or {}
         info["awaiting"] = "report_preview"
         info["paths"] = paths
@@ -661,6 +659,10 @@ async def _resume_after_plan(ctx: ContextTypes.DEFAULT_TYPE, info: dict,
         await _set_run_status(ctx, run_id, "awaiting_report",
                               report_dir=paths.get("folder"))
         await _send_report_preview(ctx, info)
+        lib = _get_library(ctx)                         # v4: runs.exa_usd, the run's Exa spend so far (§2.4)
+        if lib is not None and not await lib.update_run(
+                run_id, exa_usd=(cur.get("search_spend") or {}).get("exa_usd")):
+            logger.warning("run %s has no library row; its exa_usd is in the checkpoint only", run_id)
     except Exception as e:
         logger.exception("resume failed")
         await _set_run_status(ctx, run_id, "error")

@@ -11,8 +11,9 @@ Run with:
 """
 from __future__ import annotations
 
+from argus.graph.report_builder_helpers import build_tldr
 from argus.quarantine import (apply_cuts, cut, locate, render_cut_appendix, render_unlocated_appendix,
-                              sentences)
+                              sentences, strip_unknown_ids)
 
 
 def test_sentences_end_at_a_terminator_before_a_capital_a_digit_or_markup():
@@ -79,6 +80,74 @@ def test_two_flags_on_one_sentence_make_one_appendix_line():
     findings = [dict(FINDINGS[1]), {**FINDINGS[1], "id": "f9", "claim": "Beta again"}]
     _, _, cut_rows, _ = apply_cuts(findings, MDS, {"f1": "wrong", "f9": "also wrong"}, n_sources=3)
     assert cut_rows == [{"section": "S", "text": "The beta value is 4.5 points [2].", "reason": "wrong; also wrong"}]
+
+
+def _f(fid, sentence, ids, claim=None, section="S"):
+    return {"id": fid, "claim": claim or sentence.rstrip("."), "section": section, "source_ids": ids,
+            "sentence": sentence, "status": "kept"}
+
+
+def test_a_flagged_sentence_stated_twice_is_cut_at_every_occurrence():               # reviewer B's P2
+    md = "X is the fastest model on the board [1]. Other text here [2]. X is the fastest model on the board [1]."
+    findings, mds, rows, _ = apply_cuts([_f("f1", "X is the fastest model on the board [1].", [1])], {"S": md},
+                                        {"f1": "unsupported"}, 3)
+    assert findings[0]["status"] == "cut" and mds["S"] == "Other text here [2]."
+    assert rows == [{"section": "S", "text": "X is the fastest model on the board [1].", "reason": "unsupported"}]
+
+
+def test_a_whole_sentence_match_comes_before_containment():                          # reviewer B's P3
+    md = "Analysts said prices rose sharply in March [1]. Prices rose [2]."
+    assert locate("Prices rose [2].", md) == [1]
+    findings, mds, _, _ = apply_cuts([_f("f1", "Prices rose [2].", [2]),
+                                      _f("f2", "Analysts said prices rose sharply in March [1].", [1])],
+                                     {"S": md}, {"f1": "unsupported"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "kept"]
+    assert mds["S"] == "Analysts said prices rose sharply in March [1]."
+
+
+def test_a_finding_stated_in_a_cut_sentence_is_cut_too():                             # reviewer B's P4
+    s = "Model A has 70B parameters and was released in May [1]."
+    findings, mds, rows, _ = apply_cuts([_f("f1", s, [1], claim="Model A has 70B parameters"),
+                                         _f("f2", s, [1], claim="Model A came out in May"),
+                                         _f("f3", "It is open weights [2].", [2])],
+                                        {"S": f"{s} It is open weights [2]."}, {"f1": "no such size"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "cut", "kept"] and mds["S"] == "It is open weights [2]."
+    assert rows == [{"section": "S", "text": s, "reason": "no such size; stated in a cut sentence (f1)"}]
+
+
+def test_a_kept_near_duplicate_of_a_cut_finding_takes_the_stricter_verdict():
+    findings, mds, rows, _ = apply_cuts(
+        [_f("f1", "QISA runs 2.6x longer inference time [1].", [1]),
+         _f("f2", "QISA has a 2.6x longer inference time [2].", [2], section="Analysis"),
+         _f("f3", "Other models are faster [3].", [3], section="Analysis")],
+        {"S": "QISA runs 2.6x longer inference time [1].",
+         "Analysis": "QISA has a 2.6x longer inference time [2]. Other models are faster [3]."},
+        {"f1": "no such model"}, 3)
+    assert [f["status"] for f in findings] == ["cut", "cut", "kept"]
+    assert mds == {"S": "", "Analysis": "Other models are faster [3]."}
+    assert rows[1] == {"section": "Analysis", "text": "QISA has a 2.6x longer inference time [2].",
+                       "reason": "near-duplicate of cut f1"}
+
+
+def test_a_cut_sentence_never_reaches_the_tldr():                                      # reviewer B's P1
+    s1 = "Revenue grew 30 percent in 2024 and margins doubled across the group [1]."
+    s3 = "Revenue grew 31 percent in 2024 and margins doubled across the group [2]."
+    findings, mds, _, _ = apply_cuts([_f("f1", s1, [1]), _f("f2", s1, [1]), _f("f3", s3, [2])],
+                                     {"S": f"{s1} {s3}"}, {"f1": "the quote says 3 percent"}, 3)
+    items, _ = build_tldr(analysis=None, analysis_md="", sections=[{"title": "S", "md": mds["S"]}],
+                          findings=findings)
+    assert not any("30 percent" in i for i in items)
+    # and by containment only: a kept finding whose sentence is gone never enters by a fuzzy match
+    kept = [{**_f("f2", s1, [1]), "status": "kept"}]
+    assert build_tldr(analysis=None, analysis_md="", sections=[{"title": "S", "md": s3}],
+                      findings=kept) == ([], "omitted")
+
+
+def test_an_unknown_id_beside_known_ones_is_stripped():
+    md = "Alpha holds [2][9]. Beta holds [9]. Gamma [1] and delta [12] hold.\n\n- Item [3] [9]."
+    assert strip_unknown_ids(md, 3) == (
+        "Alpha holds [2]. Beta holds [9]. Gamma [1] and delta hold.\n\n- Item [3].", [9, 12])
+    assert strip_unknown_ids("Untouched [1].", 3) == ("Untouched [1].", [])
 
 
 def test_the_appendices():

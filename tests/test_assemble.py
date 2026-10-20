@@ -117,6 +117,17 @@ def test_strip_fences(raw, clean):
     ("Rates rose [^2].", "Rates rose [2]."),
     ("Rates rose [Source 3].", "Rates rose [3]."),
     ("Rates rose [sources 3, 4].", "Rates rose [3][4]."),
+    # fix round 1 (reviewer A's probe inputs)
+    ("Rates rose 【1-3】.", "Rates rose [1][2][3]."),
+    ("Rates rose 【3:0†source】.", "Rates rose [3]."),
+    ("Rates rose [1–3, 5].", "Rates rose [1][2][3][5]."),
+    ("Rates rose [Source: 3].", "Rates rose [3]."),
+    ("Rates rose [1，2].", "Rates rose [1][2]."),
+    ("Many [1-20].", "Many " + "".join(f"[{i}]" for i in range(1, 21)) + "."),
+    ("Claim [^2].\n\n[^2]: https://example.com/paper", "Claim [2].\n\n[^2]: https://example.com/paper"),
+    ("- Item [1, 2].\n\n    More of the item [3, 4].", "- Item [1][2].\n\n    More of the item [3][4]."),
+    # the documented [n, m] form: prose that looks like a list cannot be told apart
+    ("The array [1, 2, 3] is sorted.", "The array [1][2][3] is sorted."),
 ])
 def test_normalize_cite_markers_table(raw, clean):
     assert normalize_cite_markers(raw) == clean
@@ -127,6 +138,20 @@ def test_normalize_cite_markers_table(raw, clean):
     "An array `[1, 2]` and a fence:\n```\nx = 【4】\n```\n",
     "A wide span [1-40] is not a citation range.",
     "Years [2019, 2020] are not source ids.",
+    # fix round 1 (reviewer A's probe inputs): never a fabricated citation
+    "See [the guide](https://ex.com/a?ids[1,2]=x) for details [3].",
+    "See [docs](https://ex.com/r/[1-3]/x) [4].",
+    "[1-3](https://ex.com/p) is the paper.",
+    "Read [Source 3](https://src3.example) now.",
+    "![1, 2](img.png)",
+    "See https://ex.com/a?ids[1,2]=x now [3].",
+    "Scores are normalised to [0, 1] before ranking.",
+    "~~~\nx = [1, 2]\n~~~",
+    "Use ``a [1, 2] b`` here.",
+    "```python\nx = [1, 2]\n",
+    "Code:\n\n    x = [1, 2]\n",
+    "[^2]: https://example.com/paper",
+    "Many [1-21].",
 ])
 def test_normalize_cite_markers_leaves_the_rest(md):
     assert normalize_cite_markers(md) == md

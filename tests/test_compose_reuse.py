@@ -4,23 +4,30 @@ revision-notes order, the flat body and the extractor's verbatim sentence.
 
 A section writer sees only its allocated notes (``note_ids``) plus the
 pinned ones, filtered by ``writer_min_relevance`` and ``quote_verified is
-not False``. Compose rewrites only ``panel_verdict.revise_sections`` (a
-panel rewrite) or ``outline.changed_sections`` (fresh, gap wave, extend,
-user revise) — new sections always; the rest keep md, ``note_ids`` and
-findings (re-ided). A first write that is skipped merges its notes into its
-neighbour (the previous section, else the next), written once more; a
-skipped re-write keeps the previous version; every section skipped raises.
+not False``, within 24 000 chars (the rest recorded). Compose rewrites only
+``panel_verdict.revise_sections`` (a panel rewrite) or
+``outline.changed_sections`` (fresh, gap wave, extend, user revise) — new
+sections always; the rest keep md, ``note_ids`` and findings (re-ided), and
+one citing ``[n]`` without findings is extracted again. A pre-v4 outline is
+allocated first. A first write that is skipped merges into its neighbour (the
+previous section, else the next: sub-questions, notes, focus), written once
+more, and the merge sticks for the round; a skipped re-write keeps the
+previous version; every section skipped raises.
 """
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langgraph.runtime import Runtime
 
+from argus import config as config_mod
 from argus import llm
 from argus.engines.llm_openai import DriverError
+from argus.graph import nodes as nodes_mod
 from argus.graph.compose import (EXTRACT_SYSTEM, FLAT_SYSTEM, SECTION_SYSTEM, compose_node, extract_findings,
                                  render_notes)
 from argus.graph.nodes import revise_prep_node
@@ -130,6 +137,30 @@ def test_render_notes_puts_pinned_notes_first():
     assert block.index("[4] ") < block.index("[1] ") and "[3] " not in block
 
 
+def _big(i: int, relevance: int) -> dict:
+    """A note whose block is ~7 000 chars: three fit the 24 000-char writer budget, four do not."""
+    return _note(i, [0], relevance=relevance,
+                 claims=[{"text": f"claim {i} " + "x" * 7000, "confidence": "high", "quote_verified": True}])
+
+
+BIG = [_big(1, 3), _big(2, 5), _big(3, 4), _big(4, 1), _big(6, 3)]          # 4 is the pinned local clip
+
+
+def test_render_notes_keeps_24000_chars_dropping_the_lowest_relevance_first():
+    block = render_notes(BIG, [1, 2, 3, 6])
+    assert [int(i) for i in re.findall(r"^\[(\d+)\] ", block, re.M)] == [4, 2, 3], (
+        "the pinned note first, then by relevance — no longer the silent 7 000-char cap")
+
+
+def test_notes_over_the_writer_budget_are_recorded(monkeypatch):
+    seen = _llm(monkeypatch)
+    outline = {"sections": [{"title": "A", "sub_qs": [0, 1, 2], "note_ids": [1, 2, 3, 6]}], "changed_sections": ["A"]}
+    out = compose_node(_state(evidence=BIG, outline=outline))
+    (_, prompt), = _writes(seen)
+    assert sorted(int(i) for i in re.findall(r"^\[(\d+)\] ", prompt, re.M)) == [2, 3, 4]
+    assert '[r1] compose: section "A" — notes [1, 6] over the writer budget' in out["errors"]
+
+
 # ---------------------------------------------------------------------------
 # The reuse rule and compose_runs
 # ---------------------------------------------------------------------------
@@ -181,6 +212,68 @@ def test_a_user_revise_rewrites_every_section_with_the_newest_note_first(monkeyp
     assert out["compose_runs"] == 1
 
 
+LEGACY_OUTLINE = {"sections": [{"title": t, "focus": "", "sub_qs": [k]} for k, t in enumerate("ABC")]}
+LEGACY_SECTIONS = [{"title": "A", "md": _sentence(1)}, {"title": "B", "md": _sentence(3)},
+                   {"title": "C", "md": _sentence(6)}]
+
+
+def test_a_revise_on_a_pre_v4_checkpoint_allocates_the_notes_first(monkeypatch):
+    seen = _llm(monkeypatch)
+    state = _state(outline=LEGACY_OUTLINE, sections=LEGACY_SECTIONS, findings=[], compose_runs=1,
+                   revision_notes=["make it shorter"], panel_verdict={"next": "report_builder"})
+    state = {**state, **revise_prep_node(state)}
+    out = compose_node(state)
+    ids = {t: sorted(int(i) for i in re.findall(r"^\[(\d+)\] ", p, re.M)) for t, p in _writes(seen)}
+    assert ids == {"A": [1, 2, 4], "B": [3, 4], "C": [4, 6]}, "every writer gets its sub-questions' notes"
+    assert [s["note_ids"] for s in out["sections"]] == [[1, 2, 4], [3], [6]]
+    assert [s["note_ids"] for s in out["outline"]["sections"]] == [[1, 2, 4], [3], [6]]
+
+
+def test_a_reused_section_citing_sources_without_findings_is_re_extracted(monkeypatch):
+    seen = _llm(monkeypatch)
+    out = compose_node(_later(findings=[f for f in PRIOR_FINDINGS if f["section"] != "B"],
+                              panel_verdict={"next": "compose", "revise_sections": ["C"], "notes": []}))
+    assert sorted(m[1].split("\n", 1)[0] for m in seen if m[0] == EXTRACT_SYSTEM) == ["Section: B", "Section: C"]
+    assert [t for t, _ in _writes(seen)] == ["C"]
+    assert next(s for s in out["sections"] if s["title"] == "B") == PRIOR_SECTIONS[1], "reused, byte-identical"
+    assert [f["claim"] for f in out["findings"] if f["section"] == "B"] == ["Resume takes a command"]
+
+
+def _report_md(monkeypatch, tmp_path, state) -> tuple[str, dict]:
+    monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
+    monkeypatch.setattr(nodes_mod, "markdown_to_pdf", lambda *a, **k: None)
+    out = nodes_mod.report_builder_node(state)
+    folder = Path(out["report_paths"]["folder"])
+    return (folder / "report.md").read_text(encoding="utf-8"), json.loads(
+        (folder / "metadata.json").read_text(encoding="utf-8"))
+
+
+def _judged(state: dict, out: dict) -> dict:
+    """``out`` applied to ``state`` as the graph would, every finding judged and passed."""
+    n = len(out["findings"])
+    return {**state, **out, "errors": state["errors"] + out["errors"],
+            "model_calls": state["model_calls"] + out["model_calls"],
+            "panel_verdict": {"verdict": "pass", "judged": n, "total": n, "flagged_finding_ids": []}}
+
+
+def test_a_skipped_extraction_is_named_in_the_banner_until_a_later_compose_re_extracts_it(monkeypatch, tmp_path):
+    _llm(monkeypatch, extract={"B": "no json at all"})
+    first = _judged(_state(), compose_node(_state()))
+    assert not [f for f in first["findings"] if f["section"] == "B"]
+    md, meta = _report_md(monkeypatch, tmp_path, first)
+    assert '> ⚠ Not fact-checked — section "B" was not fact-checked (unparseable)' in md
+    assert meta["degraded"] is True
+
+    _llm(monkeypatch)
+    later = compose_node({**first, "panel_verdict": {"next": "compose", "revise_sections": ["C"], "notes": []}})
+    b = next(s for s in later["sections"] if s["title"] == "B")
+    assert b == next(s for s in first["sections"] if s["title"] == "B"), "reused, byte-identical"
+    assert [f["claim"] for f in later["findings"] if f["section"] == "B"] == [
+        "The user clip mentions approvals", "Resume takes a command"]
+    md, meta = _report_md(monkeypatch, tmp_path / "later", _judged(first, later))
+    assert "⚠ Not fact-checked" not in md and "⚠ Degraded run" not in md and meta["degraded"] is False
+
+
 def test_revision_notes_are_the_users_then_the_panels_capped_at_eight(monkeypatch):
     seen = _llm(monkeypatch)
     compose_node(_later(revision_notes=["u1", "u2"],
@@ -221,6 +314,49 @@ def test_when_the_merged_rewrite_is_skipped_too_the_neighbour_keeps_its_first_ve
     assert a["note_ids"] == [1, 2, 5] and "[3]" not in a["md"]
     assert '[r1] compose: section "B" dropped — notes 3 not written (its merge into "A" was skipped)' in out["errors"]
     assert sum(e.startswith("[r1] skip: compose.section ") for e in out["errors"]) == 2
+
+
+def _subqs(prompt: str) -> list[str]:
+    return re.search(r"Sub-questions to answer here:\n(.*?)\nTarget", prompt, re.S).group(1).splitlines()
+
+
+def test_the_merged_rewrite_carries_the_skipped_sections_sub_questions_and_focus(monkeypatch):
+    outline = {"sections": [{**s, "focus": f"focus {s['title']}"} for s in OUTLINE["sections"]],
+               "changed_sections": ["A", "B", "C"]}
+    seen = _llm(monkeypatch, fail=lambda title, human: title == "B")
+    out = compose_node(_state(outline=outline))
+    merged = [p for t, p in _writes(seen) if t == "A"][-1]
+    assert _subqs(merged) == ["- A?", "- B?"] and "Focus: focus A; focus B\n" in merged
+    assert out["outline"] == {"sections": [
+        {"title": "A", "focus": "focus A; focus B", "sub_qs": [0, 1], "note_ids": [1, 2, 5, 3]},
+        {"title": "C", "focus": "focus C", "sub_qs": [2], "note_ids": [6]}], "changed_sections": ["A", "C"]}, (
+        "the merge sticks: B is merged into A and removed from the outline")
+
+
+def _next(state: dict, out: dict, **over) -> dict:
+    """The state a later compose of the round sees: this compose's output applied."""
+    return {**state, **{k: out[k] for k in ("sections", "findings", "compose_runs", "outline") if k in out},
+            **over}
+
+
+@pytest.mark.parametrize("later", ["a panel rewrite of C", "a gap wave changing only C"])
+@pytest.mark.parametrize("skipped", ["A", "B"])
+def test_the_merge_sticks_for_the_round(monkeypatch, skipped, later):
+    fail = {skipped}
+    seen = _llm(monkeypatch, fail=lambda title, human: title in fail)
+    first = compose_node(_state())
+    fail.clear()
+    seen.clear()
+    if later == "a panel rewrite of C":
+        over = {"panel_verdict": {"next": "compose", "revise_sections": ["C"], "notes": []}}
+    else:                                   # the extend-mode outline: only C's notes changed
+        over = {"panel_verdict": {"next": "research"},
+                "outline": {**first.get("outline", OUTLINE), "changed_sections": ["C"]}}
+    out = compose_node(_next(_state(), first, **over))
+    assert [t for t, _ in _writes(seen)] == ["C"], "the merged-away section is not written again"
+    assert skipped not in [s["title"] for s in out["sections"]]
+    for i in (1, 2, 3):
+        assert out["draft_md"].count(_sentence(i)) == 1, f"note {i}'s sentence once"
 
 
 def test_every_section_skipped_raises(monkeypatch):
@@ -267,6 +403,22 @@ def test_dedupe_keeps_a_duplicate_whose_sentence_backs_another_finding(monkeypat
     assert len([f for f in out["findings"] if f["section"] == "B"]) == 2
 
 
+def test_dedupe_drops_a_rewritten_section_it_empties(monkeypatch):
+    _llm(monkeypatch, write={"B": "Graphs pause at interrupts here [1]. Checkpoints persist the state here [2]."})
+    out = compose_node(_later(panel_verdict={"next": "compose", "revise_sections": ["B"], "notes": []}))
+    assert [s["title"] for s in out["sections"]] == ["A", "C"] and "## B" not in out["draft_md"]
+    assert ('[r1] compose: section "B" dropped — the dedupe pass cut every sentence (each repeats an earlier '
+            'section)') in out["errors"]
+
+
+def test_dedupe_keeps_a_near_duplicate_citing_other_sources(monkeypatch):
+    md = "Graphs pause at interrupts here [3]. Resume takes a command [3]."
+    _llm(monkeypatch, write={"B": md})
+    out = compose_node(_later(panel_verdict={"next": "compose", "revise_sections": ["B"], "notes": []}))
+    assert next(s for s in out["sections"] if s["title"] == "B")["md"] == md, (
+        "[3] is not within the earlier finding's [1]: a different source, not a duplicate")
+
+
 def test_dedupe_can_be_switched_off(monkeypatch):
     _llm(monkeypatch, write={"B": "Graphs pause at interrupts here [1]. Resume takes a command [3]."})
     out = compose_node(_later(run_config=make_run_config("medium", **{"compose.dedupe_pass": False}),
@@ -296,6 +448,16 @@ def test_the_extractor_returns_the_verbatim_sentence_and_its_ids(monkeypatch):
         {"claim": "Model ids only", "citation_urls": [FETCHED[0]["url"]], "confidence": "medium", "section": "A",
          "source_ids": [1], "sentence": "", "status": "kept"}]
     assert [c["role"] for c in calls] == ["compose.findings_extract"] and errors == []
+
+
+def test_the_extractor_intersects_the_models_ids_with_the_sentences(monkeypatch):
+    reply = json.dumps({"findings": [
+        {"claim": "X holds", "sentence": "X holds [1], and Y holds [2].", "source_ids": [1]},
+        {"claim": "Y holds", "sentence": "X holds [1], and Y holds [2].", "source_ids": [2, 7]}]})
+    fake_llm(monkeypatch, lambda system, human: reply)
+    rc = RunConfig.model_validate(make_run_config("medium"))
+    findings, _, _ = extract_findings("A", "X holds [1], and Y holds [2].", FETCHED, engines=rc.engines, rnd=1)
+    assert [f["source_ids"] for f in findings] == [[1], [2]]
 
 
 def test_a_skipped_extraction_is_declared(monkeypatch):
@@ -344,6 +506,16 @@ def test_a_flat_writer_failure_raises(monkeypatch):
     with pytest.raises(llm.EngineError):
         compose_node(_state(length="short", run_config=make_run_config("short"),
                             outline={"sections": [], "changed_sections": []}))
+
+
+def test_a_too_short_flat_reply_raises_after_the_retry(monkeypatch):
+    seen = fake_llm(monkeypatch, lambda system, human: (
+        "  short [1] " if system.startswith(FLAT_SYSTEM)
+        else json.dumps({"findings": [{"claim": "s", "sentence": "short [1]", "source_ids": [1]}]})))
+    with pytest.raises(llm.EngineError, match="unparseable"):
+        compose_node(_state(length="short", run_config=make_run_config("short"),
+                            outline={"sections": [], "changed_sections": []}))
+    assert len(seen) == 2, "the sections' 40-char rule, through the validate hook: one retry, then raise"
 
 
 def test_no_usable_note_is_the_classified_no_evidence_draft(monkeypatch):

@@ -8,11 +8,13 @@ coverage judge, the precision scan and a deterministic merge that writes
   word overlap with the batch, quotes up to 250 chars — within 24 000 chars
   (system + human); a batch over that is halved until it fits, and a single
   finding still over it is skipped. Batches run on a pool of 3. A batch that
-  is skipped, fails or returns unparseable JSON leaves its findings
-  **unjudged** (``judged < total``), never passed. When the judge served a
-  model of a writer's family, the batches are rerun once on an engine of the
-  binding from another family (``panel.diversity_rerun``); the rerun's
-  verdict counts when it judged as much, else ``judge_not_diverse``.
+  is skipped, fails or returns unparseable JSON — an id that, normalised
+  (``[f3]``, ``F3``, ``3``, a ``finding_id`` key), names no finding of the
+  batch included — leaves its findings **unjudged** (``judged < total``),
+  never passed. When the judge served a model of a writer's family, the
+  batches are rerun once on an engine of the binding from another family
+  (``panel.diversity_rerun``); the rerun's verdict counts when it judged as
+  much, else ``judge_not_diverse``.
 - **coverage** (``panel.coverage``, ``skip_item``): weak sections and the
   sub-questions no section answers (``missing_sub_qs``).
 - **precision** (``panel.precision_mode``): the deterministic
@@ -39,6 +41,7 @@ from langgraph.runtime import Runtime
 from .. import llm
 from ..engines.registry import family
 from . import precision, run_config
+from .assemble import ANALYSIS_SECTION
 from .jsonx import parse_json_obj
 from .outline import _ints
 from .research import _round
@@ -51,7 +54,6 @@ _CLAIMS_PER_NOTE = 3
 _QUOTE_CHARS = 250
 _POOL = 3
 _WRITER_ROLES = ("compose.section", "compose.flat", "compose.analyst")
-_ANALYSIS = "Analysis"
 
 GROUNDING_SYSTEM = """You are an adversarial grounding auditor for a
 research report. You get a batch of the report's findings — each with its
@@ -207,16 +209,26 @@ def _batches(findings: list[dict], size: int, notes: dict[int, dict]) -> list[tu
     return [piece for b in packed for piece in _fit(b, notes)]
 
 
+_FID = re.compile(r"\[?\s*f?\s*(\d+)\s*\]?", re.I)          # [f3]  f3  F3  3  → f3
+
+
 def _parse_grounding(text: str, ids: set[str]) -> tuple[dict[str, str], list[str]]:
+    """``(flagged id → reason, notes)``. Each entry's id (or ``finding_id``) is
+    normalised; one that names no finding of the batch makes the reply
+    unparseable — retried, then the batch is unjudged (spec R1), never passed."""
     data = parse_json_obj(text, require_any=("flagged",))
     raw = data.get("flagged")
     if not isinstance(raw, list):
         raise ValueError(f"'flagged' is {type(raw).__name__}, not a list")
     flagged: dict[str, str] = {}
     for item in raw:
-        fid, reason = (item.get("id"), item.get("reason")) if isinstance(item, dict) else (item, "")
-        if str(fid) in ids:
-            flagged.setdefault(str(fid), " ".join(str(reason or "").split()) or "not supported by its sources")
+        fid, reason = ((item.get("id", item.get("finding_id")), item.get("reason")) if isinstance(item, dict)
+                       else (item, ""))
+        m = _FID.fullmatch(str(fid).strip())
+        key = f"f{int(m.group(1))}" if m else None
+        if key not in ids:
+            raise ValueError(f"flagged id {fid!r} names no finding of this batch")
+        flagged.setdefault(key, " ".join(str(reason or "").split()) or "not supported by its sources")
     notes = data.get("notes")
     return flagged, [str(n) for n in notes if str(n).strip()] if isinstance(notes, list) else []
 
@@ -228,6 +240,7 @@ class _Judged:
         self.flagged: dict[str, str] = {}
         self.notes: list[str] = []
         self.judged = 0
+        self.batches = 0                      # this pass's batches
         self.skipped: list[str] = []          # skipped_judges entries
         self.errors: list[str] = []
         self.calls: list[dict] = []
@@ -237,6 +250,7 @@ class _Judged:
 
 def _judge(pieces: list[tuple[list[dict], str | None]], engines, rnd: int) -> _Judged:
     out = _Judged()
+    out.batches = len(pieces)
 
     def one(i: int, piece):
         batch, prompt = piece
@@ -379,6 +393,7 @@ def panel_node(state, runtime: Runtime | None = None) -> dict:
         judge_notes = g.notes
         judge_verdicts["grounding"] = "unjudged" if not judged else "revise" if flagged else "pass"
         judge_verdicts["flag_reasons"] = flagged
+        judge_verdicts["grounding_batches"] = g.batches   # the degraded-run count is over this pass (§2.3)
     coverage = None
     if rc.panel.coverage:
         coverage, ccalls, cerrors = _coverage(state, rc, rnd)
@@ -397,7 +412,7 @@ def panel_node(state, runtime: Runtime | None = None) -> dict:
     titles = [s.get("title") for s in state.get("sections") or []]
     weak = [t for t in (coverage or {}).get("weak_sections") or [] if t in titles]
     flagged_sections = {f.get("section") for f in findings if f.get("id") in flagged}
-    revise_sections = [t for t in titles if t != _ANALYSIS and (t in flagged_sections or t in weak)]
+    revise_sections = [t for t in titles if t != ANALYSIS_SECTION and (t in flagged_sections or t in weak)]
     wants_rewrite = bool(flagged and judged and len(flagged) / judged >= rc.panel.rewrite_flag_ratio) or bool(weak)
     gaps = gap_signal(state, rc, (coverage or {}).get("missing_sub_qs") or [])
     rounds = int(state.get("revision_rounds") or 0)

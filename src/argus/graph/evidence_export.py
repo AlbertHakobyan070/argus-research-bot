@@ -2,11 +2,16 @@
 report_builder next to ``report.md`` and validated by ``Evidence`` (schema
 1) before it is written. Read by the console (WP-E2) and the bench (WP-G).
 
-Strict models: an unknown key anywhere is refused, so no ``markdown_path``,
-secret or env value can ride along. ``degradations`` are exactly the
-``skip:`` / ``degrade:`` / ``legacy:`` lines of ``errors`` that the bench
-counts (``bench.metrics.degradations_count``), each with its round (an
-untagged line takes the current round).
+The typed parts are strict models — run, sources, notes, claims, findings,
+analysis, takeaways, tldr, search, degradations and the top level refuse an
+unknown key, so no ``markdown_path``, secret or env value can ride along
+there. The free-form dicts (``run_config``, ``engines``, ``brief``,
+``gap_history``, ``stance_map``, ``queries``, ``spend``, ``recency``) are
+written as built, and ``panel`` is the state's ``PanelVerdict``, which
+ignores an unknown key. ``degradations`` are exactly the ``skip:`` /
+``degrade:`` / ``legacy:`` lines of ``errors`` that the bench counts
+(``bench.metrics.degradations_count``), each ``{round, text}`` with the text
+without its ``[r<k>]`` tag (an untagged line takes the current round).
 """
 from __future__ import annotations
 
@@ -140,13 +145,21 @@ class Evidence(_Strict):
 
 
 def degradations(errors: list[str], rnd: int) -> list[dict]:
-    """The ``skip:`` / ``degrade:`` / ``legacy:`` lines as ``{round, text}``."""
+    """The ``skip:`` / ``degrade:`` / ``legacy:`` lines as ``{round, text}``:
+    the round from the line's ``[r<k>]`` tag (else ``rnd``), the text without it."""
     out = []
     for line in errors:
         m = DEGRADATION_LINE.match(line)
         if m:
-            out.append({"round": int(m.group(1) or rnd), "text": line})
+            out.append({"round": int(m.group(1) or rnd), "text": re.sub(r"^\[r\d+\]\s*", "", line)})
     return out
+
+
+def run_config_dump(rc: run_config.RunConfig) -> dict:
+    """The RunConfig as evidence.json and metadata.json carry it: without ``engines.roles``."""
+    dump = rc.model_dump(mode="json")
+    dump["engines"].pop("roles", None)
+    return dump
 
 
 def write_evidence(path: Path, state, *, findings: list[dict], errors: list[str], degraded: bool, tldr: dict,
@@ -170,8 +183,6 @@ def write_evidence(path: Path, state, *, findings: list[dict], errors: list[str]
             "authority": int(note.get("authority", item.get("authority_prior", 1))),
             "credibility_score": item.get("credibility_score"), "chars": int(item.get("chars") or 0),
             "pinned": bool(item.get("pinned"))})
-    rc_dump = rc.model_dump(mode="json")
-    rc_dump["engines"].pop("roles", None)
     analysis = state.get("analysis")
     doc = Evidence.model_validate({
         "schema": 1,
@@ -179,7 +190,7 @@ def write_evidence(path: Path, state, *, findings: list[dict], errors: list[str]
                 "topic": state.get("user_request") or "", "generated_at": generated_at, "length": rc.length,
                 "depth": rc.depth, "recency": spend.get("recency"), "archetype": brief.archetype,
                 "origin": rc.origin},
-        "run_config": rc_dump, "engines": engines, "brief": brief.model_dump(),
+        "run_config": run_config_dump(rc), "engines": engines, "brief": brief.model_dump(),
         "coverage": {str(k): int(v) for k, v in (state.get("coverage") or {}).items()},
         "gap_history": list(state.get("gap_history") or []),
         **{k: int(state.get(k) or 0) for k in ("compose_runs", "revision_rounds", "gap_waves", "revise_rounds",
@@ -211,4 +222,4 @@ def write_evidence(path: Path, state, *, findings: list[dict], errors: list[str]
     return out
 
 
-__all__ = ["Evidence", "write_evidence", "degradations", "DEGRADATION_LINE"]
+__all__ = ["Evidence", "write_evidence", "degradations", "run_config_dump", "DEGRADATION_LINE"]

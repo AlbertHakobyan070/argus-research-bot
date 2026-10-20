@@ -87,9 +87,9 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
         # flat report writer (short mode)
         compose_calls["write"] += 1
         if compose_calls["write"] == 1:
-            return "X is true [1]."
+            return "X is true, as the source states it plainly [1]."      # >= 40 chars: a body, not an empty write
         assert "quote the supporting evidence directly" in human, "the judge's notes reach the rewrite"
-        return "X is true, per the direct quote [1]."
+        return "X is true, per the direct quote from the source [1]."
 
     seen = fake_llm(monkeypatch, _reply)
 

@@ -34,17 +34,19 @@ from datetime import datetime
 from typing import Any
 
 from .. import quarantine
+from .assemble import CITE_RE
 from .panel import failure_reason
 
 TLDR_LABEL = "_TL;DR — compiled from the report's own cited, judged findings_"
 _TLDR_ITEMS = 4
-# The per-item roles (spec §2.3 skip_item) and what a skipped item is, for the degraded-run banner.
+# The per-item roles (spec §2.3: invoked once per source, section or judging batch) and what a
+# skipped item is, for the degraded-run banner. A single-call role's skip (the coverage review)
+# is a degradation note only.
 _ITEM_ROLES = {
     "research.digest": "sources could not be digested",
     "compose.section": "sections could not be written",
     "compose.findings_extract": "finding extractions failed",
     "panel.grounding": "grounding batches could not be judged",
-    "panel.coverage": "coverage reviews failed",
 }
 _SKIP_LINE = re.compile(r"^(?:\[r\d+\]\s*)?skip:\s*([a-z0-9_.]+)\s")
 # The degradation notes: the bench's skip / degrade / legacy lines, plus the other visible losses.
@@ -293,39 +295,63 @@ def info_lines(*, state, rc, panel: dict, reroute_rate: float | None) -> list[st
     return lines
 
 
-def not_fact_checked(rc, panel: dict, findings: list[dict]) -> str | None:
+def unjudged_sections(parts: list[tuple[str, str]], findings: list[dict], errors: list[str]) -> list[str]:
+    """§2.3: ``section "<title>" was not fact-checked (<reason>)`` for every
+    (title, final markdown) — the sections and the Analysis — that cites
+    ``[n]`` but has no finding: the reason of its last ``skip:
+    compose.findings_extract <title>`` line, else "no findings extracted"."""
+    have = {f.get("section") for f in findings}
+    out = []
+    for title, md in parts:
+        if title in have or not CITE_RE.search(md):
+            continue
+        skip = re.compile(rf"^(?:\[r\d+\]\s*)?skip: compose\.findings_extract {re.escape(title)} \(")
+        lines = [e for e in errors if skip.match(e)]
+        out.append(f'section "{title}" was not fact-checked '
+                   f'({failure_reason(lines[-1]) if lines else "no findings extracted"})')
+    return out
+
+
+def not_fact_checked(rc, panel: dict, findings: list[dict], unjudged: list[str] = ()) -> str | None:
     """The "⚠ Not fact-checked" banner text, or None: the grounding judge is
-    off, failed outright, or left some findings unjudged (spec §2.8 R1)."""
-    if not findings:
-        return None
+    off, failed outright or left some findings unjudged (spec §2.8 R1), and
+    the ``unjudged`` sections (``unjudged_sections``), each named (§2.3)."""
     if not (rc.panel.enabled and rc.panel.grounding):
-        return "the grounding judge is off"
+        return "the grounding judge is off" if findings else None
+    parts = []
     judged, total = int(panel.get("judged") or 0), int(panel.get("total") or 0)
-    if judged >= total:
-        return None
-    reasons = ", ".join(dict.fromkeys(e.split(": ", 1)[1] for e in panel.get("skipped_judges") or []
-                                      if e.startswith("grounding") and ": " in e)) or "unknown"
-    if judged == 0:
-        return f"the grounding judge failed ({reasons})"
-    return f"{total - judged} of {total} findings were not judged ({reasons})"
+    if judged < total:
+        reasons = ", ".join(dict.fromkeys(e.split(": ", 1)[1] for e in panel.get("skipped_judges") or []
+                                          if e.startswith("grounding") and ": " in e)) or "unknown"
+        parts.append(f"the grounding judge failed ({reasons})" if judged == 0
+                     else f"{total - judged} of {total} findings were not judged ({reasons})")
+    return "; ".join([*parts, *unjudged]) or None
 
 
-def degraded_run(model_calls: list[dict], errors: list[str]) -> str | None:
+def degraded_run(model_calls: list[dict], errors: list[str], panel: dict) -> str | None:
     """The "⚠ Degraded run" banner text, or None: every per-item role that
     skipped half or more of its items (spec §2.3), e.g. "14 of 28 sources
-    could not be digested (429)". Items = its ok calls plus its skip lines."""
+    could not be digested (429)". Items = its ok calls plus its skip lines;
+    the grounding batches are counted over the last panel pass only — the
+    panel verdict's skipped batches of ``judge_verdicts["grounding_batches"]``."""
     ok = Counter(c.get("role") for c in model_calls
                  if c.get("ok", True) and c.get("retry_reason") != "diversity_rerun")
     skips: dict[str, list[str]] = {}
     for line in errors:
         m = _SKIP_LINE.match(line)
-        if m and m.group(1) in _ITEM_ROLES:
+        if m and m.group(1) in _ITEM_ROLES and m.group(1) != "panel.grounding":
             skips.setdefault(m.group(1), []).append(failure_reason(line))
+    items = {role: (len(skips.get(role) or []), ok[role]) for role in _ITEM_ROLES}
+    grounding = [e.split(": ", 1)[1] for e in panel.get("skipped_judges") or [] if e.startswith("grounding batch")]
+    if grounding:
+        skips["panel.grounding"] = grounding
+        items["panel.grounding"] = (len(grounding), (panel.get("judge_verdicts") or {})["grounding_batches"]
+                                    - len(grounding))
     parts = []
     for role, what in _ITEM_ROLES.items():
-        k = len(skips.get(role) or [])
-        if k and 2 * k >= k + ok[role]:
-            parts.append(f"{k} of {k + ok[role]} {what} ({', '.join(dict.fromkeys(skips[role]))})")
+        k, n_ok = items[role]
+        if k and 2 * k >= k + n_ok:
+            parts.append(f"{k} of {k + n_ok} {what} ({', '.join(dict.fromkeys(skips[role]))})")
     return "; ".join(parts) or None
 
 
@@ -333,17 +359,18 @@ def build_tldr(*, analysis: dict | None, analysis_md: str, sections: list[dict],
                ) -> tuple[list[str], str]:
     """R2, after the cuts: ``(items, source)``. With an analysis, its first
     ≤ 4 takeaways still in the (cut) analysis, with their labels; without
-    one, the first kept finding sentence still in each section (≤ 4); else
+    one, the first kept finding sentence still in each section (≤ 4) — by
+    normalised containment in the cut markdown, never a fuzzy match; else
     none ("omitted")."""
     if analysis:
         items = [f"{t['text']} — confidence **{t['confidence']}**" for t in analysis.get("takeaways") or []
-                 if t["text"] in analysis_md][:_TLDR_ITEMS]
+                 if quarantine.contains(t["text"], analysis_md)][:_TLDR_ITEMS]
         return items, "takeaways" if items else "omitted"
     items = []
     for s in sections:
         first = next((f.get("sentence") or f.get("claim") for f in findings
                       if f.get("section") == s["title"] and f.get("status") == "kept"
-                      and quarantine.locate(f.get("sentence") or f.get("claim") or "", s["md"]) is not None), None)
+                      and quarantine.contains(f.get("sentence") or f.get("claim") or "", s["md"])), None)
         if first:
             items.append(" ".join(first.split()))
     items = items[:_TLDR_ITEMS]
@@ -381,6 +408,7 @@ __all__ = [
     "TLDR_LABEL",
     "info_lines",
     "not_fact_checked",
+    "unjudged_sections",
     "degraded_run",
     "build_tldr",
     "render_degradation_notes",

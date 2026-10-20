@@ -119,6 +119,7 @@ def test_a_single_finding_over_the_budget_is_unjudged(monkeypatch):
     pv = out["panel_verdict"]
     assert (pv["judged"], pv["total"]) == (1, 2)
     assert pv["skipped_judges"] == ["grounding batch 2: input over the 24000-char budget"]
+    assert out["errors"] == ["[r1] skip: panel.grounding batch 2 (input over the 24000-char budget)"]
 
 
 @pytest.mark.parametrize("failure", ["skipped", "unparseable"])
@@ -184,6 +185,64 @@ def test_grounding_off_judges_nothing_and_says_so(monkeypatch, tmp_path):
     rb = nodes_mod.report_builder_node({**_state(findings, evidence, **{"panel.grounding": False}), **out})
     md = Path(rb["report_paths"]["md"]).read_text(encoding="utf-8")
     assert "> ⚠ Not fact-checked — the grounding judge is off" in md
+    meta = json.loads((Path(rb["report_paths"]["folder"]) / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["degraded"] is False, "the judge was switched off, not lost"
+
+
+@pytest.mark.parametrize("entry", [{"id": "[f1]"}, {"id": " f1 "}, {"id": "F1"}, {"id": 1}, {"id": "1"},
+                                   {"finding_id": "f1"}, "[f1]", "f1"])
+def test_the_judges_ids_are_normalised(monkeypatch, entry):
+    evidence = [_note(1, [("c", "q")])]
+    findings = _findings({"Alpha": 2}, n_notes=1)
+    item = {**entry, "reason": "not in the quote"} if isinstance(entry, dict) else entry
+    fake_llm(monkeypatch, lambda system, human: json.dumps({"flagged": [item], "notes": []}))
+    pv = panel_node(_state(findings, evidence))["panel_verdict"]
+    assert pv["flagged_finding_ids"] == ["f1"] and (pv["judged"], pv["total"]) == (2, 2)
+
+
+def test_a_reply_naming_no_finding_of_its_batch_is_unparseable_and_unjudged(monkeypatch, tmp_path):
+    evidence = [_note(1, [("c", "q")])]
+    findings = _findings({"Alpha": 2}, n_notes=1)
+    seen = fake_llm(monkeypatch, lambda system, human: json.dumps({"flagged": [{"id": "f7", "reason": "x"}],
+                                                                   "notes": []}))
+    out = panel_node(_state(findings, evidence))
+    pv = out["panel_verdict"]
+    assert (pv["judged"], pv["total"]) == (0, 2) and pv["flagged_finding_ids"] == [], "never read as a pass"
+    assert len(seen) == 2 and seen[1][-1] == "Reply with only the JSON object."
+    monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
+    monkeypatch.setattr(nodes_mod, "markdown_to_pdf", lambda *a, **k: None)
+    rb = nodes_mod.report_builder_node({**_state(findings, evidence), **out})
+    md = Path(rb["report_paths"]["md"]).read_text(encoding="utf-8")
+    assert "> ⚠ Not fact-checked — the grounding judge failed (unparseable)" in md
+
+
+def test_grounding_is_counted_over_its_last_panel_pass(monkeypatch, tmp_path):
+    evidence = [_note(i, [(f"claim {i}", f"quote {i}")]) for i in range(1, 5)]
+    findings = _findings({"Alpha": 4, "Beta": 4}, n_notes=4)
+    down = {"on": True}
+
+    def reply(system, human):
+        if down["on"]:
+            raise DriverError("provider fake: 429 Too Many Requests", code=429)
+        return _judge()(system, human)
+
+    monkeypatch.setattr("argus.llm._sleep", lambda s: None)
+    fake_llm(monkeypatch, reply)
+    state = _state(findings, evidence, **{"panel.judge_batch_size": 4})
+    first = panel_node(state)
+    assert first["panel_verdict"]["judged"] == 0 and len(first["panel_verdict"]["skipped_judges"]) == 2
+    down["on"] = False                                     # judged after a gap wave
+    state = {**state, **first}
+    second = panel_node(state)
+    assert (second["panel_verdict"]["judged"], second["panel_verdict"]["total"]) == (8, 8)
+    state = {**state, **second, "errors": first["errors"] + second["errors"],
+             "model_calls": first["model_calls"] + second["model_calls"]}
+    monkeypatch.setattr(config_mod, "get_settings", lambda: SimpleNamespace(reports_root=tmp_path))
+    monkeypatch.setattr(nodes_mod, "markdown_to_pdf", lambda *a, **k: None)
+    rb = nodes_mod.report_builder_node(state)
+    md = Path(rb["report_paths"]["md"]).read_text(encoding="utf-8")
+    assert "⚠ Degraded run" not in md and "⚠ Not fact-checked" not in md
+    assert "skip: panel.grounding batch 1" in md.split("## Degradation notes")[1], "the first pass's skips: notes"
 
 
 def test_the_judge_events(monkeypatch):

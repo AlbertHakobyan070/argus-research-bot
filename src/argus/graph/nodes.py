@@ -22,15 +22,14 @@ from ..engines.registry import summarize_calls
 from ..sources_block import sanitize_sources_block
 from ..tools import markdown_to_pdf
 from . import precision, run_config
-from .assemble import assemble_draft
-from .evidence_export import DEGRADATION_LINE, write_evidence
+from .assemble import ANALYSIS_SECTION, assemble_draft
+from .evidence_export import DEGRADATION_LINE, run_config_dump, write_evidence
 from .grounding import check_grounding, grounding_banner
+from .insight import ANALYSIS_LABEL
 from .research import _round
 from .state import ArgusState
 
 logger = logging.getLogger("argus.nodes")
-
-_ANALYSIS = "Analysis"        # = insight.ANALYSIS_SECTION
 
 
 # ---------------------------------------------------------------------------
@@ -105,19 +104,23 @@ def _integrity(md: str, fetched: list[dict]) -> str:
 def report_builder_node(state: ArgusState) -> dict:
     """The deliverable (v4 spec §3 WP-C).
 
-    1. Cut-not-flag: the panel's flagged findings and every finding citing
-       only unknown source ids are cut from their section or the analysis
-       (``quarantine.apply_cuts``: whole sentences; a section left empty is
-       dropped); a flag that cannot be located stays in the body and is
-       listed as such. Findings come back with their status.
+    1. Cut-not-flag: the panel's flagged findings, every finding citing
+       only unknown source ids and the kept near-duplicates of those are cut
+       from their section or the analysis, with the findings their cut
+       sentences state (``quarantine.apply_cuts``: whole sentences; a section
+       left empty is dropped); a flag that cannot be located stays in the
+       body and is listed as such. Findings come back with their status. An
+       unknown id cited beside known ones is stripped (a ``cite:`` line).
     2. The deterministic TL;DR over what was kept (``tldr_md``), then
-       ``assemble_draft``: TL;DR → sections → Analysis → appendices (cut,
-       unlocated, uncited specifics) → Sources over all of them. Without
-       sections (no usable evidence) the draft is the body.
+       ``assemble_draft``: TL;DR → sections → Analysis (dropped when the
+       cuts left only its label) → appendices (cut, unlocated, uncited
+       specifics) → Sources over all of them. Without sections (no usable
+       evidence) the draft is the body.
     3. Title block with the engines / recency / research lines; the
-       grounding banner and the "⚠ Not fact-checked" / "⚠ Degraded run"
-       banners above the body; the degradation notes by round after
-       Sources; the citation-integrity passes.
+       grounding banner and the "⚠ Not fact-checked" (unjudged findings, and
+       each section or the Analysis citing ``[n]`` with no finding) /
+       "⚠ Degraded run" banners above the body; the degradation notes by
+       round after Sources; the citation-integrity passes.
     4. report.md, report.pdf (ReportLab; a failure is an ``[r<k>] pdf:``
        line and a degradation note, and report.md is written again with
        it), evidence.json and metadata.json; then the report-preview gate.
@@ -126,7 +129,7 @@ def report_builder_node(state: ArgusState) -> dict:
     from .report_builder_helpers import (
         TLDR_LABEL, build_sidecar_metadata, build_tldr, degraded_run, info_lines, merge_reviewer_into_assessment,
         not_fact_checked, now_iso, render_degradation_notes, render_lecture_appendix, render_title_block,
-        sidecar_to_json)
+        sidecar_to_json, unjudged_sections)
     from .synthesis_modes import get_mode
 
     rc = run_config.require(state)
@@ -146,23 +149,38 @@ def report_builder_node(state: ArgusState) -> dict:
     sections = state.get("sections") or []
     analysis = state.get("analysis")
     mds = {s["title"]: s["md"] for s in sections}
-    if analysis:
-        mds[_ANALYSIS] = analysis["md"]
+    if analysis:            # its findings are the analyst's: insight replaces an "Analysis" section's
+        mds[ANALYSIS_SECTION] = analysis["md"]
     reasons = (pv.get("judge_verdicts") or {}).get("flag_reasons") or {}
     flagged = {i: reasons.get(i) or "not supported by its sources" for i in pv.get("flagged_finding_ids") or []}
     findings, cut_mds, cut_rows, unlocated = quarantine.apply_cuts(state.get("findings") or [], mds, flagged,
                                                                    len(fetched))
+    for title in cut_mds:
+        cut_mds[title], dropped = quarantine.strip_unknown_ids(cut_mds[title], len(fetched))
+        new_errors += [f'[r{rnd}] cite: dropped unknown source id [{i}] in section "{title}"' for i in dropped]
     appendices = [quarantine.render_cut_appendix(cut_rows), quarantine.render_unlocated_appendix(unlocated)]
 
     # 2. the TL;DR and the body
     tldr_md = None
     tldr = {"source": "omitted", "items": []}
+    unjudged: list[str] = []
     if sections:
-        kept_sections = [{**s, "md": cut_mds[s["title"]]} for s in sections if cut_mds[s["title"]].strip()]
-        analysis_md = cut_mds.get(_ANALYSIS) or ""
+        def body(s: dict) -> str:       # an outline section titled "Analysis" keeps its own body
+            return s["md"] if analysis and s["title"] == ANALYSIS_SECTION else cut_mds[s["title"]]
+        kept_sections = [{**s, "md": body(s)} for s in sections if body(s).strip()]
+        analysis_md = cut_mds[ANALYSIS_SECTION] if analysis else ""
+        if analysis and analysis_md.strip() == ANALYSIS_LABEL:
+            analysis_md = ""
+            new_errors.append("analysis: every takeaway cut — section dropped")
         items, source = build_tldr(analysis=analysis, analysis_md=analysis_md, sections=kept_sections,
                                    findings=findings)
+        items = [quarantine.strip_unknown_ids(i, len(fetched))[0] for i in items]
         tldr = {"source": source, "items": items}
+        if rc.panel.enabled and rc.panel.grounding:     # with the judge off, nothing is due for judging
+            parts = [(s["title"], s["md"]) for s in kept_sections]
+            if analysis_md:
+                parts.append((ANALYSIS_SECTION, analysis_md))
+            unjudged = unjudged_sections(parts, findings, [*(state.get("errors") or []), *new_errors])
         if items:
             tldr_md = TLDR_LABEL + "\n\n" + "\n".join(f"- {i}" for i in items)
         else:
@@ -186,8 +204,8 @@ def report_builder_node(state: ArgusState) -> dict:
         validated_assessment=validated,
         info_lines=info_lines(state=state, rc=rc, panel=pv,
                               reroute_rate=summarize_calls(model_calls)["reroute_rate"]))
-    unchecked = not_fact_checked(rc, pv, findings)
-    degraded_items = degraded_run(model_calls, [*(state.get("errors") or []), *new_errors])
+    unchecked = not_fact_checked(rc, pv, findings, unjudged)
+    degraded_items = degraded_run(model_calls, [*(state.get("errors") or []), *new_errors], pv)
     banners = "".join(f"> ⚠ {b}\n\n" for b in (
         f"Not fact-checked — {unchecked}" if unchecked else None,
         f"Degraded run — {degraded_items}" if degraded_items else None) if b)
@@ -217,17 +235,15 @@ def report_builder_node(state: ArgusState) -> dict:
     errors = [*(state.get("errors") or []), *new_errors]
     spend = state.get("search_spend") or {}
     engines = summarize_calls(model_calls, errors, exa_usd=spend.get("exa_usd"))
-    degraded = bool(degraded_items) or int(pv.get("judged") or 0) < int(pv.get("total") or 0)
+    degraded = bool(degraded_items) or int(pv.get("judged") or 0) < int(pv.get("total") or 0) or bool(unjudged)
     write_evidence(evidence_path, state, findings=findings, errors=errors, degraded=degraded, tldr=tldr,
                    engines=engines, generated_at=now_iso())
-    rc_dump = rc.model_dump(mode="json")
-    rc_dump["engines"].pop("roles", None)
     meta = build_sidecar_metadata(
         topic=state["user_request"], thread_id=state.get("thread_id"), user_id=state.get("user_id"),
         length=rc.length, length_label=mode.label, stamp=stamp, n_findings=len(kept), n_sources=len(fetched),
         revision_rounds=int(state.get("revision_rounds") or 0), validated_assessment=validated,
         lecture_appendix=state.get("lecture_appendix"), model_calls=model_calls, engines=engines,
-        run_config=rc_dump, evidence_path=str(evidence_path),
+        run_config=run_config_dump(rc), evidence_path=str(evidence_path),
         degradations=[e for e in errors if DEGRADATION_LINE.match(e)], degraded=degraded,
         exa_usd=spend.get("exa_usd"))
     (folder / "metadata.json").write_text(sidecar_to_json(meta), encoding="utf-8")
