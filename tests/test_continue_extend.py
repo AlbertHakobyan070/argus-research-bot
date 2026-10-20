@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -26,6 +26,7 @@ from langgraph.types import Command
 
 from argus.bot import common as bot_common
 from argus.bot import history as bot_history
+from argus.bot import runs
 from argus.bot.history import append_cmd, continue_cmd
 from argus.config import Settings
 from argus.engines import registry
@@ -36,7 +37,7 @@ from argus.graph import research as research_mod
 from argus.graph import search_providers as sp_mod
 from argus.graph.run_config import FetchConfig
 
-from helpers import fake_engines_snapshot, make_run_config
+from helpers import fake_engines_snapshot, make_run_config, settle_runs
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +224,10 @@ def test_fetch_missing_local_file_is_loud(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _clear_inflight():
+async def _clear_inflight():
     bot_common._inflight.clear()
     yield
+    await settle_runs()
     bot_common._inflight.clear()
 
 
@@ -250,8 +252,11 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
-    """/continue first awaits registry.active_snapshot() (v4 WP-A)."""
+async def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """/continue first awaits registry.active_snapshot() (v4 WP-A); a
+    re-attached plan card names the shipped engines file's profiles."""
+    monkeypatch.setattr(registry, "_state", registry._State())
+    await registry.load_config()
     monkeypatch.setattr(registry, "active_snapshot",
                         AsyncMock(return_value=fake_engines_snapshot()))
 
@@ -283,6 +288,9 @@ class _FakeLib:
 
     async def set_run_status(self, run_id, status, report_dir=None):
         self.statuses.append((run_id, status))
+        return True
+
+    async def update_run(self, run_id, **cols):
         return True
 
     async def list_runs(self, chat_id=None, limit=10):
@@ -353,12 +361,18 @@ async def test_append_again_requeues_a_ref_continue_marked_failed():
 
 
 class _FakeGraph:
-    """Finished-run double: empty snap.next, records update/stream calls."""
+    """Finished-run double (empty snap.next by default): records update and
+    stream calls; a drive runs ``on_drive(values)`` and stops at the report
+    preview."""
 
-    def __init__(self, values, nxt=()):
+    def __init__(self, values, nxt=(), on_drive=None):
         self.values = values
         self.nxt = tuple(nxt)
         self.updates: list[tuple] = []
+        self.streams: list = []
+        self.on_drive = on_drive or (lambda values: None)
+        self.nodes: dict = {}
+        self.checkpointer = SimpleNamespace(aget_tuple=AsyncMock(return_value=None))
 
     async def aget_state(self, cfg):
         return SimpleNamespace(values=self.values, next=self.nxt,
@@ -366,6 +380,25 @@ class _FakeGraph:
 
     async def aupdate_state(self, cfg, payload, as_node=None):
         self.updates.append((payload, as_node))
+        self.values = {**self.values, **payload}
+
+    def astream(self, resume, cfg, **_kw):
+        self.streams.append(resume)
+        self.on_drive(self.values)
+        self.nxt = ("deliver",)
+
+        async def _gen():
+            return
+            yield
+
+        return _gen()
+
+
+async def _continue(update, ctx) -> None:
+    """/continue, then wait for the drive it started (if any)."""
+    await runs.init(ctx.application)
+    await continue_cmd(update, ctx)
+    await settle_runs()
 
 
 async def test_continue_finished_run_forks_with_full_sources():
@@ -373,21 +406,15 @@ async def test_continue_finished_run_forks_with_full_sources():
     lib.pending = [{"ref": "asset:7", "kind": "asset", "status": "pending"}]
     old_sources = [{"kind": "web", "title": "Old",
                     "url": "https://old.example/o"}]
-    graph = _FakeGraph(values={"sources": old_sources, "length": "short"})
-
-    async def fake_resume(ctx, info, resume_input=...):
-        assert resume_input is None, (
-            "a fork (no pending interrupt) must resume with None, not "
-            "Command(resume=True)")
+    def research_ingests(values):
         from argus.graph.research import _local_url
-        graph.values["fetched"] = [{"url": _local_url(r"V:\t.txt"), "title": "T"}]   # research ingested it
-        info["awaiting"] = "report_preview"
+        values["fetched"] = [{"url": _local_url(r"V:\t.txt"), "title": "T"}]   # research ingested it
 
-    with patch.object(bot_history, "_resume_after_plan",
-                      side_effect=fake_resume) as rp:
-        await continue_cmd(_update(), _ctx(["ab12"], lib, graph))
+    graph = _FakeGraph(values={"sources": old_sources, "length": "short"}, on_drive=research_ingests)
+    await _continue(_update(), _ctx(["ab12"], lib, graph))
 
-    assert rp.call_count == 1
+    assert graph.streams == [None], (
+        "a fork (no pending interrupt) must resume with None, not Command(resume=True), exactly once")
     payload, as_node = graph.updates[-1]
     assert as_node == "deliver", "fork must be positioned after deliver"
     assert payload["extend_requested"] is True
@@ -408,18 +435,16 @@ async def test_continue_marks_only_fetched_appends_ingested_and_names_the_failur
     lib = _FakeLib(run=dict(_RUN))
     lib.pending = [{"ref": "https://ok.example/a", "kind": "url", "status": "pending"},
                    {"ref": "https://walled.example/b", "kind": "url", "status": "pending"}]
-    graph = _FakeGraph(values={"sources": [], "length": "short"})
     line = ("fetch https://walled.example/b failed: native: HTTP 403; exa_contents: no EXA_API_KEY "
             "(rungs tried: native, exa_contents)")
 
-    async def fake_resume(ctx, info, resume_input=...):
-        graph.values.update(fetched=[{"url": "https://ok.example/a", "title": "A"}],
-                            errors=["an earlier, unrelated line", line])
-        info["awaiting"] = "report_preview"
+    def research_fetches(values):
+        values.update(fetched=[{"url": "https://ok.example/a", "title": "A"}],
+                      errors=["an earlier, unrelated line", line])
 
+    graph = _FakeGraph(values={"sources": [], "length": "short"}, on_drive=research_fetches)
     update = _update()
-    with patch.object(bot_history, "_resume_after_plan", side_effect=fake_resume):
-        await continue_cmd(update, _ctx(["ab12"], lib, graph))
+    await _continue(update, _ctx(["ab12"], lib, graph))
 
     assert lib.marked == [("ab12cd34", ("https://ok.example/a",), "ingested"),
                           ("ab12cd34", ("https://walled.example/b",), "failed")]
@@ -439,12 +464,13 @@ async def test_continue_reattaches_plan_gate_paused_run():
     update = _update()
     ctx = _ctx(["ab12"], lib, graph)
 
-    await continue_cmd(update, ctx)
+    await _continue(update, ctx)
 
     assert "ab12cd34" in bot_common._inflight
-    info = bot_common._inflight["ab12cd34"]
-    assert info["awaiting"] == "plan_approval"
-    assert info["length"] == "long"
+    h = bot_common._inflight["ab12cd34"]
+    assert not h.live and h.gate_kind == runs.PLAN
+    assert (await runs.plan_payload("ab12cd34"))["length"] == "long"
+    assert graph.streams == [], "a re-attach drives nothing"
     # Plan message re-rendered with the run-scoped keyboard.
     sends = ctx.application.bot.send_message.await_args_list
     markup = next((c.kwargs.get("reply_markup") for c in sends

@@ -76,7 +76,7 @@ def test_format_plan_basic():
              "rationale": "adjacent commentary"},
         ],
     }
-    text = _format_plan(plan)
+    text = _format_plan({"plan": plan})
     assert "Research plan" in text
     assert "Investigate X" in text
     assert "What is X?" in text
@@ -100,7 +100,7 @@ def test_format_plan_prefers_query_over_target_url():
              "rationale": "adjacent"},
         ],
     }
-    text = _format_plan(plan)
+    text = _format_plan({"plan": plan})
     # The fabricated URL the researcher will never use must not appear
     # anywhere in the plan preview.
     assert "blog.ought.com/fabricated-x" not in text
@@ -122,7 +122,7 @@ def test_format_plan_never_shows_planner_urls():
              "https://example.com/x", "rationale": "docs"},
         ],
     }
-    text = _format_plan(plan)
+    text = _format_plan({"plan": plan})
     assert "example.com/x" not in text, (
         "planner-invented URLs must never reach the plan preview")
 
@@ -137,7 +137,7 @@ def test_format_plan_lists_live_found_sources():
         {"title": "Real paper", "url": "https://arxiv.org/abs/2501.00001",
          "kind": "paper"},
     ]
-    text = _format_plan(plan, sources=sources)
+    text = _format_plan({"plan": plan, "sources": sources})
     assert "Found sources" in text
     assert "https://github.com/real/repo" in text
     assert "Real paper" in text
@@ -146,7 +146,7 @@ def test_format_plan_lists_live_found_sources():
 
 def test_format_plan_warns_when_live_search_found_nothing():
     plan = {"summary": "s", "sub_questions": ["q"], "planned_sources": []}
-    text = _format_plan(plan, sources=[])
+    text = _format_plan({"plan": plan, "sources": []})
     assert "no sources" in text.lower(), (
         "an empty live-search result must be called out loudly at the "
         "gate — approving would fetch nothing")
@@ -160,12 +160,12 @@ def test_format_plan_no_query_no_url_says_live_search():
             {"kind": "search", "rationale": "broad"},
         ],
     }
-    text = _format_plan(plan)
+    text = _format_plan({"plan": plan})
     assert "live search" in text.lower()
 
 
 def test_plan_keyboard_has_buttons():
-    kb = _plan_keyboard()
+    kb = _plan_keyboard({})
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert any("Approve" in l for l in labels)
     assert any("Cancel" in l for l in labels)
@@ -228,3 +228,94 @@ def test_report_keyboard_has_extend_button():
     labels = [b.text for row in _report_keyboard().inline_keyboard for b in row]
     assert any("Extend" in l for l in labels)
     assert any("Send" in l for l in labels)
+
+
+def test_help_lists_engines():
+    """/engines (WP-A) belongs in the compact help (pointer 11)."""
+    assert "/engines" in HELP_TEXT
+
+
+def test_plan_keyboard_rows_and_run_scoping():
+    """Lengths (✅ on the chosen), depths (✅ on the chosen), the cycling
+    ⚙ profile and 🕒 recency buttons, then Approve / Edit / Cancel — every
+    button scoped to the run (WP-E1, spec §3)."""
+    kb = _plan_keyboard({"run_id": "ab12cd34", "length": "long", "depth": "exhaustive",
+                         "profile": "max-quality", "profile_problem": "ANTHROPIC_API_KEY is not set",
+                         "recency": "w"})
+    rows = [[(b.text, b.callback_data) for b in row] for row in kb.inline_keyboard]
+    assert [d for _, d in rows[0] + rows[1]] == [f"len:{m}:ab12cd34" for m in
+                                                ("tldr", "short", "medium", "long", "lecture")]
+    assert [t for t, _ in rows[0] + rows[1] if "✅" in t] == ["Long ✅"]
+    assert [d for _, d in rows[2]] == [f"dep:{d}:ab12cd34" for d in ("quick", "standard", "deep", "exhaustive")]
+    assert [t for t, _ in rows[2] if "✅" in t] == ["Exhaustive ✅"]
+    assert rows[3] == [("⚙ max-quality ⚠", "prof:next:ab12cd34"), ("🕒 past week", "rec:next:ab12cd34")]
+    assert [d for _, d in rows[4]] == ["plan:approve:ab12cd34", "plan:edit:ab12cd34", "plan:cancel:ab12cd34"]
+    assert not any("console" in t.lower() for row in rows for t, _ in row)     # no console button (spec §3)
+
+
+@pytest.mark.parametrize("payload,shown", [
+    ({"exa_enabled": True, "exa_estimate_usd": 0.054}, "Exa: ≈ $0.054"),
+    ({"exa_enabled": True, "exa_estimate_usd": None}, "Exa: n/a"),            # no pricing configured
+    ({"exa_enabled": False, "exa_estimate_usd": None}, "Exa: off"),
+])
+def test_format_plan_shows_the_exa_estimate_only_for_an_enabled_exa(payload, shown):
+    text = _format_plan({"plan": {"summary": "s"}, **payload})
+    assert shown in text
+    assert ("≈" in text) is (payload["exa_estimate_usd"] is not None)
+
+
+@pytest.mark.parametrize("recency,window,shown", [
+    (None, {"window": "m", "start_date": "2026-09-20"}, "Recency: auto — past month (since 2026-09-20)"),
+    (None, None, "Recency: auto — no filter"),
+    ("d", {"window": "d", "start_date": "2026-10-19"}, "Recency: past day (since 2026-10-19)"),
+    ("any", None, "Recency: any date (no filter)"),
+])
+def test_format_plan_shows_archetype_recency_depth_and_profile(recency, window, shown):
+    text = _format_plan({"plan": {"summary": "s"}, "archetype": "forecast", "recency": recency,
+                         "recency_window": window, "length": "medium", "depth": "standard", "depth_auto": True,
+                         "profile": "free-proxy", "profile_problem": None})
+    assert text.splitlines()[0] == "📋 *Research plan*  ·  mode: Medium  ·  depth: standard (auto)"
+    assert "Archetype: forecast" in text and shown in text and "Engines: free-proxy" in text
+
+
+async def test_hook_runner_runs_every_hook_and_reraises_the_first_failure():
+    """Pointer 1: a raising stop/shutdown hook never skips the later hooks
+    or the library and saver close; the first error is re-raised."""
+    from unittest.mock import AsyncMock, MagicMock
+    from argus.bot import app as bot_app
+
+    ran: list[str] = []
+
+    async def bad(app):
+        ran.append("bad")
+        raise RuntimeError("tunnel stop failed")
+
+    async def worse(app):
+        ran.append("worse")
+        raise ValueError("second failure")
+
+    async def good(app):
+        ran.append("good")
+
+    app = SimpleNamespace(bot_data={"library": MagicMock(close=AsyncMock()),
+                                    "saver_cm": MagicMock(__aexit__=AsyncMock())})
+    with pytest.raises(RuntimeError, match="tunnel stop failed"):
+        await bot_app._run_hooks([bad, worse, good], app)
+    assert ran == ["bad", "worse", "good"]
+
+    ran.clear()
+    original = bot_app.POST_SHUTDOWN_HOOKS[:]
+    bot_app.POST_SHUTDOWN_HOOKS[:] = [bad, good]
+    try:
+        with pytest.raises(RuntimeError, match="tunnel stop failed"):
+            await bot_app._post_shutdown(app)
+    finally:
+        bot_app.POST_SHUTDOWN_HOOKS[:] = original
+    assert ran == ["bad", "good"]
+    app.bot_data["library"].close.assert_awaited_once()
+    app.bot_data["saver_cm"].__aexit__.assert_awaited_once()
+
+
+def test_the_run_driver_hooks_are_registered():
+    from argus.bot import app as bot_app, runs
+    assert runs.init in bot_app.POST_INIT_HOOKS and runs.drain_all in bot_app.POST_STOP_HOOKS

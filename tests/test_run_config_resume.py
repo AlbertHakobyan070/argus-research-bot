@@ -5,7 +5,9 @@ point (plan approve, plan edit, report send / extend / revise, /continue
 re-attach and extend fork) first resolves the engines snapshot and calls
 ``ensure_in_checkpoint``, so a pre-v4 checkpoint gets the legacy defaults
 visibly (Review Focus 1). Approve writes ``rc.rebuild(...)`` with the chosen
-length to the checkpoint and the library, before anything else changes.
+length to the checkpoint and the library, before anything else changes. A
+resume that cannot resolve is refused in the chat and changes nothing (the
+run driver, ``bot/runs.py``, WP-E1).
 
 The real Argus graph (LLM and network nodes stubbed; gates, deliver,
 extend_prep, revise_prep and the routers real) on a MemorySaver, a real
@@ -23,11 +25,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from argus import llm
 from argus.bot import app as bot_app
 from argus.bot import common as bot_common
 from argus.bot import history as bot_history
 from argus.bot import research as bot_research
+from argus.bot import runs
 from argus.config import Settings
 from argus.engines import registry
 from argus.engines.registry import EngineConfigError
@@ -37,7 +39,7 @@ from argus.graph.state import (
     ArgusState, EvidenceClaim, EvidenceNote, FetchedItem, Finding, OutlineSection,
     PanelVerdict, ResearchBrief)
 from argus.library import Library
-from helpers import fake_engines_snapshot, fake_llm, make_run_config
+from helpers import fake_engines_snapshot, fake_llm, make_run_config, settle_runs
 
 LEGACY = "legacy: run_config defaults applied (pre-v4 checkpoint)"
 RUN_ID, CHAT = "ab12cd34", 5
@@ -52,7 +54,7 @@ _V3_STATE = {"thread_id": THREAD, "user_id": CHAT, "user_request": "topic", "len
 
 
 @pytest.fixture(autouse=True)
-def _bot_env(monkeypatch, tmp_path):
+async def _bot_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test")
     dummy = dataclasses.replace(
         Settings.load(), telegram_allowed_user_id=CHAT,
@@ -63,11 +65,14 @@ def _bot_env(monkeypatch, tmp_path):
     for mod in (bot_app, bot_research, bot_history):
         monkeypatch.setattr(mod, "get_settings", lambda: dummy)
         monkeypatch.setattr(mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(registry, "_state", registry._State())
+    await registry.load_config()                 # the plan card names the shipped profiles; no network
     monkeypatch.setattr(registry, "active_snapshot",
                         AsyncMock(return_value=fake_engines_snapshot()))
     bot_common._inflight.clear()
     bot_common._pending_reply.clear()
     yield
+    await settle_runs()
     bot_common._inflight.clear()
     bot_common._pending_reply.clear()
 
@@ -133,7 +138,8 @@ def _callback(data: str) -> MagicMock:
     return u
 
 
-def _ctx(graph, lib, args=()) -> MagicMock:
+async def _ctx(graph, lib, args=()) -> MagicMock:
+    """The handlers' context; the run driver drives on the same application."""
     app = MagicMock()
     app.bot = MagicMock()
     app.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
@@ -144,6 +150,7 @@ def _ctx(graph, lib, args=()) -> MagicMock:
     ctx = MagicMock()
     ctx.application = app
     ctx.args = list(args)
+    await runs.init(app)
     return ctx
 
 
@@ -183,17 +190,23 @@ async def _run_at(graph, lib, at: str, *, state: dict | None = None) -> None:
                              depth=rc["depth"], origin=rc["origin"])
 
 
-async def _attach(graph, at: str, length: str = "long") -> dict:
-    """The in-flight entry the bot holds for a run at a gate (as /continue's
-    re-attach builds it, minus its own ensure_in_checkpoint)."""
-    info = {"run_id": RUN_ID, "chat_id": CHAT, "thread_id": THREAD,
-            "state": {"user_request": "topic"}, "stage": "continue", "length": length,
-            "cfg": CFG, "graph": graph, "plan_text": "Plan",
-            "awaiting": "plan_approval" if at == "plan" else "report_preview"}
-    if at == "report":
-        info["paths"] = (await graph.aget_state(CFG)).values.get("report_paths") or {}
-    bot_common._inflight[RUN_ID] = info
-    return info
+async def _attach(graph, at: str, length: str = "long") -> runs.RunHandle:
+    """The handle the run driver holds for a run resting at a gate (as a
+    drive's end or /continue leaves it, minus /continue's own
+    ensure_in_checkpoint — the injection is then the action's own); at the
+    plan gate ``length`` is the chosen length (a Length tap)."""
+    h = runs.RunHandle(run_id=RUN_ID, chat_id=CHAT, thread_id=THREAD, topic="topic")
+    h.gate_kind = runs.PLAN if at == "plan" else runs.REPORT
+    h.choices = runs.Choices(length=length)
+    bot_common._inflight[RUN_ID] = h
+    return h
+
+
+def _refusal(ctx) -> str:
+    """The one message an action sent: its refusal."""
+    (text,) = _sent(ctx)
+    assert text.startswith(f"⚠️ Could not ") and f"run `{RUN_ID}`" in text, text
+    return text
 
 
 def _approve(ctx):
@@ -237,9 +250,10 @@ async def test_pre_v4_checkpoint_survives_every_resume_path(graph, lib, name, at
     assert "run_config" not in (await graph.aget_state(CFG)).values
     if attached:
         await _attach(graph, at)
-    ctx = _ctx(graph, lib)
+    ctx = await _ctx(graph, lib)
 
     await entry(ctx)                                            # no exception
+    await settle_runs()                                         # the drive it started, if any
 
     snap = await graph.aget_state(CFG)
     rc = require(snap.values)                     # valid, and its length agrees with the state's
@@ -257,8 +271,9 @@ async def test_require_rejects_a_checkpoint_whose_length_disagrees_with_its_conf
         require((await graph.aget_state(CFG)).values)
     before = (await graph.aget_state(CFG)).config
     await _attach(graph, "plan", length="short")
-    with pytest.raises(ValueError, match="run_config"):          # resumes refuse it
-        await _approve(_ctx(graph, lib))
+    ctx = await _ctx(graph, lib)
+    await _approve(ctx)                                         # resumes refuse it, in the chat
+    assert "run_config" in _refusal(ctx)
     assert (await graph.aget_state(CFG)).config == before
 
 
@@ -270,9 +285,10 @@ async def test_approve_rebuilds_the_config_keeping_console_overrides(graph, lib)
     rc0 = make_run_config("short", **{"research.waves": 2})   # quick, with a console override
     await _run_at(graph, lib, "plan", state=dict(_V3_STATE, length="short", run_config=rc0))
     await _attach(graph, "plan", length="long")                # Length tap → depth quick → deep
-    ctx = _ctx(graph, lib)
+    ctx = await _ctx(graph, lib)
 
     await _approve(ctx)
+    await settle_runs()
 
     values = (await graph.aget_state(CFG)).values
     rc = require(values)
@@ -307,8 +323,9 @@ async def test_a_failed_resolution_leaves_the_run_unchanged(graph, lib, monkeypa
                                                             entry, failure):
     """The engines snapshot and ensure_in_checkpoint come before any change: a
     failure (the proxy down after a restart; a checkpoint ensure cannot repair)
-    leaves the checkpoint, the library status, the in-flight entry and the
-    keyboard as they were, so the run is never stranded as running."""
+    is refused in the chat and leaves the checkpoint, the library status, the
+    run's handle and the keyboard as they were, so the run is never stranded
+    as running."""
     at, attached, data = _FAIL_ENTRIES[entry]
     state = dict(_V3_STATE)
     if failure == "no_length":
@@ -321,20 +338,21 @@ async def test_a_failed_resolution_leaves_the_run_unchanged(graph, lib, monkeypa
         await _attach(graph, at)
     before = await graph.aget_state(CFG)
     status = (await lib.get_run(RUN_ID))["status"]
-    ctx = _ctx(graph, lib)
+    ctx = await _ctx(graph, lib)
     upd = _callback(f"{data}:{RUN_ID}") if data else None
 
-    with pytest.raises(EngineConfigError if failure == "engines" else ValueError):
-        await (bot_app.on_callback(upd, ctx) if upd else _continue(ctx))
+    await (bot_app.on_callback(upd, ctx) if upd else _continue(ctx))
 
+    assert ("cannot list models" if failure == "engines" else "has no length") in _refusal(ctx)
     after = await graph.aget_state(CFG)
     assert (after.config, after.values) == (before.config, before.values)
     assert (await lib.get_run(RUN_ID))["status"] == status
-    assert (bot_common._inflight.get(RUN_ID) or {}).get("plan_approved") is not True
-    ctx.application.bot.send_message.assert_not_awaited()
+    h = bot_common._inflight.get(RUN_ID)
+    assert (h is None) if not attached else (not h.live and h.gate_kind is not None)
     ctx.application.bot.send_document.assert_not_awaited()
+    ctx.application.bot.edit_message_text.assert_not_awaited()      # the keyboard stays
     if upd:
-        upd.callback_query.edit_message_text.assert_not_awaited()   # the keyboard stays
+        upd.callback_query.edit_message_text.assert_not_awaited()
 
 
 async def test_approve_that_cannot_rebuild_leaves_the_run_unchanged(graph, lib):
@@ -345,15 +363,15 @@ async def test_approve_that_cannot_rebuild_leaves_the_run_unchanged(graph, lib):
     await _attach(graph, "plan", length="long")
     before = await graph.aget_state(CFG)
     upd = _callback(f"plan:approve:{RUN_ID}")
-    ctx = _ctx(graph, lib)
-    with pytest.raises(ValueError, match="total_fetch_cap"):
-        await bot_app.on_callback(upd, ctx)
+    ctx = await _ctx(graph, lib)
+    await bot_app.on_callback(upd, ctx)
+    assert "total_fetch_cap" in _refusal(ctx)
     after = await graph.aget_state(CFG)
     assert after.config == before.config
     assert (await lib.get_run(RUN_ID))["status"] == "awaiting_plan"
-    assert bot_common._inflight[RUN_ID].get("plan_approved") is not True
+    assert not bot_common._inflight[RUN_ID].live
     upd.callback_query.edit_message_text.assert_not_awaited()
-    ctx.application.bot.send_message.assert_not_awaited()
+    ctx.application.bot.edit_message_text.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +379,11 @@ async def test_approve_that_cannot_rebuild_leaves_the_run_unchanged(graph, lib):
 # ---------------------------------------------------------------------------
 
 async def test_research_cmd_records_the_run_config_in_checkpoint_and_library(graph, lib):
-    ctx = _ctx(graph, lib, ["/length", "long", "some", "topic"])
+    ctx = await _ctx(graph, lib, ["/length", "long", "some", "topic"])
     await bot_research.research_cmd(_update(), ctx)
-    ((run_id, info),) = bot_common._inflight.items()
-    values = (await graph.aget_state(info["cfg"])).values
+    await settle_runs()                                         # the drive to the plan gate
+    ((run_id, h),) = bot_common._inflight.items()
+    values = (await graph.aget_state(h.cfg)).values
     rc = require(values)
     assert (rc.length, rc.depth, rc.origin, rc.legacy) == ("long", "deep", "telegram", False)
     assert rc.engines == fake_engines_snapshot()
@@ -375,16 +394,17 @@ async def test_research_cmd_records_the_run_config_in_checkpoint_and_library(gra
 
 
 async def test_research_cmd_tells_the_chat_when_the_brief_is_exhausted(monkeypatch, lib):
-    """``brief.draft`` must raise (spec §2.1): the user is told before the
-    re-raise, the run is marked ``error`` and leaves the in-flight registry."""
+    """``brief.draft`` must raise (spec §2.1): the drive reports it — the user
+    is told, the run is marked ``error`` and leaves the in-flight registry."""
     monkeypatch.setattr(graph_mod, "intake_node", lambda s: {"mode": "deep"})
     fake_llm(monkeypatch, lambda system, human: "no JSON here")       # the real brief node, unparseable
     graph = graph_mod.build_graph(checkpointer=MemorySaver())
-    ctx = _ctx(graph, lib, ["some", "topic"])
-    with pytest.raises(llm.EngineError) as raised:
-        await bot_research.research_cmd(_update(), ctx)
-    assert raised.value.role == "brief.draft"
-    assert _sent(ctx)[-1] == f"⚠️ Research failed: {raised.value}"
+    ctx = await _ctx(graph, lib, ["some", "topic"])
+    await bot_research.research_cmd(_update(), ctx)
+    await settle_runs()
+    failed = [t for t in _sent(ctx) if t.startswith("⚠️ Research failed: ")]
+    assert failed == [t for t in failed if t.startswith("⚠️ Research failed: role brief.draft: every engine failed")]
+    assert len(failed) == 1
     (row,) = await lib.list_runs(chat_id=CHAT)
     assert row["status"] == "error"
     assert bot_common._inflight == {}
@@ -394,9 +414,10 @@ async def test_ask_cmd_records_the_run_config_in_checkpoint_and_library(monkeypa
     monkeypatch.setattr(graph_mod, "intake_node", lambda s: {"mode": "quick"})
     monkeypatch.setattr(graph_mod, "quick_answer_node", lambda s: {"quick_answer": "42"})
     quick = graph_mod.quick_answer_graph(checkpointer=MemorySaver())
-    ctx = _ctx(None, lib, ["what", "is", "x"])
+    ctx = await _ctx(None, lib, ["what", "is", "x"])
     ctx.application.bot_data["quick_graph"] = quick
     await bot_research.ask_cmd(_update(), ctx)
+    await settle_runs()                                         # the drive to the answer
     (row,) = await lib.list_runs(chat_id=CHAT)
     values = (await quick.aget_state({"configurable": {"thread_id": row["thread_id"]}})).values
     rc = require(values)

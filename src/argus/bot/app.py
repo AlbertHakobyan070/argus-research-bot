@@ -21,7 +21,7 @@ from ..engines.registry import EngineConfigError
 from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from ..library import Library
 from ..media import resolve_ffmpeg
-from . import delete, engines_cmd, history, media, research
+from . import delete, engines_cmd, history, media, research, runs
 from .common import (
     _TG_CONNECT_TIMEOUT_S, _TG_MEDIA_WRITE_TIMEOUT_S, _TG_POOL_TIMEOUT_S,
     _TG_READ_TIMEOUT_S, _TG_WRITE_TIMEOUT_S, _allowed, _safe_send, _set_run_status,
@@ -33,15 +33,19 @@ logger = logging.getLogger("argus.bot")
 # Hook points for later work packages. Each HANDLER_MODULES entry has
 # register(app), called in list order by build_application. Each POST_*
 # hook is ``async def hook(app: Application) -> None``, awaited in list
-# order with exceptions propagating: POST_INIT_HOOKS at the end of
-# _post_init; POST_STOP_HOOKS from post_stop, after Application.stop()
-# has awaited the app.create_task tasks; POST_SHUTDOWN_HOOKS at the start
-# of _post_shutdown, before the library and checkpoint saver close.
+# order: POST_INIT_HOOKS at the end of _post_init (an exception aborts the
+# startup); POST_STOP_HOOKS from post_stop, after Application.stop() has
+# awaited the app.create_task tasks; POST_SHUTDOWN_HOOKS at the start of
+# _post_shutdown, before the library and checkpoint saver close. A failing
+# stop/shutdown hook is logged, the later hooks and the closes still run,
+# and the first failure is re-raised (_run_hooks).
 HANDLER_MODULES = [research, media, history, delete]
 HANDLER_MODULES.append(engines_cmd)
 POST_INIT_HOOKS: list = []
 POST_STOP_HOOKS: list = []
 POST_SHUTDOWN_HOOKS: list = []
+POST_INIT_HOOKS.append(runs.init)
+POST_STOP_HOOKS.append(runs.drain_all)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -252,26 +256,40 @@ def app_ctx(app: Application):
     return SimpleNamespace(application=app)
 
 
+async def _run_hooks(hooks: list, app: Application) -> None:
+    """Await every hook in order. A failing hook is logged and the later
+    ones still run; the first failure is re-raised at the end."""
+    first: Exception | None = None
+    for hook in hooks:
+        try:
+            await hook(app)
+        except Exception as e:
+            logger.exception("hook %s failed", getattr(hook, "__qualname__", hook))
+            first = first or e
+    if first is not None:
+        raise first
+
+
 async def _post_stop(app: Application) -> None:
-    for hook in POST_STOP_HOOKS:
-        await hook(app)
+    await _run_hooks(POST_STOP_HOOKS, app)
 
 
 async def _post_shutdown(app: Application) -> None:
-    for hook in POST_SHUTDOWN_HOOKS:
-        await hook(app)
-    lib = app.bot_data.get("library")
-    if lib is not None:
-        try:
-            await lib.close()
-        except Exception:
-            logger.exception("library close on shutdown failed")
-    saver_cm = app.bot_data.get("saver_cm")
-    if saver_cm is not None:
-        try:
-            await saver_cm.__aexit__(None, None, None)
-        except Exception:
-            logger.exception("saver close on shutdown failed")
+    try:
+        await _run_hooks(POST_SHUTDOWN_HOOKS, app)
+    finally:
+        lib = app.bot_data.get("library")
+        if lib is not None:
+            try:
+                await lib.close()
+            except Exception:
+                logger.exception("library close on shutdown failed")
+        saver_cm = app.bot_data.get("saver_cm")
+        if saver_cm is not None:
+            try:
+                await saver_cm.__aexit__(None, None, None)
+            except Exception:
+                logger.exception("saver close on shutdown failed")
 
 
 def build_application() -> Application:

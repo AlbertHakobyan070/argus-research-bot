@@ -26,12 +26,13 @@ from argus.bot import common as bot_common
 from argus.bot import engines_cmd
 from argus.bot import history as bot_history
 from argus.bot import research as bot_research
+from argus.bot import runs
 from argus.config import Settings
 from argus.engines import llm_openai, registry
 from argus.engines.registry import EngineConfigError
 from argus.library import Library
 
-from helpers import fake_engines_snapshot, make_run_config
+from helpers import fake_engines_snapshot, make_run_config, settle_runs
 
 CFG: dict = {
     "active_profile": "main",
@@ -358,13 +359,15 @@ class _Graph:
         self.order = order
         self.aupdate_state = AsyncMock()
         self.driven = False
+        self.nodes: dict = {}
+        self.checkpointer = SimpleNamespace(aget_tuple=AsyncMock(return_value=None))
 
-    def astream(self, inp, config=None, stream_mode=None):
+    def astream(self, inp, config=None, **_kw):
         self.driven = True
 
         async def gen():
             self.order.append("node:" + llm.resolve_tier("cheap"))
-            yield {"scout": {"sources": []}}
+            yield "updates", {"scout": {"sources": []}}
         return gen()
 
     async def aget_state(self, cfg):
@@ -375,31 +378,37 @@ class _Graph:
                                next=(), created_at="2026-10-19T00:00:00+00:00")
 
 
-def _info(graph) -> dict:
-    return {"run_id": "ab12cd34", "chat_id": 5, "thread_id": "tg:5:ab12cd34", "graph": graph,
-            "cfg": {"configurable": {"thread_id": "tg:5:ab12cd34"}}, "length": "short",
-            "state": {"user_request": "t"}, "paths": {}}
+_HANDLERS = ("research_cmd", "ask_cmd", "continue_cmd")
+_AT_GATE = {"approve": runs.PLAN, "plan_edit": runs.PLAN, "report_send": runs.REPORT,
+            "report_extend": runs.REPORT, "report_revise": runs.REPORT}
 
 
-def _entry_call(name: str, graph, lib):
-    """(coroutine, ctx) for one drive entry with minimal fakes."""
-    if name in ("research_cmd", "ask_cmd", "continue_cmd"):
+async def _call_entry(name: str, graph, lib):
+    """Run one drive entry with minimal fakes: a command handler (which
+    relays a refusal to the chat; returns None) or a driver action on a run
+    resting at its gate (returns its Outcome). Returns (outcome, ctx)."""
+    if name in _HANDLERS:
         ctx = _ctx(["ab12"] if name == "continue_cmd" else ["topic"], lib, graph=graph,
                    quick_graph=graph)
+        await runs.init(ctx.application)
         mod = bot_history if name == "continue_cmd" else bot_research
-        return getattr(mod, name)(_update(5), ctx), ctx
-    ctx = _ctx([], lib)
-    info = _info(graph)
-    bot_common._inflight[info["run_id"]] = info
-    if name == "_resume_after_report":
-        return bot_research._resume_after_report(ctx, info, MagicMock()), ctx
-    if name == "_resume_after_plan":
-        return bot_research._resume_after_plan(ctx, info), ctx
-    return getattr(bot_research, name)(ctx, info, "feedback"), ctx
+        await getattr(mod, name)(_update(5), ctx)
+        return None, ctx
+    ctx = _ctx([], lib, graph=graph)
+    await runs.init(ctx.application)
+    h = runs.RunHandle(run_id="ab12cd34", chat_id=5, thread_id="tg:5:ab12cd34", topic="t")
+    h.gate_kind, h.choices = _AT_GATE[name], runs.Choices(length="short")
+    bot_common._inflight[h.run_id] = h
+    action = {"approve": lambda: runs.approve_plan(h.run_id),
+              "plan_edit": lambda: runs.edit_plan(h.run_id, "feedback"),
+              "report_send": lambda: runs.report_action(h.run_id, "send"),
+              "report_extend": lambda: runs.report_action(h.run_id, "extend"),
+              "report_revise": lambda: runs.report_action(h.run_id, "revise", feedback="feedback")}[name]
+    return await action(), ctx
 
 
 @pytest.fixture
-def entry_env(monkeypatch, tmp_path):
+async def entry_env(monkeypatch, tmp_path):
     for mod in (bot_research, bot_history):
         monkeypatch.setattr(mod, "get_settings", lambda: _settings(tmp_path))
         monkeypatch.setattr(mod, "_allowed", lambda _s, _uid: True)
@@ -408,26 +417,32 @@ def entry_env(monkeypatch, tmp_path):
     lib.resolve_run = AsyncMock(return_value={"run_id": "ab12cd34", "thread_id": "tg:5:ab12cd34",
                                               "topic": "t", "length": "short"})
     lib.set_run_status = AsyncMock()
-    return lib
+    lib.pending_sources = AsyncMock(return_value=[])
+    bot_common._inflight.clear()
+    yield lib
+    await settle_runs()
+    bot_common._inflight.clear()
 
 
-@pytest.mark.parametrize("name", ["research_cmd", "ask_cmd", "_replan_after_edit",
-                                  "_revise_after_feedback", "_resume_after_plan",
-                                  "_resume_after_report", "continue_cmd"])
+@pytest.mark.parametrize("name", [*_HANDLERS, *_AT_GATE])
 async def test_every_drive_entry_awaits_the_snapshot_before_driving(monkeypatch, entry_env, name):
     async def refuse():
         raise EngineConfigError("role intake.classify: provider freellmapi: cannot list models")
     monkeypatch.setattr(registry, "active_snapshot", refuse)
     graph = _Graph([])
-    coro, ctx = _entry_call(name, graph, entry_env)
-    with pytest.raises(EngineConfigError):
-        await coro
+    out, ctx = await _call_entry(name, graph, entry_env)
     assert not graph.driven and not graph.aupdate_state.await_count
     entry_env.create_run.assert_not_awaited()
-    ctx.application.bot.send_message.assert_not_awaited()
+    if out is None:                                  # a handler: the refusal reached the chat (pointer 4)
+        (sent,) = ctx.application.bot.send_message.await_args_list
+        assert "⚠️" in sent.kwargs["text"] and "cannot list models" in sent.kwargs["text"]
+    else:                                            # the handler relays it; the run is as it was
+        assert out.code == "refused" and "cannot list models" in out.text
+        ctx.application.bot.send_message.assert_not_awaited()
+        assert not bot_common._inflight["ab12cd34"].live
 
 
-@pytest.mark.parametrize("name", ["research_cmd", "_replan_after_edit", "_resume_after_plan"])
+@pytest.mark.parametrize("name", ["research_cmd", "plan_edit", "approve"])
 async def test_a_resumed_run_after_restart_resolves_before_the_wrappers_run(
         monkeypatch, entry_env, name):
     order: list[str] = []
@@ -438,6 +453,6 @@ async def test_a_resumed_run_after_restart_resolves_before_the_wrappers_run(
         return registry._state.snapshot
     monkeypatch.setattr(registry, "active_snapshot", fill)   # restart: the cache starts empty
     graph = _Graph(order)
-    coro, _ctx_ = _entry_call(name, graph, None)
-    await coro
+    await _call_entry(name, graph, None)
+    await settle_runs()
     assert order == ["active_snapshot", "node:fake-model"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,21 +11,16 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
-from ..engines import registry
 from ..engines.urls import canonical_url
 from ..graph.research import _source_key
-from ..graph.run_config import ensure_in_checkpoint
-from ..graph.state import DEFAULT_LENGTH
 from ..library import Library
 from ..media import extract_urls
-from . import common
+from . import runs
 from .common import (
     HELP_TEXT, _HELP_MD_PATH, _STATUS_GLYPHS, _allowed, _bot_data_get,
-    _chat_entries, _get_library, _safe_send, _set_run_status,
+    _fmt_duration, _get_library, _safe_send,
 )
-from .research import (
-    _format_plan, _plan_keyboard, _resume_after_plan, _send_report_preview,
-)
+from .progress import describe
 
 logger = logging.getLogger("argus.bot")
 
@@ -35,30 +31,37 @@ logger = logging.getLogger("argus.bot")
 
 
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Registry-backed status: live in-flight runs + recent run history."""
+    """Registry-backed status: the tracked runs (stage, elapsed, last event,
+    or the gate they wait at), the console, recent run history."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
     chat_id = update.effective_chat.id
     lines: list[str] = []
-    entries = _chat_entries(chat_id)
+    entries = runs.tracked(chat_id)
     if entries:
         lines.append("*In flight:*")
-        for rid, i in entries.items():
-            lines.append(
-                f"- `{rid}` · stage `{i.get('stage','?')}` · awaiting "
-                f"`{i.get('awaiting','-')}` · length `{i.get('length','?')}`")
+        for rid, h in entries.items():
+            if not h.live:
+                lines.append(f"- `{rid}` · waiting at its {h.gate_kind} gate")
+                continue
+            elapsed = _fmt_duration(time.time() - h.started_at) or "0:00"
+            lines.append(f"- `{rid}` · stage `{h.stage or 'start'}` · {elapsed}"
+                         + (" · ⏹ cancelling" if h.control.drain_requested else ""))
+            last = runs.bus.since(rid, runs.bus.last_seq(rid) - 1)
+            if last:
+                lines.append(f"    last: {describe(last[-1])}")
     lib = _get_library(ctx)
-    runs: list[dict[str, Any]] = []
+    recent: list[dict[str, Any]] = []
     if lib is not None:
         try:
-            runs = await lib.list_runs(chat_id=chat_id, limit=5)
+            recent = await lib.list_runs(chat_id=chat_id, limit=5)
         except Exception:
             logger.exception("status: list_runs failed")
-    if runs:
+    if recent:
         lines.append("*Recent runs:*")
-        for r in runs:
+        for r in recent:
             glyph = _STATUS_GLYPHS.get(r["status"], "·")
             topic = (r["topic"] or "")[:48]
             lines.append(
@@ -67,8 +70,10 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if r.get("report_dir"):
                 lines.append(f"    `{r['report_dir']}`")
     if not lines:
-        await update.message.reply_text("No runs recorded for this chat yet.")
-        return
+        lines.append("No runs recorded for this chat yet.")
+    url = runs.console_url()
+    lines.append(f"Console: {url} ({'ok' if _bot_data_get(ctx, 'webapp_ok') else 'down'})" if url
+                 else "Console: not running")
     text = "\n".join(lines)
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -81,12 +86,9 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     Without an argument: cancels when exactly one run is in flight,
     otherwise lists the candidates (never guesses which one you meant).
-
-    Bookkeeping only: it forgets the run and marks it cancelled. A graph
-    that is mid-stream is NOT interrupted — ``_resume_after_plan`` keeps
-    running, then sets the status back to awaiting_report and sends a
-    preview whose buttons no longer resolve (probe-verified). Runs that
-    are paused at a gate are genuinely stopped.
+    A running drive drains — it finishes its current step, then stops
+    with its checkpoint saved (/continue resumes it); a run waiting at a
+    gate is cancelled at once.
     """
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
@@ -94,7 +96,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     target = (ctx.args[0].lower().strip() if ctx.args else "")
-    entries = _chat_entries(chat_id)
+    entries = runs.tracked(chat_id)
     if not entries:
         await update.message.reply_text("No in-flight runs for this chat.")
         return
@@ -114,11 +116,8 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Multiple runs in flight: " + ", ".join(entries)
             + "\nUse /cancel <run-id> or /cancel all.")
         return
-    for rid in picked:
-        common._inflight.pop(rid, None)
-        await _set_run_status(ctx, rid, "cancelled")
-    await update.message.reply_text(
-        f"❌ Cancelled {len(picked)} run(s): " + ", ".join(picked))
+    outcomes = [await runs.cancel_run(rid) for rid in picked]
+    await _safe_send(ctx.application.bot, chat_id, "\n".join(o.text for o in outcomes))
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +262,9 @@ async def append_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/continue <run-id> — re-attach a paused run, or extend a finished
-    one (with appended sources if any, else a fresh search pass)."""
+    """/continue <run-id> — re-attach a run waiting at a gate, resume a
+    stopped (cancelled) one from its checkpoint, or extend a finished one
+    (with appended sources if any, else a fresh search pass)."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -284,99 +284,24 @@ async def continue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"No unique run matches '{ctx.args[0]}' — see /runs.")
         return
     run_id = run["run_id"]
-    if run_id in common._inflight and common._inflight[run_id].get("resuming"):
-        await update.message.reply_text(
-            f"Run {run_id} is already resuming — hang on.")
-        return
-    engines = await registry.active_snapshot()
     cfg = {"configurable": {"thread_id": run["thread_id"]}}
-    try:
-        snap = await graph.aget_state(cfg)
-    except Exception:
-        logger.exception("aget_state failed for %s", run["thread_id"])
-        snap = None
-    if snap is None or not (snap.values or {}):
-        await update.message.reply_text(
-            f"No checkpoint found for run {run_id} — it may predate the "
-            "v2 upgrade or its checkpoint DB was deleted.")
-        return
-    cur = snap.values
-    info: dict[str, Any] = {
-        "run_id": run_id, "chat_id": chat_id,
-        "thread_id": run["thread_id"],
-        "state": {"user_request": run.get("topic", "")},
-        "stage": "continue", "length": cur.get("length") or run.get("length")
-                                        or DEFAULT_LENGTH,
-        "cfg": cfg, "graph": graph,
-    }
-
-    nxt = tuple(snap.next or ())
-    if nxt and nxt not in (("research",), ("fetcher",), ("deliver",)):
-        await update.message.reply_text(
-            f"Run {run_id} is mid-pipeline (next: {', '.join(nxt)}) — "
-            "wait for it to pause or finish.")
-        return
-    # Re-attach and the extend fork are resumes: the run's config first
-    # (legacy defaults for a pre-v4 checkpoint), before anything changes.
-    await ensure_in_checkpoint(graph, cfg, engines=engines)
-    if nxt in (("research",), ("fetcher",)):
-        # Paused at the plan gate (possibly before a restart) — re-render.
-        # ("fetcher",) accepted for pre-v3 checkpoints.
-        common._inflight[run_id] = info
-        info["awaiting"] = "plan_approval"
-        plan = cur.get("plan") or {}
-        text = _format_plan(plan, length=info["length"],
-                            sources=cur.get("sources") or [])
-        info["plan_text"] = text
-        await _safe_send(ctx.application.bot, chat_id, text,
-                         reply_markup=_plan_keyboard(
-                             default_length=info["length"], run_id=run_id),
-                         parse_mode=ParseMode.MARKDOWN)
-        await _set_run_status(ctx, run_id, "awaiting_plan")
-        return
-    if nxt == ("deliver",):
-        # Paused at the report preview — re-render preview + keyboard.
-        common._inflight[run_id] = info
-        info["awaiting"] = "report_preview"
-        info["paths"] = cur.get("report_paths") or {}
-        await _send_report_preview(ctx, info)
-        await _set_run_status(ctx, run_id, "awaiting_report")
-        return
-
-    # Finished run → extend fork. Merge pending appended sources into the
-    # FULL sources list (last-value channel: never send a delta).
+    # A finished run's Extend fork ingests the pending appended sources;
+    # after its report gate each one is marked ingested or failed.
     pending = await lib.pending_sources(run_id)
     appended = await _sources_from_refs(lib, pending)
-    merged = list(cur.get("sources") or []) + appended
-    append_only = bool(appended)
-    try:
-        await graph.aupdate_state(
-            cfg,
-            {"sources": merged, "extend_requested": True,
-             "extend_rounds": 0, "revision_rounds": 0,
-             "append_only": append_only},
-            as_node="deliver")
-    except Exception as e:
-        logger.exception("extend fork failed for %s", run_id)
-        await update.message.reply_text(f"⚠️ Could not fork the run: {e}")
-        return
-    common._inflight[run_id] = info
-    await _set_run_status(ctx, run_id, "running")
-    mode_note = (f"with {len(appended)} appended source(s), no new searches"
-                 if append_only else "with a fresh search pass")
-    await update.message.reply_text(
-        f"▶️ Continuing run {run_id} {mode_note}…")
-    await _resume_after_plan(ctx, info, resume_input=None)
-    if pending and info.get("awaiting") == "report_preview":
-        try:
-            lines = await _mark_appended(lib, graph, cfg, run_id, pending, appended)
-        except Exception:
-            logger.exception("mark_sources failed for %s", run_id)
+
+    async def on_report() -> None:
+        if not pending:
             return
+        lines = await _mark_appended(lib, graph, cfg, run_id, pending, appended)
         if lines:
             await update.message.reply_text(
                 f"⚠️ {len(lines)} appended source(s) could not be ingested "
                 "(marked failed — /append them again to retry):\n" + "\n".join(lines))
+
+    out = await runs.continue_run(run, chat_id=chat_id, appended=appended, on_report=on_report)
+    if out.text:
+        await _safe_send(ctx.application.bot, chat_id, out.text)
 
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

@@ -21,17 +21,19 @@ import pytest
 
 from argus.bot import common as bot_common
 from argus.bot import research as bot_research
+from argus.bot import runs
 from argus.bot.research import research_cmd
 from argus.config import Settings
 from argus.engines import registry
 
-from helpers import fake_engines_snapshot
+from helpers import fake_engines_snapshot, make_run_config, settle_runs
 
 
 @pytest.fixture(autouse=True)
-def _clear_inflight():
+async def _clear_inflight():
     bot_common._inflight.clear()
     yield
+    await settle_runs()
     bot_common._inflight.clear()
 
 
@@ -62,30 +64,35 @@ def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
-    """/research first awaits registry.active_snapshot() (v4 WP-A)."""
+async def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """/research first awaits registry.active_snapshot() (v4 WP-A); the plan
+    card names the shipped engines file's profiles (no network)."""
+    monkeypatch.setattr(registry, "_state", registry._State())
+    await registry.load_config()
     monkeypatch.setattr(registry, "active_snapshot",
                         AsyncMock(return_value=fake_engines_snapshot()))
 
 
 class _FakeGraph:
-    """Async-graph double: streams one planner event, then reports a
-    plan in the state snapshot (so research_cmd reaches the plan gate)."""
+    """Async-graph double: streams one brief update, then reports a plan
+    at the plan gate (so the drive stops there)."""
 
     def __init__(self):
         self.seen_thread_ids: list[str] = []
 
-    def astream(self, _state, config=None, stream_mode=None):
+    def astream(self, _state, config=None, **_kw):
         self.seen_thread_ids.append(config["configurable"]["thread_id"])
 
         async def _gen():
-            yield {"planner": {"plan": {"summary": "s"}}}
+            yield "updates", {"brief": {"plan": {"summary": "s"}}}
 
         return _gen()
 
     async def aget_state(self, _cfg):
-        return SimpleNamespace(values={"plan": {
-            "summary": "s", "sub_questions": ["q"], "planned_sources": []}})
+        return SimpleNamespace(values={
+            "length": "short", "run_config": make_run_config("short"),
+            "plan": {"summary": "s", "sub_questions": ["q"], "planned_sources": []}},
+            next=("research",))
 
 
 def _make_update(chat_id: int) -> MagicMock:
@@ -110,12 +117,20 @@ def _make_ctx(graph) -> MagicMock:
     return ctx
 
 
+async def _research(update, ctx) -> None:
+    """/research, then wait for its drive to reach the plan gate (a second
+    run is refused as busy while one executes)."""
+    await runs.init(ctx.application)
+    await research_cmd(update, ctx)
+    await settle_runs()
+
+
 async def test_each_research_gets_its_own_thread_id():
     graph = _FakeGraph()
     ctx = _make_ctx(graph)
 
-    await research_cmd(_make_update(777), ctx)
-    await research_cmd(_make_update(777), ctx)
+    await _research(_make_update(777), ctx)
+    await _research(_make_update(777), ctx)
 
     assert len(graph.seen_thread_ids) == 2
     t1, t2 = graph.seen_thread_ids
@@ -129,15 +144,15 @@ async def test_each_research_gets_its_own_thread_id():
 
     # Both runs are individually tracked in flight, keyed by run id.
     assert len(bot_common._inflight) == 2
-    for run_id, info in bot_common._inflight.items():
-        assert info["thread_id"].endswith(run_id)
-        assert info["awaiting"] == "plan_approval"
+    for run_id, h in bot_common._inflight.items():
+        assert h.thread_id.endswith(run_id)
+        assert not h.live and h.gate_kind == runs.PLAN       # resting at its plan gate
 
 
 async def test_plan_keyboard_of_each_run_is_scoped_to_it():
     graph = _FakeGraph()
     ctx = _make_ctx(graph)
-    await research_cmd(_make_update(778), ctx)
+    await _research(_make_update(778), ctx)
 
     (run_id,) = list(bot_common._inflight)
     # The plan message was sent through bot.send_message with the keyboard.

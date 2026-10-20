@@ -67,6 +67,21 @@ def fake_llm(monkeypatch, reply):
     return seen
 
 
+async def settle_runs(timeout: float = 10.0) -> None:
+    """Await every drive the run driver still holds (``bot/runs.py``), so a test
+    ends with no task pending; a drive still running after ``timeout`` is
+    cancelled and the test fails."""
+    import asyncio
+    from argus.bot import common
+    tasks = [h.task for h in list(common._inflight.values()) if getattr(h, "task", None) is not None]
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    assert not pending, f"drives still running after {timeout} s: {[t.get_name() for t in pending]}"
+
+
 def make_run_config(length="short", depth=None, **overrides) -> dict:
     """A ``state["run_config"]`` dict from the presets; overrides are dotted
     keys (``**{"research.waves": 1}``)."""

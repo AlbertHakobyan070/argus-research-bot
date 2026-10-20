@@ -42,6 +42,9 @@ HELP_TEXT = """\
   /continue <id> — resume or extend a run
   /delete — free up space · /cancel [id] — stop a run
 
+*Engines*
+  /engines — models per role · /engines use <profile>
+
 _Tip: paste any YouTube / X / Reddit / Instagram link for a download menu._
 """
 
@@ -85,17 +88,12 @@ def _parse_length(args: list[str]) -> tuple[str, list[str]]:
     return mode, list(args[2:])
 
 
-# In-memory bookkeeping of in-flight runs, keyed by run_id (8-hex).
-# Persisted checkpoint state + the Library registry are the sources of
-# truth; this holds live objects (graph cfg, progress message ids,
-# chosen length, resuming flag) for runs the current process started.
-_inflight: dict[str, dict[str, Any]] = {}
-
-
-def _chat_entries(chat_id: int) -> dict[str, dict[str, Any]]:
-    """All in-flight entries belonging to one chat, keyed by run_id."""
-    return {rid: i for rid, i in _inflight.items()
-            if i.get("chat_id") == chat_id}
+# The run driver's in-flight registry (``runs.py``): {run_id (8-hex):
+# RunHandle} for every run this process drives or holds at a gate. The
+# checkpoints and the Library are the sources of truth; a handle holds the
+# live objects (the drive task, its RunControl, the per-run lock, the gate
+# message, the plan-gate choices).
+_inflight: dict[str, Any] = {}
 
 
 def _bot_data_get(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> Any:

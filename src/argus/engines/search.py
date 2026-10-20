@@ -51,9 +51,13 @@ _ARXIV_LOCK = threading.Lock()
 def resolve_recency(rc: RunConfig, brief: ResearchBrief, *, today: date | None = None
                     ) -> tuple[dict | None, str | None]:
     """``({"window", "start_date"} | None, note | None)``: an explicit
-    ``run_config.recency`` wins; else the brief's ``recency_hint``, only for a
-    ``time_sensitive`` brief. An unusable hint is ignored with a note."""
+    ``run_config.recency`` wins ("any": no recency, so nothing is dropped as
+    undated, even for a time-sensitive brief); else the brief's
+    ``recency_hint``, only for a ``time_sensitive`` brief. An unusable hint is
+    ignored with a note."""
     window = rc.recency
+    if window == "any":
+        return None, None
     if window is None and brief.time_sensitive and brief.recency_hint:
         hint = brief.recency_hint.strip().lower()
         if hint not in RECENCY_DAYS:

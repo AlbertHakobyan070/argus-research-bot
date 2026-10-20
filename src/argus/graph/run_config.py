@@ -172,7 +172,7 @@ class RunConfig(BaseModel):
     length: Length
     depth: Depth
     preset_origin: str                                         # preset name the values came from
-    recency: Literal["d", "w", "m", "y"] | None = None         # None → brief's time-sensitivity hint decides
+    recency: Literal["d", "w", "m", "y", "any"] | None = None  # None → brief's time-sensitivity hint decides; "any" → no recency filter, even for a time-sensitive brief
     research: ResearchConfig
     search: SearchConfig
     fetch: FetchConfig

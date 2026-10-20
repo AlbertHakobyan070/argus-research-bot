@@ -76,7 +76,7 @@ def test_report_preview_send_uses_html_or_safe_fallback() -> None:
     We verify by reading the source text of the resume_after_report
     function and asserting at least one of these patterns is present.
     """
-    src = inspect.getsource(bot_research._resume_after_plan)
+    src = inspect.getsource(bot_research._send_report_preview)
     assert "ParseMode.MARKDOWN" not in src or "ParseMode.HTML" in src, (
         "bot._resume_after_plan still uses ParseMode.MARKDOWN for the "
         "report preview. Switch to ParseMode.HTML with proper escaping, "
