@@ -21,6 +21,7 @@ from ..engines.registry import EngineConfigError
 from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from ..library import Library
 from ..media import resolve_ffmpeg
+from ..webapp import server as webapp_server
 from . import delete, engines_cmd, history, media, research, runs
 from .common import (
     _TG_CONNECT_TIMEOUT_S, _TG_MEDIA_WRITE_TIMEOUT_S, _TG_POOL_TIMEOUT_S,
@@ -48,6 +49,8 @@ POST_STOP_HOOKS: list = []
 POST_SHUTDOWN_HOOKS: list = []
 POST_INIT_HOOKS.append(runs.init)
 POST_STOP_HOOKS.append(runs.drain_all)
+POST_INIT_HOOKS.append(webapp_server.start)
+POST_SHUTDOWN_HOOKS.append(webapp_server.stop)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

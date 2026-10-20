@@ -31,3 +31,6 @@ tools/bin/
 argus_engines.local.json
 bench/results/
 docs/v4-notes/.scratch/
+
+# v4 WP-E2: runtime logs (cloudflared stderr)
+logs/
