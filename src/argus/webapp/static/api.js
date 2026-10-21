@@ -10,16 +10,33 @@ export class ApiError extends Error {
   }
 }
 
+const UNREACHABLE = "the tunnel may have restarted — reopen the console from the menu button";
+
+/** No answer, or one that cannot be read (a dropped tunnel, a proxy's error page): ApiError(0, "network"). */
+const network = (what) => new ApiError(0, "network", `${what}; ${UNREACHABLE}`);
+
 export async function api(path, { method = "GET", body } = {}) {
   const headers = { Authorization: `tma ${authData()}` };
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  const json = (r.headers.get("Content-Type") || "").includes("application/json");
-  if (!r.ok) {
-    const err = json ? (await r.json()).error : null;
-    throw new ApiError(r.status, err?.code || `http_${r.status}`, err?.message || `${r.status} ${r.statusText}`);
+  let r;
+  try {
+    r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    throw network(`the console could not reach the bot (${e.message})`);
   }
-  return json ? r.json() : r.text();
+  const json = (r.headers.get("Content-Type") || "").includes("application/json");
+  let data;
+  try {
+    data = json ? await r.json() : await r.text();
+  } catch (e) {
+    throw network(`the answer to ${method} ${path.split("?")[0]} could not be read (${e.message})`);
+  }
+  if (!r.ok) {
+    const err = json ? data?.error : null;           // the console's own refusals are always JSON
+    if (!err) throw network(`the bot did not answer (HTTP ${r.status} ${r.statusText}, not the console's own error)`);
+    throw new ApiError(r.status, err.code, err.message);
+  }
+  return data;
 }
 
 const enc = encodeURIComponent;

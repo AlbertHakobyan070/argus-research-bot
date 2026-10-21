@@ -54,6 +54,7 @@ const PROBLEMS = {
   bad_request: ["Request", "The console sent something the server refused"],
   send_failed: ["Send to chat", "Sending to the chat failed"],
   internal: ["Server", "The server hit an error"],
+  network: ["Connection", "The console cannot reach the bot"],
 };
 
 /** The explicit panel for an API failure: what went wrong, the server's own message. */
@@ -100,7 +101,20 @@ export function mainButton(text, handler) {
   clearMainButton();
   const mb = tg()?.MainButton;
   if (!mb || !tgAtLeast("6.0")) return;
-  mainHandler = handler;
+  let busy = false;                              // a second tap while the action runs is ignored
+  mainHandler = async () => {
+    if (busy) return;
+    busy = true;
+    mb.showProgress?.(false);
+    mb.disable?.();
+    try {
+      await handler();
+    } finally {
+      busy = false;
+      mb.hideProgress?.();
+      mb.enable?.();
+    }
+  };
   mb.setText(text);
   mb.onClick(mainHandler);
   mb.show();

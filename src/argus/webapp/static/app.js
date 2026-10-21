@@ -18,11 +18,9 @@ const view = $("#view");
 let cleanup = null;
 let authFailed = false;
 
-// ---- theme: the kit's dark theme when Telegram says dark, else the default (no picker) ------------
+// ---- theme: the kit's dark when Telegram says dark, else the default ledger (no picker, no OS fallback)
 function applyTheme() {
-  const scheme = tg()?.colorScheme;
-  if (scheme === "dark") document.documentElement.setAttribute("data-theme", "dark");
-  else if (scheme === "light") document.documentElement.setAttribute("data-theme", "ledger");
+  document.documentElement.setAttribute("data-theme", tg()?.colorScheme === "dark" ? "dark" : "ledger");
 }
 
 function crumbs(items) {
@@ -43,6 +41,14 @@ function showAuth(err) {
   $("#who").textContent = "not signed in";
 }
 window.addEventListener("argus:auth", (e) => showAuth(e.detail));
+
+/** A view (or the sign-in check) that could not load: the explicit problem view, with the API's message. */
+function showLoadProblem(e) {
+  crumbs([["", "Problem"]]);
+  view.innerHTML = `<div class="page-head"><div><span class="kicker">Argus console</span><h1>This view could not load</h1>`
+    + "<p>Use the refresh button above to try again.</p></div></div>"
+    + `<section class="sec">${problemHtml(e, { dismiss: false })}<div class="btn-row"><a class="btn" href="#/runs">Back to runs</a></div></section>`;
+}
 
 const goBack = () => { if (history.length > 1) history.back(); else location.hash = "#/runs"; };
 
@@ -66,9 +72,7 @@ async function route() {
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
     if (e.status === 401 || e.status === 403) { showAuth(e); return; }
-    crumbs([["", "Problem"]]);
-    view.innerHTML = `<div class="page-head"><div><span class="kicker">Argus console</span><h1>This view could not load</h1></div></div>`
-      + `<section class="sec">${problemHtml(e, { dismiss: false })}<div class="btn-row"><a class="btn" href="#/runs">Back to runs</a></div></section>`;
+    showLoadProblem(e);
   } finally {
     view.removeAttribute("aria-busy");
   }
@@ -77,11 +81,11 @@ async function route() {
 
 async function start() {
   takeLaunchParams();
+  applyTheme();
   const webApp = tg();
   if (webApp) {
     webApp.ready?.();
     webApp.expand?.();
-    applyTheme();
     webApp.onEvent?.("themeChanged", applyTheme);
   }
   $("#refresh").addEventListener("click", () => route());
@@ -90,8 +94,11 @@ async function start() {
     const me = await get.me();
     $("#who").textContent = `${me.user.first_name || me.user.id} · Argus ${me.bot.version}`;
   } catch (e) {
-    if (e instanceof ApiError && (e.status === 401 || e.status === 403)) { showAuth(e); return; }
-    throw e;
+    if (!(e instanceof ApiError)) throw e;
+    if (e.status === 401 || e.status === 403) { showAuth(e); return; }
+    $("#who").textContent = "not reachable";
+    showLoadProblem(e);                    // e.g. the network view; the refresh button retries
+    return;
   }
   await route();
 }

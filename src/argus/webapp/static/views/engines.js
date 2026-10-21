@@ -2,8 +2,8 @@
 // active profile with its validation and warnings, per-profile tier and role overrides (live model
 // lists, fallback lists), the transcriber, the month-to-date Exa spend, and the provider definitions
 // (read-only: they are file-only). The server takes one change per PUT; each control sends one.
-import { get, putEngines } from "../api.js";
-import { $, $$, act, esc, toast, usd, when } from "./common.js";
+import { ApiError, get, putEngines } from "../api.js";
+import { $, $$, act, esc, showProblem, toast, usd, when } from "./common.js";
 
 const TIERS = ["cheap", "strong", "judge"];
 const POLICIES = ["raise", "skip_item", "degrade"];
@@ -120,7 +120,7 @@ function roleEditor(s) {
       <small>${esc(source)}${resolved ? ` · resolves to ${esc(specText(resolved.primary))}${resolved.fallbacks?.length ? ` then ${resolved.fallbacks.map(specText).map(esc).join(", ")}` : ""}` : ""}</small></span>
     <div class="field"><span class="field-l">Primary</span>${enginePick(s, binding?.primary || null, ' data-slot="primary"')}</div>
     <div class="field"><span class="field-l">Fallbacks <span class="faint">(tried in order)</span></span>
-      <ol class="fallbacks">${fallbacks.map((f) => `<li>${fallbackRow(s, f)}</li>`).join("")}</ol>
+      <ol class="fallbacks">${fallbacks.map((f, i) => `<li>${fallbackRow(s, f, i)}</li>`).join("")}</ol>
       <div class="btn-row"><button class="btn btn-s" type="button" data-act="fb-add"><i data-icon="plus"></i>Add fallback</button></div></div>
     <div class="field"><label for="on-exhausted">When every engine fails</label>
       <select class="input" id="on-exhausted">${POLICIES.map((p) => `<option${p === (binding?.on_exhausted || "raise") ? " selected" : ""}>${p}</option>`).join("")}</select>
@@ -130,14 +130,16 @@ function roleEditor(s) {
     <p class="hint" data-f="list"></p><p class="err" data-f="err" hidden></p></div>`;
 }
 
-const fallbackRow = (s, spec) => `<div class="row">${enginePick(s, spec, ' data-slot="fallback"')}<button class="ib" type="button" data-act="fb-remove" aria-label="Remove this fallback"><i data-icon="x"></i></button></div>`;
+const fallbackRow = (s, spec, i = null) => `<div class="row">${enginePick(s, spec, ` data-slot="fallback"${i === null ? "" : ` data-orig="${i}"`}`)}<button class="ib" type="button" data-act="fb-remove" aria-label="Remove this fallback"><i data-icon="x"></i></button></div>`;
 
-/** The spec a picker describes; an empty model keeps the original's preferences tier (same provider). */
+/** The spec a picker describes. With the original's provider it starts from the original (per-model
+ *  fields survive) and an empty model keeps its preferences tier; another provider is {provider, model}. */
 function specOf(pick, original) {
   const provider = $('[data-f="provider"]', pick).value;
   const model = $('[data-f="model"]', pick).value.trim();
-  if (model) return { provider, model };
-  if (original?.provider === provider && original.model_from_preferences) return { provider, model_from_preferences: original.model_from_preferences };
+  const same = original?.provider === provider;   // same provider: keep the spec's per-model fields
+  if (model) return same ? { ...original, model, model_from_preferences: null } : { provider, model };
+  if (same && original.model_from_preferences) return { ...original };
   throw new Error(`choose a model for ${provider}`);
 }
 
@@ -161,6 +163,8 @@ async function loadModels(s, provider, row) {
     s.lists[provider] = `${provider}: ${models.length} live models to choose from.`;
     hint.textContent = s.lists[provider];
   } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (e.status === 401 || e.status === 403) { showProblem(null, e); return; }   // the app swaps to the sign-in view
     hint.textContent = "";
     const err = $('[data-f="err"]', row);
     err.textContent = `${provider}'s model list is unavailable — ${e.message}. You can still type a model id.`;
@@ -272,7 +276,7 @@ function wire(s) {
       const fbs = $$('[data-slot="fallback"]', editor);
       next = {
         primary: specOf($('[data-slot="primary"]', editor), binding?.primary),
-        fallbacks: fbs.map((p, i) => specOf(p, binding?.fallbacks?.[i])),
+        fallbacks: fbs.map((p) => specOf(p, p.dataset.orig === undefined ? null : binding?.fallbacks?.[Number(p.dataset.orig)])),
         on_exhausted: $("#on-exhausted", editor).value,
         retry_on_truncation: binding?.retry_on_truncation ?? true,
       };

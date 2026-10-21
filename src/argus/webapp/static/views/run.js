@@ -14,7 +14,7 @@ const MAX_EVENTS = 500;          // the bus keeps as many per run
 export async function render(el, [id], ctx) {
   ctx.crumbs([["#/runs", "Runs"], ["", id]]);
   const [data, presets] = await Promise.all([get.run(id), get.presets()]);
-  const s = { id, data, presets, events: [], lastSeq: 0, needSnap: false, grace: 0,
+  const s = { id, data, presets, events: [], lastSeq: 0, between: false, grace: 0, ticking: false,
               timer: null, stopped: false, reportKey: null, evidence: null };
   await moreEvents(s);
   el.innerHTML = `<div id="run-head"></div><div id="notice" hidden></div>
@@ -28,9 +28,11 @@ export async function render(el, [id], ctx) {
 }
 
 // ---- polling -------------------------------------------------------------------------------------
+// One chain at a time: a tick reschedules itself when it ends, so schedule() during a tick does nothing.
 function schedule(s) {
+  if (s.stopped || s.ticking) return;
   clearTimeout(s.timer);
-  if (!s.stopped && (s.data.run.in_flight || s.needSnap || s.grace > 0)) s.timer = setTimeout(() => tick(s), POLL_MS);
+  if (s.data.run.in_flight || s.between || s.grace > 0) s.timer = setTimeout(() => tick(s), POLL_MS);
 }
 
 /** The events after s.lastSeq: the server answers in pages, so read on until its last_seq. */
@@ -47,31 +49,42 @@ async function moreEvents(s) {
   return fresh;
 }
 
-async function tick(s) {
-  if (s.stopped) return;
-  if (s.grace > 0) { s.grace -= 1; s.needSnap = true; }
+const ends = (e) => (e.kind === "stage" && e.data?.status !== "start") || e.kind === "gate";
+
+/** One poll: new events; the snapshot is re-read when any of them ends a step (a stage end, error,
+ *  cancel or drain, or a gate), and on each later tick until the next stage starts or the drive is
+ *  over (the last stage end can come before the driver releases the run). */
+export async function tick(s) {
+  if (s.stopped || s.ticking) return;    // one chain at a time
+  s.ticking = true;
   try {
+    const grace = s.grace > 0;            // after an action: re-read until the new drive shows up
+    if (grace) s.grace -= 1;
     const fresh = await moreEvents(s);
-    for (const e of fresh) {               // a stage end (or a gate) ends a step: re-read the snapshot until the next starts
-      if (e.kind === "stage") s.needSnap = e.data?.status !== "start";
-      else if (e.kind === "gate") s.needSnap = true;
-    }
-    if (s.needSnap) {
-      s.data = await get.run(s.id);
-      if (!s.data.run.in_flight && s.grace === 0) s.needSnap = false;
-      if (s.data.run.in_flight) s.grace = 0;
+    if (s.stopped) return;
+    const last = fresh.filter((e) => e.kind === "stage" || e.kind === "gate").pop();
+    if (last) s.between = ends(last);
+    if (fresh.some(ends) || s.between || grace) {
+      const data = await get.run(s.id);
+      if (s.stopped) return;
+      s.data = data;
+      if (!data.run.in_flight) s.between = false;
+      else s.grace = 0;
       paint(s);
     } else if (fresh.length) paintProgress(s);
   } catch (e) {
-    if (s.stopped) return;
-    showProblem(s.notice, e);              // polling stops; the refresh button starts it again
+    showProblem(s.notice, e);              // polling stops; the top bar refresh starts it again
     return;
+  } finally {
+    s.ticking = false;
   }
   schedule(s);
 }
 
 async function refresh(s) {
-  s.data = await get.run(s.id);
+  const data = await get.run(s.id);
+  if (s.stopped) return;
+  s.data = data;
   s.grace = GRACE_TICKS;
   paint(s);
   schedule(s);

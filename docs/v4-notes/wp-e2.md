@@ -178,12 +178,12 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
   - initData comes from `Telegram.WebApp.initData` when the SDK loaded, else from the `#tgWebAppData=` fragment the dev URL provides;
   - a route may lead the fragment (`#/run/<id>&tgWebAppData=…`), so a signed link can open any view;
   - the parameters are then dropped from the address bar (`history.replaceState`; the route stays);
-  - initData lives in memory only. It never goes into storage, a log or a URL the server sees.
+  - the console's own code keeps initData in memory only. It never puts it into storage, a log or a URL the server sees. (The Telegram SDK keeps its own launch parameters in sessionStorage; fix round 1.)
 - `static/api.js` calls `fetch` with `Authorization: tma <initData>`. A non-2xx answer throws `ApiError(status, code, message)` from the server's `{"error": {code, message}}`.
 - `static/app.js` is the hash router (`#/runs`, `#/run/<id>`, `#/new`, `#/engines`):
   - it calls `GET /api/me` first; the rail shows the user and the bot version;
   - each view module exports `render(el, params, ctx)` and may return a cleanup function (for polling, the MainButton or the popover);
-  - Telegram: `ready()` and `expand()`. The theme is the kit's `dark` when `colorScheme` is `dark` and the default `ledger` when it is `light`, applied again on `themeChanged`. Without the SDK the page follows the OS like any kit page. The `BackButton` shows on every view except the runs list;
+  - Telegram: `ready()` and `expand()`. The theme is the kit's `dark` when `colorScheme` is `dark` and the default `ledger` otherwise, applied again on `themeChanged`. This holds without the SDK too: there is no OS fallback (fix round 1). The `BackButton` shows on every view except the runs list;
   - every `Telegram.WebApp` call is guarded, for an absent SDK and for a client version below the method's.
 - `static/views/common.js` holds the shared helpers:
   - escaping: all text goes through `esc`;
@@ -196,13 +196,13 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
 - `static/views/run.js` shows one run:
   - progress: the snapshot's counts as KPIs and the events as a timeline, newest first, with only the newest few dozen shown.
     - While a drive runs, it polls `GET …/events?after=<last seq>` every 2 s and reads on in pages until the server's `last_seq` (the bus answers in bounded pages).
-    - It re-fetches the snapshot on a `stage` event that is not a start (end, error, cancelled, draining) and on a `gate` event. It keeps re-fetching on each tick until the next stage starts or the drive is over, because the last stage end can arrive before the driver releases the run.
+    - It re-fetches the snapshot when any event in a poll batch ends a step: a `stage` event that is not a start (end, error, cancelled, draining) or a `gate` event. This holds even when the next stage's start follows in the same batch (fix round 1). If the batch's last stage or gate event is not a start, it keeps re-fetching on each tick until the next stage starts or the drive is over, because the last stage end can arrive before the driver releases the run.
     - After an action, it polls for a few more ticks so the new drive shows up.
-    - A polling failure stops the polling and shows the problem. The top bar's refresh starts it again.
+    - A polling failure, including a network one, stops the polling and shows the problem. The top bar's refresh starts it again. Only one poll chain runs at a time, and nothing is painted after the view's cleanup (fix round 1).
   - the plan gate (`snapshot.plan`):
     - it shows the summary, sub-questions, search intents, the found sources (or the "Live search found no sources" warning) and `plan.error`;
     - the knobs are the kit's console rows: length; depth (Auto shows the length's default depth); the engines profile with its `profile_problem`; recency, read-only, because the approve route takes no recency (the chat card's button changes it); and the Exa estimate. The estimate is the server's for the drafted plan, recomputed for other choices, and "off" when Exa is off for the run;
-    - Approve (also the Telegram MainButton) sends `{action: "approve", length, depth, engines_profile}`. Edit needs feedback, and Cancel asks for confirmation in a dialog;
+    - Approve (also the Telegram MainButton, which shows its progress and ignores a second tap while the action runs) sends `{action: "approve", length, depth, engines_profile}`. Edit needs feedback, and Cancel asks for confirmation in a dialog;
     - when `snapshot.plan` is null (a legacy checkpoint), it shows "Plan not available" and keeps Approve (sending no knobs), Edit and Cancel.
   - the report:
     - the fact-check line comes from `panel_verdict`. `judged < total` shows a "Not fact-checked" warning and is never shown as passed;
@@ -228,7 +228,7 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
     - one role at a time has a primary, an ordered fallback list (add/remove) and `on_exhausted`, with Override role and Clear role override;
     - each PUT sends that profile's whole override object, `{overrides: {<profile>: {tiers, roles}}}`: the stored overrides plus the change;
     - model fields are free text with a `<datalist>` filled from the live model list (`GET …/providers/<name>/models`, once per provider per page). A failed listing is shown under the row, and an id can still be typed;
-    - an empty model keeps the original spec's `model_from_preferences` when the provider is unchanged; otherwise the row says "choose a model".
+    - when the provider is unchanged, the saved spec starts from the original (`{...original}`), so per-model fields such as `temperature`, `max_tokens` and `extra_body` survive, and an empty model keeps its `model_from_preferences`. With another provider the spec is `{provider, model}`, and an empty model makes the row say "choose a model" (fix round 1).
   - the transcriber: `asr_engine`, sent as `{transcriber: {…current, asr_engine}}`; the engine's settings are shown read-only;
   - the month-to-date Exa spend and the configured prices;
   - the provider definitions, read-only: the base URL, the key env (set, missing or keyless), the live list or known models, and notes. Key values never reach the page.
@@ -236,6 +236,7 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
   - a 401/403 from any call replaces the view and stops everything. It shows "Session expired — reopen from the menu button" (`expired`) or "The console could not sign you in" (the other codes), with the server's message;
   - 409 `busy` / `already_running` / `refused`, 400 (`engine_config`, `bad_request`), 404, 502 `send_failed` and 500 each show an explicit panel next to the action: a kicker, a title, the server's message, the code and the status. The inputs are kept;
   - a view that cannot load shows the panel in its place;
+  - no answer at all (a failed `fetch`, the tunnel gone), an answer that cannot be read, or an error page that is not the console's JSON (cloudflared's 502) becomes `ApiError(0, "network")`. It shows the "Connection — The console cannot reach the bot" panel or view, which says the tunnel may have restarted and to reopen the console from the menu button (fix round 1);
   - an error that is not an API answer is rethrown (a console error), never hidden.
 
 ### Decisions where the spec is silent
@@ -245,7 +246,7 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
 - **No `'unsafe-inline'` for styles either.** The kit's JS positions popovers and tooltips through the CSSOM (`el.style.left = …`), which `style-src 'self'` allows. Nothing uses `style=` attributes or injected `<style>`. The CSP is unchanged.
 - **Recency at the plan gate is read-only.** `POST …/plan` takes `length`, `depth` and `engines_profile`; recency changes from the chat card.
 - **The runs list does not poll**; the spec has only the run view poll. The top bar's refresh reloads any view.
-- **A 4xx answer is a console line in Chromium.** Chromium logs every failed `fetch` response as "Failed to load resource". The kit's checker counts that line as an error. So the views whose job is to show a refusal (the expired-session view, and the 409/400 panels after an action) produce exactly that one line: the network log of the expected answer, never a script error.
+- **A 4xx answer is a console line in Chromium.** Chromium logs every failed `fetch` response as "Failed to load resource". The kit's checker counts that line as an error. So the views whose job is to show a refusal (the expired-session view, and the 409/400 panels after an action) produce exactly that one line: the network log of the expected answer, never a script error. Controller ruling (fix round 1): on the expired-session and no-initData views, this single line for the expected 401 is accepted as the only console line.
 
 ### Behaviour changes for handoff.md
 
@@ -316,3 +317,43 @@ Logs, scripts and screenshots are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Ag
 - I looked at the light, dark and 390 px screenshots of every view (`*.png`).
 - `grep -rn "<script>[^<]\|onclick=" src/argus/webapp/static --include=*.html` finds only the kit's reference templates under `static/vendor/` (see the decisions). Outside `vendor/` it is empty.
 - Not checked live: the console inside Telegram, behind the tunnel, and against the real driver. Those are the orchestrator's §4 checks.
+
+### Task 12 fix round 1 (review of fc132ee)
+
+What changed (the sections above are updated to match):
+
+- `views/run.js`, polling:
+  - the snapshot is re-fetched when **any** event in a poll batch ends a step: a stage event that is not a start, or a gate. The driver publishes `[end A, start B]` milliseconds apart, so before this fix the batch's last event (the start) won, and the KPIs and stage stayed as loaded for the whole drive;
+  - the "until the next start" retry follows the batch's last stage or gate event;
+  - `tick` and `refresh` return after each `await` once the view is gone, so nothing is painted after cleanup. The catch that silently returned after cleanup is gone, and every error goes to the problem panel;
+  - one poll chain at a time: a `ticking` flag makes `schedule()` and a second `tick()` do nothing while a tick runs, and the tick reschedules itself when it ends.
+- `api.js`: a `fetch` rejection, an answer that cannot be read, or an error answer that is not the console's JSON (cloudflared's 502 page) becomes `ApiError(0, "network", …)`. The message ends "the tunnel may have restarted — reopen the console from the menu button".
+- `views/common.js`:
+  - `PROBLEMS.network` is "Connection — The console cannot reach the bot";
+  - the MainButton wrapper shows progress, disables the button and ignores a second tap while its action runs, then restores it.
+- `app.js`:
+  - a failure of the start-up `GET /api/me` that is not 401/403 (network included) shows the "This view could not load" problem view, which the top bar's refresh retries; before, it rethrew and left the skeleton;
+  - the theme is `dark` when `colorScheme === "dark"`, else the default `ledger`, also without the SDK (no OS fallback).
+- `views/engines.js`:
+  - with the provider unchanged, a saved tier, role or fallback spec starts from the original (`{...original}`, with `model_from_preferences` cleared when a model is typed), so per-model fields survive. Fallback rows carry their original index, so a removal does not shift which original a row merges with;
+  - a 401/403 while loading a model list goes to the sign-in view through `showProblem`.
+- Notes:
+  - **sessionStorage**: the Telegram SDK keeps its own launch parameters in sessionStorage; the console's own code stores nothing.
+  - **Controller ruling**: the single Chromium "Failed to load resource" line for the expected 401 is accepted as the only console line on the expired-session and no-initData views.
+  - **The network view behaves the same way**: Chromium logs the 502 (or the failed fetch) once, and the page shows the panel.
+
+Evidence (`A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t12-fix1\` and `…\t12\`):
+
+- The reviewer's probes (`t12-review\probe_stage_end.mjs`, `probe_network.mjs`) were re-run on copies of the fixed files (`t12-fix1\static\`), with one shared stub (`fake_el.mjs`, a DOM element deep enough for `paint`; the reviewer's stubs had no element to paint into):
+  - `probe_stage_end.after.log`: requests `['/api/runs/r1/events?after=0', '/api/runs/r1']`, "snapshot re-fetched after the stage end: true" (it was `false`);
+  - `probe_network.after.log`: "tick resolved", "problem panel shown: true", "next poll scheduled: false" (before: "tick rejected: TypeError", panel false).
+- `probe_guards.log` (new): the network panel names the problem and the menu button; a tick that resolves after cleanup paints nothing and schedules nothing; a second tick entering while one is in flight schedules no second chain (one timer). The same probe on the reviewer's copies of fc132ee crashes at the first case, with an unhandled `TypeError: Failed to fetch` (`probe_guards.before.log`).
+- `t12\flows_fix1.py` / `flows-fix1.log` (Edge at 390 px):
+  - aborting `…/events` on a live run shows the Connection panel, and no further events request follows within 4.5 s (polling stopped);
+  - with every `/api` answer an HTML 502 (`preview.py --gateway`), the page shows "This view could not load" with the Connection panel;
+  - with the SDK blocked and the OS dark, `data-theme` is `ledger`.
+- `render-check-fix1.log`, `tools/render.py check` at 390 px in light and dark:
+  - run-live, run-plan, run-legacy and run-report: OK in both;
+  - the network view (`--gateway`): its only console line is Chromium's "502 (Bad Gateway)" log of the expected answer, in both.
+- `flows-fix1-regression.log`: every earlier flow passes again.
+- Full suite (`t12-fix1\suite.log`, `PYTHONPATH="" FREELLMAPI_BASE_URL=http://127.0.0.1:9/v1 ./venv/Scripts/python.exe -m pytest -q`): the only failures are the live-proxy tests in `tests/test_llm.py` and the `tests/test_graph.py` fixture, by design. No warnings summary.
