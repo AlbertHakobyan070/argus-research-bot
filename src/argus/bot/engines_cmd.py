@@ -148,10 +148,7 @@ async def _transcriber(rest: list[str], lib) -> str:
     try:
         backend, problem = transcribers.asr_engine(t, cfg).backend, ""
     except EngineConfigError as e:
-        oa = t.openai_audio
-        backend = (f"openai_audio:{oa.get('provider', '?')}/{oa.get('model', '?')}" if t.asr_engine == "openai_audio"
-                   else f"faster_whisper:{t.faster_whisper.get('model', '?')}")
-        problem = f"\n⚠ {e} — transcriptions fail until it is fixed"
+        backend, problem = transcribers.asr_label(t), f"\n⚠ {e} — transcriptions fail until it is fixed"
     head = "✅ transcriber" if rest else "🎙 Transcriber"
     return f"{head}: {backend}\nYouTube: {' → '.join(t.youtube) or '(no steps)'}{problem}"
 

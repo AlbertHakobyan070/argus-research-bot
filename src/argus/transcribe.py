@@ -54,7 +54,7 @@ class TranscriptResult(BaseModel):
     elapsed_s: float = 0.0
 
 
-async def _engines_config(library) -> EnginesConfig:
+async def engines_config(library) -> EnginesConfig:
     """The registry's config, loaded now when startup did not load it (a
     failing load raises the real problem)."""
     try:
@@ -85,7 +85,7 @@ async def transcribe_url(
                                 elapsed_s=time.monotonic() - t0)
 
     try:
-        cfg = engines if engines is not None else await _engines_config(library)
+        cfg = engines if engines is not None else await engines_config(library)
     except EngineConfigError as e:
         return fail(f"transcriber configuration: {e}")
 

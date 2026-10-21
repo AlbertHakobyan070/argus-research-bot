@@ -252,6 +252,58 @@ async def test_without_engines_it_reads_the_registry_and_the_persisted_choice(tm
     assert r.ok and seen[0].asr_engine == "openai_audio"
 
 
+@pytest.mark.parametrize("url, transcriber, expect, absent", [
+    ("https://x.com/u/status/9", {}, ["faster_whisper:small", "downloads the model"], ["captions"]),
+    ("https://x.com/u/status/9", {"asr_engine": "openai_audio"}, ["openai_audio:aud/w1"], ["downloads the model"]),
+    ("https://youtu.be/abc123DEF45", {}, ["captions → faster_whisper:small"], []),
+    ("https://youtu.be/abc123DEF45", {"youtube": ["captions"]}, ["captions"], ["faster_whisper", "speech-to-text"]),
+])
+async def test_bot_status_note_names_the_configured_backend(tmp_path, monkeypatch, url, transcriber, expect, absent):
+    """Review Minor 6: the bot's "Transcribing…" note names what will run,
+    not a hardcoded "whisper"."""
+    from unittest.mock import AsyncMock, MagicMock
+    from argus.bot import media as bot_media
+    cfg = _cfg(**transcriber)
+
+    async def engines_config(library):
+        return cfg
+    monkeypatch.setattr(bot_media, "engines_config", engines_config)
+    monkeypatch.setattr(bot_media, "get_settings", lambda: SimpleNamespace(
+        transcripts_root=tmp_path / "t", media_root=tmp_path / "m"))
+    monkeypatch.setattr(bot_media, "transcribe_url", AsyncMock(return_value=tr_mod.TranscriptResult(
+        ok=False, error="stop here")))
+    app = MagicMock()
+    app.bot.send_message = AsyncMock()
+    app.bot_data = {}
+    await bot_media._transcript_for_item(app, 1, {"url": url})
+    note = app.bot.send_message.await_args_list[0].kwargs["text"]
+    assert "whisper (" not in note and "via whisper" not in note
+    for want in expect:
+        assert want in note, note
+    for no in absent:
+        assert no not in note, note
+
+
+async def test_bot_status_note_with_a_broken_config_still_lets_the_error_through(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    from argus.bot import media as bot_media
+
+    async def engines_config(library):
+        raise EngineConfigError("engines file not found: x.json")
+    monkeypatch.setattr(bot_media, "engines_config", engines_config)
+    monkeypatch.setattr(bot_media, "get_settings", lambda: SimpleNamespace(
+        transcripts_root=tmp_path / "t", media_root=tmp_path / "m"))
+    monkeypatch.setattr(bot_media, "transcribe_url", AsyncMock(return_value=tr_mod.TranscriptResult(
+        ok=False, error="transcriber configuration: engines file not found: x.json")))
+    app = MagicMock()
+    app.bot.send_message = AsyncMock()
+    app.bot_data = {}
+    await bot_media._transcript_for_item(app, 1, {"url": "https://x.com/u/status/9"})
+    texts = [c.kwargs["text"] for c in app.bot.send_message.await_args_list]
+    assert texts[0] == "🎙 Transcribing…"
+    assert "engines file not found" in texts[-1]
+
+
 async def test_without_a_loadable_config_the_error_is_reported(tmp_path, monkeypatch):
     monkeypatch.setenv("ARGUS_ENGINES_FILE", str(tmp_path / "missing.json"))
     t_root, m_root = _vault(tmp_path)

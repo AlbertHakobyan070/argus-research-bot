@@ -22,12 +22,17 @@ Spec: `docs/argus-v4-design.md` §3 WP-F, with §2.2 (`TranscriberConfig`, the l
       - an ffmpeg failure;
       - a faster-whisper failure, with the cause chained;
       - **an all-empty result** ("produced no speech"). A silent empty transcript is never returned.
-    - The provider key is replaced by `***` in every error text, and HTTP errors are not chained, so a key quoted by the transport can't leak through `__cause__`. Nothing logs headers.
+    - The provider key is replaced by `***` in every error text.
+    - A transport error is raised outside its handler, so neither `__cause__` nor `__context__` holds a key the transport quoted.
+    - Nothing logs headers, which a `caplog` test checks with every logger at DEBUG.
   - No retry and no cross-engine fallback.
-- `src/argus/media.py`: `extract_audio_chunks(src, out_dir, *, chunk_seconds, ffmpeg=None, timeout_s=3600) -> list[Path]`.
-  - It is blocking: the engine runs it in a worker thread.
-  - It uses the resolved ffmpeg (`resolve_ffmpeg`) with the segment muxer, and returns `chunk_000.mp3`, … in order.
-  - `RuntimeError` names the cause: no ffmpeg, ffmpeg's exit code and stderr tail, the timeout, or no output.
+- `src/argus/media.py`: `async extract_audio_chunks(src, out_dir, *, chunk_seconds, ffmpeg=None, timeout_s=3600) -> list[Path]`. Fix round 1 changed it from blocking and segment-muxed to the description below.
+  - It uses the resolved ffmpeg (`resolve_ffmpeg`).
+  - It decodes the audio once to 16 kHz mono raw PCM, cuts it at exact sample offsets, and encodes each cut to MP3 on its own. It returns `chunk_000.mp3`, … in order, and the intermediate PCM is removed.
+  - The chunks are contiguous and nothing is lost: each chunk decodes alone to exactly its share. They don't overlap, so no word is sent twice.
+  - `timeout_s` bounds each ffmpeg run.
+  - A cancel or a timeout kills the running ffmpeg and awaits it, so no child outlives the call holding files open.
+  - `RuntimeError` names the cause: no ffmpeg, ffmpeg's exit code and stderr tail, the timeout, or no audio.
   - On POSIX it runs with `start_new_session=True`.
 - `src/argus/transcribe.py`: `transcribe_url(url, *, transcripts_root, media_root, quality="auto", library=None, engines=None)`. The existing callers' arguments are unchanged.
   - `engines` defaults to `registry.current_config()`. When startup did not load the config, it loads it now, and a failing load is reported.
@@ -53,12 +58,12 @@ Spec: `docs/argus-v4-design.md` §3 WP-F, with §2.2 (`TranscriberConfig`, the l
 - **The backend string for faster-whisper changed** from `whisper` to `faster_whisper:<model>`, to match the `openai_audio:<provider>/<model>` pattern. Nothing in the code reads the old value. The library's `meta.backend` of earlier transcripts keeps `whisper`.
 - **The faster-whisper model can't be changed from chat.** The spec's `[provider/model]` doesn't fit a local engine, so `/engines transcriber faster_whisper <x>` is refused with a pointer to `transcriber.faster_whisper.model`.
 - **The upload cap is a code constant** (`MAX_UPLOAD_BYTES`, the OpenAI and Groq limit), because the spec's block has no key for it. At the shipped `chunk_seconds`, a chunk is a few MB.
-- **`set_transcriber` stores the whole block in the library** (WP-A's registry). A later edit to the file's `transcriber` values is therefore shadowed by a stored `/engines transcriber` or console choice, until that setting is changed again.
-- **`ARGUS_WHISPER_MODEL` is no longer read.** The model is `transcriber.faster_whisper.model`. The startup-WARNING table (`registry.REMOVED_ENV_KNOBS`, whose comment says the WP that stops reading a knob adds it there) belongs to WP-A's file, and §7 does not list the knob. It is left to the orchestrator: one line. The variable is not set in this PC's `.env`.
+- **`engines.transcriber` holds only what differs from the files** (fix round 1, `registry.set_transcriber`), so a file edit keeps reaching every key a choice left alone. See the fix-round section.
+- **`ARGUS_WHISPER_MODEL` is no longer read.** The model is `transcriber.faster_whisper.model`. Since fix round 1, startup warns once if the variable is set (`registry.REMOVED_ENV_KNOBS`, approved by the orchestrator), and spec §7 lists it as removed.
 
 ### Behaviour changes for handoff.md
 
-- The whisper model, device and compute type come from `argus_engines.json` `transcriber.faster_whisper` (or the local file), not from `ARGUS_WHISPER_MODEL`. `handoff.md` §"Whisper on Apple Silicon" still names the old variable; that is WP-H's file.
+- The whisper model, device and compute type come from `argus_engines.json` `transcriber.faster_whisper` (or the local file), not from `ARGUS_WHISPER_MODEL`, which startup now warns about. `handoff.md` §"Whisper on Apple Silicon" says so (fix round 1).
 - `/engines transcriber openai_audio groq/<model>` switches transcription to Groq's Whisper API. It needs `GROQ_API_KEY`; without it, every transcription answers "transcriber configuration: provider groq: GROQ_API_KEY is not set", and nothing is downloaded.
 - The transcript caption and the file header read `faster_whisper:small` (or `openai_audio:groq/…`) instead of `whisper`. A YouTube video whose captions failed reads `captions→…`, and its header has the caption error.
 - A YouTube order of `["captions"]` no longer falls back to ASR; `["asr"]` skips captions.
@@ -100,3 +105,53 @@ Logs and scripts are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83
   - `fw` with the shipped `small` block: `TranscribeError: RuntimeError: mkl_malloc: failed to allocate memory`, from `ctranslate2` loading the model. The PC had about 0.2 GB of free RAM, both during and after the suite. The error path surfaced as designed.
   - `fw_block.py` with `{"model":"tiny","device":"cpu","compute_type":"int8"}` (cached weights, `HF_HUB_OFFLINE=1`): `backend=faster_whisper:tiny language=en`, text "The quick brown fox jumps over the lazy dog. / Argus transcribes this short clip."
 - **Not verified:** the shipped `openai_audio` model id `whisper-large-v3-turbo` against Groq. The spec asks for it to be confirmed before the block is committed, but this PC has no `GROQ_API_KEY` and the task forbade live calls. It remains unverified data until the orchestrator's Groq check runs. If the id differs, only `argus_engines.json` changes.
+
+### Fix round 1 (review of abd1463)
+
+The review is `.superpowers/sdd/2026-10-19-argus-v4/task-13-review.md`. The orchestrator approved edits outside WP-F's files for items 1 and 2 only: `src/argus/engines/registry.py`, the spec §7 "Removed" list and `handoff.md` §4. Item 7 needed `src/argus/bot/media.py`.
+
+1. **A stored choice no longer shadows file edits.**
+   - `registry.set_transcriber(t)` keeps its signature, so `/engines transcriber` and the console's `PUT /api/engines` are unchanged callers. It stores only `t`'s difference from the files' block, with the schema defaults filled in: dicts key by key, a list or scalar whole.
+   - A value set back to the files' value leaves the library.
+   - `_deep_merge` no longer applies the engine-spec "a dict naming `provider` replaces whole" rule inside `transcriber`. A partial `openai_audio` row (just `model`) therefore merges key by key, as a local file's `transcriber` edit does.
+   - **Pre-fix rows:** a stored row holding every `TranscriberConfig` field was written before this rule. It still loads, and its in-memory layer keeps only what a choice could set there: `asr_engine`, and `openai_audio.provider`/`model` where they differ from the files. The copied rest (`youtube`, the `faster_whisper` block, `chunk_seconds`, `language`) follows the files again. Startup writes nothing; the pruned layer is persisted at the next change.
+     - The trade-off: a pre-fix row's `provider`/`model` that differs from today's file is kept, as a user choice, even if it was only an older file value.
+     - This PC's library has no `engines.*` rows (read-only check).
+2. **`ARGUS_WHISPER_MODEL` warns at startup.** It is in `REMOVED_ENV_KNOBS`, pointing at `argus_engines.json transcriber.faster_whisper.model` and `/engines transcriber`. It is also in spec §7 "Removed", and `handoff.md` §4 no longer advises setting it.
+3. **Contiguous chunks**, via the PCM-cut approach described above.
+   - Experiment (`scratchpad\t13fix\exp_gapless.py`): a 7.3 s tone cut into 2 s PCM slices, each encoded on its own. MP3 decodes to `[2.0, 2.0, 2.0, 1.3]`, a sum of 7.3. FLAC gives the same.
+   - So MP3 was kept: it is a fraction of FLAC's size against the upload cap.
+4. **Cancel hygiene.**
+   - Each ffmpeg runs as an asyncio subprocess (`media._run_ffmpeg`). A cancel or the timeout kills the child and awaits it before propagating.
+   - `OpenAIAudio` awaits the chunker directly, no longer in a worker thread. The `TemporaryDirectory` cleanup therefore runs after the child is gone, and the `CancelledError` is not replaced by a Windows `PermissionError`.
+5. **`asr_available()`** uses `importlib.util.find_spec`, so it no longer imports faster-whisper on the event loop.
+6. **New tests** (see the list below).
+7. **The bot's "Transcribing…" note** names what will run: for example `🎙 Transcribing via captions → faster_whisper:small (…)` or `via openai_audio:groq/…`.
+   - It mentions the model download only for faster-whisper.
+   - With an unloadable config it says "🎙 Transcribing…", and `transcribe_url`'s configuration error follows.
+   - `transcribe.engines_config` is now public, for this caller. `transcribers.asr_label` gives the display string, and `/engines transcriber` reuses it.
+
+Review Minor 5 (the configured vs detected language) is parked by the orchestrator and is unchanged.
+
+**Tests added or changed:**
+- `test_transcribers.py`:
+  - the reviewer's shadowing probe, plus a file-corrected model reaching a stored provider choice;
+  - a value set back to the file leaving the library;
+  - a pre-fix whole-block row loading;
+  - the startup warning, through `bot.app._post_init` via `test_engines_cmd`'s helper;
+  - chunk durations summing to the source (on a path with a space and non-ASCII characters);
+  - a cancel killing and awaiting ffmpeg, and the folder removable;
+  - a timeout killing ffmpeg;
+  - a cancelled `openai_audio` leaving no temp folder;
+  - `asr_available` not importing the package (a subprocess check);
+  - the provider's `timeout_s` reaching `_client` and httpx;
+  - no key or Authorization header in any log at DEBUG;
+  - no `__context__` on a transport error;
+  - the `/engines transcriber` persistence assertions updated to the stored difference.
+- `test_transcribe.py`: the bot note per engine and per YouTube order, and the broken-config note.
+
+**Evidence** (`scratchpad\t13fix\`):
+- `red.log`: 29 failed (the new behaviour, and the async chunker the old fakes did not match).
+- `green.log`: the WP-F, engines, webapp-API and media files, 260 passed.
+- `suite.log`: the full suite.
+- `live_check.log`: the no-key error again, and the async chunker on the TTS clip.

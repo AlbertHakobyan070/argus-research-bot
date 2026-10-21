@@ -21,7 +21,9 @@ from ..media import (
     detect_platform, download_media, extract_urls, quality_format,
     reddit_search, resolve_ffmpeg,
 )
-from ..transcribe import transcribe_url
+from ..engines.registry import EngineConfigError
+from ..engines.transcribers import asr_label
+from ..transcribe import engines_config, transcribe_url
 from .common import (
     _TG_UPLOAD_CAP_BYTES, _allowed, _fmt_duration, _get_library,
     _html_escape_for_tg, _md_escape, _parse_indices, _safe_send,
@@ -265,18 +267,27 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
 
 async def _transcript_for_item(app, chat_id: int, item: dict) -> None:
     """Background task: transcript for one pool item, persisted into the
-    DS vault. YouTube goes via captions; X/Reddit/Instagram go via local
-    whisper ASR (download → speech-to-text)."""
+    DS vault, by the configured transcriber (YouTube: its captions/asr
+    order; X/Reddit/Instagram: the ASR engine, after a download)."""
     bot = app.bot
     s = get_settings()
     url = item.get("url") or ""
     platform = item.get("platform") or detect_platform(url) or "?"
     lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
 
-    note = ("🎙 Transcribing captions…" if platform == "youtube" else
-            "🎙 Transcribing via whisper (download + speech-to-text — this "
-            "can take a few minutes; the first ever run also downloads "
-            "the model)…")
+    try:
+        t = (await engines_config(lib)).transcriber
+    except EngineConfigError:
+        note = "🎙 Transcribing…"   # transcribe_url reports the configuration problem itself, next
+    else:
+        steps = t.youtube if platform == "youtube" else ["asr"]
+        note = "🎙 Transcribing via " + " → ".join(
+            asr_label(t) if step == "asr" else "captions" for step in steps)
+        if "asr" in steps:
+            note += (" (speech-to-text downloads the media first — this can take a few minutes"
+                     + ("; the first ever run also downloads the model" if t.asr_engine == "faster_whisper" else "")
+                     + ")")
+        note += "…"
     await bot.send_message(chat_id=chat_id, text=note)
 
     quality = await _get_media_quality(app)

@@ -11,7 +11,10 @@ Layers, lowest first: the defaults file (``ARGUS_ENGINES_FILE``), the
 optional local file (``ARGUS_ENGINES_LOCAL_FILE``), then the library keys
 ``engines.active_profile``, ``engines.overrides``, ``engines.transcriber``.
 Dicts merge key by key, except that an engine spec naming its ``provider``
-replaces the old spec whole; lists and scalars replace.
+replaces the old spec whole (not inside ``transcriber``, which has no engine
+specs); lists and scalars replace. ``engines.transcriber`` holds only what
+differs from the files, so file edits keep reaching the keys a choice left
+alone.
 
 Binding rules:
 - A role's binding is the override's, else the profile's, else the tier
@@ -83,6 +86,8 @@ REMOVED_ENV_KNOBS = {
     "ARGUS_DIGEST_CONCURRENCY": "run_config research.digest_concurrency",
     "ARGUS_MAX_REVISIONS": "run_config panel.max_compose_revisions",
     "ARGUS_COMPOSE_CONCURRENCY": "run_config compose.concurrency",
+    "ARGUS_WHISPER_MODEL": ("argus_engines.json transcriber.faster_whisper.model "
+                            "(the engine itself: /engines transcriber)"),
 }
 
 
@@ -125,6 +130,8 @@ async def load_config(paths: Sequence[str | Path] | None = None, library: Any = 
     _state.cfg = _state.snapshot = None
     _state.base = await asyncio.to_thread(_read_files, files)
     _state.layer = await _read_layer(_state.library) if _state.library is not None else {}
+    if "transcriber" in _state.layer:
+        _state.layer["transcriber"] = _transcriber_row(_state.layer["transcriber"], _state.base)
     _state.cfg = _build(_state.base, _state.layer)
     return _state.cfg
 
@@ -165,15 +172,56 @@ async def _read_layer(library: Any) -> dict:
     return layer
 
 
-def _deep_merge(base: Any, over: Any) -> Any:
+def _deep_merge(base: Any, over: Any, *, spec_rule: bool = True) -> Any:
     """Dicts merge key by key; an engine spec naming its provider, a list or
-    a scalar replaces."""
-    if isinstance(base, dict) and isinstance(over, dict) and "provider" not in over:
+    a scalar replaces. Inside ``transcriber`` there are no engine specs (its
+    ``openai_audio`` block names a provider), so everything merges key by key."""
+    if isinstance(base, dict) and isinstance(over, dict) and not (spec_rule and "provider" in over):
         out = dict(base)
         for k, v in over.items():
-            out[k] = _deep_merge(base[k], v) if k in base else v
+            out[k] = _deep_merge(base[k], v, spec_rule=spec_rule and k != "transcriber") if k in base else v
         return out
     return over
+
+
+_UNSET = object()
+
+
+def _deviation(over: Any, base: Any) -> Any:
+    """What ``over`` says that ``base`` does not: dicts key by key, anything
+    else whole; ``_UNSET`` when nothing differs."""
+    if isinstance(over, dict) and isinstance(base, dict):
+        out = {}
+        for k, v in over.items():
+            d = _deviation(v, base[k]) if k in base else v
+            if d is not _UNSET:
+                out[k] = d
+        return out or _UNSET
+    return _UNSET if over == base else over
+
+
+def _file_transcriber(base: dict | None) -> dict:
+    """The files' ``transcriber`` block with the schema defaults filled in."""
+    try:
+        return TranscriberConfig.model_validate((base or {}).get("transcriber") or {}).model_dump()
+    except ValidationError as e:
+        raise EngineConfigError(f"engines config invalid: transcriber: {_errors(e)}") from e
+
+
+def _transcriber_row(stored: Any, base: dict | None) -> Any:
+    """The library's ``engines.transcriber`` row, as a layer. Rows hold only
+    what differs from the files (``set_transcriber``). A row written before
+    that rule holds the whole block (every ``TranscriberConfig`` field): it
+    loads, keeping only what a choice could set there — ``asr_engine`` and
+    ``openai_audio``'s ``provider``/``model`` — where it differs from the
+    files; the copied rest follows the files again."""
+    if not isinstance(stored, dict) or not all(k in stored for k in TranscriberConfig.model_fields):
+        return stored
+    oa = stored.get("openai_audio") if isinstance(stored.get("openai_audio"), dict) else {}
+    picked = {"asr_engine": stored["asr_engine"],
+              "openai_audio": {k: oa[k] for k in ("provider", "model") if k in oa}}
+    d = _deviation(picked, _file_transcriber(base))
+    return {} if d is _UNSET else d
 
 
 def _build(base: dict, layer: dict) -> EnginesConfig:
@@ -407,7 +455,14 @@ async def set_overrides(profile: str, overrides: ProfileOverrides) -> EnginesSna
 
 
 async def set_transcriber(transcriber: TranscriberConfig) -> None:
-    change = {"transcriber": transcriber.model_dump()}
+    """Persist the transcriber choice as its difference from the files'
+    block (schema defaults included), so a later edit of the files reaches
+    every key the choice leaves alone, and a value set back to the files'
+    value is dropped from the library."""
+    if _state.base is None:
+        raise EngineConfigError("engines config not loaded (registry.load_config)")
+    d = _deviation(transcriber.model_dump(), _file_transcriber(_state.base))
+    change = {"transcriber": {} if d is _UNSET else d}
     cfg = _rebuild(change)
     await _persist("transcriber", change["transcriber"])
     _commit(cfg, change, _state.snapshot)

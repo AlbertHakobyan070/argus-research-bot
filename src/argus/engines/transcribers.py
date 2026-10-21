@@ -19,6 +19,7 @@ failed request, a chunk over the upload limit or an all-silent result raises
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import tempfile
 import threading
@@ -49,11 +50,9 @@ class TranscribeError(RuntimeError):
 
 
 def asr_available() -> bool:
-    try:
-        import faster_whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """Whether faster-whisper is installed, without importing it (the import
+    costs seconds, and this runs on the event loop)."""
+    return importlib.util.find_spec("faster_whisper") is not None
 
 
 def _block(t: TranscriberConfig, name: str, keys: tuple[str, ...]) -> dict:
@@ -63,6 +62,14 @@ def _block(t: TranscriberConfig, name: str, keys: tuple[str, ...]) -> dict:
         raise EngineConfigError(f"transcriber.{name} is missing {', '.join(missing)} "
                                 f"(the transcriber block in argus_engines.json)")
     return block
+
+
+def asr_label(t: TranscriberConfig) -> str:
+    """The configured ASR engine as its backend string, without building it
+    ("?" for a key the block lacks): for display only."""
+    if t.asr_engine == "faster_whisper":
+        return f"faster_whisper:{t.faster_whisper.get('model', '?')}"
+    return f"openai_audio:{t.openai_audio.get('provider', '?')}/{t.openai_audio.get('model', '?')}"
 
 
 def asr_engine(t: TranscriberConfig, cfg: EnginesConfig) -> FasterWhisper | OpenAIAudio:
@@ -141,8 +148,8 @@ class OpenAIAudio:
     async def transcribe(self, media_path: Path) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="argus_audio_") as tmp:
             try:
-                chunks = await asyncio.to_thread(extract_audio_chunks, Path(media_path), Path(tmp),
-                                                 chunk_seconds=self.chunk_seconds)
+                chunks = await extract_audio_chunks(Path(media_path), Path(tmp),
+                                                    chunk_seconds=self.chunk_seconds)
             except RuntimeError as e:
                 raise TranscribeError(f"{self.backend}: audio extraction failed: {e}") from e
             n = len(chunks)
@@ -170,7 +177,11 @@ class OpenAIAudio:
             r = await client.post(self.url, headers=headers, data=data,
                                   files={"file": (chunk.name, chunk.read_bytes(), "audio/mpeg")})
         except httpx.HTTPError as e:
-            raise TranscribeError(self._redact(f"{self.backend}: {where}: {type(e).__name__}: {e}")) from None
+            failure = self._redact(f"{self.backend}: {where}: {type(e).__name__}: {e}")
+        else:
+            failure = None
+        if failure is not None:                 # raised outside the handler: no __context__ holds the key
+            raise TranscribeError(failure)
         if r.status_code >= 400:
             hint = "; lower transcriber.openai_audio.chunk_seconds" if r.status_code == 413 else ""
             raise TranscribeError(self._redact(f"{self.backend}: {where}: HTTP {r.status_code} "

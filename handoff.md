@@ -315,7 +315,10 @@ The bot now tells you when an error looks cookie-shaped.
 
 `faster-whisper` is configured for **CPU int8** (`transcribe.py`). It works on
 Apple Silicon but does not use the GPU, so long audio is slow. First run
-downloads the model (`ARGUS_WHISPER_MODEL`, default `small`).
+downloads the model. The model, device and compute type come from
+`transcriber.faster_whisper` in `argus_engines.json` (override them in the
+gitignored `argus_engines.local.json`); `/engines transcriber` picks the
+engine. `ARGUS_WHISPER_MODEL` is no longer read; startup warns if it is set.
 **UNVERIFIED ON MAC.**
 
 ---
