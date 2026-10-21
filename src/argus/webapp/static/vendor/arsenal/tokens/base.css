@@ -1,0 +1,34 @@
+/* Minimal house base: typography, selection, focus, reduced motion, code, kbd.
+   Load order: fonts.css -> tokens.css -> base.css -> your page/kit CSS.
+   Components (rail, cards, callouts, toggles...) live in kits/web-ui, not here. */
+*,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ground);color:var(--ink);font:400 var(--fs-body)/var(--lh-body) var(--body);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:var(--sel)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r-sm)}
+h1,h2,h3,h4{font-family:var(--disp);color:var(--ink);text-wrap:balance;margin:0}
+h1{font-size:var(--fs-h1);line-height:var(--lh-h1);letter-spacing:var(--track-h1);font-weight:700}
+h2{font-size:var(--fs-h2);line-height:var(--lh-h2);letter-spacing:var(--track-h2);font-weight:600}
+h3{font-size:var(--fs-h3);line-height:var(--lh-h3);font-weight:600}
+p{margin:0 0 1em;text-wrap:pretty}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+.kicker{display:block;font:600 var(--fs-kicker)/1 var(--disp);letter-spacing:var(--track-kicker);text-transform:uppercase;color:var(--accent)}
+.prose{max-width:var(--measure)}
+.num,table td{font-variant-numeric:tabular-nums}
+code,kbd,pre,samp{font-family:var(--mono)}
+code{font-size:.885em;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:.08em .34em}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:var(--r);padding:13px 15px;overflow-x:auto;font-size:var(--fs-code);line-height:1.6}
+pre code{background:none;border:0;padding:0;font-size:inherit}
+kbd{font:500 10.5px/1 var(--mono);color:var(--ink-dim);border:1px solid var(--line);border-bottom-width:2px;border-radius:var(--r-sm);padding:2px 5px;background:var(--panel)}
+mark{background:var(--mark);color:var(--ink);border-radius:2px;padding:0 1px}
+hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+.vh{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+}
+@media print{
+  body{background:#fff;color:#000}
+  a{color:inherit;text-decoration:none}
+}

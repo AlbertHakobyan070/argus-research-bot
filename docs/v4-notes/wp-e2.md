@@ -155,3 +155,164 @@ Evidence (`A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-43
 - RED (`red.log`): the new tests fail against 9182fd9. Two held already and fill a gap: the off-gate `plan_payload` test and the no-marker render test.
 - GREEN: the focused files pass (`green.log`). The full suite (`suite-final.log`) passes except the same live-proxy tests, and no warnings summary appears.
 - The reviewer's probes (`…\scratchpad\t11-review\`), re-run on the fixed code (`probe_*.after.log`). With an unopenable log the supervisor stays alive and reports the URL, a raising `on_url` is logged and the supervision goes on, and `stop()` returns cleanly. Every refusal is one log line with a `%r` path, and the injected field name is counted as "+1 other". The unclosed `<style>` renders as the marker.
+
+## Task 12: frontend
+
+Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend above and served from `webapp/static/` by `server.build_app` (`GET /` is `static/index.html`; everything else is under `/static/*`).
+
+### What changed
+
+- `scripts/sync_arsenal.py [--arsenal DIR] [--pair ledger] [--out DIR]` copies the arsenal kit into `src/argus/webapp/static/vendor/arsenal/`, mirroring the kit's relative tree:
+  - `FIXED_FILES`, listed in the script: `tokens/{tokens,base,fonts}.css`; `kits/web-ui/ui.css` and each `components/*.css` it imports; `ui.classic.js`; `icons/icons.js`; `motion/motion.css`; `templates/app-shell.html` and `templates/console.html`;
+  - the chosen pairing's `type/pair-<pair>.css`, the `type/faces/*.css` it `@import`s, the `vendor/fonts/web/**` font files those faces and `tokens/fonts.css` reference, and each font folder's `LICENSE.txt` (the fonts are SIL OFL);
+  - every relative `@import`/`url()` of a copied stylesheet must resolve to a copied file, or it raises before writing anything. A listed file that is missing raises too;
+  - the old snapshot is removed first. Then `MANIFEST.json` `{source_root, copied_at, pair, files: [{path, sha256}]}` and a `.gitattributes` (`* -text`) are written. The `.gitattributes` keeps git's `core.autocrlf` from rewriting line endings, so the sums hold on every checkout (the kit's files are CRLF on this PC, and a Linux CI checkout would otherwise change them);
+  - without `--arsenal`, the source is the existing manifest's `source_root`, so a re-sync needs no path. With neither, it exits with a message naming `--arsenal`.
+- The snapshot (`static/vendor/arsenal/`, pairing `ledger`) is committed with its manifest.
+- `static/index.html` follows the kit's `app-shell.html` structure, with the hrefs pointing at the snapshot: the rail with the lane-track nav, the sticky top bar with breadcrumbs, `page-head` and `sec` sections. The template's demo content, command palette and theme picker/toggle are not used (the spec says no theme picker).
+  - It loads `tokens.css`, `base.css`, `pair-ledger.css`, `ui.css` and `motion.css`, then `static/app.css`. Then the Telegram SDK from `https://telegram.org/js/telegram-web-app.js`, the kit's `icons.js` and `ui.classic.js`, and `app.js` as an ES module.
+  - None of the console's own files has an inline script, an `on*=` handler or a `style=` attribute; the CSP allows none of them.
+  - The favicon is `data:,`, an empty icon. Without it, the browser's request for `/favicon.ico` returns a 404, which shows as a console error.
+- `static/app.css` is the console's layout on top of the kit. It uses token variables only, with no colour or font of its own.
+- `static/auth.js` reads the launch parameters once:
+  - initData comes from `Telegram.WebApp.initData` when the SDK loaded, else from the `#tgWebAppData=` fragment the dev URL provides;
+  - a route may lead the fragment (`#/run/<id>&tgWebAppData=…`), so a signed link can open any view;
+  - the parameters are then dropped from the address bar (`history.replaceState`; the route stays);
+  - initData lives in memory only. It never goes into storage, a log or a URL the server sees.
+- `static/api.js` calls `fetch` with `Authorization: tma <initData>`. A non-2xx answer throws `ApiError(status, code, message)` from the server's `{"error": {code, message}}`.
+- `static/app.js` is the hash router (`#/runs`, `#/run/<id>`, `#/new`, `#/engines`):
+  - it calls `GET /api/me` first; the rail shows the user and the bot version;
+  - each view module exports `render(el, params, ctx)` and may return a cleanup function (for polling, the MainButton or the popover);
+  - Telegram: `ready()` and `expand()`. The theme is the kit's `dark` when `colorScheme` is `dark` and the default `ledger` when it is `light`, applied again on `themeChanged`. Without the SDK the page follows the OS like any kit page. The `BackButton` shows on every view except the runs list;
+  - every `Telegram.WebApp` call is guarded, for an absent SDK and for a client version below the method's.
+- `static/views/common.js` holds the shared helpers:
+  - escaping: all text goes through `esc`;
+  - status labels as the kit's `.status`, a shape plus a label;
+  - the problem panel, and `act()`: the action's button is disabled while it runs, and a failure is shown;
+  - `MainButton`/`BackButton`, and `openLink`, which goes through Telegram when it is there;
+  - a confirm dialog on the kit's `.dlg` (no `window.confirm`);
+  - the Exa estimate formula from `RunConfig.exa_cost_estimate_usd`: searches × search price + pages × page price, with any dotted overrides of the two caps applied.
+- `static/views/runs.js` is the runs list (`GET /api/runs`). Each row shows the topic, id, length · depth, the update time and the status: running at a stage, plan or report waiting for you, done, error or cancelled.
+- `static/views/run.js` shows one run:
+  - progress: the snapshot's counts as KPIs and the events as a timeline, newest first, with only the newest few dozen shown.
+    - While a drive runs, it polls `GET …/events?after=<last seq>` every 2 s and reads on in pages until the server's `last_seq` (the bus answers in bounded pages).
+    - It re-fetches the snapshot on a `stage` event that is not a start (end, error, cancelled, draining) and on a `gate` event. It keeps re-fetching on each tick until the next stage starts or the drive is over, because the last stage end can arrive before the driver releases the run.
+    - After an action, it polls for a few more ticks so the new drive shows up.
+    - A polling failure stops the polling and shows the problem. The top bar's refresh starts it again.
+  - the plan gate (`snapshot.plan`):
+    - it shows the summary, sub-questions, search intents, the found sources (or the "Live search found no sources" warning) and `plan.error`;
+    - the knobs are the kit's console rows: length; depth (Auto shows the length's default depth); the engines profile with its `profile_problem`; recency, read-only, because the approve route takes no recency (the chat card's button changes it); and the Exa estimate. The estimate is the server's for the drafted plan, recomputed for other choices, and "off" when Exa is off for the run;
+    - Approve (also the Telegram MainButton) sends `{action: "approve", length, depth, engines_profile}`. Edit needs feedback, and Cancel asks for confirmation in a dialog;
+    - when `snapshot.plan` is null (a legacy checkpoint), it shows "Plan not available" and keeps Approve (sending no knobs), Edit and Cancel.
+  - the report:
+    - the fact-check line comes from `panel_verdict`. `judged < total` shows a "Not fact-checked" warning and is never shown as passed;
+    - **Send to chat** has a checkbox for each file the run has and calls `POST …/send`;
+    - at the report gate there are Deliver, Extend, Revise (needs feedback) and Cancel;
+    - the reader puts the server-sanitised HTML into `article.prose`. At 390 px long URLs wrap and tables scroll inside themselves.
+  - tap-to-verify:
+    - every `.cite[data-n]` gets `role="button"` and a `tabindex`, so Enter and Space open it too;
+    - a tap opens the kit's popover under the citation (`UI.place`). It shows the `evidence.json` source (title, domain, date, type, "pinned by you"), the first few quoted claims tagged "quote verified in the page" or "quote not verified", and a link that opens through Telegram;
+    - `evidence.json` is fetched only when `report_paths` lists it. Without one, the popover says the run has no evidence file.
+  - Cancel run, in the page head, asks for confirmation in a dialog. The text says the run finishes its current step for a live drive (the drain), or leaves its gate otherwise.
+- `static/views/new.js` is the new-research form on the console layout. The fields:
+  - topic (required), length, depth (Auto or a preset) and recency;
+  - the engines profile, from `GET /api/engines`. If that returns an `engine_config` refusal, the refusal shows in the field and no profile is sent;
+  - dotted overrides, one `key=value` per line. Values are parsed as JSON where they parse. A malformed line shows an error under the field, and nothing is sent;
+  - the Exa upper bound for those settings: "n/a" without prices, and marked "when Exa is enabled", because the browser cannot know whether it is.
+
+  Start (also the MainButton) calls `POST /api/runs` and opens the run's view.
+- `static/views/engines.js` is the engines console, laid out as the kit's `console.html` sections (`set-sec` rows). It makes one change per PUT, as the backend requires:
+  - active profile: the validation result (`validation.errors` as a warning, else "Validated · resolved …"), the snapshot's warnings, and each profile with "Make active" (`{active_profile}`). A profile that does not validate is refused with the registry's text, and nothing changes;
+  - overrides for a chosen profile:
+    - each tier has a provider and a model, with Override and Clear;
+    - one role at a time has a primary, an ordered fallback list (add/remove) and `on_exhausted`, with Override role and Clear role override;
+    - each PUT sends that profile's whole override object, `{overrides: {<profile>: {tiers, roles}}}`: the stored overrides plus the change;
+    - model fields are free text with a `<datalist>` filled from the live model list (`GET …/providers/<name>/models`, once per provider per page). A failed listing is shown under the row, and an id can still be typed;
+    - an empty model keeps the original spec's `model_from_preferences` when the provider is unchanged; otherwise the row says "choose a model".
+  - the transcriber: `asr_engine`, sent as `{transcriber: {…current, asr_engine}}`; the engine's settings are shown read-only;
+  - the month-to-date Exa spend and the configured prices;
+  - the provider definitions, read-only: the base URL, the key env (set, missing or keyless), the live list or known models, and notes. Key values never reach the page.
+- Problem views:
+  - a 401/403 from any call replaces the view and stops everything. It shows "Session expired — reopen from the menu button" (`expired`) or "The console could not sign you in" (the other codes), with the server's message;
+  - 409 `busy` / `already_running` / `refused`, 400 (`engine_config`, `bad_request`), 404, 502 `send_failed` and 500 each show an explicit panel next to the action: a kicker, a title, the server's message, the code and the status. The inputs are kept;
+  - a view that cannot load shows the panel in its place;
+  - an error that is not an API answer is rethrown (a console error), never hidden.
+
+### Decisions where the spec is silent
+
+- **The engines console is a view in the one page, not a second HTML file.** The hash router has `#/engines`, so `views/engines.js` rebuilds `console.html`'s structure inside `index.html`. One page means one pairing: `ledger`, the house default. (`console.html` itself links `pair-civic`.)
+- **The kit templates are in the snapshot as unchanged reference copies**, because the spec lists them. The console does not load them. Their own inline `<script>` and `onclick=` stay, since they are the kit's files and the manifest sums cover them. So the brief's grep finds those two lines under `static/vendor/`; under the console's CSP they could not run even if opened. Outside `vendor/` the grep is empty, and `test_the_console_has_no_inline_script_and_its_references_exist` guards that.
+- **No `'unsafe-inline'` for styles either.** The kit's JS positions popovers and tooltips through the CSSOM (`el.style.left = …`), which `style-src 'self'` allows. Nothing uses `style=` attributes or injected `<style>`. The CSP is unchanged.
+- **Recency at the plan gate is read-only.** `POST …/plan` takes `length`, `depth` and `engines_profile`; recency changes from the chat card.
+- **The runs list does not poll**; the spec has only the run view poll. The top bar's refresh reloads any view.
+- **A 4xx answer is a console line in Chromium.** Chromium logs every failed `fetch` response as "Failed to load resource". The kit's checker counts that line as an error. So the views whose job is to show a refusal (the expired-session view, and the 409/400 panels after an action) produce exactly that one line: the network log of the expected answer, never a script error.
+
+### Behaviour changes for handoff.md
+
+- The `Argus` menu button opens a working console. It shows the runs, a run's live progress, the plan gate, and the report with tap-to-verify citations and Send to chat, and it has a new-run form and the engines settings. It follows Telegram's light/dark theme. A session older than `ARGUS_WEBAPP_INITDATA_MAX_AGE_S` shows "Session expired — reopen from the menu button".
+- To update the kit snapshot, run `./venv/Scripts/python.exe scripts/sync_arsenal.py`, then commit the folder. The source is the manifest's `source_root`; pass `--arsenal DIR` on another machine.
+
+### New env vars
+
+None.
+
+### Test files touched
+
+New: `tests/test_sync_arsenal.py`. It covers:
+
+- on a fixture arsenal tree:
+  - the fixed list plus the pairing's faces, fonts and licences are mirrored with a sha256 manifest, and nothing unlisted is copied (an unused font is not);
+  - another pairing copies only its own faces;
+  - a re-sync removes stale files;
+  - the default source is the manifest's;
+  - no source and no manifest is an error naming `--arsenal`;
+  - a missing listed file, an unknown pairing and a reference outside the snapshot each raise;
+- the committed snapshot matches its manifest, file for file and sum for sum;
+- the console's own HTML has no inline script, no `on*=` handler and no `style=` attribute; every `/static/` reference in it exists; and every relative ES-module import resolves.
+
+### Verification evidence (2026-10-21)
+
+Logs, scripts and screenshots are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t12\`. No test or preview started the bot or cloudflared, or called a live service.
+
+- **The preview** is `preview.py`. It runs `tests/webapp_fakes.make_app` on a `FakeRuns`/`FakeLibrary` with seeded runs:
+  - a live drive, with a task publishing events so the polling has something to show;
+  - a plan gate, a plan gate with no sources and a profile problem, and a legacy plan gate (`plan` null);
+  - a report gate whose report has hostile markdown, a table and a long URL, with `evidence.json` and a PDF;
+  - a delivered run without `evidence.json`, an error run and a cancelled run.
+
+  The engines are the real `argus_engines.json` with `registry._get_json` patched (no network; ollama's listing fails) and a dummy key in that process only. A second instance (`--busy`) answers `busy` to a start and `already_running` to an approve. Every URL is signed by `webapp_fakes.init_data`, plus one expired URL (auth_date two hours back) and one without initData.
+- **RED** (`red.log`): `tests/test_sync_arsenal.py` failed at collection before the script existed.
+- **GREEN**: `tests/test_sync_arsenal.py` passes. The full suite (`suite.log`, `PYTHONPATH="" FREELLMAPI_BASE_URL=http://127.0.0.1:9/v1 ./venv/Scripts/python.exe -m pytest -q -p no:cacheprovider`) fails only the live-proxy tests in `tests/test_llm.py` and the `tests/test_graph.py` fixture (the closed port, by design), and no warnings summary appears.
+- **The kit's render checker**, `tools/render.py check <url> --width 390 --height 844 --wait 2500`, ran in light (`--scheme light`) and dark (`--scheme dark --theme dark`) for every view (`check_all.sh`, `render-check-final.log`; `render-check-rerun.log` re-checks the plan and report views after the last edit):
+
+  ```
+  runs · light OK · dark OK
+  run-live (polling) · light OK · dark OK
+  run-plan · light OK · dark OK
+  run-plan-nosources (profile problem) · light OK · dark OK
+  run-legacy (plan null) · light OK · dark OK
+  run-report (tap-to-verify, hostile markdown) · light OK · dark OK
+  run-noevidence · light OK · dark OK
+  new · light OK · dark OK
+  engines · light OK · dark OK
+  expired · light FAIL · dark FAIL — the only line: console.error: Failed to load resource: the server responded with a status of 401 (Unauthorized)
+  no-initdata · light FAIL · dark FAIL — the same single 401 line
+  ```
+
+  The two FAILs are the views that exist to show a 401: Chromium logs the expected 401 response of `GET /api/me` as that line, and the page then shows the session-expired / sign-in view. There is no script error and no CSP violation in any view. The CSP was the server's, and the Telegram SDK loaded from telegram.org. Its `postEvent` lines are `console.log`, not errors.
+- **Scripted flows** (`flows.py` / `flows-final.log`: Playwright on Edge at 390 px, failing on any assertion; `flow-*.png`):
+  - tap `[2]`: the source, both quotes and their verified/not-verified tags, in light and dark;
+  - a run with no `evidence.json` says so in the popover;
+  - Send to chat: "Sent report.md, report.pdf to the chat.";
+  - the plan knobs: Exhaustive recomputes the estimate;
+  - Approve shows its toast; Cancel goes through the dialog;
+  - `busy` on Start shows the panel with the driver's text and keeps the topic typed;
+  - `already_running` on Approve shows its panel;
+  - a malformed override line is refused before sending;
+  - live polling: the newest timeline row changes within 4.5 s;
+  - engines: making `local-ollama` active shows the registry's refusal ("role intake.classify: choose a model for provider ollama …"); a judge-tier override from the live list saves and shows "console override"; ollama's failed model listing is shown under the row.
+
+  The only console errors are Chromium's lines for the expected 409/400 answers. `scrollWidth` is 390 on every page, so nothing scrolls horizontally.
+- I looked at the light, dark and 390 px screenshots of every view (`*.png`).
+- `grep -rn "<script>[^<]\|onclick=" src/argus/webapp/static --include=*.html` finds only the kit's reference templates under `static/vendor/` (see the decisions). Outside `vendor/` it is empty.
+- Not checked live: the console inside Telegram, behind the tunnel, and against the real driver. Those are the orchestrator's §4 checks.

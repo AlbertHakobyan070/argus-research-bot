@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workspace Settings</title>
+<!-- TEMPLATE: settings / console. Each .set-sec = an intro column (what this group controls and why)
+     beside a panel of rows; each row = label + one control. Controls are native (checkbox role=switch,
+     radio segmented control, select, input) so they work without JS. Destructive actions confirm in a <dialog>. -->
+<link rel="stylesheet" href="../../../tokens/tokens.css">
+<link rel="stylesheet" href="../../../tokens/base.css">
+<link rel="stylesheet" href="../type/pair-civic.css">
+<link rel="stylesheet" href="../ui.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="rail" data-ui="rail">
+    <div class="rail-head">
+      <span class="mark-word"><b>Lantern</b><span>Console</span></span>
+      <button class="rail-toggle" data-rail-toggle></button>
+    </div>
+    <p class="mark-sub">Workspace: support-search &middot; region eu-west</p>
+    <nav class="rail-nav" aria-label="Settings"><ol class="track" data-auto></ol></nav>
+    <div class="rail-tools"><div><span class="rail-k" id="theme-k">Theme</span><div data-ui="theme-picker" aria-labelledby="theme-k"></div></div></div>
+  </aside>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <nav class="crumbs" aria-label="Breadcrumb"><ol><li><a href="#main">support-search</a></li><li><span aria-current="page">Settings</span></li></ol></nav>
+      <div class="topbar-actions">
+        <button class="cmdk-btn" type="button" data-ui="cmdk-open"><i data-icon="search"></i><span class="cmdk-label">Find a setting</span><span class="kbd-hint"><kbd data-kbd-mod>Ctrl</kbd><kbd>K</kbd></span></button>
+        <button class="ib" type="button" data-ui="theme-toggle"></button>
+      </div>
+    </header>
+    <div class="page-head">
+      <div><span class="kicker">Settings</span><h1>Workspace settings</h1><p>Changes apply to the next query. Retrieval changes also trigger a validation run against the frozen question set.</p></div>
+    </div>
+
+    <section class="sec set-sec" id="retrieval" data-kicker="Retrieval" data-title="Retrieval">
+      <div class="set-intro"><h2>Retrieval</h2><p>How candidates are found and ordered before the assistant reads them.</p></div>
+      <form class="set-panel" onsubmit="event.preventDefault(); UI.toast('Retrieval settings saved. A validation run has been queued.', {title: 'Saved', kind: 'cost'})">
+        <label class="set-row"><span class="set-l"><b>Hybrid retrieval</b><small>Combine BM25 with dense retrieval. Off uses dense only.</small></span><input type="checkbox" role="switch" class="switch" checked></label>
+        <label class="set-row"><span class="set-l"><b>Cross-encoder reranking</b><small>Reorders the fused candidates. Adds about 38 ms at p50.</small></span><input type="checkbox" role="switch" class="switch" checked></label>
+        <div class="set-row"><span class="set-l"><b id="fusion-l">Fusion method</b><small>Rank fusion needs no score calibration.</small></span>
+          <div class="seg seg-s" role="radiogroup" aria-labelledby="fusion-l"><label><input type="radio" name="fusion" checked><span>RRF</span></label><label><input type="radio" name="fusion"><span>Weighted</span></label><label><input type="radio" name="fusion"><span>Dense only</span></label></div></div>
+        <div class="fields">
+          <div class="field"><label for="cand">Candidates to rerank</label><input class="input mono" id="cand" type="number" value="50" min="8" max="200"><p class="hint">Recall flattens past 50 on the frozen set.</p></div>
+          <div class="field"><label for="keep">Passages kept</label><input class="input mono" id="keep" type="number" value="8" min="1" max="20"><p class="hint">What the assistant reads.</p></div>
+        </div>
+        <div class="set-panel-f"><span class="hint">Unsaved changes are kept until you leave the page.</span><button class="btn" type="reset">Discard</button><button class="btn btn-a" type="submit">Save changes</button></div>
+      </form>
+    </section>
+
+    <section class="sec set-sec" id="evaluation" data-kicker="Evaluation" data-title="Evaluation">
+      <div class="set-intro"><h2>Evaluation</h2><p>When the frozen question set runs and who hears about regressions.</p></div>
+      <div class="set-panel">
+        <div class="set-row"><label class="set-l" for="sched"><b>Schedule</b><small>Runs use the same index snapshot for every question.</small></label>
+          <select class="input" id="sched" style="width:auto"><option>Nightly at 02:00</option><option>After every index rebuild</option><option>Manual only</option></select></div>
+        <label class="set-row"><span class="set-l"><b>Alert on regression</b><small>Posts when hit@5 drops outside its 95% interval or p95 rises by 20 ms.</small></span><input type="checkbox" role="switch" class="switch" checked></label>
+        <label class="set-row"><span class="set-l"><b>Include dev split</b><small>Never report dev-split numbers as results.</small></span><input type="checkbox" role="switch" class="switch"></label>
+      </div>
+    </section>
+
+    <section class="sec set-sec" id="access" data-kicker="Access" data-title="Access">
+      <div class="set-intro"><h2>API keys</h2><p>Keys are shown once at creation. Revoking takes effect within a minute.</p></div>
+      <div class="set-panel">
+        <div class="tw" style="margin:0;border:0;border-radius:var(--r) var(--r) 0 0">
+          <table>
+            <thead><tr><th>Name</th><th>Key</th><th>Last used</th><th class="n" data-sort="none"><span class="vh">Actions</span></th></tr></thead>
+            <tbody>
+              <tr><td>nightly-eval</td><td><code>sample_&hellip;7Q2c</code></td><td>2 hours ago</td><td class="n"><button class="btn btn-s btn-ghost" type="button" data-toast="Key nightly-eval revoked" data-toast-kind="trap">Revoke</button></td></tr>
+              <tr><td>dashboard-ro</td><td><code>sample_&hellip;M41x</code></td><td>yesterday</td><td class="n"><button class="btn btn-s btn-ghost" type="button" data-toast="Key dashboard-ro revoked" data-toast-kind="trap">Revoke</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="set-panel-f"><span class="hint"><span class="sample">Sample data</span> placeholders, not real keys</span><button class="btn" type="button" data-toast="A new key would be shown here once" data-toast-kind="mech">Create key</button></div>
+      </div>
+    </section>
+
+    <section class="sec set-sec" id="danger" data-kicker="Danger zone" data-title="Danger zone">
+      <div class="set-intro"><h2>Danger zone</h2><p>Irreversible actions. Each one asks for confirmation.</p></div>
+      <div class="set-panel danger">
+        <div class="set-row"><span class="set-l"><b>Rebuild the index</b><small>Takes about 40 minutes; search serves the old index until it finishes.</small></span><button class="btn btn-danger" type="button" data-dialog-open="confirm-rebuild">Rebuild&hellip;</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog class="dlg danger" id="confirm-rebuild" aria-labelledby="dlg-t">
+  <form method="dialog">
+    <div class="dlg-h"><span class="kicker">Confirm</span><h2 id="dlg-t">Rebuild the support-search index?</h2></div>
+    <div class="dlg-b"><p>The current index keeps serving until the new one passes validation. Nightly evaluation is skipped while the rebuild runs.</p></div>
+    <div class="dlg-f"><button class="btn" value="cancel">Cancel</button><button class="btn btn-danger" value="rebuild">Rebuild index</button></div>
+  </form>
+</dialog>
+<script src="../icons/icons.js"></script>
+<script src="../ui.classic.js"></script>
+<script>
+  document.getElementById("confirm-rebuild").addEventListener("close", (e) => {
+    if (e.target.returnValue === "rebuild") UI.toast("Rebuild started. Search keeps serving the current index.", { title: "Index rebuild", kind: "why" });
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,239 @@
+/* content.css — reading-column blocks: prose, callouts (why/trap/mech/cost), TL;DR,
+   cards, decision records, data tables (sortable), figures, annotated code study,
+   code blocks with copy, KPI rows, sidenotes, tabs, accordion, on-this-page TOC. */
+
+/* ---- prose ------------------------------------------------------------------- */
+.prose{max-width:var(--measure)}
+.prose p{margin:0 0 16px}
+.prose h2{margin:44px 0 12px}
+.prose h3{margin:34px 0 12px;letter-spacing:-.005em}
+.prose h4{font:600 15px/1.35 var(--disp);margin:26px 0 8px}
+.prose > :first-child{margin-top:0}
+.prose ul,.prose ol{margin:0 0 16px;padding-left:22px}
+.prose li{margin-bottom:6px}
+.prose li::marker{color:var(--ink-faint)}
+.prose strong,.prose b{font-weight:600;color:var(--ink)}
+.prose blockquote{margin:22px 0;padding:2px 0 2px 18px;border-left:2px solid var(--accent);color:var(--ink-dim);font:italic 400 17px/1.55 var(--serif)}
+.prose blockquote p:last-child{margin-bottom:0}
+.prose pre{margin:0 0 16px}
+.prose img{max-width:100%;height:auto;border-radius:var(--r)}
+.prose hr{margin:34px 0}
+.prose a:hover{text-decoration-thickness:2px}
+.dropcap::first-letter{float:left;font:600 3.4em/.82 var(--serif);margin:.06em .08em 0 0;color:var(--accent)}
+
+/* ---- callouts: the four annotation kinds ------------------------------------- */
+.callout{border:1px solid var(--line);border-left:3px solid var(--kc,var(--line));border-radius:var(--r);
+  background:var(--panel);padding:15px 19px 16px;margin:26px 0;max-width:74ch}
+.callout h4{font:600 10px/1 var(--kit-label,var(--disp));letter-spacing:.14em;text-transform:uppercase;color:var(--kc,var(--ink-faint));margin:0 0 9px}
+.callout h4 i{display:block;margin-top:7px;font:600 15.5px/1.3 var(--disp);font-style:normal;color:var(--ink);letter-spacing:0;text-transform:none}
+.callout p{margin:0 0 11px;font-size:14px} .callout p:last-child{margin-bottom:0}
+.callout ul,.callout ol{margin:0 0 11px;padding-left:19px;font-size:14px}
+.callout li{margin-bottom:5px}
+.callout .aside{font-size:12.8px;color:var(--ink-faint);border-top:1px dashed var(--line);padding-top:10px;margin-top:12px}
+.kinds-legend{display:flex;flex-direction:column;gap:4px}
+.kchip{display:flex;align-items:center;gap:8px;background:none;border:1px solid transparent;border-radius:var(--r);
+  padding:4px 6px;font:400 12px/1.3 var(--body);color:var(--ink-dim);cursor:pointer;text-align:left}
+.kchip .tag{width:42px;text-align:center}
+.kchip:hover{border-color:var(--line)}
+.kchip[aria-pressed="true"]{border-color:var(--kc);background:var(--panel-2);color:var(--ink)}
+[data-kind-filter] [data-kind].kind-out{opacity:.28}
+
+/* ---- in 30 seconds ------------------------------------------------------------- */
+.tldr{background:var(--panel-2);border:1px solid var(--line-soft);border-radius:var(--r);padding:13px 18px 14px;margin:0 0 26px;max-width:78ch}
+.tldr-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.tldr-k{font:600 10px/1 var(--kit-label,var(--disp));letter-spacing:.15em;text-transform:uppercase;color:var(--ink-dim);margin-right:auto}
+.tldr ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.tldr li{position:relative;padding-left:19px;font-size:14px;line-height:1.55}
+.tldr li::before{content:"";position:absolute;left:2px;top:.56em;width:7px;height:7px;border-radius:50%;border:1.5px solid var(--accent)}
+
+/* ---- cards (use sparingly: a wall of identical cards is an anti-pattern) -------- */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(272px,100%),1fr));gap:14px;margin:24px 0}
+.card{border:1px solid var(--line);border-radius:var(--r);padding:15px 17px 17px;background:var(--panel);display:flex;flex-direction:column;gap:7px;min-width:0}
+.card .tag{align-self:flex-start}
+.card h4{font:600 15px/1.3 var(--disp);margin:0;text-wrap:balance}
+.card p{margin:0;font-size:13.3px;line-height:1.56;color:var(--ink-dim)}
+a.card{text-decoration:none;color:inherit;transition:border-color var(--t-fast) var(--ease)}
+a.card:hover{border-color:var(--accent-line)}
+.panel{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);box-shadow:var(--shadow)}
+.panel-h{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line)}
+.panel-h h3{font-size:15px;margin:0;flex:1;min-width:0}
+.panel-b{padding:16px 18px}
+
+/* ---- decision records ----------------------------------------------------------- */
+.dec{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:17px 20px 18px;margin-bottom:12px}
+.dec h4{font:600 16px/1.3 var(--disp);margin:0 0 12px;color:var(--accent);text-wrap:balance}
+.dl{display:grid;grid-template-columns:76px minmax(0,1fr);gap:6px 14px;font-size:13.4px;margin:0}
+.dl dt{font:600 9.5px/1.7 var(--kit-label,var(--disp));letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint)}
+.dl dd{margin:0;color:var(--ink-dim);line-height:1.55}
+.dl dd.chose{color:var(--ink);font-weight:500}
+.dl dd.rej{color:var(--ink-faint);text-decoration:line-through;text-decoration-color:var(--line)}
+.dl dt.cost-dt{color:var(--cost)} .dl dt.trap-dt{color:var(--trap)}
+
+/* ---- tables ------------------------------------------------------------------------ */
+.tw{overflow-x:auto;margin:24px 0;border:1px solid var(--line);border-radius:var(--r);background:var(--panel)}
+.tw table{border-collapse:collapse;width:100%;font-size:13.4px}
+.tw.wide table{min-width:660px}
+.tw th{text-align:left;font:600 9.5px/1.4 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;color:var(--ink-faint);
+  padding:12px 16px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--panel-2);vertical-align:bottom}
+.tw td{padding:12px 16px;border-bottom:1px solid var(--line-soft);vertical-align:top;line-height:1.54;color:var(--ink-dim)}
+.tw tr:last-child td{border-bottom:0}
+.tw td:first-child{color:var(--ink);font-weight:500}
+.tw td.n{text-align:right;font:400 12.6px/1.54 var(--mono);color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tw th.n{text-align:right}
+.tw.dense td{padding:8px 14px} .tw.dense th{padding:9px 14px}
+.tw.zebra tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--panel-2) 45%,transparent)}
+.tw tbody tr:hover td{background:var(--accent-soft)}
+.tw caption{caption-side:bottom;text-align:left;font-size:12.6px;color:var(--ink-faint);padding:11px 16px;border-top:1px solid var(--line);background:var(--panel-2)}
+.tnote{font-size:12.6px;color:var(--ink-faint);padding:11px 16px;border-top:1px solid var(--line);background:var(--panel-2);line-height:1.55;margin:0}
+/* sortable: ui.js wraps each header in a button and sets aria-sort */
+.tw th .th-sort{all:unset;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:var(--r-sm)}
+.tw th .th-sort:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.tw th .th-sort::after{content:"";width:0;height:0;border:4px solid transparent;border-top-color:var(--line);margin-top:4px;opacity:.9}
+.tw th:hover .th-sort{color:var(--ink-dim)}
+.tw th[aria-sort="ascending"] .th-sort,.tw th[aria-sort="descending"] .th-sort{color:var(--accent)}
+.tw th[aria-sort="ascending"] .th-sort::after{border-top-color:transparent;border-bottom-color:var(--accent);margin:0 0 4px}
+.tw th[aria-sort="descending"] .th-sort::after{border-top-color:var(--accent)}
+
+/* ---- figures ------------------------------------------------------------------------ */
+figure.fig{margin:28px 0;padding:0}
+.fig-frame{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:22px 20px;overflow-x:auto;color:var(--ink-dim)}
+.fig-frame svg{max-width:100%;height:auto;display:block;margin:0 auto}
+.fig-title{font:600 15.5px/1.3 var(--disp);margin:0 0 12px;text-wrap:balance}
+figure figcaption{margin-top:12px;font-size:13.2px;color:var(--ink-faint);max-width:72ch;line-height:1.6}
+figure figcaption em{color:var(--ink-dim)}
+.sample{display:inline-block;font:600 8.5px/1 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;
+  color:var(--ink-faint);border:1px dashed var(--line);border-radius:2px;padding:3px 5px 2px;vertical-align:.12em}
+
+/* ---- KPI row ------------------------------------------------------------------------- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));border:1px solid var(--line);
+  border-radius:var(--r);background:var(--panel);margin:24px 0;overflow:hidden}
+.kpi{padding:14px 18px 15px;border-left:1px solid var(--line-soft);display:flex;flex-direction:column;gap:5px;min-width:0;margin-left:-1px}
+.kpi-k{font:600 9.5px/1.3 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;color:var(--ink-faint)}
+.kpi-v{font:600 26px/1.1 var(--body);color:var(--ink);letter-spacing:-.015em;font-variant-numeric:proportional-nums} /* stat tile: sans, proportional figures */
+.kpi-v small{font-size:13px;color:var(--ink-faint);margin-left:3px;letter-spacing:0}
+.kpi-s{font-size:12px;color:var(--ink-faint);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+
+/* ---- code ----------------------------------------------------------------------------- */
+.code{position:relative;margin:0 0 16px}
+.code pre{margin:0}
+.code-h{display:flex;align-items:center;gap:10px;font:500 11px/1 var(--mono);color:var(--ink-faint);
+  background:var(--panel-2);border:1px solid var(--line);border-bottom:0;border-radius:var(--r) var(--r) 0 0;padding:8px 12px}
+.code-h + pre{border-radius:0 0 var(--r) var(--r)}
+.copy{position:absolute;top:7px;right:7px;font:500 11px/1 var(--body);color:var(--ink-faint);background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--r-sm);padding:5px 8px;cursor:pointer;opacity:0;transition:opacity var(--t-fast) var(--ease)}
+.code-h .copy{position:static;opacity:1;margin-left:auto}
+.code:hover .copy,.copy:focus-visible{opacity:1}
+.copy:hover{color:var(--accent);border-color:var(--accent-line)}
+@media (hover:none){.copy{opacity:1}}
+/* token colours for highlight.js / Pygments class names (no library needed to style) */
+.hljs-keyword,.hljs-built_in,.tok-k{color:var(--mech)}
+.hljs-string,.tok-s{color:var(--cost)}
+.hljs-comment,.tok-c{color:var(--ink-faint);font-style:italic}
+.hljs-number,.hljs-literal,.tok-n{color:var(--trap)}
+.hljs-title,.hljs-title.function_,.hljs-title.class_,.tok-f{color:var(--accent)}
+/* Pygments (HtmlFormatter short classes, as emitted by build/mdpage.py) */
+pre .k,pre .kc,pre .kd,pre .kn,pre .kp,pre .kr,pre .kt,pre .ow,pre .nb,pre .bp{color:var(--mech)}
+pre .s,pre .s1,pre .s2,pre .sa,pre .sb,pre .sc,pre .sd,pre .se,pre .sh,pre .si,pre .sx,pre .sr,pre .ss{color:var(--cost)}
+pre .c,pre .c1,pre .cm,pre .cp,pre .cs,pre .ch,pre .cpf{color:var(--ink-faint);font-style:italic}
+pre .m,pre .mi,pre .mf,pre .mh,pre .mo,pre .il{color:var(--trap)}
+pre .nf,pre .nc,pre .nd,pre .fm{color:var(--accent)}
+
+/* ---- annotated code study (Atlas) -------------------------------------------------------
+   <figure class="study" data-ui="study"><div class="study-head">…</div>
+     <pre data-start="40">code…</pre><ol class="notes"><li data-kind="why" data-at="3-5"><h4>…</h4><p>…</p></li></ol></figure> */
+.study{margin:30px 0 8px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);box-shadow:var(--shadow);overflow:hidden}
+.study-head{padding:17px 20px 15px;border-bottom:1px solid var(--line)}
+.study-src{font:500 11px/1.4 var(--mono);color:var(--ink-faint);display:flex;gap:9px;flex-wrap:wrap;align-items:baseline;margin-bottom:8px}
+.study-src b{color:var(--accent);font-weight:500}
+.study-head h3{font-size:17px;line-height:1.28;margin:0 0 5px}
+.study-head p{margin:0;color:var(--ink-dim);font-size:13.5px;max-width:70ch}
+.study-body{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(280px,.88fr)}
+.code-pane{background:var(--code-bg);overflow-x:auto;padding:14px 0 16px;min-width:0;margin:0;border:0;border-radius:0}
+.cl{display:grid;grid-template-columns:44px 1fr;align-items:start;font:400 12.4px/1.68 var(--mono);white-space:pre;min-height:1px;
+  border-left:3px solid transparent;transition:background var(--t-fast) var(--ease)}
+.cl .ln{color:var(--ink-faint);opacity:.7;text-align:right;padding-right:13px;user-select:none;font-size:11px}
+.cl .lc{padding-right:18px}
+.cl[data-kind]{border-left-color:color-mix(in srgb,var(--kc) 42%,transparent)}
+.cl.hot{background:var(--sel);border-left-color:var(--kc)}
+.notes{list-style:none;margin:0;padding:12px 14px 14px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:8px;background:var(--panel)}
+.note{border:1px solid var(--line-soft);border-left:3px solid var(--kc,var(--line));border-radius:4px;padding:9px 12px 10px;
+  background:var(--panel-2);cursor:pointer;transition:border-color var(--t-fast) var(--ease),background var(--t-fast) var(--ease)}
+.note:hover,.note.hot{border-color:var(--kc,var(--line));background:var(--panel)}
+.note-top{display:flex;gap:8px;align-items:baseline;margin-bottom:4px}
+.note-at{font:500 10px/1.4 var(--mono);color:var(--ink-faint);margin-left:auto;flex:none}
+.note h4{font:600 13px/1.34 var(--body);margin:0;color:var(--ink)}
+.note p{margin:0;font-size:12.9px;line-height:1.56;color:var(--ink-dim)}
+
+/* ---- sidenotes (Tufte margin notes; inline below 1280px) ------------------------------- */
+.has-sidenotes{position:relative}
+.sn-ref{font:600 10px/1 var(--mono);color:var(--accent);vertical-align:super;margin-left:1px}
+.sidenote{display:block;font-size:12.6px;line-height:1.5;color:var(--ink-faint);border-left:2px solid var(--line);padding:2px 0 2px 10px;margin:8px 0 14px}
+.sidenote b{color:var(--ink-dim);font-weight:600}
+@media (min-width:1400px){
+  .has-sidenotes .sidenote{float:right;clear:right;width:220px;margin:4px -260px 14px 0;border-left:0;padding:0;border-top:1px solid var(--line)}
+  .has-sidenotes .sidenote::before{content:attr(data-n);display:block;font:600 10px/1 var(--mono);color:var(--accent);padding:7px 0 5px}
+}
+
+/* ---- tabs: <div class="tabs" data-ui="tabs"><div class="tablist"><button>…</button></div><div class="tabpanel">…</div></div> */
+.tabs{margin:20px 0}
+.tablist{display:flex;gap:2px;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
+.tablist [role="tab"],.tablist > button{font:500 13px/1 var(--body);color:var(--ink-dim);background:none;border:0;border-bottom:2px solid transparent;
+  padding:10px 14px 11px;margin-bottom:-1px;cursor:pointer;white-space:nowrap;border-radius:var(--r-sm) var(--r-sm) 0 0;
+  transition:color var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease)}
+.tablist [role="tab"]:hover{color:var(--ink)}
+.tablist [role="tab"][aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
+.tablist [role="tab"]:focus-visible{outline-offset:-2px}
+.tabpanel{padding:16px 0 4px}
+.tabpanel:focus-visible{outline-offset:4px}
+.tabs.boxed .tabpanel{border:1px solid var(--line);border-top:0;border-radius:0 0 var(--r) var(--r);background:var(--panel);padding:16px 18px}
+.tabs.code-tabs .tabpanel{padding:0}
+.tabs.code-tabs .tabpanel pre{border-top:0;border-radius:0 0 var(--r) var(--r)}
+.tabs.code-tabs .tablist{background:var(--panel-2);border:1px solid var(--line);border-bottom:0;border-radius:var(--r) var(--r) 0 0;padding:0 6px}
+.tabs.code-tabs{margin:0 0 16px}
+
+/* ---- accordion: native <details class="acc" name="group"> (name = exclusive) ------------ */
+.acc{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);margin-bottom:8px;interpolate-size:allow-keywords}
+.acc > summary{list-style:none;display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start;padding:14px 18px;cursor:pointer;border-radius:var(--r)}
+.acc > summary::-webkit-details-marker{display:none}
+.acc > summary h4,.acc > summary .acc-t{font:600 15px/1.36 var(--disp);margin:0;text-wrap:balance}
+.acc > summary .acc-k{display:block;font:600 9px/1 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;color:var(--accent);margin-bottom:7px}
+.acc > summary::after{content:"";width:8px;height:8px;margin-top:5px;border-right:1.5px solid var(--ink-faint);border-bottom:1.5px solid var(--ink-faint);
+  transform:rotate(45deg);transition:transform var(--t-med) var(--ease)}
+.acc[open] > summary::after{transform:rotate(225deg);border-color:var(--accent)}
+.acc > summary:hover::after{border-color:var(--accent)}
+.acc-b{padding:0 18px 16px;border-top:1px solid var(--line-soft)}
+.acc-b > :first-child{margin-top:14px}
+.acc-b p{font-size:14px;max-width:68ch} .acc-b p:last-child{margin-bottom:0}
+.acc::details-content{block-size:0;overflow:hidden;transition:block-size var(--t-med) var(--ease),content-visibility var(--t-med) allow-discrete}
+.acc[open]::details-content{block-size:auto}
+.acc .tell{margin-top:13px;padding-top:11px;border-top:1px dashed var(--line);font-size:12.7px;color:var(--ink-faint)}
+.acc .tell b{font:600 9.5px/1 var(--kit-label,var(--disp));letter-spacing:.12em;text-transform:uppercase;color:var(--cost);margin-right:8px}
+
+/* ---- on-this-page TOC (docs) ---------------------------------------------------------------- */
+.toc{font-size:12.8px}
+.toc ol{list-style:none;margin:0;padding:0;border-left:1px solid var(--line)}
+.toc a{display:block;padding:4px 0 4px 12px;margin-left:-1px;border-left:1px solid transparent;color:var(--ink-dim);text-decoration:none;line-height:1.4}
+.toc a:hover{color:var(--ink)}
+.toc a.on{color:var(--accent);border-left-color:var(--accent);font-weight:500}
+.toc .l3 a{padding-left:24px;font-size:12.3px}
+
+/* ---- glossary list ------------------------------------------------------------------------------ */
+.glossary{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));gap:10px;margin:6px 0 0}
+.glossary > div{border:1px solid var(--line-soft);border-radius:var(--r);background:var(--panel);padding:12px 15px 13px;display:flex;flex-direction:column;gap:6px;min-width:0;scroll-margin-top:20px}
+.glossary dt{font:600 14.5px/1.3 var(--disp)}
+.glossary dd{margin:0;font-size:13.2px;line-height:1.55;color:var(--ink-dim)}
+
+@media (max-width:1140px){
+  .study-body{grid-template-columns:1fr}
+  .notes{border-left:0;border-top:1px solid var(--line)}
+}
+@media (max-width:620px){
+  .dl{grid-template-columns:1fr;gap:2px}
+  .dl dt{margin-top:8px}
+  .kpi{border-left:0;border-top:1px solid var(--line-soft);margin:-1px 0 0}
+  .callout{padding:13px 15px 14px}
+}
+@media print{
+  .callout,.study,.tw,.card,.dec{break-inside:avoid}
+  .copy{display:none}
+}

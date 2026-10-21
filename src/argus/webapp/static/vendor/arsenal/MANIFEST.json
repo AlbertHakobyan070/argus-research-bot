@@ -1,0 +1,235 @@
+{
+ "source_root": "G:/Big Projects/Useful for AGENTS/arsenal",
+ "copied_at": "2026-10-20T22:44:52+00:00",
+ "pair": "ledger",
+ "files": [
+  {
+   "path": "kits/web-ui/components/content.css",
+   "sha256": "bae530e94091957ccfc844a3e09876686d8b39743a5c6657e9095b54b6da54e6"
+  },
+  {
+   "path": "kits/web-ui/components/core.css",
+   "sha256": "794af04abf8740ff6ffbdba6b756d0a4c28117041daff6bc0052e8021c637eaa"
+  },
+  {
+   "path": "kits/web-ui/components/layouts.css",
+   "sha256": "b04c425b5c1949d845077bc0f59756abdb1bac3cb608b3f505cf4999209e8696"
+  },
+  {
+   "path": "kits/web-ui/components/overlay.css",
+   "sha256": "9ed0aef494e4a5129ccf6cdcfa75050924c1a37472170a062c3753a5c4b26dff"
+  },
+  {
+   "path": "kits/web-ui/components/shell.css",
+   "sha256": "a2a1df06ddbae2790b051e66d6210b80599393fa554d74d696482e43696b8f9c"
+  },
+  {
+   "path": "kits/web-ui/components/study.css",
+   "sha256": "62647a58e7a1ec67d93a02bdd790733ba38f2b08dc41997e9195d3363c20245b"
+  },
+  {
+   "path": "kits/web-ui/components/themes.gen.css",
+   "sha256": "6e1e0758c9f13dfebd50d014929a62f952c31271490c05a3a6e3351065f36909"
+  },
+  {
+   "path": "kits/web-ui/icons/icons.js",
+   "sha256": "65f8ff85f4e48e00d18a3115d57329e7177c53a4562a531ecd795105eceb583c"
+  },
+  {
+   "path": "kits/web-ui/motion/motion.css",
+   "sha256": "06123213d5fecde8261784d7eefa63f1cb7f11e14ee5e35c689159da610fdc75"
+  },
+  {
+   "path": "kits/web-ui/templates/app-shell.html",
+   "sha256": "ebb6eea14e7e5f2e8dc9448e88970fc8886799d8b6a4cf2bf378a2089fb65ce5"
+  },
+  {
+   "path": "kits/web-ui/templates/console.html",
+   "sha256": "0ef0e19b5a90a521f76701e551fcb798cd11ab4de2b9894be243807b91620902"
+  },
+  {
+   "path": "kits/web-ui/type/faces/fraunces.css",
+   "sha256": "1989cab11e2f5b6b0a9d911258cd3f435181b88c065ea491b43aa9e9db5f43c6"
+  },
+  {
+   "path": "kits/web-ui/type/faces/ibm-plex-mono.css",
+   "sha256": "8c11c41f410d93e348b6d52e8a441a69e4ca98e2149a0430251a2a05d8488fe1"
+  },
+  {
+   "path": "kits/web-ui/type/faces/ibm-plex-sans-condensed.css",
+   "sha256": "cfb7ba14aadc4041f1dd90cb8bb8e4c8fa15e27ddd5b401d55cfce4793a11b08"
+  },
+  {
+   "path": "kits/web-ui/type/faces/ibm-plex-sans.css",
+   "sha256": "b9449fdd1dac4d7251e19bc261c1b90e705edcaaa871fe96c009d847e763e7b7"
+  },
+  {
+   "path": "kits/web-ui/type/pair-ledger.css",
+   "sha256": "42c721087aacc77b79067bd17d51211677562c23891be6871062dd27d25bd68a"
+  },
+  {
+   "path": "kits/web-ui/ui.classic.js",
+   "sha256": "9022c101fb9e6119ab120b8a46b14f21fc9ba776b8cf9c25f613ef2a9363bd57"
+  },
+  {
+   "path": "kits/web-ui/ui.css",
+   "sha256": "f8ebd547e9b313f4885c2148401342ff993ad209e350323015e993cb3c43c592"
+  },
+  {
+   "path": "tokens/base.css",
+   "sha256": "2bb9d08dc5aa7b877e2221085f1464a35b1aed7d7eb6152b53a1c4f3f916dc9d"
+  },
+  {
+   "path": "tokens/fonts.css",
+   "sha256": "ef34f922713e042b5c7f39206e1c6a1d63dacdacc380286ec692ba219fb4752b"
+  },
+  {
+   "path": "tokens/tokens.css",
+   "sha256": "19efe7ef1a537ca8ab0a3f8b53ecdb9640f88002899843be025f289ed81a5e66"
+  },
+  {
+   "path": "vendor/fonts/web/fraunces/LICENSE.txt",
+   "sha256": "cd3384cafac6f2bddc3955273958a2e029f97027c8037ac539ef5744a77b579e"
+  },
+  {
+   "path": "vendor/fonts/web/fraunces/fraunces-latin-ext-opsz-italic.woff2",
+   "sha256": "4983926d3a16544eedcd2233448bd8a43f711e7bf1fabaae8431e78e0b798635"
+  },
+  {
+   "path": "vendor/fonts/web/fraunces/fraunces-latin-ext-opsz-normal.woff2",
+   "sha256": "a2930b27d13a228bd9ab6a49269b5f800237892ad560cb9dd7fab01b1620f88e"
+  },
+  {
+   "path": "vendor/fonts/web/fraunces/fraunces-latin-opsz-italic.woff2",
+   "sha256": "066710ce7ed235a339d3d6cdcc8b55c0bea5632232662d83aacea25852108271"
+  },
+  {
+   "path": "vendor/fonts/web/fraunces/fraunces-latin-opsz-normal.woff2",
+   "sha256": "7234ed860a9cc83045413c4faee63c960a8f2d1917adcf728119307d56e0d783"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/LICENSE.txt",
+   "sha256": "23b0a9d0c6d3f140a0b77e483c5cfa6bba574325ef5cb189ed9f2fec4884533f"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-400-italic.woff2",
+   "sha256": "0840095faae86403735a8c04014b72cb29e7923646b222b360b7e8252932e4e3"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-400-normal.woff2",
+   "sha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-500-normal.woff2",
+   "sha256": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-600-normal.woff2",
+   "sha256": "0d1f0b8d0722224e32e9f28261bdc86c79115be73444ae5eceb73976a1bcdf83"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-ext-400-italic.woff2",
+   "sha256": "1b07eee6df7d26b31864581c2365131d384077605e0b63ae67c4a0a64363a6de"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-ext-400-normal.woff2",
+   "sha256": "6bc0f226a5b7884a8170e3f62c63d7675609d4631bdc5931b5cdab81821f00eb"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-ext-500-normal.woff2",
+   "sha256": "6bb06407c97584b0867a959e05e8874693bfeb8c317de190811c51598f2d99ea"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-mono/ibm-plex-mono-latin-ext-600-normal.woff2",
+   "sha256": "32057cf50dd14bdb21a2c93766c4a2c43e4abe688ea3922df3203cac7751a98b"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/LICENSE.txt",
+   "sha256": "251faa58c24c53a1855818116292bf449d591937cf5143fafc23e0be5e26ddc6"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-400-normal.woff2",
+   "sha256": "456bf5cda9c0b1f1ead43f01b80df5ba5af7cb41d7cbc0543091537c39fb4c89"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-500-normal.woff2",
+   "sha256": "e3b4fd97fd20bc70fda66d8d5f0745d8d6958068a024cb4724bbc1ffb6cbc183"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-600-normal.woff2",
+   "sha256": "3d72a0923c5830358b0a8e25b258aecadbecbf542b6ee9a25f387803e37d56b9"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-700-normal.woff2",
+   "sha256": "4768878c107d92c528a65bba206a87cdcf2c694514e75907fb91772cf8a388a5"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-ext-400-normal.woff2",
+   "sha256": "733d012e387e70d6ae5b2ecb7d7e10af7792a1c6d9d893b124bf445641ca2806"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-ext-500-normal.woff2",
+   "sha256": "a429de5d03bbd4696453c21f38d2f2e3fb96f009903e88657fbe1136b97d004c"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-ext-600-normal.woff2",
+   "sha256": "014b6bf624d39ae76c07de342b45fab064e66321c9e0d78854750948c815ecf0"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans-condensed/ibm-plex-sans-condensed-latin-ext-700-normal.woff2",
+   "sha256": "5a87e23666978e2a09671acd300ac22abc5c607e555fa96124221ddb187e145d"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/LICENSE.txt",
+   "sha256": "d0283623ef57e722fd0eb688a8041589670c608ab780cd3612d06ba6f153d3fd"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-400-italic.woff2",
+   "sha256": "6de912e531b6c98084f1b2d5e5a91bad77be4e68bc4e396e43c46fc435e5f3d9"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-400-normal.woff2",
+   "sha256": "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-500-normal.woff2",
+   "sha256": "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-600-italic.woff2",
+   "sha256": "a18bdcbc7aaeb2ee3fb50b9af5d689111e9a79767d75e40f22d70de8ded5e4ba"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-600-normal.woff2",
+   "sha256": "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-700-normal.woff2",
+   "sha256": "42e7b0c143c19df9d99fd896e76b48f846edf0902d200bc29796b34d12c33aa7"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-400-italic.woff2",
+   "sha256": "c5c00e8a32022dfedd2e7e864898ed007232e1450c6de1d6b847fe8825c2c5ce"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-400-normal.woff2",
+   "sha256": "c93d2a12aaa280f68b9ab7b726ff8dfedda67c99ef9abed047c1847a1cc6d583"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-500-normal.woff2",
+   "sha256": "2846035d85100f84c79393f80f1442d4ee720129ab8b3ffa8969aae281db8c6c"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-600-italic.woff2",
+   "sha256": "ff495e0841395139634bfee5ae7f851fad239f57d2af16e753fd0a71728f21d3"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-600-normal.woff2",
+   "sha256": "b25dfd4f979e442ae1e25cd0894463434cf01ba21ac1a35d39f4a82bd4cc060e"
+  },
+  {
+   "path": "vendor/fonts/web/ibm-plex-sans/ibm-plex-sans-latin-ext-700-normal.woff2",
+   "sha256": "92f0392bd74fa3955bfa92f6ec747e7246d3567b6f46b32ddbaf271104836ab8"
+  }
+ ]
+}

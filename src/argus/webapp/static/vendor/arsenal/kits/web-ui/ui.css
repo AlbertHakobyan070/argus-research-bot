@@ -1,0 +1,10 @@
+/* Arsenal web-ui — the whole component library in one link.
+   Load order: tokens/fonts.css -> tokens/tokens.css -> tokens/base.css -> [type/pair-<name>.css] -> ui.css -> [motion/motion.css]
+   tools/inline.py follows these @imports, so the inlined page carries only what is linked. */
+@import url("components/core.css");
+@import url("components/shell.css");
+@import url("components/content.css");
+@import url("components/overlay.css");
+@import url("components/study.css");
+@import url("components/layouts.css");
+@import url("components/themes.gen.css");

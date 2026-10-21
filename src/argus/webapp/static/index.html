@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Argus Console</title>
+<link rel="icon" href="data:,">
+<!-- From the arsenal web-ui kit's templates/app-shell.html (rail, top bar, breadcrumbs, page head);
+     the engines view follows templates/console.html (.set-sec rows). Snapshot: vendor/arsenal/MANIFEST.json.
+     Every script is a file (CSP script-src 'self' https://telegram.org); no inline style or handler. -->
+<link rel="stylesheet" href="/static/vendor/arsenal/tokens/tokens.css">
+<link rel="stylesheet" href="/static/vendor/arsenal/tokens/base.css">
+<link rel="stylesheet" href="/static/vendor/arsenal/kits/web-ui/type/pair-ledger.css">
+<link rel="stylesheet" href="/static/vendor/arsenal/kits/web-ui/ui.css">
+<link rel="stylesheet" href="/static/vendor/arsenal/kits/web-ui/motion/motion.css">
+<link rel="stylesheet" href="/static/app.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="rail" data-ui="rail">
+    <div class="rail-head">
+      <span class="mark-word"><b>Argus</b><span>Console</span></span>
+      <button class="rail-toggle" data-rail-toggle></button>
+    </div>
+    <p class="mark-sub">Research runs, plans and reports from your Telegram bot.</p>
+    <nav class="rail-nav" aria-label="Console"><ol class="track" id="nav">
+      <li><a href="#/runs" data-route="runs"><span><span class="kick">Library</span>Runs</span></a></li>
+      <li><a href="#/new" data-route="new"><span><span class="kick">Start</span>New research</span></a></li>
+      <li><a href="#/engines" data-route="engines"><span><span class="kick">Settings</span>Engines</span></a></li>
+    </ol></nav>
+    <div class="rail-tools">
+      <div><span class="rail-k">Signed in</span><p class="meta" id="who">checking…</p></div>
+    </div>
+  </aside>
+
+  <main class="main wide" id="main">
+    <header class="topbar">
+      <nav class="crumbs" aria-label="Breadcrumb"><ol id="crumbs"><li><span aria-current="page">Argus</span></li></ol></nav>
+      <div class="topbar-actions">
+        <button class="ib" type="button" id="refresh" aria-label="Refresh this view" data-tip="Refresh this view"><i data-icon="refresh-cw"></i></button>
+      </div>
+    </header>
+    <div id="view" aria-live="polite"><div class="page-head"><div><span class="skel h"></span><span class="skel w60"></span></div></div></div>
+  </main>
+</div>
+<div popover id="cite-pop" class="pop cite-pop"></div>
+<script src="/static/vendor/arsenal/kits/web-ui/icons/icons.js"></script>
+<script src="/static/vendor/arsenal/kits/web-ui/ui.classic.js"></script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

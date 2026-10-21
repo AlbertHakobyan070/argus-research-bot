@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evaluation Overview</title>
+<!-- TEMPLATE: app shell. Collapsible lane-track rail, sticky top bar with breadcrumbs, command palette
+     (Ctrl/Cmd+K) and theme toggle, wide working column. Slots: mark, mark-sub, crumbs, hero, body.
+     Generate from Markdown: kits/web-ui/build/mdpage.py in.md --template app-shell -o out.html -->
+<link rel="stylesheet" href="../../../tokens/tokens.css">
+<link rel="stylesheet" href="../../../tokens/base.css">
+<link rel="stylesheet" href="../type/pair-ledger.css">
+<link rel="stylesheet" href="../ui.css">
+<link rel="stylesheet" href="../motion/motion.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="rail" data-ui="rail">
+    <div class="rail-head">
+      <!-- slot:mark --><span class="mark-word"><b>Lantern</b><span>Eval</span></span><!-- /slot:mark -->
+      <button class="rail-toggle" data-rail-toggle></button>
+    </div>
+    <!-- slot:mark-sub --><p class="mark-sub">Retrieval evaluation for the support assistant. Nightly runs against the frozen question set.</p><!-- /slot:mark-sub -->
+    <nav class="rail-nav" aria-label="Sections"><ol class="track" data-auto></ol></nav>
+    <div class="rail-tools">
+      <div><span class="rail-k" id="theme-k">Theme</span><div data-ui="theme-picker" aria-labelledby="theme-k"></div></div>
+    </div>
+  </aside>
+
+  <main class="main wide" id="main">
+    <header class="topbar">
+      <!-- slot:crumbs --><nav class="crumbs" aria-label="Breadcrumb"><ol><li><a href="#main">Support search</a></li><li><a href="#main">Evaluation</a></li><li><span aria-current="page">Overview</span></li></ol></nav><!-- /slot:crumbs -->
+      <div class="topbar-actions">
+        <button class="cmdk-btn" type="button" data-ui="cmdk-open"><i data-icon="search"></i><span class="cmdk-label">Search or run a command</span><span class="kbd-hint"><kbd data-kbd-mod>Ctrl</kbd><kbd>K</kbd></span></button>
+        <button class="ib" type="button" data-ui="theme-toggle"></button>
+      </div>
+    </header>
+
+    <!-- slot:hero -->
+    <div class="page-head">
+      <div>
+        <span class="kicker">Nightly run &middot; 2026-10-14</span>
+        <h1>Retrieval held steady; latency regressed</h1>
+        <p>Hit@5 is flat against last week. p95 latency rose after the index rebuild and is being traced to the new shard layout.</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn" type="button" onclick="UI.copyText(location.href).then((ok) => ok && UI.toast('Link to this report copied', { kind: 'cost' }))">Copy link</button>
+        <button class="btn btn-a" type="button" data-toast="A new run was queued; results in about 20 minutes" data-toast-title="Run queued" data-toast-kind="cost">Run now</button>
+      </div>
+    </div>
+    <!-- /slot:hero -->
+
+    <!-- slot:body -->
+    <section class="sec" id="overview" data-kicker="Overview">
+      <div class="sec-head"><span class="kicker">Overview</span><h2>Headline numbers</h2></div>
+      <div class="kpis">
+        <div class="kpi"><span class="kpi-k">hit@5</span><span class="kpi-v">0.804</span><span class="kpi-s"><span class="delta flat">&plusmn;0.002</span>vs last week</span></div>
+        <div class="kpi"><span class="kpi-k">nDCG@10</span><span class="kpi-v">0.712</span><span class="kpi-s"><span class="delta good">+0.006</span>vs last week</span></div>
+        <div class="kpi"><span class="kpi-k">p95 latency</span><span class="kpi-v">83<small>ms</small></span><span class="kpi-s"><span class="delta bad">+21 ms</span>regression</span></div>
+        <div class="kpi"><span class="kpi-k">Questions</span><span class="kpi-v">1,000</span><span class="kpi-s">frozen set v3</span></div>
+      </div>
+      <p class="faint" style="font-size:var(--fs-small)"><span class="sample">Sample data</span> &middot; seeded synthetic run.</p>
+    </section>
+
+    <section class="sec" id="runs" data-kicker="Runs">
+      <div class="sec-head"><span class="kicker">Runs</span><h2>Recent runs</h2><p>Sort any column. Status always carries a label, never colour alone.</p></div>
+      <div class="tabs" data-ui="tabs">
+        <div class="tablist" aria-label="Run views"><button>All runs</button><button>Regressions</button></div>
+        <div class="tabpanel">
+          <div class="tw">
+            <table data-ui="sort">
+              <thead><tr><th>Run</th><th>Status</th><th class="n">hit@5</th><th class="n">p95 ms</th><th>Started</th></tr></thead>
+              <tbody>
+                <tr><td>nightly-1014</td><td><span class="status" data-s="warning">Latency regression</span></td><td class="n">0.804</td><td class="n">83</td><td>2026-10-14 02:00</td></tr>
+                <tr><td>nightly-1013</td><td><span class="status" data-s="good">Passed</span></td><td class="n">0.802</td><td class="n">62</td><td>2026-10-13 02:00</td></tr>
+                <tr><td>adhoc-shard-b</td><td><span class="status" data-s="critical">Failed</span></td><td class="n">0.731</td><td class="n">140</td><td>2026-10-12 16:41</td></tr>
+                <tr><td>nightly-1012</td><td><span class="status" data-s="good">Passed</span></td><td class="n">0.799</td><td class="n">61</td><td>2026-10-12 02:00</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="tabpanel">
+          <aside class="callout" data-kind="trap"><h4>trap<i>p95 rose 21 ms after the shard rebuild</i></h4><p>Queries that touch more than two shards now wait on the slowest one. Retrieval quality is unaffected; the fix is in the fan-out, not the model.</p></aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec" id="notes" data-kicker="Notes">
+      <div class="sec-head"><span class="kicker">Notes</span><h2>What changed this week</h2></div>
+      <div class="prose">
+        <p>The index was rebuilt with eight shards instead of four to cut ingest time. Ingest is now 2.1&times; faster; the cost appears at query time for long-tail questions.</p>
+      </div>
+      <aside class="callout" data-kind="why"><h4>why<i>Keep the frozen question set frozen</i></h4><p>Week-over-week numbers only mean something if the questions do not move. New questions go into v4 and run side by side for two weeks first.</p></aside>
+    </section>
+    <!-- /slot:body -->
+  </main>
+</div>
+<script src="../icons/icons.js"></script>
+<script src="../ui.classic.js"></script>
+</body>
+</html>
