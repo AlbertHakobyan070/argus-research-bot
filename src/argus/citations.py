@@ -48,7 +48,7 @@ class SourceEntry:
     url: str
     title: str = ""
     source_type: str = ""     # "paper" | "repo" | "news" | "official_doc" | "search_result"
-    tool_name: str = ""       # which tool produced it (perplexity_search, ddgs_search, ...)
+    tool_name: str = ""       # which tool produced it (e.g. ddgs_search)
 
 
 @dataclass

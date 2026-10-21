@@ -21,12 +21,12 @@ from langgraph.runtime import Runtime
 
 from .. import llm
 from ..engines.ledger import SpendLedger
-from ..engines.search import resolve_recency
+from ..engines.search import resolve_recency, run_wave
 from ..engines.urls import canonical_url
 from . import run_config
 from .brief import brief_to_plan
 from .jsonx import parse_json_obj
-from .search_providers import exa_enabled, run_query_wave
+from .search_providers import exa_enabled
 from .state import ResearchBrief
 
 logger = logging.getLogger("argus.scout")
@@ -166,7 +166,7 @@ def scout_node(state, runtime: Runtime | None = None) -> dict:
     if note:
         errors.append(note)
     ledger.set_recency(recency)
-    hits, wave_errors = run_query_wave(queries, cfg=rc.search, ledger=ledger, recency=recency, mode="first")
+    hits, wave_errors = run_wave(queries, cfg=rc.search, ledger=ledger, recency=recency, mode="first")
     errors.extend(wave_errors)
     _emit(runtime, "search", {"wave": 1, "mode": "first", "queries": len(queries), "hits": len(hits),
                               "errors": len(wave_errors)})

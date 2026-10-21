@@ -1,6 +1,6 @@
 """LLM facade (v4 WP-A, spec §2.3): ``complete()`` semantics on a fake
-driver, the openai-SDK driver's request shape on a mock transport, and the
-Phase 1–2 legacy wrappers. Hermetic: no network."""
+driver and the openai-SDK driver's request shape on a mock transport.
+Hermetic: no network."""
 from __future__ import annotations
 
 import json
@@ -49,7 +49,7 @@ def _resp(text: str, *, finish: str = "stop", served: str = "served-m",
 
 def _snap(role: str, primary: str = "p1", fallbacks: tuple[str, ...] = ("p2",), *,
           policy: str | None = None, rot: bool = True) -> EnginesSnapshot:
-    tier = ROLE_TIERS.get(role) or role.removeprefix("legacy.")
+    tier = ROLE_TIERS[role]
     policy = policy or ("degrade" if role in DEGRADABLE_ROLES else
                         "skip_item" if role in SKIPPABLE_ROLES else "raise")
     b = ResolvedBinding(role=role, tier=tier, primary=EngineSpec(provider=primary, model=f"{primary}-m"),
@@ -250,7 +250,7 @@ def test_truncation_retry_doubles_the_budget_once_with_a_cap(monkeypatch):
     assert [c.max_tokens for c in d.calls] == [None, 4096], "the retry uses the cap"
 
     d = _drive(monkeypatch, p1=[_resp("cut", finish="length")])        # not a JSON role
-    llm.complete("legacy.cheap", MSGS, engines=_snap("legacy.cheap"), max_tokens=100)
+    llm.complete("quick.answer", MSGS, engines=_snap("quick.answer"), max_tokens=100)
     assert len(d.calls) == 1
 
     d = _drive(monkeypatch, p1=[_resp("cut", finish="length")])        # retry_on_truncation off
@@ -260,27 +260,27 @@ def test_truncation_retry_doubles_the_budget_once_with_a_cap(monkeypatch):
 
 def test_parsed_is_the_validator_value_else_not_validated(monkeypatch):
     _drive(monkeypatch, p1=[_resp("anything"), _resp("{}")])
-    assert llm.complete("legacy.cheap", MSGS, engines=_snap("legacy.cheap")).parsed is llm.NOT_VALIDATED
-    out = llm.complete("legacy.cheap", MSGS, engines=_snap("legacy.cheap"), validate=lambda t: {})
+    assert llm.complete("quick.answer", MSGS, engines=_snap("quick.answer")).parsed is llm.NOT_VALIDATED
+    out = llm.complete("quick.answer", MSGS, engines=_snap("quick.answer"), validate=lambda t: {})
     assert out.parsed == {} and out.parsed is not llm.NOT_VALIDATED
 
 
 def test_json_mode_default_follows_role_and_provider(monkeypatch):
     d = _drive(monkeypatch, pj=[_resp("{}")] * 3, p1=[_resp("{}")])
     llm.complete("intake.classify", MSGS, engines=_snap("intake.classify", "pj"))
-    llm.complete("legacy.cheap", MSGS, engines=_snap("legacy.cheap", "pj"))
+    llm.complete("quick.answer", MSGS, engines=_snap("quick.answer", "pj"))
     llm.complete("intake.classify", MSGS, engines=_snap("intake.classify", "pj"), json_mode=False)
     llm.complete("intake.classify", MSGS, engines=_snap("intake.classify", "p1"))
     assert [c.json_mode for c in d.calls] == [True, False, False, False]
 
 
 def test_temperature_and_budget_fall_back_to_the_engine_spec(monkeypatch):
-    snap = _snap("legacy.cheap")
-    snap.roles["legacy.cheap"].primary = EngineSpec(provider="p1", model="p1-m", temperature=0.7,
+    snap = _snap("quick.answer")
+    snap.roles["quick.answer"].primary = EngineSpec(provider="p1", model="p1-m", temperature=0.7,
                                                     max_tokens=321)
     d = _drive(monkeypatch, p1=[_resp("a"), _resp("b")])
-    llm.complete("legacy.cheap", MSGS, engines=snap)
-    llm.complete("legacy.cheap", MSGS, engines=snap, temperature=0.1, max_tokens=9)
+    llm.complete("quick.answer", MSGS, engines=snap)
+    llm.complete("quick.answer", MSGS, engines=snap, temperature=0.1, max_tokens=9)
     assert [(c.temperature, c.max_tokens) for c in d.calls] == [(0.7, 321), (0.1, 9)]
 
 
@@ -472,14 +472,14 @@ def test_an_unusable_body_fails_the_engine_and_goes_to_the_fallback(monkeypatch,
 
 
 def test_error_bodies_everywhere_raise_by_policy_never_an_empty_success(monkeypatch, sleeps):
-    registry._state.snapshot = fake_engines_snapshot()
+    snap = fake_engines_snapshot()
     _hosts(monkeypatch, fake=[_error_body("All models exhausted", 429)] * 6)
     with pytest.raises(llm.EngineError) as ei:
-        llm.invoke_with_retry(llm.chat_for_tier("cheap"), MSGS)
+        llm.complete("quick.answer", MSGS, engines=snap)
     assert type(ei.value) is llm.EngineError and len(ei.value.attempts) == 3
-    assert str(ei.value).startswith("role legacy.cheap: every engine failed after 3 attempts")
+    assert str(ei.value).startswith("role quick.answer: every engine failed after 3 attempts")
     with pytest.raises(llm.EngineDegraded) as ei:
-        llm.complete("scout.querygen", MSGS, engines=registry._state.snapshot, validate=json.loads)
+        llm.complete("scout.querygen", MSGS, engines=snap, validate=json.loads)
     assert all(not a.ok and "All models exhausted" in a.error for a in ei.value.attempts)
 
 
@@ -573,36 +573,6 @@ def test_a_key_in_a_provider_error_is_never_recorded_or_logged(monkeypatch, slee
         out = llm.complete("brief.draft", MSGS, engines=_snap("brief.draft", "pk"))
         assert "sk-leaky-123" not in out.records[0].error and "***" in out.records[0].error
     assert caplog.records and not any("sk-leaky-123" in r.getMessage() for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# the Phase 1–2 legacy wrappers
-# ---------------------------------------------------------------------------
-
-def test_legacy_wrappers_route_through_complete_on_the_cached_snapshot(monkeypatch, sleeps):
-    with pytest.raises(EngineConfigError):
-        llm.resolve_tier("cheap")                         # nothing resolved yet
-    registry._state.snapshot = fake_engines_snapshot()
-    d = _drive(monkeypatch, fake=[_status(503), _resp("hello")])
-
-    chat = llm.chat_for_tier("strong", temperature=0.3, max_tokens=50)
-    resp = llm.invoke_with_retry(chat, MSGS)
-    assert resp.content == "hello"
-    assert (d.calls[-1].model, d.calls[-1].temperature, d.calls[-1].max_tokens) == ("fake-model", 0.3, 50)
-
-    rec = llm.record_from_response("strong", llm.resolve_tier("strong"), resp)
-    dumped = rec.model_dump()
-    assert dumped["role"] == "legacy.strong" and dumped["routed_via"] == "groq/served-m"
-    assert dumped["attempt"] == 2 and dumped["retry_reason"] == "transient"
-    prior = dumped["extra"]["prior_attempts"]
-    assert len(prior) == 1 and prior[0]["ok"] is False, "failed attempts ride along"
-
-    assert llm.pick_strong_and_judge() == ("fake-model", "fake-model")
-    with pytest.raises(ValueError, match="model_override"):
-        llm.invoke_with_retry(llm.chat_for_tier("judge", model_override="other-model"), MSGS)
-    _drive(monkeypatch, fake=[_resp("judged")])
-    ok = llm.invoke_with_retry(llm.chat_for_tier("judge", model_override="fake-model"), MSGS)
-    assert ok.content == "judged"
 
 
 DIGEST_OK = '{"relevance": 3, "stance": "supports", "claims": []}'

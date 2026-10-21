@@ -1,39 +1,50 @@
 # Argus
 
-Multi-agent Telegram research bot. Its brain is your local **FreeLLMAPI**
-proxy (OpenAI-compatible, free-tier models behind one Bearer token).
-The v3 research engine: brief → scout (live multi-query discovery over
-Exa/DDGS/arXiv/GitHub) → deep research (every fetched source is READ and
-digested into cited evidence notes, with gap-driven follow-up waves) →
-outline → parallel section writers → tripartite review panel
-(grounding/coverage/precision judges) → md + PDF report → Telegram,
-with two human-in-the-loop gates and bounded revision loops.
+Single-user Telegram research + media bot. The research engine (LangGraph)
+scopes a request, searches live (Exa / DDGS / arXiv / GitHub), fetches and
+**reads** every source into cited evidence notes, writes a sectioned
+report, analyses it, has a grounding judge check every finding against the
+quotes it cites, **cuts** what fails, and delivers markdown + PDF + an
+`evidence.json` — with two human-in-the-loop gates (plan, report preview).
+A Telegram Mini App console (menu button) shows the same runs, plans and
+reports. The media side downloads YouTube / X / Reddit / Instagram media
+into the vault and transcribes it.
 
-Optional: set `EXA_API_KEY` in `.env` to enable Exa neural search
-(search + full page text in one call; auto-falls back to DDGS without
-it, and beyond `ARGUS_EXA_MAX_CALLS` per run).
+Which models do the work is configuration: **engines profiles** in
+`argus_engines.json` bind every pipeline role to a provider and model (the
+default profile uses a local **FreeLLMAPI** proxy; others use paid APIs or
+local servers). See `/engines` and `docs/help.md`.
+
+Optional: set `EXA_API_KEY` in `.env` to enable Exa neural search (search +
+page text in one call). Without it, DDGS takes its queries; with it, a
+per-run Exa budget (from the depth preset) applies.
 
 ## Quick start
 
 ```bash
 # 1) secrets
 cp .env.example .env
-# Edit .env: paste your FREELLMAPI_API_KEY and TELEGRAM_BOT_TOKEN
-#   (plus TELEGRAM_ALLOWED_USER_ID = your numeric Telegram id).
+# Edit .env: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID (your numeric
+#   Telegram id), and the key of the engines profile you use
+#   (FREELLMAPI_API_KEY for the default profile).
 
 # 2) install (from the repo root)
 uv venv --python 3.12 venv
-./venv/Scripts/python.exe -m pip install -e .   # Windows venv layout
+VIRTUAL_ENV=venv uv pip install -e ".[dev]"     # add ",asr" for local faster-whisper
 
-# 3) start the bot
+# 3) start the bot (Windows: Git Bash; macOS/Linux: scripts/run_mac.sh)
 ./scripts/run.sh
 ```
 
-Then in Telegram: `/research <topic>` (deep) or `/ask <question>` (quick).
-Every run gets its own SQLite checkpoint thread (`tg:<chat>:<run8>`), is
-registered in the Argus library DB (`argus_library.sqlite`), and reports
-are persisted to the DS-vault research-history folder (override with
+Then in Telegram: `/research <topic>` (deep) or `/ask <question>` (quick, no
+search). Every run gets its own SQLite checkpoint thread (`tg:<chat>:<run8>`),
+is registered in the library DB (`argus_library.sqlite`), and its report
+folder lands in the vault research-history folder (override with
 `ARGUS_REPORTS_ROOT` / `ARGUS_VAULT_ROOT`).
+
+The bot starts without any LLM server reachable: media, `/find` and `/runs`
+work, engines problems are logged and DM'd once, and a run that needs a
+missing engine is refused with the reason.
 
 ## ⚠ PYTHONPATH gotcha (read this or nothing will start)
 
@@ -42,228 +53,142 @@ The parent Hermes venv exports a `PYTHONPATH` that prepends its own
 with a **clean** `PYTHONPATH`, otherwise pydantic_core fails to import
 and the whole bot explodes on startup.
 
-`scripts/run.sh`, `scripts/run_tests.sh`, and `scripts/run_demo.sh` all
-start with `export PYTHONPATH=""`. Use them. If you bypass the scripts,
-do `set PYTHONPATH=` (cmd) or `unset PYTHONPATH` (bash) first.
+`scripts/run.sh`, `scripts/run_mac.sh`, `scripts/run_tests.sh` and
+`scripts/run_demo.sh` all start with `export PYTHONPATH=""`. Use them. If you
+bypass the scripts, do `set PYTHONPATH=` (cmd) or `unset PYTHONPATH` (bash)
+first.
 
-## Architecture (v3 research engine)
+## Architecture
 
 ```
-              ┌────────────── Telegram chat (single user) ───────────┐
-              │  /research <topic>   /ask <q>   /status   /cancel    │
-              └──────────────────────────┬───────────────────────────┘
-                                         ▼
-                         ┌────────────────────────────────┐
-                         │   python-telegram-bot (async)  │
-                         │  long-polling, HITL keyboards  │
-                         └───────────────┬────────────────┘
-                                         ▼
-          ┌────────────────────────────────────────────────────────────────┐
-          │                    LangGraph engine                            │
-          │  AsyncSqliteSaver (one per process; thread_id=tg:<chat>:<run8>)│
-          └────────────────────────────────────────────────────────────────┘
-
-   Intake ─► Brief ─► Scout ══╣ PLAN GATE ╠══► Research ─► Outline ─►
-             Compose ─► Panel ─┬─(revise flagged sections)─► Compose
-                               └─(pass / budget)─►
-                    ─►Report_builder ══╣ REPORT GATE ╠══►
-                      ══► Deliver ─┬─ End
-                                   ├─ Extend ─► extend_prep ─► research (more sources, new wave)
-                                   └─ Revise ─► revise_prep ─► compose  (same evidence + notes)
-
-                 Quick path (/ask):  intake ─► quick_answer ─► deliver
-
-           ┌── search providers ──┐   ┌── page fetch ──┐   ┌── FreeLLMAPI ──┐
-           │ Exa / DDGS / arXiv / │   │ intel-stack:   │   │  /v1/chat      │
-           │    GitHub  (parallel │   │ snatch / crawl │   │  /v1/models    │
-           │      query waves)    │   │ / convert      │   │ 3-tier routing │
-           └──────────────────────┘   └────────────────┘   └────────────────┘
+   Telegram chat (single user)            Mini App console (menu button)
+              │                                        │  aiohttp on 127.0.0.1,
+              ▼                                        ▼  cloudflared quick tunnel
+   python-telegram-bot (async) ──► run driver (bot/runs.py) ◄── webapp/api.py
+                                     one live drive per run · cancel by drain
+                                     · event bus → progress card / console
+                                          │
+                                          ▼
+   intake → brief → scout ══╣ PLAN GATE ╠══ research → outline → compose → analyst → panel
+   panel → research         (a coverage gap: a targeted, bounded gap wave, then outline in extend mode)
+   panel → compose          (a targeted, bounded rewrite of the weak sections)
+   panel → report_builder ══╣ REPORT GATE ╠══ deliver → end
+                                                     | Extend → extend_prep → research
+                                                     | Revise → revise_prep → compose
+   quick path (/ask):  intake → quick_answer → deliver
 ```
 
-The two `╣ GATE ╠` bars are LangGraph interrupts: the run pauses after
-`scout` (plan approval, with the real live-search sources shown) and
-before `deliver` (report preview). The Telegram layer drives each resume
-with `Command(resume=…)`.
+The two gates are LangGraph interrupts: after `scout` (plan approval over the
+real sources live search found) and before `deliver` (report preview). The
+run driver resumes them; it treats a gate as one only while no drive holds
+the run.
 
 ### What each stage does
 
-| Stage | Job | LLM tier |
-|---|---|---|
-| `intake` | classify quick vs deep, refine the request | cheap |
-| `brief` | draft sub-questions + success criteria (no URLs — hallucinated links are structurally impossible); deterministic quality checks + one bounded re-draft | strong |
-| `scout` | one live discovery wave: 1–2 targeted queries **per sub-question** across Exa/DDGS/arXiv/GitHub, in parallel; search-API only, no page fetch | cheap (query-gen) |
-| **PLAN GATE** | Telegram keyboard — Approve / Edit / Cancel — over the **real found sources** | — |
-| `research` | the deep phase: waves of triage → parallel fetch → **digest** (a cheap LLM *reads each fetched document* into evidence notes: claims + quotes + relevance + stance, keyed to sub-questions) → coverage check → gap-targeted follow-up queries | cheap ×N |
-| `outline` | plan the report sections against the gathered evidence | strong |
-| `compose` | parallel per-section writers, each seeing only its own evidence notes; output is **plain markdown, never JSON**; findings extracted per section with citation ids | strong ×sections |
-| `panel` | three judges (grounding / coverage / precision), family-diverse where the proxy allows; deterministic merge → section-targeted revision | judge + strong + cheap |
-| **revise loop** | `panel` → `compose`, rewriting only the flagged sections, capped at `ARGUS_MAX_REVISIONS` (default 3) | — |
-| `report_builder` | assemble md, citation verification + quarantine, render PDF (ReportLab) | — |
-| **REPORT GATE** | Telegram keyboard — Send / Extend / Revise / Cancel | — |
-| `deliver` | persist metadata, hand off to Telegram send; routes end / extend / revise | — |
+| Stage | Job |
+|---|---|
+| `intake` | classify quick vs deep, refine the request |
+| `brief` | sub-questions, success criteria, archetype, time sensitivity, entities — no URLs, so hallucinated links are structurally impossible |
+| `scout` | one live discovery wave per sub-question across the search providers; decides the recency window |
+| **PLAN GATE** | Approve / Edit / Cancel over the real found sources, with length, depth, engines-profile and recency knobs |
+| `research` | waves of rerank → fetch (an SSRF-guarded native fetcher, Exa text, optional intel-stack rungs) → digest (an LLM reads each document into claims with verbatim-checked quotes) under one spend ledger; gap waves and Extend passes are targeted and budgeted |
+| `outline` | sections with allocated evidence notes, shaped by the archetype; an Extend keeps the titles |
+| `compose` | parallel section writers over their own notes (plain markdown), then finding extraction per section |
+| `analyst` | takeaways with confidence labels, disagreements and scenarios, from the findings |
+| `panel` | batched grounding judge (every finding judged against its cited quotes), coverage review, deterministic precision scan; routes to a gap wave, a targeted rewrite or the report |
+| `report_builder` | cuts rejected claims, compiles the TL;DR from kept findings, banners and degradation notes, Sources, PDF, `metadata.json`, `evidence.json` |
+| **REPORT GATE** | Send / Extend / Revise / Cancel |
+| `deliver` | ends the run, or routes to Extend / Revise |
 
-### Evidence-first design (why v3 replaced the linear pipeline)
+Design docs: `docs/argus-v4-design.md` (the v4 spec), `docs/v4-notes/` (what
+each work package built and why), `docs/research-engine-v3.md` (the engine v4
+builds on).
 
-The old pipeline (`intake→planner→researcher→fetch→norm→rank→synth→rev`)
-never let the writer read the evidence: the synthesizer saw only a
-400-char excerpt per source while the full fetched markdown sat unread
-on disk. v3's **digest** step reads each document with a cheap-tier LLM
-into structured `EvidenceNote`s (claims with supporting quotes, a 0–5
-relevance score, and a stance), keyed to the sub-questions the source
-was gathered for. The section writers compose from those notes with
-`[n]` source ids — so depth comes from evidence the model actually read,
-and long-form output is plain markdown rather than the markdown-inside-
-JSON that used to break on weaker proxy-routed models. See
-[`docs/research-engine-v3.md`](docs/research-engine-v3.md) for the full
-design and its sources.
+### Engines
 
-### State
+- `engines/roles.py` — the pipeline roles and their failure-policy classes.
+- `engines/schema.py` / `argus_engines.json` — providers (base URL, key env
+  var name, capabilities), profiles (tier engines + per-role bindings with
+  fallbacks and `on_exhausted` = `raise` / `skip_item` / `degrade`), the
+  transcriber block, dated prices.
+- `engines/registry.py` — merges the defaults file, the optional
+  `argus_engines.local.json` (gitignored) and the library's `/engines`
+  choices; validates the schema at startup (no network) and the active
+  profile at run start; resolves it into the snapshot every run carries.
+- `llm.py` — the one facade, `complete(role, …)`: retries, fallbacks, the
+  declared policy, and a `CallRecord` per attempt (requested vs served model,
+  routing) in `state["model_calls"]` and `metadata.json["engines"]`.
+- A declared fallback is never silent: it is a `degrade:` / `skip:` line in
+  the report's degradation notes and, past a threshold, a "⚠ Degraded run"
+  banner.
 
-`ArgusState` (TypedDict, `src/argus/graph/state.py`) carries the run.
-The load-bearing channels:
+### Run configuration
 
-- `thread_id`, `user_id`, `user_request`, `mode`, `length`
-- `messages`, `model_calls`, `errors` — append-only (reducers)
-- `brief` — `ResearchBrief` (sub-questions + success criteria)
-- `plan` — a v2-compatible dict the Telegram plan-gate renderer reads
-- `queries` — the executed search queries (scout + follow-up waves)
-- `sources` — candidate hits from the search waves
-- `fetched` — `FetchedItem` list (markdown_path + excerpt on disk)
-- `evidence` — `EvidenceNote` list (the digested, cited claims)
-- `coverage` — per-sub-question strength count
-- `outline`, `sections` — the section plan and the composed markdown
-- `findings` — `Finding` list (`claim + citation_urls + confidence`)
-- `draft_md`, `panel_verdict` / `review_verdict`, `revision_notes`
-- `hitl` — pending gate descriptor; `report_paths`, `quick_answer`
-
-### Search providers
-
-`src/argus/graph/search_providers.py` gives every provider one uniform
-`SearchHit` shape and runs a wave of queries in parallel, isolating
-failures (one provider's outage never poisons the others):
-
-- **Exa** — optional, enabled iff `EXA_API_KEY` is set. Returns search
-  hits **with full page text in one call**, so those hits skip the fetch
-  stage entirely. The free plan is ~1000 requests/month, so Exa calls
-  per run are capped (`ARGUS_EXA_MAX_CALLS`, default 6) and DDGS takes
-  the overflow.
-- **DDGS** (keyless web), **arXiv** (Atom API), **GitHub** (repo search).
-
-### Model-tier routing
-
-`src/argus/llm.py` maps three tiers — `cheap` / `strong` / `judge` —
-onto whatever the proxy currently serves:
-
-- `fetch_live_models()` — calls `GET /v1/models` once, caches the ID list.
-- `resolve_tier(tier)` — picks the first present preferred id per tier;
-  falls back to `"auto"` (the proxy's own router) if none remain.
-- `pick_strong_and_judge()` — keeps the judge in a different model family
-  than the strong writer (avoids same-family judge bias).
-- `chat_for_tier(tier)` / `record_from_response(...)` — build the
-  `ChatOpenAI` client and capture the actually-served model + provider
-  into a `CallRecord`.
-
-Every LLM call is logged to `state["model_calls"]` (requested vs served),
-so a run's `metadata.json` shows exactly which models answered.
-
-## Architecture decisions
-
-- **State checkpointer**: one long-lived `AsyncSqliteSaver` opened in PTB
-  `post_init`, shared by every run. Threads are per-run
-  (`thread_id = tg:<chat>:<run8>`), so runs are individually resumable
-  and survive bot restarts; the run registry lives in
-  `argus_library.sqlite` (`src/argus/library.py`).
-- **Grounded plan gate**: the graph pauses *after* `scout`
-  (`interrupt_after=["scout"]`), so the plan preview shows the real
-  sources live search found — the brief never contains URLs, so there is
-  nothing for the model to hallucinate. A second interrupt sits before
-  `deliver` (report preview).
-- **Bounded waves + revision**: `research` runs at most
-  `ARGUS_RESEARCH_WAVES` search/digest waves (default 2) up to
-  `ARGUS_TOTAL_FETCH_CAP` sources; the `panel → compose` revision loop is
-  capped at `ARGUS_MAX_REVISIONS` (default 3). Every LLM output is parsed
-  through `graph/jsonx.py`, which repairs and salvages weak-model JSON.
-- **Failure isolation over silent swallowing**: search providers, the
-  fetch path, and the digest step append to `state["errors"]` (via the
-  `Annotated[list[str], operator.add]` reducer) instead of dropping
-  exceptions. When every source fails to fetch, `research` appends an
-  explicit summary error so the writer never runs on empty evidence.
-- **PDF rendering**: ReportLab Platypus in the argus venv (no browser,
-  deterministic, fast); the intel-stack Chromium path is a last-resort
-  fallback (headless Chromium IO is flaky on Windows under memory
-  pressure).
-- **Tool interpreter routing**: `tools._run_script` defaults to
-  `INTEL_PYTHON_BIN` (the intel-stack venv), which has
-  `feedparser` / `crawl4ai` / `markitdown` / `yt_dlp`; the argus venv
-  does not. Override with `python_bin=...` for a tool that needs a
-  different interpreter.
-- **No prebuilt agent**: every node is a small, explicit function — the
-  contract is "explicit node/subgraph, no black box".
+Each run carries a `RunConfig` (`graph/run_config.py`): length, depth preset
+(`quick` / `standard` / `deep` / `exhaustive`), recency, the research /
+search / fetch / compose / panel knobs, and the engines snapshot. The
+presets are the table in `PRESETS`; the console accepts dotted overrides.
+Pre-v4 checkpoints resume with their length's legacy preset, recorded in the
+run's errors and notes.
 
 ## Project layout
 
 ```
 argus/
-├── README.md               (this file)
+├── README.md, handoff.md       (this file; operations and migration notes)
 ├── pyproject.toml
-├── .env.example            (NEVER commit .env)
+├── argus_engines.json          (engine providers, profiles, transcriber, prices)
+├── .env.example                (NEVER commit .env)
 ├── docs/
-│   ├── help.md             (the /help full command guide)
-│   └── research-engine-v3.md (v3 engine design + sources)
+│   ├── help.md                 (the /help full command guide)
+│   ├── argus-v4-design.md      (v4 build spec)
+│   ├── v4-notes/               (one note per work package)
+│   └── research-engine-v3.md   (the v3 engine design)
 ├── src/argus/
-│   ├── config.py           (Settings, .env loader, env validation)
-│   ├── llm.py              (FreeLLMAPI tier routing, CallRecord)
-│   ├── tools.py            (intel-stack subprocess wrappers + PDF render)
-│   ├── bot.py              (python-telegram-bot async commands + HITL)
-│   ├── library.py          (run + asset registry, aiosqlite)
-│   └── graph/
-│       ├── state.py            (TypedDict + Pydantic models)
-│       ├── jsonx.py            (robust weak-model JSON parsers)
-│       ├── search_providers.py (Exa / DDGS / arXiv / GitHub waves)
-│       ├── brief.py            (scoping node)
-│       ├── scout.py            (live discovery wave → plan gate)
-│       ├── research.py         (triage → fetch → digest → coverage)
-│       ├── compose.py          (outline + parallel section writers)
-│       ├── panel.py            (tripartite review panel)
-│       ├── nodes.py            (intake / report_builder / deliver / preps)
-│       ├── credibility.py      (domain-trust scoring)
-│       ├── grounding.py        (entity-mention grounding check)
-│       └── graph.py            (build_graph + quick_answer_graph)
+│   ├── config.py               (Settings, .env loader)
+│   ├── llm.py                  (the LLM facade)
+│   ├── engines/                (roles, schema, registry, driver, ledger,
+│   │                            URLs, fetchers, search, transcribers)
+│   ├── graph/                  (state, run_config, the nodes, assembly,
+│   │                            evidence export, precision, quarantine)
+│   ├── bot/                    (the Telegram package; run driver, progress)
+│   ├── webapp/                 (Mini App: server, auth, API, render, tunnel, static/)
+│   ├── library.py              (run + asset registry, aiosqlite)
+│   ├── tools.py                (intel-stack wrappers, search, PDF and YouTube helpers)
+│   ├── media.py, transcribe.py (media downloads, transcription into the vault)
+│   └── quarantine.py, citations.py, sources_block.py, cache_cleanup.py
+├── bench/                      (runner, deterministic metrics, compare, queries)
 ├── scripts/
-│   ├── run.sh              (clears PYTHONPATH, starts the bot)
-│   ├── run_tests.sh        (clears PYTHONPATH, runs pytest)
-│   ├── run_demo.sh         (clears PYTHONPATH, runs demo_run.py)
-│   ├── demo_run.py         (self-contained v3 end-to-end demo)
-│   └── verify_live.sh      (live-proxy verification pass)
-├── tests/                  (hermetic suite + live-proxy tests)
-├── argus_checkpoints.sqlite (LangGraph checkpoints, one thread per run)
-└── argus_library.sqlite     (run + asset registry; see src/argus/library.py)
+│   ├── run.sh / run_mac.sh     (pre-flight, then the bot)
+│   ├── run_tests.sh, run_demo.sh, demo_run.py
+│   ├── live_check.py, verify_live.sh   (live end-to-end checks)
+│   ├── engines_probe.py        (probe a provider's request shapes)
+│   ├── webapp_dev_url.py, sync_arsenal.py  (console dev URL, kit snapshot)
+│   └── reconcile_vault.py
+├── tests/                      (hermetic suite + live-proxy tests)
+├── tools/bin/                  (gitignored: cloudflared)
+├── argus_checkpoints.sqlite    (LangGraph checkpoints, one thread per run)
+└── argus_library.sqlite        (run + asset registry)
 ```
 
 ## Tests
 
 ```bash
-./scripts/run_tests.sh          # hermetic subset (what CI runs)
-# Full suite incl. live-proxy tests (needs FreeLLMAPI up):
-PYTHONPATH="" ./venv/Scripts/python.exe -m pytest tests/ --ignore=tests/manual_e2e.py -q
+./scripts/run_tests.sh -q       # the whole suite; the live-proxy tests need the proxy
+# hermetic only, as CI runs it: see the --ignore list in .github/workflows/ci.yml
 ```
 
-The hermetic subset (`.github/workflows/ci.yml`) runs everything that
-doesn't need the live proxy. Notable files: `test_brief.py` (scoping +
-no-URL guarantee), `test_search_providers.py` (wave merge/dedupe, Exa
-budget, error isolation), `test_reflexion.py` (the full v3 graph with a
-scripted panel revise→pass loop), `test_grounded_gate.py` (the plan gate
-pauses after scout with real sources), `test_continue_extend.py`
-(`/append` + `/continue` mechanics). `test_llm.py` and `test_graph.py`
-are the live-proxy tests (tier resolution; a network-deterministic v3
-drive where the LLM reads a controlled source and must still produce a
-grounded, cited report).
+`tests/test_llm.py` and `tests/test_graph.py` are the live-proxy tests
+(the shipped engines config resolved against the live proxy; a
+network-deterministic graph drive where the LLM reads a controlled source).
+Shared test helpers live in `tests/helpers.py`.
 
 **Verification rule:** green tests ≠ a working bot. For research changes,
-drive the real graph end-to-end — `scripts/verify_live.sh`, or
-`tests/manual_e2e.py` for a graph-direct deep run whose report you read
-on disk. The proxy re-routes models, so also confirm behaviour against a
-weaker served model (check `served_model` in a run's `metadata.json`).
+drive the real graph end-to-end: `scripts/verify_live.sh` (proxy check, the
+live tests, then `scripts/live_check.py`, which prints an acceptance table and
+exits non-zero on any failed check). The proxy re-routes models, so also
+check `served_model` in a run's `metadata.json`. `python -m bench.metrics` and
+`python -m bench.compare` measure runs deterministically.
 
 ## Demo
 
@@ -271,48 +196,40 @@ weaker served model (check `served_model` in a run's `metadata.json`).
 ./scripts/run_demo.sh
 ```
 
-Drives the **full v3 graph** against the live FreeLLMAPI proxy. The
-search wave and page fetches are stubbed to a small controlled corpus so
-the run is network-deterministic, but the LLM does the real work — it
-digests the corpus into evidence notes, composes a sectioned report, and
-the panel reviews it. Output lands in `demo_output/`:
-
-- `<stamp>_<topic>_<length>/report.md` — markdown with cited findings.
-- `<stamp>_<topic>_<length>/report.pdf` — same content, ReportLab.
-- `<stamp>_<topic>_<length>/metadata.json` — `model_calls` telemetry.
-- `demo_transcript.json` — the run summary (findings, evidence, verdict).
-
-The transcript prints, for every LLM call, the **requested** tier vs the
-**served** model — FreeLLMAPI's own router picks the actual model, so a
-`strong` request may be served by whatever the proxy currently fronts.
+Drives the **full graph** on the active engines profile. The search wave and
+page fetches are stubbed to a small controlled corpus so the run is
+network-deterministic, but the LLM does the real work — it digests the corpus
+into evidence notes, composes and analyses a sectioned report, and the panel
+judges it. Output lands in `demo_output/`: the report folder (`report.md`,
+`report.pdf`, `metadata.json`, `evidence.json`) and `demo_transcript.json`.
+The demo prints, for every LLM call, the role, the **requested** model and
+the **served** one.
 
 ## Operational notes
 
-- **Memory budget**: the bot is a few hundred MB, but a research run
-  fans out parallel fetches and per-source digest calls. On a tight box,
-  don't co-run it with Docker + both Hermes gateways + heavy crawls.
-- **Rate limits**: FreeLLMAPI throttles per IP and per key. A v3 run
-  makes many cheap-tier calls (digests parallelize), so lean on the
-  proxy's own throttling — Argus adds none of its own. Cap search cost
-  with `ARGUS_EXA_MAX_CALLS` / `ARGUS_TOTAL_FETCH_CAP`.
-- **Concurrency**: fetches and digests run in bounded thread pools
-  (`ARGUS_FETCH_CONCURRENCY` / `ARGUS_DIGEST_CONCURRENCY`); the
-  intel-stack `crawl.py` (playwright) is the per-source bottleneck.
-- **Source provenance**: every fetched item keeps its `markdown_path` on
-  disk, and each report folder's `metadata.json` lists the models and
-  sources the run actually used.
-- **Grounding, not a fabrication guarantee**: the panel enforces that
-  claims trace to evidence, and the report_builder verifies every
-  citation against the fetched sources. When the panel can't pass, the
-  report still ships with its open questions surfaced in the body.
+- See `handoff.md` for running the bot, the console and tunnel, migration,
+  and troubleshooting.
+- **Rate limits**: the free proxy throttles per IP and per key, and a run makes
+  many per-source calls. Only one run researches at a time; depth presets and
+  the per-run Exa budget bound the spend, and `/engines` shows this month's Exa
+  cost.
+- **Cancel** drains: the run finishes its current step, keeps its checkpoint,
+  and `/continue` resumes it.
+- **Source provenance**: every fetched item keeps its `markdown_path` on disk;
+  `metadata.json` and `evidence.json` list the models, sources, quotes and
+  verdicts.
+- **Trust, not a guarantee**: the judge only sees the notes' quotes; a claim
+  it cannot locate stays in the body and is listed as such, and an unjudged
+  finding marks the report "⚠ Not fact-checked".
 
 ## Secret handling
 
-- `FREELLMAPI_API_KEY` — read from `FREELLMAPI_API_KEY` env var only.
-  Never logged, never hardcoded, never committed (`.env` is gitignored).
-- `TELEGRAM_BOT_TOKEN` — same.
-- `TELEGRAM_ALLOWED_USER_ID` — gates the bot to a single Telegram user.
-  Without this set, the bot refuses to start.
+- API keys (`FREELLMAPI_API_KEY`, the paid providers' keys, `EXA_API_KEY`) and
+  `TELEGRAM_BOT_TOKEN` are read from the environment / `.env` only.
+  `argus_engines.json` holds env var **names**, never values. Never logged,
+  never hardcoded, never committed (`.env` is gitignored).
+- `TELEGRAM_ALLOWED_USER_ID` gates the bot (and the console's signed
+  `initData`) to a single Telegram user; unset, every user is refused.
 
 ## Where outputs live
 
@@ -321,4 +238,5 @@ reports default to the vault research-history folder; override the
 location with `ARGUS_REPORTS_ROOT` (and the vault root with
 `ARGUS_VAULT_ROOT`) in `.env`. The run + asset registry and the LangGraph
 checkpoints stay in the project dir (`argus_library.sqlite` /
-`argus_checkpoints.sqlite`), never in a synced vault.
+`argus_checkpoints.sqlite`), never in a synced vault. The console's tunnel log
+is `logs/cloudflared.log`.

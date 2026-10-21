@@ -278,10 +278,6 @@ def test_wave_error_isolation(monkeypatch):
     assert errors == ["arxiv: ConnectError: boom"]
 
 
-def test_run_query_wave_is_a_thin_alias():
-    assert sp.run_query_wave is search.run_wave
-
-
 # ---------------------------------------------------------------------------
 # Scout query planning
 # ---------------------------------------------------------------------------
@@ -367,7 +363,7 @@ def test_scout_node_merges_preseeded_first_and_writes_spend(monkeypatch):
         kw["ledger"].count("ddgs_queries")
         return [_hit("https://new.example"), _hit("https://www.seeded.example/?utm_source=x")], []
 
-    monkeypatch.setattr(scout_mod, "run_query_wave", wave)
+    monkeypatch.setattr(scout_mod, "run_wave", wave)
     out = scout_mod.scout_node({
         "brief": _brief().model_dump(), "run_config": make_run_config("medium"),
         "sources": [{"url": "https://seeded.example", "title": "seed"}],
@@ -384,7 +380,7 @@ def test_scout_node_drops_a_malformed_source_and_keeps_the_pinned_copy(monkeypat
     fails on it), and a pinned (appended) copy wins the dedupe over an unpinned one."""
     monkeypatch.setattr(scout_mod, "plan_queries",
                         lambda brief, **kw: ([{"query": "q", "provider": "ddgs", "sub_qs": [0]}], [], []))
-    monkeypatch.setattr(scout_mod, "run_query_wave", lambda queries, **kw: ([_hit("https://new.example")], []))
+    monkeypatch.setattr(scout_mod, "run_wave", lambda queries, **kw: ([_hit("https://new.example")], []))
     out = scout_mod.scout_node({
         "brief": _brief().model_dump(), "run_config": make_run_config("medium"),
         "sources": [{"url": "https://www.blog.example/post/", "title": "scout copy"},
@@ -399,6 +395,6 @@ def test_scout_node_caps_sources(monkeypatch):
     monkeypatch.setattr(scout_mod, "plan_queries",
                         lambda brief, **kw: ([{"query": "q", "provider": "ddgs", "sub_qs": [0]}], [], []))
     many = [_hit(f"https://h{i}.example") for i in range(80)]
-    monkeypatch.setattr(scout_mod, "run_query_wave", lambda queries, **kw: (many, []))
+    monkeypatch.setattr(scout_mod, "run_wave", lambda queries, **kw: (many, []))
     out = scout_mod.scout_node({"brief": _brief().model_dump(), "run_config": make_run_config("medium")})
     assert len(out["sources"]) == scout_mod.SCOUT_SOURCE_CAP

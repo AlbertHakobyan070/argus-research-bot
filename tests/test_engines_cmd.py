@@ -1,7 +1,7 @@
 """/engines and the bot side of the engines registry (v4 WP-A):
 
-- the handlers on fake Updates (show, use, set, tier — which also fixes the
-  legacy.* bindings — fallback, reset, models);
+- the handlers on fake Updates (show, use, set, tier — which also moves
+  every role that follows the tier — fallback, reset, models);
 - wiring: engines_cmd is registered through HANDLER_MODULES, and a raising
   static-validation path at startup is logged and DM'd, never fatal, with no
   network I/O on the startup path;
@@ -20,7 +20,6 @@ import httpx
 import pytest
 from telegram.ext import ApplicationHandlerStop
 
-from argus import llm
 from argus.bot import app as bot_app
 from argus.bot import common as bot_common
 from argus.bot import engines_cmd
@@ -155,31 +154,30 @@ async def _engines(lib, *args) -> str:
 # /engines handlers
 # ---------------------------------------------------------------------------
 
-async def test_engines_tier_fixes_the_legacy_bindings(loaded):
+async def test_engines_tier_fixes_the_roles_that_follow_the_tier(loaded):
     text = await _engines(loaded)
     assert "main" in text and "❌" in text and "choose a model for provider gem" in text
 
     text = await _engines(loaded, "tier", "judge", "gem/g2")
     assert "✅" in text, text
-    snap = registry.current_snapshot_cached()
-    assert snap.roles["legacy.judge"].primary.model == "g2", "/engines tier fixes legacy.judge"
+    snap = registry.cached_snapshot()
     pg = snap.roles["panel.grounding"]
     assert pg.primary.model == "g2" and [f.model for f in pg.fallbacks] == ["k2"], (
         "a policy-only binding follows the tier and keeps its fallbacks")
     stored = json.loads(await loaded.get_setting("engines.overrides"))
     assert stored["main"]["tiers"]["judge"]["model"] == "g2"
     shown = await _engines(loaded)
-    assert "✅" in shown and "legacy.judge: gem/g2" in shown
+    assert "✅" in shown and "panel.grounding: gem/g2" in shown
 
 
 async def test_engines_use_switches_and_refuses_an_invalid_profile(loaded):
     assert "✅" in await _engines(loaded, "use", "other")
-    assert registry.current_snapshot_cached().profile == "other"
+    assert registry.cached_snapshot().profile == "other"
     assert json.loads(await loaded.get_setting("engines.active_profile")) == "other"
 
     text = await _engines(loaded, "use", "broken")
     assert "choose a model for provider local" in text
-    assert registry.current_snapshot_cached().profile == "other", "the switch is refused"
+    assert registry.cached_snapshot().profile == "other", "the switch is refused"
     assert json.loads(await loaded.get_setting("engines.active_profile")) == "other"
     assert "unknown profile" in await _engines(loaded, "use", "nope")
 
@@ -187,17 +185,17 @@ async def test_engines_use_switches_and_refuses_an_invalid_profile(loaded):
 async def test_engines_set_fallback_reset_and_models(loaded):
     await _engines(loaded, "use", "other")
     assert "✅" in await _engines(loaded, "set", "research.rerank", "fixed/k2")
-    b = registry.current_snapshot_cached().roles["research.rerank"]
+    b = registry.cached_snapshot().roles["research.rerank"]
     assert b.primary.model == "k2"
     stored = json.loads(await loaded.get_setting("engines.overrides"))
     assert stored["other"]["roles"]["research.rerank"]["primary"]["model"] == "k2"
 
     assert "✅" in await _engines(loaded, "fallback", "research.rerank", "fixed/k1")
-    b = registry.current_snapshot_cached().roles["research.rerank"]
+    b = registry.cached_snapshot().roles["research.rerank"]
     assert (b.primary.model, [f.model for f in b.fallbacks]) == ("k2", ["k1"])
 
     assert "✅" in await _engines(loaded, "reset")
-    assert registry.current_snapshot_cached().roles["research.rerank"].primary.model == "k1"
+    assert registry.cached_snapshot().roles["research.rerank"].primary.model == "k1"
     assert json.loads(await loaded.get_setting("engines.overrides")).get("other") in (None, {"tiers": {}, "roles": {}})
 
     models = await _engines(loaded, "models", "proxy")
@@ -212,9 +210,9 @@ async def test_engines_show_last_run_tally_judge_diversity_and_exa(loaded, tmp_p
     await _engines(loaded, "tier", "judge", "gem/g2")
     rep = tmp_path / "report"
     rep.mkdir()
-    calls = [dict(role=r, tier=r.split(".")[1], profile="main", provider="proxy",
+    calls = [dict(role=r, tier=t, profile="main", provider="proxy",
                   requested_model="s1", served_model="openai/gpt-oss-120b", routed_via="groq/x",
-                  ok=True) for r in ("legacy.strong", "legacy.judge")]
+                  ok=True) for r, t in (("compose.section", "strong"), ("panel.grounding", "judge"))]
     (rep / "metadata.json").write_text(json.dumps({"model_calls": calls}), encoding="utf-8")
     await loaded.create_run(run_id="ab12cd34", thread_id="tg:1:ab12cd34", chat_id=1, topic="t",
                             config_json="{}", depth="quick", origin="telegram")
@@ -330,8 +328,7 @@ async def test_post_init_sends_nothing_when_the_config_is_clean(monkeypatch, tmp
     app = await _post_init(monkeypatch, tmp_path, json.dumps(CFG))
     app.bot.send_message.assert_not_awaited()
     assert registry.current_config().active_profile == "main", "loaded at startup, not resolved"
-    with pytest.raises(EngineConfigError):
-        registry.current_snapshot_cached()
+    assert registry.cached_snapshot() is None
 
 
 async def test_engine_config_error_reaches_the_chat_and_stops_other_handlers():
@@ -356,8 +353,8 @@ async def test_engine_config_error_reaches_the_chat_and_stops_other_handlers():
 # ---------------------------------------------------------------------------
 
 class _Graph:
-    """Records the order of events; a node calls a legacy wrapper first,
-    as every Phase 1 node does."""
+    """Records the order of events; its node reads the resolved snapshot
+    first, so it fails if no drive entry resolved it."""
 
     def __init__(self, order: list[str]):
         self.order = order
@@ -370,7 +367,7 @@ class _Graph:
         self.driven = True
 
         async def gen():
-            self.order.append("node:" + llm.resolve_tier("cheap"))
+            self.order.append("node:" + registry.cached_snapshot().roles["intake.classify"].primary.model)
             yield "updates", {"scout": {"sources": []}}
         return gen()
 
@@ -447,7 +444,7 @@ async def test_every_drive_entry_awaits_the_snapshot_before_driving(monkeypatch,
 
 
 @pytest.mark.parametrize("name", ["research_cmd", "plan_edit", "approve"])
-async def test_a_resumed_run_after_restart_resolves_before_the_wrappers_run(
+async def test_a_resumed_run_after_restart_resolves_before_any_node_runs(
         monkeypatch, entry_env, name):
     order: list[str] = []
 

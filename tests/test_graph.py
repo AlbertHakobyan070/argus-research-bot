@@ -22,9 +22,8 @@ from argus.graph import build_graph, quick_answer_graph
 
 @pytest.fixture(autouse=True)
 def _live_engines(monkeypatch):
-    """The nodes' legacy LLM wrappers read the registry's cached snapshot
-    (v4 WP-A): resolve the shipped engines config against the live proxy,
-    as every bot drive entry does first."""
+    """Resolve the shipped engines config against the live proxy, as every
+    bot drive entry does first; the run's RunConfig carries the snapshot."""
     monkeypatch.setattr(registry, "_state", registry._State())
     asyncio.run(registry.load_config([str(registry._ROOT / "argus_engines.json")]))
     asyncio.run(registry.active_snapshot())
@@ -37,7 +36,7 @@ def _make_state_in(thread_id: str, user_id: int, text: str) -> dict:
         "user_id": user_id,
         "user_request": text,
         "run_config": RunConfig.from_preset(       # v4: every node reads it (WP-C: intake, quick_answer)
-            length="short", engines=registry.current_snapshot_cached(), origin="telegram").model_dump(),
+            length="short", engines=registry.cached_snapshot(), origin="telegram").model_dump(),
         "messages": [], "plan": None,
         "sources": [], "fetched": [], "findings": [],
         "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -105,8 +104,8 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
         }]
         return hits, []
 
-    monkeypatch.setattr(scout_mod, "run_query_wave", fake_wave)
-    monkeypatch.setattr(research_mod, "run_query_wave", fake_wave)
+    monkeypatch.setattr(scout_mod, "run_wave", fake_wave)
+    monkeypatch.setattr(research_mod, "run_wave", fake_wave)
 
     def fake_fetch(src, **kw):
         from argus.graph.state import FetchedItem

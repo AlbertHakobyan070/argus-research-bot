@@ -1,6 +1,6 @@
 # WP-A — Engines registry and LLM facade (Task 4)
 
-Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation and activation) and §2.3 (the facade). Every LLM call now names a role and runs on a binding from an `EnginesSnapshot`: a primary, explicit fallbacks and a failure policy. Every attempt is a `CallRecord` with the requested model, the served model and `routed_via`. The Phase 1 nodes are unchanged: the v3 wrappers route through `complete()` with role `legacy.<tier>`.
+Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation and activation) and §2.3 (the facade). Every LLM call now names a role and runs on a binding from an `EnginesSnapshot`: a primary, explicit fallbacks and a failure policy. Every attempt is a `CallRecord` with the requested model, the served model and `routed_via`. The Phase 1 nodes are unchanged: the v3 wrappers route through `complete()` with role `legacy.<tier>`. *(WP-H: the nodes moved to real roles in Tasks 7–9, and WP-H deleted the wrappers and the `legacy.*` roles.)*
 
 ### What changed
 
@@ -20,7 +20,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
     - `validate_active(cfg)` is `validate_schema` plus `resolve_snapshot` of the active profile.
   - The cache:
     - `active_snapshot()` returns the cached snapshot, or loads, validates and caches it. Only a success is cached.
-    - `current_snapshot_cached()` is the sync accessor for the wrappers. It raises when no drive entry resolved first.
+    - `current_snapshot_cached()` is the sync accessor for the wrappers. It raises when no drive entry resolved first. *(WP-H: deleted; `cached_snapshot()` returns the cached snapshot or `None` and never raises.)*
   - Changes, which validate before they persist:
     - `set_active_profile(name)`.
     - `set_overrides(profile, overrides)`: a full check for the active profile, the schema check for any other.
@@ -65,7 +65,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
     - A reply the `validate` hook rejects gets one retry with "Reply with only the JSON object."
   - When every engine has failed, the binding's `on_exhausted` applies: `raise` raises `EngineError`, `skip_item` raises `EngineSkipped`, and `degrade` raises `EngineDegraded`. The message is "role <id>: every engine failed after <n> attempts (last: …)", so the role id and the attempt count can be parsed back out of `errors`.
   - A per-provider `rpm_limit` sliding window applies across threads.
-  - The Phase 1–2 wrappers `chat_for_tier`, `invoke_with_retry`, `record_from_response`, `resolve_tier` and `pick_strong_and_judge` keep their call sites. They route through `complete("legacy.<tier>", …, engines=registry.current_snapshot_cached())`. `record_from_response` returns the successful attempt, with the earlier attempts in `extra["prior_attempts"]`.
+  - The Phase 1–2 wrappers `chat_for_tier`, `invoke_with_retry`, `record_from_response`, `resolve_tier` and `pick_strong_and_judge` keep their call sites. They route through `complete("legacy.<tier>", …, engines=registry.current_snapshot_cached())`. `record_from_response` returns the successful attempt, with the earlier attempts in `extra["prior_attempts"]`. *(WP-H: all deleted.)*
 - `argus_engines.json` (new):
   - The providers: `freellmapi`, `groq`, `openrouter`, `gemini`, `openai`, `anthropic`, `ollama` and `lmstudio`.
     - Key names only.
@@ -81,7 +81,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - `src/argus/bot/engines_cmd.py` (new):
   - `/engines` shows the profile, every binding with its fallbacks and policy, the validation state, the snapshot warnings, the last run's served tally and reroute rate, the judge-diversity line with the command that fixes a ⚠, the month-to-date Exa spend (`n/a` until the library records it), and the profile list.
   - `/engines use <profile>`, `set <role> <provider>/<model>`, `tier <tier> <provider>/<model>`, `fallback <role> <provider>/<model>`, `reset [profile]` and `models <provider>`.
-  - `set` and `fallback` take `ROLES` ids only. The `legacy.*` roles follow `tier`.
+  - `set` and `fallback` take `ROLES` ids only. The `legacy.*` roles follow `tier`. *(WP-H: the `legacy.*` roles are gone.)*
   - An error handler sends any `EngineConfigError` raised by a drive entry to the chat as its text. It then stops the generic handler from logging it as unhandled.
 - `scripts/engines_probe.py` (new):
   - Usage: `[--provider NAME | --all] [--model ID]`.
@@ -114,7 +114,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - **`served_provider`** is the first segment of `routed_via`. v3 recorded it as `""` on every call.
 - **`CallRecord.extra["headers"]`** keeps `retry-after`, `x-fallback-attempts` and `x-ratelimit-*` from the response.
 - **v3's judge re-pick is not reproduced.** v3 re-picked the judge when it shared a family with the strong model. v4 binds the judge from the profile and reports the diversity instead: the `/engines` line and the `summarize_calls` warning.
-- **`legacy.*` model override:** `invoke_with_retry` raises `ValueError` when a call site's `model_override` differs from the bound model. In practice the call sites pass the model `resolve_tier` returned.
+- **`legacy.*` model override:** `invoke_with_retry` raises `ValueError` when a call site's `model_override` differs from the bound model. In practice the call sites pass the model `resolve_tier` returned. *(WP-H: gone with the wrappers.)*
 - **Probe model choice:** `--model`, else a fixed tier model of any profile for that provider (cheapest tier first), else the first preference its `/models` list serves.
 
 ### Behaviour changes for handoff.md
@@ -125,7 +125,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-A, with §2.2 (engines config, validation
 - `ARGUS_TIMEOUT` and `ARGUS_LLM_RETRIES` are no longer read. A startup WARNING names each one still set, and `PERPLEXITY_API_KEY` (§7) too. The timeout is `ProviderSpec.timeout_s`; the retry policy is the facade's.
 - `model_calls` entries carry the v4 fields: role, profile, provider, requested and served model, `routed_via`, attempt, fallback rank, retry reason, finish reason and token counts. `metadata.json` gains `engines` (the summary).
 - The `/models` fetch is not retried; v3 retried it. A failed listing fails the resolution, with the URL in the text.
-- `/engines` is new. `HELP_TEXT` and `docs/help.md` don't list it yet; they belong to other WPs.
+- `/engines` is new. `HELP_TEXT` and `docs/help.md` don't list it yet; they belong to other WPs. *(WP-E1 added it to `HELP_TEXT`; WP-H to `docs/help.md`, with `/engines transcriber`.)*
 - Until their WPs add `await registry.active_snapshot()`, `scripts/demo_run.py` (WP-D) and `bench/runner.py` (WP-G) raise "no engines snapshot resolved".
 - A response with an error object in its body is a failed attempt, as in v3, never an empty success. So is a response with no choices or one that isn't a chat completion. An error object with code 429 or 5xx is retried like a 429 or 5xx status.
 - An exhausted call's error text reads "role <id>: every engine failed after <n> attempts (last: …)". `metadata.json["engines"]` counts such calls in `calls` and `exhausted`, and keeps attempt counts apart (`attempts`, `failed_attempts`, `exhausted_attempts`). The earlier per-row `errors` field is gone.

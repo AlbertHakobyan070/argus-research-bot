@@ -99,7 +99,7 @@ def test_panel_reflexion_revise_then_pass(monkeypatch, tmp_path):
                                          "provider": "ddgs",
                                          "sub_qs": [0]}], [], []))
     monkeypatch.setattr(
-        scout_mod, "run_query_wave",
+        scout_mod, "run_wave",
         lambda queries, **kw: ([{"url": "https://example.com/a",
                            "title": "Source A", "snippet": "evidence",
                            "kind": "blog", "provider": "ddgs",

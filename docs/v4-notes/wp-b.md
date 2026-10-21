@@ -51,7 +51,7 @@ The first cut is commit `98ebc5b`. Its review found defects; fix round 1 (the se
 - `src/argus/graph/search_providers.py`:
   - The provider functions stay. `exa_search` gains `text_max_chars`, `include_domains`, `start_published_date`, `search_type` and `ledger`; with a ledger it counts `costDollars.total` and the hits that came with text (`exa_text_pages`). Its `published` is the date part.
   - `ddgs_hits` gains `timelimit`. `arxiv_hits` gains `sort_by`, and parses `<published>` into the hit's date.
-  - `run_query_wave` is now `engines.search.run_wave` (a re-export). `exa_max_calls` and the per-wave budget are gone.
+  - `run_query_wave` is now `engines.search.run_wave` (a re-export). `exa_max_calls` and the per-wave budget are gone. *(WP-H: the re-export is gone; scout and research import `engines.search.run_wave`.)*
 - `src/argus/graph/research.py` (rewritten). One node run is one pass, chosen from the state:
   - **append** (`append_only`): exactly the pinned sources, with no search and no budget.
   - **gap** (`coverage_gaps`): refused at `gap_waves_max`, with a `research: gap wave refused — gap_waves_max (<n>) reached` line. Otherwise it is one wave:
@@ -260,7 +260,7 @@ Finding: **inline text pages were not billed**; the search price covered them. `
 - The grounding banner now needs `brief.entities` (WP-I). Until then it does not show.
 - Cancel: research stops between fetches and returns what it has, with a `cancelled:` line.
 - A DDGS failure is now visible in `errors`.
-- The removed research env knobs (`ARGUS_RESEARCH_WAVES`, `ARGUS_FETCH_PER_WAVE`, `ARGUS_TOTAL_FETCH_CAP`, `ARGUS_EXA_MAX_CALLS`, `ARGUS_FETCH_CONCURRENCY`, `ARGUS_DIGEST_CONCURRENCY`) are no longer read; each logs one startup warning if set (`registry.REMOVED_ENV_KNOBS`). `README.md`, `.env.example` and `.env.mac.example` still describe them. That is WP-H's docs pass, so they are left unchanged here.
+- The removed research env knobs (`ARGUS_RESEARCH_WAVES`, `ARGUS_FETCH_PER_WAVE`, `ARGUS_TOTAL_FETCH_CAP`, `ARGUS_EXA_MAX_CALLS`, `ARGUS_FETCH_CONCURRENCY`, `ARGUS_DIGEST_CONCURRENCY`) are no longer read; each logs one startup warning if set (`registry.REMOVED_ENV_KNOBS`). `README.md`, `.env.example` and `.env.mac.example` still describe them. That is WP-H's docs pass, so they are left unchanged here. *(WP-H: done; `.env.mac.example` is folded into `.env.example`.)*
 
 ### New env vars
 

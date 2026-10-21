@@ -25,13 +25,6 @@ def _path_env(name: str, default: str | Path) -> Path:
     return Path(raw).expanduser()
 
 
-def _repo_path_env(name: str, default: str | Path) -> Path:
-    """``_path_env``, with a relative value taken relative to the repo root
-    (the engines registry resolves ``ARGUS_ENGINES_*`` the same way)."""
-    p = _path_env(name, default)
-    return p if p.is_absolute() else _PROJECT_ROOT / p
-
-
 def _bool_env(name: str, default: bool) -> bool:
     raw = (os.environ.get(name) or "").strip().lower()
     if not raw:
@@ -64,12 +57,10 @@ class Settings:
 
     # v4 (spec §7). These defaults are the only ones: load() falls back to
     # them. Read by the run driver (WP-E1: drain on cancel and on shutdown)
-    # and the console (WP-E2); the engines registry still resolves
-    # ARGUS_ENGINES_FILE / ARGUS_ENGINES_LOCAL_FILE itself.
+    # and the console (WP-E2). ARGUS_ENGINES_FILE / ARGUS_ENGINES_LOCAL_FILE
+    # are read by the engines registry only (registry.default_paths).
     webapp_enabled: bool = True
     webapp_port: int = 8787
-    engines_file: Path = _PROJECT_ROOT / "argus_engines.json"
-    engines_local_file: Path = _PROJECT_ROOT / "argus_engines.local.json"
     cancel_drain_timeout_s: float = 300.0   # cancel: wait this long for the drain, then task.cancel()
     shutdown_drain_s: float = 120.0         # shutdown: bound on draining every live run
 
@@ -126,8 +117,6 @@ class Settings:
             ffmpeg_path=os.environ.get("ARGUS_FFMPEG") or None,
             webapp_enabled=_bool_env("ARGUS_WEBAPP_ENABLED", cls.webapp_enabled),
             webapp_port=int(os.environ.get("ARGUS_WEBAPP_PORT") or cls.webapp_port),
-            engines_file=_repo_path_env("ARGUS_ENGINES_FILE", cls.engines_file),
-            engines_local_file=_repo_path_env("ARGUS_ENGINES_LOCAL_FILE", cls.engines_local_file),
             cancel_drain_timeout_s=float(os.environ.get("ARGUS_CANCEL_DRAIN_TIMEOUT_S")
                                          or cls.cancel_drain_timeout_s),
             shutdown_drain_s=float(os.environ.get("ARGUS_SHUTDOWN_DRAIN_S") or cls.shutdown_drain_s),

@@ -63,6 +63,44 @@ if command -v powershell.exe >/dev/null 2>&1; then
     echo "Stop the offending tool, then re-run this script." >&2
     exit 1
   fi
+
+  # Pre-flight v3 (2026-10-21): a hard-killed bot leaves its cloudflared
+  # child orphaned on Windows, and the old tunnel keeps serving the console
+  # port. Stop every cloudflared whose executable is this repo's binary
+  # (tools/bin/cloudflared.exe) or the ARGUS_CLOUDFLARED path the bot would
+  # spawn (resolved by the bot's own code, .env included), then assert none
+  # is left. A cloudflared started from any other binary is never touched.
+  # No pipe here: set -e must see a Python failure, never an empty target list.
+  ARGUS_PREFLIGHT_CF=$(./venv/Scripts/python.exe -c "from argus.config import _PROJECT_ROOT as r; from argus.webapp import tunnel; print('|'.join({str((r / 'tools' / 'bin' / 'cloudflared.exe').resolve()), str(tunnel.binary().resolve())}))")
+  ARGUS_PREFLIGHT_CF=${ARGUS_PREFLIGHT_CF//$'\r'/}
+  if [ -z "$ARGUS_PREFLIGHT_CF" ]; then
+    echo "FATAL: pre-flight could not resolve this repo's cloudflared path." >&2
+    exit 1
+  fi
+  export ARGUS_PREFLIGHT_CF
+  # PowerShell, single-quoted so bash leaves it alone; [char]124 is the "|" separator.
+  CF_FILTER='$want = @($env:ARGUS_PREFLIGHT_CF.Split([char]124) | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_) }); $cf = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ($want -contains [System.IO.Path]::GetFullPath($_.ExecutablePath)) })'
+  echo "[run.sh] pre-flight: killing any orphaned cloudflared of this repo…"
+  powershell.exe -NoProfile -Command "$CF_FILTER; \$cf | ForEach-Object {
+      Write-Output \"  killing cloudflared PID \$(\$_.ProcessId) (\$(\$_.ExecutablePath))\"
+      Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue
+    }"
+  sleep 1
+  CF_REMAINING=$(powershell.exe -NoProfile -Command "$CF_FILTER; \$cf.Count" | tr -d '\r\n[:space:]')
+  if [ -z "$CF_REMAINING" ]; then
+    echo "" >&2
+    echo "FATAL: pre-flight assertion could not query cloudflared processes." >&2
+    echo "Kill this repo's cloudflared manually (Task Manager → cloudflared.exe," >&2
+    echo "path $ARGUS_PREFLIGHT_CF), then re-run this script." >&2
+    exit 1
+  fi
+  if [ "$CF_REMAINING" != "0" ]; then
+    echo "" >&2
+    echo "FATAL: $CF_REMAINING cloudflared process(es) of this repo survived the pre-flight kill." >&2
+    echo "Diagnose with:" >&2
+    echo "  powershell.exe -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"Name='cloudflared.exe'\\\" | Select-Object ProcessId, ExecutablePath, CommandLine\"" >&2
+    exit 1
+  fi
   echo "[run.sh] pre-flight: clear."
 fi
 

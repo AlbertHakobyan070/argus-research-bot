@@ -7,7 +7,6 @@ mocked so no network/LLM is touched.
 from __future__ import annotations
 
 from argus.graph import research as research_mod
-from argus.graph import search_providers as sp_mod
 from argus.graph.nodes import (
     MAX_EXTEND_ROUNDS, deliver_node, extend_prep_node, route_after_deliver,
 )
@@ -65,7 +64,7 @@ def test_extend_prep_only_resets_counters_and_flags(monkeypatch):
         raise AssertionError("extend_prep must not search: research runs the Extend wave")
 
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
-    monkeypatch.setattr(sp_mod, "run_query_wave", _boom)
+    monkeypatch.setattr(research_mod, "run_wave", _boom)
     out = extend_prep_node({
         "brief": ResearchBrief(sub_questions=[SubQuestion(q="How does RAG ground answers?")],
                                must_have_keywords=["rag"], summary="s").model_dump(),
@@ -142,13 +141,9 @@ def test_a_plain_continue_runs_the_extend_pass_through_the_real_graph(monkeypatc
         return FetchedItem(url=src["url"], title="t", markdown_path=str(md), excerpt=doc[:600],
                            sub_qs=list(src.get("sub_qs") or []), provider="ddgs", fetcher="native").model_dump(), []
 
-    def no_search(*a, **kw):
-        raise AssertionError("extend_prep must not search: research runs the Extend wave")
-
     monkeypatch.setattr(research_mod.llm, "complete", complete)
-    monkeypatch.setattr(research_mod, "run_query_wave", wave)
+    monkeypatch.setattr(research_mod, "run_wave", wave)
     monkeypatch.setattr(research_mod, "fetch_one_source", fetch)
-    monkeypatch.setattr(sp_mod, "run_query_wave", no_search)
     stubs = {
         "intake_node": lambda s: {"mode": "deep"},
         "brief_node": lambda s: {"brief": dict(brief), "plan": {"summary": "s", "sub_questions": ["a", "b"],

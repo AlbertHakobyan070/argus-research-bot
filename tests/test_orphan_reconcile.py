@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from argus import bot as bot_mod
 from argus.bot.app import _reconcile_orphaned_runs
 from argus.library import Library
 

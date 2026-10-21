@@ -1,3 +1,5 @@
+> **Historical (v2/v3 era).** Names here such as `run_post_synthesis_passes_async` and `bot.py` no longer exist; current state: `handoff.md` and `docs/v4-notes/`.
+
 # Argus — Handoff 2026-07-09 (desktop shortcut & current build state)
 
 **From:** coding-app (MiniMax-M3). Short task: create a desktop

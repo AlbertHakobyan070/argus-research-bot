@@ -74,9 +74,8 @@ class SubQuestion(BaseModel):
 
 
 class ResearchBrief(BaseModel):
-    """v3 scoping artifact (replaces the v2 ResearchPlan as the driver;
-    a v2-compatible ``plan`` dict is still emitted for the Telegram
-    plan-gate renderer)."""
+    """The scoping artifact that drives research. ``brief_to_plan`` also
+    emits a plain ``plan`` dict for the plan card (Telegram and console)."""
     sub_questions: list[SubQuestion] = Field(default_factory=list)
     must_have_keywords: list[str] = Field(default_factory=list)
     summary: str = ""
@@ -227,7 +226,7 @@ class ArgusState(TypedDict, total=False):
     draft_md: str                   # current draft markdown
     review_verdict: dict | None     # ReviewVerdict-compatible dict
     revision_notes: list[str]       # panel notes (grow each revise round) + user revise
-                                    # requests, which bot.py appends LAST
+                                    # requests, which the run driver (bot/runs.py) appends LAST
     revision_rounds: int            # counter
 
     # v3 research engine

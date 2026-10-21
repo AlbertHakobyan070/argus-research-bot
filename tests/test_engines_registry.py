@@ -18,7 +18,7 @@ import pytest
 
 from argus.engines import llm_openai, registry
 from argus.engines.registry import EngineConfigError
-from argus.engines.roles import DEGRADABLE_ROLES, LEGACY_ROLES, ROLES, SKIPPABLE_ROLES
+from argus.engines.roles import DEGRADABLE_ROLES, ROLES, SKIPPABLE_ROLES
 from argus.engines.schema import EngineSpec, EnginesConfig, ProfileOverrides
 from argus.library import Library
 
@@ -126,15 +126,15 @@ async def lib(tmp_path):
 
 async def test_resolution_fixed_id_and_preferences_against_live_list(fetches):
     snap = await registry.resolve_snapshot(_cfg(), "main")
-    assert set(snap.roles) == set(ROLES) | set(LEGACY_ROLES)
+    assert set(snap.roles) == set(ROLES)
     cheap = snap.roles["intake.classify"].primary
     assert (cheap.provider, cheap.model, cheap.model_from_preferences) == ("proxy", "c2", None), (
         "c1 is not live, so the first live preference (c2) is chosen")
     assert snap.roles["research.rerank"].primary.model == "k1", "a fixed id resolves to itself"
-    legacy = snap.roles["legacy.strong"]
-    assert (legacy.tier, legacy.primary.model, legacy.on_exhausted) == ("strong", "s1", "raise")
+    unbound = snap.roles["brief.draft"]
+    assert (unbound.tier, unbound.primary.model, unbound.on_exhausted) == ("strong", "s1", "raise"), (
+        "unbound role: tier spec + raise")
     assert snap.roles["research.digest"].on_exhausted == "skip_item"
-    assert snap.roles["brief.draft"].on_exhausted == "raise", "unbound role: tier spec + raise"
     assert fetches == ["http://proxy/v1/models"], "one listing per provider; fixed ids need none"
 
 
@@ -178,7 +178,7 @@ async def test_policy_only_binding_follows_a_tier_override_pinned_does_not(fetch
     snap = await registry.resolve_snapshot(_cfg(data), "main")
     assert snap.roles["research.digest"].primary.model == "k2", "policy-only binding follows the tier"
     assert snap.roles["research.digest"].on_exhausted == "skip_item", "and keeps its policy"
-    assert snap.roles["legacy.cheap"].primary.model == "k2"
+    assert snap.roles["intake.classify"].primary.model == "k2", "an unbound role follows the tier"
     assert snap.roles["research.rerank"].primary.model == "k1", "a pinned primary does not move"
 
 
@@ -230,10 +230,10 @@ async def test_load_config_merge_order_and_per_profile_overrides(tmp_path, lib, 
 
     main = await registry.resolve_snapshot(cfg, "main")
     other = await registry.resolve_snapshot(cfg, "other")
-    assert main.roles["legacy.cheap"].primary.model == "k1", "main's override applies to main"
-    assert other.roles["legacy.cheap"].primary.model == "k1"
-    assert other.roles["legacy.strong"].primary.model == "k2"
-    assert main.roles["legacy.strong"].primary.model == "s1", "overrides are scoped per profile"
+    assert main.roles["intake.classify"].primary.model == "k1", "main's override applies to main"
+    assert other.roles["intake.classify"].primary.model == "k1"
+    assert other.roles["brief.draft"].primary.model == "k2"
+    assert main.roles["brief.draft"].primary.model == "s1", "overrides are scoped per profile"
 
 
 async def test_load_config_reports_bad_files(tmp_path):
@@ -289,27 +289,26 @@ async def test_load_config_names_a_file_it_cannot_stat_without_utf8_advice(tmp_p
 # active snapshot cache and persistence of /engines changes
 # ---------------------------------------------------------------------------
 
-def test_current_snapshot_cached_raises_when_nothing_resolved():
-    with pytest.raises(EngineConfigError, match="active_snapshot"):
-        registry.current_snapshot_cached()
+def test_cached_snapshot_is_none_when_nothing_resolved():
+    assert registry.cached_snapshot() is None
 
 
 async def test_active_snapshot_caches_and_set_calls_validate_before_persisting(tmp_path, lib, fetches):
     await registry.load_config([_write(tmp_path, "d.json", BASE)], library=lib)
     snap = await registry.active_snapshot()
     assert await registry.active_snapshot() is snap
-    assert registry.current_snapshot_cached() is snap
+    assert registry.cached_snapshot() is snap
     assert fetches == ["http://proxy/v1/models"], "cached: resolved once"
 
     new = await registry.set_overrides("main", ProfileOverrides(
         tiers={"judge": EngineSpec(provider="fixed", model="k2")}))
-    assert registry.current_snapshot_cached() is new
-    assert new.roles["legacy.judge"].primary.model == "k2"
+    assert registry.cached_snapshot() is new
+    assert new.roles["panel.grounding"].primary.model == "k2"
     stored = json.loads(await lib.get_setting("engines.overrides"))
     assert stored["main"]["tiers"]["judge"]["model"] == "k2"
 
     await registry.set_active_profile("other")
-    assert registry.current_snapshot_cached().profile == "other"
+    assert registry.cached_snapshot().profile == "other"
     assert json.loads(await lib.get_setting("engines.active_profile")) == "other"
 
     for refused in ("nope", "broken"):
@@ -317,7 +316,7 @@ async def test_active_snapshot_caches_and_set_calls_validate_before_persisting(t
             await registry.set_active_profile(refused)
         assert json.loads(await lib.get_setting("engines.active_profile")) == "other", (
             "a refused switch persists nothing")
-        assert registry.current_snapshot_cached().profile == "other", "and changes nothing"
+        assert registry.cached_snapshot().profile == "other", "and changes nothing"
 
 
 async def test_set_transcriber_persists_and_keeps_the_snapshot(tmp_path, lib, fetches):
@@ -327,7 +326,7 @@ async def test_set_transcriber_persists_and_keeps_the_snapshot(tmp_path, lib, fe
     await registry.set_transcriber(TranscriberConfig(asr_engine="openai_audio"))
     assert registry.current_config().transcriber.asr_engine == "openai_audio"
     assert json.loads(await lib.get_setting("engines.transcriber"))["asr_engine"] == "openai_audio"
-    assert registry.current_snapshot_cached() is snap
+    assert registry.cached_snapshot() is snap
 
 
 async def test_live_models_ttl_cache_known_models_and_no_key_in_errors(tmp_path, fetches, monkeypatch):

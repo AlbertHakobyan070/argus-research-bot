@@ -156,7 +156,7 @@ def run_wave(queries: list[dict], *, cfg: SearchConfig, ledger: SpendLedger, rec
              mode: str) -> tuple[list[dict], list[str]]:
     """Run one wave of planned queries (``{query, provider, sub_qs[, category]}``)
     → ``(hits, errors)``; every hit carries ``canonical_url``."""
-    from ..graph import search_providers as sp      # lazy: search_providers re-exports run_wave
+    from ..graph import search_providers as sp      # lazy: the argus.graph package imports this module
 
     if mode not in MODES:
         raise ValueError(f"run_wave: unknown mode {mode!r} (expected one of {sorted(MODES)})")

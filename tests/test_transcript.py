@@ -6,9 +6,9 @@ Covers:
   - ``tools.youtube_video_transcript`` — fail-soft on bad URL, fail-soft
     on no-vtt, success path. We monkeypatch ``_run_yt_dlp`` and the on-disk
     reads so the suite is hermetic (no network, no real yt-dlp invocations).
-  - ``bot._parse_indices`` — comma/space separators, ranges, ``all``,
+  - ``bot.common._parse_indices`` — comma/space separators, ranges, ``all``,
     bad tokens silently dropped, command prefix.
-  - ``bot._pool_put`` / ``_pool_get`` — basic round-trip and TTL expiry.
+  - ``bot.media._pool_put`` / ``_pool_get`` — basic round-trip and TTL expiry.
 
 No Telegram bot is started; we exercise the parsers and the tool layer
 directly. The bot's glue (transcript_cmd) is shaped identically to other

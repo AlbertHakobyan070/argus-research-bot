@@ -906,11 +906,8 @@ async def _payload(h: RunHandle, values: dict) -> dict:
     cfg = registry.current_config()
     profile = c.profile or cfg.active_profile
     if c.profile is None:
-        try:
-            registry.current_snapshot_cached()
-            problem = None
-        except EngineConfigError as e:
-            problem = str(e)
+        problem = (None if registry.cached_snapshot() is not None
+                   else "not validated yet — Approve validates it")
     else:
         check = h.profile_checks.get(profile)
         problem = check if isinstance(check, str) else None

@@ -1,5 +1,12 @@
 # Argus research engine v3 — design
 
+> **Superseded by v4** (`docs/argus-v4-design.md`) for everything it
+> contradicts: engines profiles and roles instead of the three-tier router,
+> depth presets instead of the `ARGUS_*` research env knobs, the analyst step,
+> batched grounding with cut-not-flag, the deterministic TL;DR, `evidence.json`,
+> the run driver and the console. This document stays the description of the
+> engine v4 is built on; what v4 built is in `docs/v4-notes/`.
+
 > Replaces the v2 linear pipeline
 > (`intake → planner → planner_reflect → researcher → fetcher → normalizer →
 > credibility → filter → synthesizer → reviewer`) with a supervisor-style

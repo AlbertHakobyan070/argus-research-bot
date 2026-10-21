@@ -321,7 +321,7 @@ async def test_main_without_a_checkpoint_reports_the_run_and_fails(monkeypatch, 
     _no_reports_root(monkeypatch)
 
     async def fake_run_one(query_obj, **kw):
-        return {"status": "error", "error": "EngineError('role legacy.cheap: every engine failed')"}
+        return {"status": "error", "error": "EngineError('role quick.answer: every engine failed')"}
 
     monkeypatch.setattr(runner, "_run_one", fake_run_one)
     assert await live_check._main(live_check.parse_args(["--out", str(tmp_path)])) == 1

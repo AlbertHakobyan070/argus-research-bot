@@ -14,7 +14,6 @@ ROLES: tuple[str, ...] = (
     "research.followup_querygen", "research.extend_querygen", "outline.plan", "compose.section", "compose.flat",
     "compose.findings_extract", "compose.analyst", "panel.grounding", "panel.coverage", "quick.answer",
 )
-LEGACY_ROLES = ("legacy.cheap", "legacy.strong", "legacy.judge")     # Phases 1–2 only (wrappers); removed by WP-H
 ROLE_TIERS: dict[str, Tier] = {
     "intake.classify": "cheap", "brief.draft": "strong", "scout.querygen": "cheap", "research.rerank": "cheap",
     "research.digest": "cheap", "research.followup_querygen": "cheap", "research.extend_querygen": "cheap",

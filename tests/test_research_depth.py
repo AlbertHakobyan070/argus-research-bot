@@ -353,7 +353,7 @@ def _fake_fetch(monkeypatch, tmp_path):
                            sub_qs=src["sub_qs"]).model_dump(), []
 
     monkeypatch.setattr(research_mod, "fetch_one_source", fetch)
-    monkeypatch.setattr(research_mod, "run_query_wave", lambda queries, **kw: ([], []))
+    monkeypatch.setattr(research_mod, "run_wave", lambda queries, **kw: ([], []))
 
 
 def test_every_digest_skipped_with_no_evidence_raises(monkeypatch, tmp_path):

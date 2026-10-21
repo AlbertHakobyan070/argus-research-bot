@@ -10,7 +10,7 @@ Its killer feature for Argus is search + full page text in ONE call —
 hits that carry text skip the fetch stage entirely. How many Exa searches
 a run may make is a per-run budget (``run_config.search.exa``, spent
 through the ``SpendLedger``); ``engines/search.run_wave`` plans each wave
-under it and is re-exported here as ``run_query_wave``.
+under it and calls the providers here.
 """
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ import re
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
-
-from ..engines.search import run_wave as run_query_wave
 
 if TYPE_CHECKING:
     from ..engines.ledger import SpendLedger
@@ -237,5 +235,5 @@ def github_hits(query: str, *, max_results: int = 8,
 
 __all__ = [
     "exa_enabled", "exa_search", "ddgs_hits",
-    "arxiv_hits", "github_hits", "run_query_wave",
+    "arxiv_hits", "github_hits",
 ]

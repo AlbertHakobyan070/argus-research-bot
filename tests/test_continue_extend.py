@@ -34,7 +34,6 @@ from argus.engines.ledger import SpendLedger
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
 from argus.graph import research as research_mod
-from argus.graph import search_providers as sp_mod
 from argus.graph.run_config import FetchConfig
 
 from helpers import fake_engines_snapshot, make_run_config, settle_runs
@@ -112,7 +111,7 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
             "append_only /continue must NOT run fresh searches")
 
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
-    monkeypatch.setattr(sp_mod, "run_query_wave", _boom)
+    monkeypatch.setattr(research_mod, "run_wave", _boom)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont1"}}
@@ -566,7 +565,7 @@ def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
         raise AssertionError("append_only must NOT run search waves")
 
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
-    monkeypatch.setattr(research_mod, "run_query_wave", _boom)
+    monkeypatch.setattr(research_mod, "run_wave", _boom)
 
     def fake_digest(item, source_id, brief, user_request, **kw):
         return ({"source_id": source_id, "source_url": item["url"],

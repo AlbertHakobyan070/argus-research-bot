@@ -175,7 +175,7 @@ def test_a_missing_font_dir_raises(tmp_path, monkeypatch):
 
 def test_markdown_to_pdf_raises_without_chromium_fallback(tmp_path, monkeypatch):
     """When ReportLab fails, ``markdown_to_pdf`` re-raises. It must not try
-    the intel-stack Chromium renderer.
+    a Chromium renderer (the intel-stack helper).
 
     A canary ``_common.py`` stands in for the intel-stack helper, so a
     regression (the fallback coming back) fails here by name instead of

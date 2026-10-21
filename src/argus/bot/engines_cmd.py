@@ -95,7 +95,7 @@ async def _dispatch(args: list[str], lib, chat_id: int) -> str:
     if sub in ("set", "fallback") and len(rest) == 2:
         role, spec = rest[0], _spec(rest[1])
         if role not in ROLES:
-            raise ValueError(f"unknown role {role!r} (legacy.* roles follow /engines tier)")
+            raise ValueError(f"unknown role {role!r}")
         cfg = registry.current_config()
         profile = cfg.active_profile
         b = registry.configured_binding(cfg, profile, role)

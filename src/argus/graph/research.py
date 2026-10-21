@@ -52,6 +52,7 @@ from langgraph.runtime import Runtime
 from .. import llm
 from ..engines import fetchers
 from ..engines.ledger import SpendLedger
+from ..engines.search import run_wave
 from ..engines.urls import canonical_url, domain
 from ..tools import normalize_to_markdown
 from . import run_config
@@ -59,7 +60,7 @@ from .credibility import (CREDIBILITY_FLOOR, authority_prior, credibility_score,
                           score_fetched)
 from .jsonx import parse_json_obj
 from .scout import _web_provider
-from .search_providers import exa_enabled, run_query_wave
+from .search_providers import exa_enabled
 from .state import EvidenceNote, FetchedItem, ResearchBrief
 
 logger = logging.getLogger("argus.research")
@@ -812,7 +813,7 @@ class _Pass:
 
     # -- search, pick, one wave ----------------------------------------------
     def search(self, queries: list[dict], mode: str, wave: int) -> None:
-        hits, errs = run_query_wave(queries, cfg=self.rc.search, ledger=self.ledger, recency=self.recency, mode=mode)
+        hits, errs = run_wave(queries, cfg=self.rc.search, ledger=self.ledger, recency=self.recency, mode=mode)
         self.errors += errs
         self.queries += queries
         index = {_source_key(s): i for i, s in enumerate(self.sources)}

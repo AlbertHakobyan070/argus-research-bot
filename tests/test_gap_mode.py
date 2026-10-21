@@ -82,7 +82,7 @@ def fake(monkeypatch, tmp_path):
                            provider="ddgs", fetcher="native").model_dump(), []
 
     monkeypatch.setattr(research_mod.llm, "complete", complete)
-    monkeypatch.setattr(research_mod, "run_query_wave", wave)
+    monkeypatch.setattr(research_mod, "run_wave", wave)
     monkeypatch.setattr(research_mod, "fetch_one_source", fetch)
     return F
 

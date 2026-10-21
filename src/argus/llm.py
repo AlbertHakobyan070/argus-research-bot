@@ -15,10 +15,6 @@ JSON object." (a JSON role) or "Reply with only the complete markdown text."
 ``EngineDegraded``, each with the message "role <id>: every engine failed
 after <n> attempts (last: …)". Every attempt is a ``CallRecord``; recorded
 and logged errors never contain the provider's key.
-
-The wrappers at the bottom keep the Phase 1 nodes unchanged: they route
-through ``complete`` with role ``legacy.<tier>`` on the registry's cached
-snapshot. WP-H deletes them.
 """
 from __future__ import annotations
 
@@ -41,7 +37,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from .engines import registry
 from .engines.llm_openai import DriverError, OpenAICompatDriver
 from .engines.registry import EngineConfigError  # noqa: F401  (re-export: llm.EngineConfigError)
-from .engines.roles import DEGRADABLE_ROLES, JSON_ROLES, LEGACY_ROLES, ROLES
+from .engines.roles import DEGRADABLE_ROLES, JSON_ROLES, ROLES
 from .engines.schema import EngineSpec, EnginesSnapshot, ProviderSpec, ResolvedBinding
 
 logger = logging.getLogger("argus.llm")
@@ -163,7 +159,7 @@ def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot
     subclasses ``EngineSkipped`` / ``EngineDegraded``, by policy), never a
     provider's own exception; ``ValueError`` only for an unknown or unbound
     role. (A ``validate`` hook's exception is a failed attempt, not raised.)"""
-    if role not in ROLES and role not in LEGACY_ROLES:
+    if role not in ROLES:
         raise ValueError(f"unknown role {role!r}")
     binding = engines.roles.get(role)
     if binding is None:
@@ -304,57 +300,3 @@ def _retry_after(e: Exception, provider: ProviderSpec) -> float | None:
 
 def _ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
-
-
-# ---------------------------------------------------------------------------
-# Phase 1–2 legacy wrappers (WP-H deletes them): the v3 call sites stay
-# unchanged and route through complete(role="legacy.<tier>").
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _LegacyChat:
-    tier: str
-    temperature: float | None
-    max_tokens: int | None
-    model_override: str | None
-
-
-@dataclass
-class _LegacyResponse:
-    content: str
-    result: LLMResult
-
-
-def chat_for_tier(tier: str, *, temperature: float | None = 0.2, max_tokens: int | None = None,
-                  model_override: str | None = None) -> _LegacyChat:
-    return _LegacyChat(tier, temperature, max_tokens, model_override)
-
-
-def invoke_with_retry(chat: _LegacyChat, messages: list[BaseMessage]) -> _LegacyResponse:
-    engines = registry.current_snapshot_cached()
-    role = f"legacy.{chat.tier}"
-    bound = engines.roles[role].primary.model
-    if chat.model_override is not None and chat.model_override != bound:
-        raise ValueError(f"{role}: model_override {chat.model_override!r} differs from the bound "
-                         f"model {bound!r}")
-    result = complete(role, messages, engines=engines, temperature=chat.temperature,
-                      max_tokens=chat.max_tokens)
-    return _LegacyResponse(content=result.text, result=result)
-
-
-def record_from_response(tier: str, requested: str, response: _LegacyResponse) -> CallRecord:
-    """The successful attempt's record; earlier failed attempts ride along
-    in ``extra["prior_attempts"]`` (the call sites append one dict)."""
-    result = response.result
-    prior = [a.model_dump() for a in result.records[:-1]]
-    if not prior:
-        return result.record
-    return dataclasses.replace(result.record, extra={**result.record.extra, "prior_attempts": prior})
-
-
-def resolve_tier(tier: str) -> str:
-    return registry.current_snapshot_cached().roles[f"legacy.{tier}"].primary.model
-
-
-def pick_strong_and_judge() -> tuple[str, str]:
-    return resolve_tier("strong"), resolve_tier("judge")

@@ -2,7 +2,7 @@
 import pytest
 
 from argus.engines.roles import (
-    ALL_SKIPPED_RAISES, DEGRADABLE_ROLES, JSON_ROLES, LEGACY_ROLES,
+    ALL_SKIPPED_RAISES, DEGRADABLE_ROLES, JSON_ROLES,
     MUST_RAISE_ROLES, ROLE_TIERS, ROLES, SKIPPABLE_ROLES)
 from argus.engines.schema import (
     EngineSpec, EnginesConfig, EnginesSnapshot, ProviderSpec, ResolvedBinding,
@@ -45,7 +45,7 @@ def test_role_tables_are_consistent():
     assert sum(len(c) for c in classes) == len(ROLES)
     assert set().union(*classes) == set(ROLES)
     assert ALL_SKIPPED_RAISES <= SKIPPABLE_ROLES   # only a skippable role can be all-skipped
-    assert not set(LEGACY_ROLES) & set(ROLES)
+    assert not any(r.startswith("legacy.") for r in ROLES)   # the Phase 1–2 wrapper roles are gone (WP-H)
 
 
 @pytest.mark.parametrize("role", ["compose.tldr", "panel.precision"])
@@ -196,10 +196,11 @@ def test_pricing_defaults_to_none_and_validates_exa_prices():
 
 def test_resolved_binding_checks_role_and_policy():
     spec = {"provider": "fake", "model": "m"}
-    ResolvedBinding(role="legacy.cheap", tier="cheap", primary=spec,
+    ResolvedBinding(role="quick.answer", tier="cheap", primary=spec,
                     fallbacks=[], on_exhausted="raise", retry_on_truncation=True)
     for role, policy, match in [("nope.role", "raise", "unknown role"),
-                                ("legacy.judge", "skip_item", "skip_item"),
+                                ("legacy.judge", "raise", "unknown role"),   # retired by WP-H
+                                ("quick.answer", "skip_item", "skip_item"),
                                 ("panel.grounding", "ignore", "on_exhausted")]:
         with pytest.raises(ValueError, match=match):
             ResolvedBinding(role=role, tier="judge", primary=spec, fallbacks=[],
@@ -213,11 +214,26 @@ def test_snapshot_role_keys_must_match_bindings():
         EnginesSnapshot.model_validate(snap)
 
 
+def test_a_stored_snapshot_naming_the_retired_legacy_roles_still_loads():
+    """WP-H removed the Phase 1–2 ``legacy.<tier>`` roles. A snapshot stored
+    before (a checkpoint's run_config) still names them: it loads with them
+    dropped, while any other unknown role still raises."""
+    snap = fake_engines_snapshot().model_dump()
+    for tier in ("cheap", "strong", "judge"):
+        role = f"legacy.{tier}"
+        snap["roles"][role] = {"role": role, "tier": tier, "primary": {"provider": "fake", "model": "m"},
+                               "fallbacks": [], "on_exhausted": "raise", "retry_on_truncation": True}
+    assert set(EnginesSnapshot.model_validate(snap).roles) == set(ROLES)
+    snap["roles"]["nope.role"] = {**snap["roles"]["quick.answer"], "role": "nope.role"}
+    with pytest.raises(ValueError, match="unknown role 'nope.role'"):
+        EnginesSnapshot.model_validate(snap)
+
+
 def test_fake_snapshot_binds_every_role_to_fake_provider():
     snap = fake_engines_snapshot()
-    assert set(snap.roles) == set(ROLES) | set(LEGACY_ROLES)
+    assert set(snap.roles) == set(ROLES)
     assert {b.primary.provider for b in snap.roles.values()} == {"fake"}
-    assert snap.roles["legacy.strong"].tier == "strong"
+    assert snap.roles["compose.section"].tier == "strong"
     assert snap.roles["panel.grounding"].on_exhausted == "skip_item"
     assert snap.roles["research.rerank"].on_exhausted == "degrade"
     assert snap.roles["research.extend_querygen"].on_exhausted == "degrade"

@@ -29,10 +29,10 @@ def test_free_proxy_resolves_and_complete_records_provenance():
     asyncio.run(registry.load_config([str(registry._ROOT / "argus_engines.json")]))
     snap = asyncio.run(registry.active_snapshot())
     live = registry.live_models("freellmapi")
-    for tier in ("cheap", "strong", "judge"):
-        assert snap.roles[f"legacy.{tier}"].primary.model in live, tier
+    for role, binding in snap.roles.items():
+        assert binding.primary.model in live, role
 
-    out = llm.complete("legacy.cheap", [HumanMessage(content="reply with the single word PONG")],
+    out = llm.complete("quick.answer", [HumanMessage(content="reply with the single word PONG")],
                        engines=snap, temperature=0, max_tokens=32)
     assert out.text and isinstance(out.text, str)
     rec = out.record

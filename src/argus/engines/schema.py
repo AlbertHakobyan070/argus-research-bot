@@ -5,16 +5,16 @@ WP-A/WP-D may add methods and validators here, never fields.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, model_validator
 
-from .roles import DEGRADABLE_ROLES, LEGACY_ROLES, MUST_RAISE_ROLES, ROLES, SKIPPABLE_ROLES, Tier
+from .roles import DEGRADABLE_ROLES, MUST_RAISE_ROLES, ROLES, SKIPPABLE_ROLES, Tier
 
 
-def _check_policy(role: str, on_exhausted: str, *, known: tuple[str, ...] = ROLES) -> None:
+def _check_policy(role: str, on_exhausted: str) -> None:
     """Unknown role → ValueError; on_exhausted must fit the role's §2.1 class."""
-    if role not in known:
+    if role not in ROLES:
         raise ValueError(f"unknown role {role!r}")
     if on_exhausted not in ("raise", "skip_item", "degrade"):
         raise ValueError(f"role {role}: unknown on_exhausted {on_exhausted!r}")
@@ -174,15 +174,26 @@ class ResolvedBinding(BaseModel):                                    # concrete,
 
     @model_validator(mode="after")
     def _role_and_policy(self) -> ResolvedBinding:
-        _check_policy(self.role, self.on_exhausted, known=ROLES + LEGACY_ROLES)
+        _check_policy(self.role, self.on_exhausted)
         return self
 
 
 class EnginesSnapshot(BaseModel):                                    # stored in RunConfig.engines (checkpointed) → resumes reproduce
     profile: str
     resolved_at: str                                                 # ISO
-    roles: dict[str, ResolvedBinding]                                # includes LEGACY_ROLES during Phases 1–2
+    roles: dict[str, ResolvedBinding]
     warnings: list[str] = []                                         # dropped/unresolved fallbacks etc. — shown in /engines, console, report engines line
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_roles(cls, data: Any) -> Any:
+        """A snapshot stored before WP-H (a checkpoint's run_config) may bind
+        the Phase 1–2 wrapper roles ``legacy.<tier>``; nothing calls them any
+        more, so they are dropped. Any other unknown role still raises."""
+        if isinstance(data, dict) and isinstance(data.get("roles"), dict):
+            retired = {f"legacy.{t}" for t in get_args(Tier)}
+            data = {**data, "roles": {k: v for k, v in data["roles"].items() if k not in retired}}
+        return data
 
     @model_validator(mode="after")
     def _keys_are_binding_roles(self) -> EnginesSnapshot:

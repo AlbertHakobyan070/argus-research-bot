@@ -1,37 +1,27 @@
 """Argus Telegram bot layer.
 
-python-telegram-bot v22 async, long-polling. Commands (registered in
-``build_application``; ``HELP_TEXT`` is the user-facing list):
-  research  /research [/length <m>] <topic> (both HITL gates) · /ask <q>
-            (one ungrounded cheap-tier answer — no search)
-  media     /find [yt|shorts|reddit] <q> · /video [shorts] <q> · /fetch <url…>
-            · /quality · /transcript <indices> · /transcripts · pasted links
-  history   /runs · /status · /append <id> <ref…> · /continue <id>
-            · /delete · /cancel [id|all]
-  /help [full]
+python-telegram-bot v22 async, long-polling. Each handler module registers
+its own commands and callbacks through ``register(app)``; ``app.py`` lists
+the modules in ``HANDLER_MODULES`` and wires the lifecycle hooks
+(``POST_INIT_HOOKS``, ``POST_STOP_HOOKS``, ``POST_SHUTDOWN_HOOKS``).
+``common.HELP_TEXT`` is the user-facing command list, ``docs/help.md`` the
+full guide.
 
-The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety.
+  research.py    /research, /ask, the plan and report buttons, Edit / Revise replies
+  runs.py        the run driver: one live drive per run, cancel by drain,
+                 attach on action, /continue, the plan card's data
+  progress.py    the run event bus and the live Telegram progress card
+  media.py       /find, /video, /fetch, /quality, /transcript(s), pasted links
+  history.py     /runs, /status, /append, /continue, /cancel, /help
+  delete.py      /delete
+  engines_cmd.py /engines (profiles, roles, tiers, the transcriber)
+  app.py         startup (engines check, restart reconcile), shutdown, dispatch
+  common.py      shared helpers and state
 
-v2 architecture (Phase 1)
--------------------------
-- ONE long-lived AsyncSqliteSaver + ONE compiled graph per flavour
-  (deep/quick), opened in PTB ``post_init`` and stored on
-  ``application.bot_data``. Runs are isolated by per-run thread ids
-  ``tg:<chat>:<run8>`` — multiple concurrent runs per chat are legal,
-  and any run can be re-attached after a bot restart.
-- Every run is registered in the Library (SQLite) so /status lists
-  history and later phases can /append + /continue + /delete.
-- Callback data is run-scoped (``plan:approve:<run8>``) so buttons on
-  old messages can never act on the wrong run.
-
-T7 additions
-------------
-- 5-button length selector at plan approval (TLDR / Short / Medium /
-  Long / Lecture). The chosen mode is pushed back into the graph
-  checkpoint via ``graph.aupdate_state`` before ``Command(resume=)``,
-  so the compose + report_builder nodes see the user's HITL choice.
-- /length flag in /research for users who want to skip the keyboard.
-- Validation summary on title page + per-section confidence in the
-  markdown + redesigned PDF.
+The bot is single-user (TELEGRAM_ALLOWED_USER_ID) for safety. Runs live in
+per-run checkpoint threads ``tg:<chat>:<run8>`` and in the Library, so any
+run can be re-attached after a restart; callback data is run-scoped, so a
+button on an old message never acts on the wrong run. The Mini App console
+(``argus.webapp``) is started by the same hooks and calls the same driver.
 """
 from .app import main  # the entry point; nothing else is re-exported

@@ -18,8 +18,7 @@ alone.
 
 Binding rules:
 - A role's binding is the override's, else the profile's, else the tier
-  spec with ``on_exhausted="raise"``. The ``legacy.*`` roles (Phases 1–2)
-  always take the tier spec.
+  spec with ``on_exhausted="raise"``.
 - A binding whose primary repeats the profile's own spec for the role's tier
   only declares the role's failure policy: its engine follows the tier,
   overrides and ``/engines tier`` included. Any other primary is pinned. So
@@ -54,7 +53,7 @@ import httpx
 from pydantic import ValidationError
 
 from ..config import _PROJECT_ROOT  # importing argus.config also loads .env
-from .roles import LEGACY_ROLES, ROLE_TIERS, ROLES
+from .roles import ROLE_TIERS, ROLES
 from .schema import (EngineSpec, EnginesConfig, EnginesSnapshot, ProfileOverrides, ProviderSpec,
                      ResolvedBinding, RoleBinding, TranscriberConfig, _engine_specs)
 
@@ -289,8 +288,6 @@ def static_problems(cfg: EnginesConfig) -> list[str]:
 def _tier(role: str) -> str:
     if role in ROLE_TIERS:
         return ROLE_TIERS[role]
-    if role in LEGACY_ROLES:
-        return role.removeprefix("legacy.")
     raise ValueError(f"unknown role {role!r}")
 
 
@@ -310,12 +307,12 @@ def configured_binding(cfg: EnginesConfig, profile: str, role: str) -> RoleBindi
 
 
 def bindings(cfg: EnginesConfig, profile: str) -> dict[str, tuple[str, RoleBinding]]:
-    """Every role (``ROLES`` + ``LEGACY_ROLES``) → (tier, effective binding)."""
+    """Every role of ``ROLES`` → (tier, effective binding)."""
     p = _profile(cfg, profile)
     ov = cfg.overrides.get(profile)
     tiers = {**p.tiers, **(ov.tiers if ov else {})}
     out = {}
-    for role in ROLES + LEGACY_ROLES:
+    for role in ROLES:
         tier = _tier(role)
         b = configured_binding(cfg, profile, role)
         if b.primary == p.tiers[tier]:          # a policy-only declaration follows the tier
@@ -393,11 +390,9 @@ async def active_snapshot() -> EnginesSnapshot:
     return snap
 
 
-def current_snapshot_cached() -> EnginesSnapshot:
-    """Sync, for the Phase 1–2 legacy wrappers inside a running graph."""
-    if _state.snapshot is None:
-        raise EngineConfigError("no engines snapshot resolved: every drive entry must "
-                                "`await registry.active_snapshot()` first")
+def cached_snapshot() -> EnginesSnapshot | None:
+    """The active snapshot if one is resolved, else None. Sync and never
+    resolving: for a view that must not validate (the plan card)."""
     return _state.snapshot
 
 
@@ -574,6 +569,8 @@ def family(model_id: str) -> str:
     return re.split(r"[^a-z0-9]+", name, maxsplit=1)[0] or name
 
 
+# legacy.<tier>: how stored records name a v3 call (no role, ``_role_of``) and a
+# Phase 1–2 wrapper call (those roles are gone from the role tables since WP-H)
 _WRITER_ROLES = frozenset({"compose.section", "compose.flat", "compose.analyst", "legacy.strong"})
 _JUDGE_ROLES = frozenset({"panel.grounding", "legacy.judge"})
 _ITEM_LINE = re.compile(r"^(?:\[r\d+\]\s*)?(skip|degrade):\s*(?:\[r\d+\]\s*)?(\S+)")
@@ -600,9 +597,10 @@ def summarize_calls(model_calls: list[dict], errors: list[str] | None = None, *,
     engine failed after <n> attempts" quoted in ``errors``). The attempt
     records are counted apart: ``attempts`` / ``failed_attempts`` over the
     records in ``model_calls`` (with any ``extra["prior_attempts"]`` the
-    legacy wrappers attach), and ``exhausted_attempts`` = the <n> of the
-    exhausted ``legacy.*`` calls, whose records the Phase 1–2 call sites do
-    not keep. A real role's call site appends every attempt record
+    Phase 1–2 wrappers attached to stored records), and
+    ``exhausted_attempts`` = the <n> of the exhausted ``legacy.*`` calls in
+    stored runs, whose records those call sites did not keep. A real role's
+    call site appends every attempt record
     (``EngineError.attempts``) to ``model_calls``, so its exhausted attempts
     are already counted there and never again from the text (0 here).
     ``skipped`` / ``degraded`` come from the ``skip:`` / ``degrade:`` lines.

@@ -41,6 +41,8 @@ def test_help_text_nonempty():
     assert "Argus" in HELP_TEXT
     assert "/research" in HELP_TEXT
     assert "/ask" in HELP_TEXT
+    for item in ("/engines transcriber", "/status", "/cancel", "/continue", "menu button"):
+        assert item in HELP_TEXT, item
 
 
 def test_help_text_is_compact():
@@ -58,7 +60,8 @@ def test_help_md_exists_and_covers_commands():
     assert _HELP_MD_PATH.exists(), "docs/help.md must ship with the bot"
     body = Path(_HELP_MD_PATH).read_text(encoding="utf-8")
     for cmd in ("/research", "/find", "/fetch", "/quality", "/transcripts",
-                "/runs", "/append", "/continue", "/delete"):
+                "/runs", "/append", "/continue", "/delete", "/status", "/cancel",
+                "/engines", "/engines transcriber", "menu button"):
         assert cmd in body, f"help.md must document {cmd}"
 
 

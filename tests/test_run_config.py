@@ -11,6 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from argus import config as config_mod
+from argus.engines import registry
 from argus.engines.schema import ExaPrices
 from argus.graph.run_config import (
     PRESETS, ExaConfig, RunConfig, SearchConfig, ensure_in_checkpoint, require)
@@ -280,6 +281,20 @@ def test_require_round_trips_make_run_config():
     assert (rc.depth, rc.research.waves) == ("standard", 1)
 
 
+def test_require_loads_a_checkpointed_config_naming_the_retired_legacy_roles():
+    """WP-H removed the Phase 1–2 ``legacy.<tier>`` roles; a run_config
+    checkpointed before still names them and must resume."""
+    data = make_run_config()
+    for tier in ("cheap", "strong", "judge"):
+        role = f"legacy.{tier}"
+        data["engines"]["roles"][role] = {
+            "role": role, "tier": tier, "primary": {"provider": "fake", "model": "fake-model"},
+            "fallbacks": [], "on_exhausted": "raise", "retry_on_truncation": True}
+    rc = require({"run_config": data, "length": "short"})
+    assert set(rc.engines.roles) == set(fake_engines_snapshot().roles)
+    assert not any(r.startswith("legacy.") for r in rc.engines.roles)
+
+
 class _S(TypedDict, total=False):
     x: int
     length: str
@@ -378,10 +393,11 @@ def test_settings_v4_knob_defaults(_bare_env):
     s = config_mod.Settings.load()
     root = config_mod._PROJECT_ROOT
     assert (s.webapp_enabled, s.webapp_port) == (True, 8787)
-    assert (s.engines_file, s.engines_local_file) == (
-        root / "argus_engines.json", root / "argus_engines.local.json")
+    # the engines files have one reader, the registry (WP-H removed the dead Settings copy)
+    assert registry.default_paths() == [root / "argus_engines.json", root / "argus_engines.local.json"]
     assert (s.cancel_drain_timeout_s, s.shutdown_drain_s) == (300, 120)
-    assert "max_revision_rounds" not in {f.name for f in dataclasses.fields(config_mod.Settings)}
+    fields = {f.name for f in dataclasses.fields(config_mod.Settings)}
+    assert not fields & {"max_revision_rounds", "engines_file", "engines_local_file"}
 
 
 def test_settings_v4_knobs_from_env(_bare_env, monkeypatch, tmp_path):
@@ -393,8 +409,8 @@ def test_settings_v4_knobs_from_env(_bare_env, monkeypatch, tmp_path):
     monkeypatch.setenv("ARGUS_SHUTDOWN_DRAIN_S", "7.5")
     s = config_mod.Settings.load()
     assert (s.webapp_enabled, s.webapp_port) == (False, 9999)
-    assert s.engines_file == config_mod._PROJECT_ROOT / "conf" / "engines.json"
-    assert s.engines_local_file == tmp_path / "local.json"
+    assert registry.default_paths() == [config_mod._PROJECT_ROOT / "conf" / "engines.json",
+                                        tmp_path / "local.json"]
     assert (s.cancel_drain_timeout_s, s.shutdown_drain_s) == (30, 7.5)
 
 

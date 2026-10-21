@@ -51,7 +51,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-G, with §2.4 (budget semantics and the p
 - `bench/queries.jsonl` gains the forecast, nonexistent-entity, non-technical and comparison queries q011–q016.
 - The bench record's `error` reads `"<Type>: <message>"` instead of the exception's repr.
 - A bench run writes its report folders under `bench/results/<label>/reports/` instead of the vault, unless `ARGUS_REPORTS_ROOT` is set. A rerun into the same results folder first deletes each query's last layout files.
-- The root `README.md` still mentions `tests/manual_e2e.py`. It is WP-H's (docs pass), so it is left unchanged here, as is a docstring line in `tests/test_bot_markdown_fallback.py`.
+- The root `README.md` still mentions `tests/manual_e2e.py`. It is WP-H's (docs pass), so it is left unchanged here, as is a docstring line in `tests/test_bot_markdown_fallback.py`. *(WP-H: both fixed.)*
 
 ### New env vars
 

@@ -1,4 +1,4 @@
-"""Regression: bot.py line ~606 sends report previews via Telegram's strict
+"""Regression: the bot (then bot.py) sent report previews via Telegram's strict
 legacy MARKDOWN parser. When the excerpt contains `_`, `*`, `[`, or `&`
 (common in research reports), Telegram raises
 ``BadRequest: Can't parse entities: can't find end of the entity starting
@@ -13,7 +13,7 @@ Fix:
    gracefully to a plain-text preview rather than blowing up ``_resume_after_plan``.
 
 These tests verify the helper and the parse-mode wiring; the actual Telegram
-call is exercised in ``manual_e2e.py``.
+call is exercised by the live bot check (scripts/verify_live.sh).
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from argus.bot import research as bot_research
 def test_helper_html_escape_for_tg_exists() -> None:
     """Argus must expose a HTML escape helper used by the report-preview path."""
     assert hasattr(bot_common, "_html_escape_for_tg"), (
-        "Add _html_escape_for_tg() to bot.py. It must escape `&`, `<`, `>` "
+        "Add _html_escape_for_tg() to argus.bot.common. It must escape `&`, `<`, `>` "
         "for Telegram's HTML parser."
     )
     assert callable(bot_common._html_escape_for_tg)
@@ -66,10 +66,10 @@ def test_html_escape_for_tg_handles_code_fence_unescaped() -> None:
     assert "```" in out
 
 
-# --- wiring check: bot.py uses ParseMode.HTML on the report-preview send -----
+# --- wiring check: the bot uses ParseMode.HTML on the report-preview send ---
 
 def test_report_preview_send_uses_html_or_safe_fallback() -> None:
-    """The report-preview send in bot.py must NOT use ParseMode.MARKDOWN
+    """The bot's report-preview send must NOT use ParseMode.MARKDOWN
     alone — it must either switch to ParseMode.HTML or be wrapped in a
     try/except fallback to a safe plain-text send.
 
@@ -78,7 +78,7 @@ def test_report_preview_send_uses_html_or_safe_fallback() -> None:
     """
     src = inspect.getsource(bot_research._send_report_preview)
     assert "ParseMode.MARKDOWN" not in src or "ParseMode.HTML" in src, (
-        "bot._resume_after_plan still uses ParseMode.MARKDOWN for the "
+        "research._send_report_preview still uses ParseMode.MARKDOWN for the "
         "report preview. Switch to ParseMode.HTML with proper escaping, "
         "or wrap the send in a try/except fallback."
     )
@@ -89,7 +89,7 @@ def test_report_preview_send_uses_html_or_safe_fallback() -> None:
         # structural check: there should be a `try:` block in the
         # report-preview region.
         assert "try:" in src, (
-            "bot._resume_after_plan still uses ParseMode.MARKDOWN and "
+            "research._send_report_preview still uses ParseMode.MARKDOWN and "
             "lacks a try/except fallback. Wrap the send so a parse "
             "failure degrades to plain text."
         )

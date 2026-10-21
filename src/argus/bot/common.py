@@ -27,7 +27,8 @@ HELP_TEXT = """\
 
 *Research*
   /research <topic> — deep report (plan → approve → preview)
-  /ask <question> — quick one-shot answer
+  /ask <question> — quick answer, no search
+  Console: the *Argus* menu button
 
 *Media → vault*
   /find [yt|shorts|reddit] <query> — search, then ⬇/📝 buttons
@@ -36,16 +37,18 @@ HELP_TEXT = """\
   /transcript <indices> — captions for /find picks
   /transcripts — browse saved transcripts
 
-*History*
-  /runs — list runs · /status — what's in flight
-  /append <id> <url|asset:N> — queue sources for a run
-  /continue <id> — resume or extend a run
-  /delete — free up space · /cancel [id] — stop a run
+*Runs*
+  /runs — list · /status — in flight + console link
+  /cancel [id|all] — stop after the current step
+  /continue <id> — resume, re-attach or extend
+  /append <id> <url|asset:N> — queue sources
+  /delete — free up space
 
 *Engines*
   /engines — models per role · /engines use <profile>
+  /engines transcriber — speech-to-text
 
-_Tip: paste any YouTube / X / Reddit / Instagram link for a download menu._
+_Tip: paste a YouTube/X/Reddit/Instagram link for a download menu._
 """
 
 # Loaded lazily from docs/help.md (repo) for `/help full`.

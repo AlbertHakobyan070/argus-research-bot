@@ -26,7 +26,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-D, with §2.4 (the RunConfig rule, the pr
   - `exa_usd_month_to_date()`: the sum of `exa_usd` over the runs created this calendar month (UTC). A run without a recorded spend counts 0.
 - `src/argus/config.py`:
   - `max_revision_rounds` is gone. Nothing read it; the panel reads `ARGUS_MAX_REVISIONS` itself until WP-C.
-  - New `Settings` fields, read from the environment by `load()`: `webapp_enabled`, `webapp_port`, `engines_file`, `engines_local_file`, `cancel_drain_timeout_s` and `shutdown_drain_s`. Their dataclass defaults are the only defaults; `load()` falls back to them. `ARGUS_WEBAPP_ENABLED` takes true/false/1/0/yes/no/on/off and raises on anything else. The engines paths resolve as the registry resolves them (relative to the repository).
+  - New `Settings` fields, read from the environment by `load()`: `webapp_enabled`, `webapp_port`, `engines_file`, `engines_local_file`, `cancel_drain_timeout_s` and `shutdown_drain_s`. Their dataclass defaults are the only defaults; `load()` falls back to them. `ARGUS_WEBAPP_ENABLED` takes true/false/1/0/yes/no/on/off and raises on anything else. The engines paths resolve as the registry resolves them (relative to the repository). *(WP-H: `engines_file` / `engines_local_file` removed — nothing read them; the registry's `default_paths()` is the one reader of `ARGUS_ENGINES_FILE` / `ARGUS_ENGINES_LOCAL_FILE`.)*
 - `src/argus/graph/run_config.py`: the module docstring only. The contract stays as the Task 1 fix round left it.
 - `src/argus/bot/research.py` (named edits):
   - `research_cmd` and `ask_cmd` build `RunConfig.from_preset(length=…, engines=<the resolved snapshot>, origin="telegram")`, put it in `state_in["run_config"]` and pass it to `create_run`.
@@ -73,7 +73,7 @@ Read into `Settings` (§7). Their readers come with WP-E1 (the drain timeouts) a
 - `ARGUS_WEBAPP_ENABLED` (default `true`) and `ARGUS_WEBAPP_PORT` (default `8787`);
 - `ARGUS_CANCEL_DRAIN_TIMEOUT_S` (default `300`): how long a cancel waits for the drain before `task.cancel()`;
 - `ARGUS_SHUTDOWN_DRAIN_S` (default `120`): the bound on draining every live run at shutdown;
-- `ARGUS_ENGINES_FILE` and `ARGUS_ENGINES_LOCAL_FILE`, which WP-A introduced, are now also `Settings` fields. The registry still resolves them itself.
+- `ARGUS_ENGINES_FILE` and `ARGUS_ENGINES_LOCAL_FILE`, which WP-A introduced, are now also `Settings` fields. The registry still resolves them itself. *(WP-H: no longer `Settings` fields.)*
 
 ### Test files touched
 

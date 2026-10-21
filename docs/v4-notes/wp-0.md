@@ -20,7 +20,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-0 Task 1; contracts §2.1, §2.2, §2.4 a
     - Profile and override `roles` keys ⊆ `ROLES`. An unknown role raises `ValueError`.
     - `on_exhausted` policy: `skip_item` only for skippable roles, `degrade` only for degradable roles, must-raise roles only `raise`.
     - `model_preferences` keys ⊆ tiers.
-    - `ResolvedBinding`: the role is in `ROLES ∪ LEGACY_ROLES` and the policy fits it. `EnginesSnapshot`: each key equals its binding's role.
+    - `ResolvedBinding`: the role is in `ROLES ∪ LEGACY_ROLES` and the policy fits it. `EnginesSnapshot`: each key equals its binding's role. *(WP-H: `LEGACY_ROLES` is gone; the role must be in `ROLES`, and `EnginesSnapshot` drops stored `legacy.<tier>` keys on load.)*
   - `src/argus/graph/run_config.py`: the §2.4 models verbatim, plus:
     - `PRESETS`, copied from the table.
     - `RunConfig.default_depth`, `from_preset` (dotted-key overrides, recorded in `overrides_applied`), `for_legacy_checkpoint` and `rebuild`.
@@ -35,7 +35,7 @@ Spec: `docs/argus-v4-design.md` §3 WP-0 Task 1; contracts §2.1, §2.2, §2.4 a
   - The unused `import re` is dropped, and `build_sources_block` leaves `__all__`, so there is no re-export.
   - `compose_node` still assembles inline; WP-C switches it to `assemble_draft`.
 - `tests/helpers.py`: plain helper functions, not pytest fixtures. Import them with `from helpers import make_run_config, fake_engines_snapshot`, never from `conftest`. The first commit had them in `tests/conftest.py`; the fix round moved them and deleted that file.
-  - `fake_engines_snapshot()` binds every `ROLES` id and the `legacy.*` ids to provider `"fake"`, with the shipped §2.2 failure policy.
+  - `fake_engines_snapshot()` binds every `ROLES` id and the `legacy.*` ids to provider `"fake"`, with the shipped §2.2 failure policy. *(WP-H: `ROLES` only.)*
   - `make_run_config(length="short", depth=None, **overrides) -> dict` builds from the presets. Overrides use dotted keys, e.g. `**{"research.waves": 1}`.
 
 ### Fix round (spec §2.0)
@@ -264,7 +264,7 @@ Reading: every `src/` hit is the symbol's own definition, a self-reference insid
 - `PERPLEXITY_API_KEY` is no longer read anywhere. The research engine never used it.
 - The intel-stack `harvest.py` is no longer wrapped. It had no v3 caller.
 - Not changed, but worth knowing: `_register_report_fonts` falls back to ReportLab's built-in fonts, with a logged warning, if a bundled font file is missing. That is a font fallback inside the one renderer, not a second renderer. It is outside item 5, and `test_markdown_to_pdf_survives_missing_font_dir` pins it.
-- Prose that is now stale and was left alone because those files are outside this step's list: the PDF-rendering bullet in `README.md` (still mentions the Chromium last resort), the module docstring of `src/argus/graph/report_builder_helpers.py` ("via the intel-stack Chromium renderer"), the comment at `src/argus/citations.py:51` (names `perplexity_search`), and the `ResearchBrief` docstring in `src/argus/graph/state.py` ("replaces the v2 ResearchPlan").
+- Prose that is now stale and was left alone because those files are outside this step's list: the PDF-rendering bullet in `README.md` (still mentions the Chromium last resort), the module docstring of `src/argus/graph/report_builder_helpers.py` ("via the intel-stack Chromium renderer"), the comment at `src/argus/citations.py:51` (names `perplexity_search`), and the `ResearchBrief` docstring in `src/argus/graph/state.py` ("replaces the v2 ResearchPlan"). *(WP-H fixed each of these.)*
 
 ### New env vars
 
@@ -364,7 +364,7 @@ New names, as the interfaces later WPs build on:
   - `/delete` is now registered last, because `delete` is last in `HANDLER_MODULES`. `bot.py` registered it between `/continue` and `/status`.
   - Every handler is still in group 0, and each command handler matches only its own command, so no update reaches a different handler (see the evidence below).
 - `scripts/run.sh`: the FATAL respawn hint names `src/argus/bot/` instead of `src/argus/bot.py`. Both launch scripts still run `python -m argus.bot`, which `__main__.py` serves. `run_mac.sh` is unchanged.
-- Stale prose left alone, because it is outside this step's file list:
+- Stale prose left alone, because it is outside this step's file list: *(WP-H fixed each of these.)*
   - The `README.md` tree still shows `bot.py`.
   - Comments in `src/argus/graph/compose.py`, `src/argus/graph/state.py` and `src/argus/graph/report_builder_helpers.py` still say `bot.py`.
   - Test docstrings and assert messages still say `bot.py` or `bot._…`.
@@ -387,10 +387,10 @@ How the tests were updated:
 - The test bodies are otherwise unchanged.
 
 Per file:
-- Imports only: `tests/test_bot.py`, `tests/test_bot_markdown_fallback.py`, `tests/test_youtube.py`, and `tests/test_orphan_reconcile.py`, whose unused `from argus import bot as bot_mod` from the base commit stays.
+- Imports only: `tests/test_bot.py`, `tests/test_bot_markdown_fallback.py`, `tests/test_youtube.py`, and `tests/test_orphan_reconcile.py`, whose unused `from argus import bot as bot_mod` from the base commit stays. *(WP-H removed that import.)*
 - `tests/test_continue_extend.py`: `_allowed`, `get_settings` and `_resume_after_plan` patched on `history`.
 - `tests/test_delete_browser.py`: `_allowed` patched on `app`, and `get_settings` on `app` and `delete`.
-- `tests/test_e2e_research.py` (opt-in e2e): the in-flight registry reached through `bot_common`.
+- `tests/test_e2e_research.py` (opt-in e2e): the in-flight registry reached through `bot_common`. *(WP-H deleted this file, stale since v2; the live end-to-end path is `scripts/verify_live.sh` / `scripts/live_check.py`.)*
 - `tests/test_hitl_edit_revise.py`: `_allowed` and `get_settings` patched on `app`, and `_replan_after_edit` and `_resume_after_plan` on `research`.
 - `tests/test_media_bot.py`: `_allowed` and `get_settings` patched on `app` and `media`, and `reddit_search` and `download_media` on `media`.
 - `tests/test_plan_hitl_gating.py`: `_allowed` and `get_settings` patched on `app`, and `_resume_after_plan` on `research`.

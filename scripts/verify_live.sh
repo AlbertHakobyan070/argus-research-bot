@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Post-proxy live verification for the Argus v2 rebuild.
-# Run this once the FreeLLMAPI proxy (127.0.0.1:3001) is back up. It drives
-# the REAL graph end-to-end (live LLM + live search) to prove the research
-# path — including the grounded plan gate, the revise loop, and parallel
-# fetch — actually works, not just the hermetic suite.
+# Live verification for Argus v4.
+# Run this once the FreeLLMAPI proxy (FREELLMAPI_BASE_URL, the default engines
+# profile's provider) is up. It drives the REAL graph end-to-end (live LLM +
+# live search) to prove the research path — the grounded plan gate, research
+# and digest, compose, analyst, the judged panel and the report — actually
+# works, not just the hermetic suite.
 set -e
 cd "$(dirname "$0")/.."
 export PYTHONPATH=""
 export PYTHONIOENCODING=utf-8
 
-echo "== 1. proxy reachable? =="
-curl -s -m 5 http://127.0.0.1:3001/v1/models -o /dev/null -w "  HTTP %{http_code}\n" \
+# The proxy URL the bot uses (.env, or the code default), not a hardcoded port.
+BASE=$(./venv/Scripts/python.exe -c "from argus.config import get_settings; print(get_settings().freellmapi_base_url)")
+BASE=${BASE//$'\r'/}
+echo "== 1. proxy reachable? ($BASE) =="
+curl -s -m 5 "$BASE/models" -o /dev/null -w "  HTTP %{http_code}\n" \
   || { echo "  proxy DOWN — start it first"; exit 1; }
 
 echo "== 2. live LLM tier + graph tests (need the proxy) =="
