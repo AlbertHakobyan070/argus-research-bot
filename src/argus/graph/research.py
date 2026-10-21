@@ -400,9 +400,14 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
                 if on_fetch is not None:
                     on_fetch(picked[i], results[i][0])
             if running and stop is not None and stop():          # the drain: stop waiting at once
-                abandoned = True
                 for fut, i in list(running.items()):
                     del running[fut]
+                    if fut.done():                               # finished since wait() returned: kept
+                        results[i] = fut.result()
+                        if on_fetch is not None:
+                            on_fetch(picked[i], results[i][0])
+                        continue
+                    abandoned = True
                     msg = f"fetch {picked[i].get('url')} failed: abandoned on cancel"
                     logger.warning(msg)
                     results[i] = (None, [msg])

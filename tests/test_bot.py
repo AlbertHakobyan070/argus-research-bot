@@ -558,3 +558,39 @@ async def test_a_long_markdown_message_goes_out_cut_on_its_plain_retry():
     assert await _safe_send(_Bot(), 1, answer) is not None
     (text,) = sent
     assert _tg_len(text) <= _TG_LIMIT and text.endswith("…(cut)") and text.startswith("🧠 a long answer")
+
+
+# --- live-check fix round 2: the cut always terminates --------------------------
+
+def _within(seconds: float, fn):
+    """``fn()`` on a daemon thread; its result, or AssertionError if it is still running."""
+    import threading
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), f"still running after {seconds} s"
+    return out[0]
+
+
+def test_tg_cut_terminates_and_fits_for_any_limit():
+    from argus.bot.common import _tg_cut
+
+    def every():
+        for text in ("abcdefghij", "😀" * 12, "x" * 5000):
+            for limit in range(-5, 11):
+                cut = _tg_cut(text, limit)
+                assert _tg_len(cut) <= max(limit, 0), (text[:5], limit, cut)
+        return True
+    assert _within(5, every)
+
+
+def test_an_escape_heavy_preview_head_returns_within_the_budget(tmp_path):
+    """Review Important 1: 8 notes of 300 "&" each (5x on escaping) drove the
+    head-cut limit negative and _tg_cut looped forever on the event loop."""
+    from argus.bot.research import _PREVIEW_BUDGET, _preview_bodies
+    values = _preview_values(tmp_path, 50)
+    values["errors"] = [f"[r1] skip: research.digest https://x.example/{i}?{'&' * 300} (429)" for i in range(8)]
+    html_body, plain_body = _within(10, lambda: _preview_bodies(values))
+    assert _tg_len(html_body) <= _PREVIEW_BUDGET and _tg_len(plain_body) <= _PREVIEW_BUDGET
+    assert html_body.startswith("📝 *Report preview*")

@@ -206,12 +206,16 @@ def _tg_len(text: str) -> int:
 
 
 def _tg_cut(text: str, limit: int = TG_LIMIT) -> str:
-    """``text`` cut to ``limit`` (``_tg_len``), with a visible "…(cut)" mark."""
+    """``text`` cut to ``limit`` (``_tg_len``), with a visible "…(cut)" mark
+    when the limit has room for it; any limit terminates (≤ 0 gives "")."""
     if _tg_len(text) <= limit:
         return text
     mark = "\n…(cut)"
-    keep = limit - _tg_len(mark)
-    while _tg_len(text[:keep]) > limit - _tg_len(mark):
+    if limit < _tg_len(mark):
+        mark = ""
+    room = max(limit - _tg_len(mark), 0)
+    keep = min(len(text), room)
+    while keep > 0 and _tg_len(text[:keep]) > room:
         keep -= 1
     return text[:keep] + mark
 

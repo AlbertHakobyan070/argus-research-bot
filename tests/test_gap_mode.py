@@ -431,3 +431,31 @@ def test_a_drain_abandons_the_fetches_still_in_flight(fake, tmp_path):
     assert "fetch https://slow.example/p failed: abandoned on cancel" in out["errors"], out["errors"]
     assert "cancelled: research stopped after 3/3 fetches in wave 1 (user cancel)" in out["errors"]
     assert sorted(fake.fetches) == ["https://fast.example/p", "https://later.example/p", "https://slow.example/p"]
+
+
+def test_a_fetch_finished_as_the_drain_is_read_is_kept(fake, tmp_path):
+    """Review Minor 1: a fetch that completes after wait() returned but before
+    the drain is read was recorded "abandoned on cancel" and its item dropped."""
+    import threading
+    import time
+
+    from argus.engines.ledger import SpendLedger
+    from argus.graph.run_config import FetchConfig
+
+    go = threading.Event()
+    fake.on_fetch = lambda src: go.wait(10)          # running until the drain check lets it finish
+    reads: list[bool] = []
+
+    def stop() -> bool:
+        if reads:                                    # the drain check after the poll timed out
+            go.set()
+            time.sleep(0.3)                          # the fetch returns: its future is done
+            reads.append(True)
+            return True
+        reads.append(False)                          # the submit check
+        return False
+
+    fetched, errors = research_mod._parallel_fetch(
+        [_src("https://done.example/p", 0)], cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False, stop=stop)
+    assert [f["url"] for f in fetched] == ["https://done.example/p"], errors
+    assert not any("abandoned on cancel" in e for e in errors), errors

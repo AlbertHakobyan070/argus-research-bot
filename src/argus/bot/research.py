@@ -403,8 +403,18 @@ def _preview_bodies(values: dict) -> tuple[str, str]:
     while excerpt and _tg_len(html_body) > _PREVIEW_BUDGET:
         excerpt = excerpt[:len(excerpt) - 200]
         html_body = _fit(excerpt)
-    while _tg_len(html_body) > _PREVIEW_BUDGET:
-        text = _tg_cut(text, _tg_len(text) - (_tg_len(html_body) - _PREVIEW_BUDGET))
+    if _tg_len(html_body) > _PREVIEW_BUDGET:
+        # the head alone is too long (the excerpt is gone): keep its longest cut whose ESCAPED
+        # (sent) length fits — escaping grows "&" fivefold, so the raw overflow is no measure.
+        # A binary search: it always ends, and the cut keeps the head's start (its title line).
+        lo, hi = 0, _tg_len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _tg_len(_html_escape_for_tg(_tg_cut(text, mid))) <= _PREVIEW_BUDGET:
+                lo = mid
+            else:
+                hi = mid - 1
+        text = _tg_cut(text, lo)
         html_body = _fit(excerpt)
     plain_body = _tg_cut(text + ("\n\n```\n" + excerpt + "\n```" if excerpt else ""), _PREVIEW_BUDGET)
     return html_body, plain_body
