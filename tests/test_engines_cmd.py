@@ -31,6 +31,7 @@ from argus.config import Settings
 from argus.engines import llm_openai, registry
 from argus.engines.registry import EngineConfigError
 from argus.library import Library
+from argus.webapp import server as webapp_server
 
 from helpers import fake_engines_snapshot, make_run_config, settle_runs
 
@@ -255,7 +256,10 @@ async def _post_init(monkeypatch, tmp_path, engines_text: str, local: bytes | No
         local_file.write_bytes(local)
     monkeypatch.setenv("ARGUS_ENGINES_FILE", str(f))
     monkeypatch.setenv("ARGUS_ENGINES_LOCAL_FILE", str(local_file))
-    monkeypatch.setattr(bot_app, "get_settings", lambda: _settings(tmp_path))
+    # hermetic: the console never binds its real port (the live bot may hold it) or DMs "console down"
+    settings = _settings(tmp_path, webapp_enabled=False)
+    monkeypatch.setattr(bot_app, "get_settings", lambda: settings)
+    monkeypatch.setattr(webapp_server, "get_settings", lambda: settings)
     app = MagicMock()
     app.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
     app.bot_data = {}

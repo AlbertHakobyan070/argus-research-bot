@@ -33,12 +33,6 @@ Guards (spec §2.8, WP-B review):
   any other ``Content-Encoding`` is refused. Text on disk is capped at
   ``max_chars_on_disk``.
 
-One wall-clock bound, ``FetchConfig.timeout_s``, covers the whole chain of one
-fetch: each rung gets what is left of it (the httpx timeout, the intel-stack
-subprocess timeout), ``native`` checks it on every redirect hop and every body
-chunk (httpx's timeout is per read), and once it is spent no rung starts —
-the rung is recorded with ``"timeout: the fetch's <n> s bound is spent"``.
-
 A rung's expected failures — HTTP status, network and timeout errors, a body
 that does not decode, size, a third-party parser's exception — are its own
 error type, recorded with the exception type; anything else propagates (an
@@ -232,14 +226,14 @@ def check_target(url: str) -> list[str]:
 # HTTP: every hop through the guard and to the address it checked, the byte cap
 # ---------------------------------------------------------------------------
 
-def _http_client(cfg: FetchConfig, *, pinned: bool = False, timeout: float | None = None) -> httpx.Client:
+def _http_client(cfg: FetchConfig, *, pinned: bool = False) -> httpx.Client:
     """No keep-alive: the pool keys connections by address, so a later hop to another
     name on the same address would reuse a TLS session verified for the first name.
     httpx's ``trust_env`` mounts the environment's HTTP(S) proxies (``NO_PROXY``
     honoured); a ``pinned`` client has an explicit transport, so httpx mounts none and
     a request to a checked address never goes through a proxy."""
     limits = httpx.Limits(max_keepalive_connections=0)
-    return httpx.Client(timeout=cfg.timeout_s if timeout is None else timeout, follow_redirects=False,
+    return httpx.Client(timeout=cfg.timeout_s, follow_redirects=False,
                         headers={"User-Agent": _UA, "Accept-Encoding": _ACCEPT_ENCODING}, limits=limits,
                         transport=httpx.HTTPTransport(limits=limits) if pinned else None)
 
@@ -277,24 +271,11 @@ def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -
     return send(last)
 
 
-def _spent(cfg: FetchConfig) -> _RungError:
-    return _RungError(f"timeout: the fetch's {cfg.timeout_s} s bound is spent")
-
-
-def _left(deadline: float | None) -> float | None:
-    return None if deadline is None else deadline - time.monotonic()
-
-
-def _check(deadline: float | None, cfg: FetchConfig) -> None:
-    if deadline is not None and time.monotonic() >= deadline:
-        raise _spent(cfg)
-
-
 def _too_large(cfg: FetchConfig) -> _RungError:
     return _RungError(f"too large (> {cfg.max_bytes} bytes)")
 
 
-def _read_body(r: httpx.Response, cfg: FetchConfig, deadline: float | None = None) -> bytes:
+def _read_body(r: httpx.Response, cfg: FetchConfig) -> bytes:
     """The body, decoded as it streams in and never more than ``cfg.max_bytes``
     decoded bytes (+ one chunk): gzip / deflate through a bounded ``zlib``
     decompressor; any other ``Content-Encoding`` is refused before a byte is decoded."""
@@ -308,7 +289,6 @@ def _read_body(r: httpx.Response, cfg: FetchConfig, deadline: float | None = Non
     inflate = zlib.decompressobj(_WBITS[codings[0]]) if codings else None
     body, raw = bytearray(), 0
     for chunk in r.iter_raw():
-        _check(deadline, cfg)
         raw += len(chunk)
         if raw > cfg.max_bytes:
             raise _too_large(cfg)
@@ -329,18 +309,15 @@ def _read_body(r: httpx.Response, cfg: FetchConfig, deadline: float | None = Non
     return bytes(body)
 
 
-def _get(client: httpx.Client, url: str, cfg: FetchConfig, deadline: float | None = None) -> tuple[str, bytes, str]:
+def _get(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, bytes, str]:
     """(final URL, decoded body, content-type) of a GET: at most ``_MAX_REDIRECTS``
     redirects, every hop read the WHATWG way, through the guard and sent to the
     address it checked — or by name through the environment's proxy, when one
     applies (``_open``); the body under the byte cap. ``client`` trusts the
-    environment; the pinned hops go on a client of their own. ``deadline``: the
-    fetch's bound, checked on every hop and every body chunk."""
-    _check(deadline, cfg)
-    pinned = _http_client(cfg, pinned=True, timeout=_left(deadline))
+    environment; the pinned hops go on a client of their own."""
+    pinned = _http_client(cfg, pinned=True)
     try:
         for _ in range(_MAX_REDIRECTS + 1):
-            _check(deadline, cfg)
             url = _whatwg(url)
             r = _open(client, pinned, url, check_target(url))
             try:
@@ -355,7 +332,7 @@ def _get(client: httpx.Client, url: str, cfg: FetchConfig, deadline: float | Non
                     continue
                 if r.status_code >= 400:
                     raise _RungError(f"HTTP {r.status_code}")
-                return url, _read_body(r, cfg, deadline), r.headers.get("content-type", "")
+                return url, _read_body(r, cfg), r.headers.get("content-type", "")
             finally:
                 r.close()
     except (httpx.TransportError, httpx.InvalidURL) as e:     # network, timeout, protocol; a URL httpx rejects
@@ -400,8 +377,8 @@ def _html_text(html: bytes, url: str) -> tuple[str, str]:
     return text, (meta.title if meta is not None and meta.title else "")
 
 
-def _page(client: httpx.Client, url: str, cfg: FetchConfig, deadline: float | None = None) -> tuple[str, str]:
-    final, body, ctype = _get(client, url, cfg, deadline)
+def _page(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, str]:
+    final, body, ctype = _get(client, url, cfg)
     if _is_pdf(final, ctype, body):
         return _pdf_text(body, cfg.max_chars_on_disk), ""
     return _html_text(body, final)
@@ -411,17 +388,17 @@ _ARXIV_ABS = "https://arxiv.org/abs/"
 _AR5IV_HOSTS = ("ar5iv.labs.arxiv.org", "ar5iv.org")
 
 
-def _arxiv(client: httpx.Client, paper: str, cfg: FetchConfig, deadline: float | None = None) -> tuple[str, str]:
+def _arxiv(client: httpx.Client, paper: str, cfg: FetchConfig) -> tuple[str, str]:
     """ar5iv's HTML rendering, else the PDF through pypdf."""
     try:
-        final, body, _ctype = _get(client, f"https://ar5iv.labs.arxiv.org/html/{paper}", cfg, deadline)
+        final, body, _ctype = _get(client, f"https://ar5iv.labs.arxiv.org/html/{paper}", cfg)
         if urlsplit(final).hostname not in _AR5IV_HOSTS:
             raise _RungError(f"ar5iv has no rendering (redirected to {final})")
         return _html_text(body, final)
     except _RungError as e:
         ar5iv_error = e
     try:
-        _final, body, _ctype = _get(client, f"https://arxiv.org/pdf/{paper}", cfg, deadline)
+        _final, body, _ctype = _get(client, f"https://arxiv.org/pdf/{paper}", cfg)
         return _pdf_text(body, cfg.max_chars_on_disk), ""
     except _RungError as e:
         raise _RungError(f"ar5iv: {ar5iv_error}; pdf: {e}") from e
@@ -433,24 +410,23 @@ def _github_repo(url: str) -> tuple[str, str] | None:
     return (segments[0], segments[1]) if parts.hostname == "github.com" and len(segments) == 2 else None
 
 
-def _native(url: str, source: dict, cfg: FetchConfig, deadline: float | None = None) -> tuple[str, str]:
-    with _http_client(cfg, timeout=_left(deadline)) as client:
+def _native(url: str, source: dict, cfg: FetchConfig) -> tuple[str, str]:
+    with _http_client(cfg) as client:
         canonical = canonical_url(url)
         if canonical.startswith(_ARXIV_ABS):
-            return _arxiv(client, canonical[len(_ARXIV_ABS):], cfg, deadline)
+            return _arxiv(client, canonical[len(_ARXIV_ABS):], cfg)
         repo = _github_repo(url)
         if repo:
             readme = f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}/HEAD/README.md"
             try:
-                _final, body, _ctype = _get(client, readme, cfg, deadline)
+                _final, body, _ctype = _get(client, readme, cfg)
             except _RungError as e:
                 raise _RungError(f"README: {e}") from e
             return body.decode("utf-8", errors="replace"), f"{repo[0]}/{repo[1]}"
-        return _page(client, url, cfg, deadline)
+        return _page(client, url, cfg)
 
 
-def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned: bool,
-                  timeout: float | None = None) -> tuple[str, str]:
+def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned: bool) -> tuple[str, str]:
     """``pinned``: the page is counted, never taken from the cap (spec §2.8) — the
     counter is shared, so it does reduce what remains for unpinned pages."""
     key = os.environ.get("EXA_API_KEY", "").strip()
@@ -463,7 +439,7 @@ def _exa_contents(url: str, cfg: FetchConfig, ledger: SpendLedger | None, pinned
     elif not ledger.take("exa_contents_pages"):
         raise _RungError("page budget spent")
     try:
-        with _http_client(cfg, timeout=timeout) as client:
+        with _http_client(cfg) as client:
             r = client.post(_EXA_CONTENTS, json={"urls": [url], "text": {"maxCharacters": cfg.max_chars_on_disk}},
                             headers={"x-api-key": key})
     except (httpx.TransportError, httpx.DecodingError) as e:     # network, timeout; a body that does not decode
@@ -515,15 +491,13 @@ def _exa_reply(data, ledger: SpendLedger) -> tuple[str, str]:
     return text, title
 
 
-def _intel(rung: str, url: str, timeout: int) -> tuple[str, str]:
-    """``timeout``: the subprocess's bound (what is left of the fetch's), in place
-    of the wrappers' own ``ARGUS_TOOL_TIMEOUT`` (120 s each)."""
+def _intel(rung: str, url: str) -> tuple[str, str]:
     if rung == "intel_snatch":
-        res = snatch_url(url, kind="auto", timeout=timeout)
+        res = snatch_url(url, kind="auto")
     elif rung == "intel_crawl":
-        res = crawl_url(url, deep=False, max_pages=4, timeout=timeout)
+        res = crawl_url(url, deep=False, max_pages=4)
     else:
-        res = snatch_url(url, kind="auto", stealth=True, timeout=timeout)
+        res = snatch_url(url, kind="auto", stealth=True)
     if not (res.ok and res.markdown_path):
         raise _RungError(res.error or "not ok")
     return Path(res.markdown_path).read_text(encoding="utf-8", errors="replace"), getattr(res, "title", "")
@@ -549,12 +523,10 @@ def _store(rung: str, url: str, text: str, cfg: FetchConfig) -> tuple[str, str]:
 
 def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_enabled: bool,
           pinned: bool = False) -> FetchResult:
-    """Fetch one search hit through the available chain (see the module doc),
-    within ``cfg.timeout_s`` of wall clock in all.
+    """Fetch one search hit through the available chain (see the module doc).
     ``pinned``: a user-appended source, which never calls ``take``."""
     url = _whatwg(source.get("url") or "")
     t0 = time.monotonic()
-    deadline = t0 + cfg.timeout_s
     tried: list[dict] = []
 
     def ms() -> int:
@@ -569,15 +541,11 @@ def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_ena
         elif rung == "exa_contents" and not exa_enabled:
             continue
         else:
-            left = deadline - time.monotonic()
-            if left < 1:                       # under a second cannot carry a request or a subprocess
-                tried.append({"rung": rung, "error": str(_spent(cfg))})
-                break
             try:
                 check_target(url)
-                text, title = (_native(url, source, cfg, deadline) if rung == "native" else
-                               _exa_contents(url, cfg, ledger, pinned, timeout=left) if rung == "exa_contents" else
-                               _intel(rung, url, int(left)))
+                text, title = (_native(url, source, cfg) if rung == "native" else
+                               _exa_contents(url, cfg, ledger, pinned) if rung == "exa_contents" else
+                               _intel(rung, url))
                 if len(text.strip()) < _MIN_CHARS:
                     raise _RungError(f"only {len(text.strip())} chars of text")
             except _Refused as e:

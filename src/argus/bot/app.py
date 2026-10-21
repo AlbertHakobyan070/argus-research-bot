@@ -235,16 +235,18 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
             logger.exception("reconcile: aget_state failed for %s", run_id)
             snap = None
         nxt = tuple(snap.next) if (snap and snap.next) else ()
+        # the driver's gate rule: ("research",) is the plan gate only before the run passed it
+        gate = runs._gate(nxt, snap.values or {}) if snap is not None else None
         topic = (run.get("topic") or "")[:48]
         if run.get("mode") == "quick":
             await _set_run_status(app_ctx(app), run_id, "cancelled")
             msg = f"♻️ /ask `{run_id}` ({topic}) was interrupted by a bot restart — ask again with /ask."
-        elif nxt in (("research",), ("fetcher",)):
+        elif gate == runs.PLAN:
             await _set_run_status(app_ctx(app), run_id, "awaiting_plan")
             msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    f"restart at the plan step.\nSend /continue {run_id} to "
                    "review the plan and resume.")
-        elif nxt == ("deliver",):
+        elif gate == runs.REPORT:
             await _set_run_status(app_ctx(app), run_id, "awaiting_report")
             msg = (f"♻️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    f"restart at the report preview.\nSend /continue {run_id} "

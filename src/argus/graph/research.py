@@ -39,7 +39,6 @@ import logging
 import math
 import re
 import tempfile
-import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -68,6 +67,7 @@ logger = logging.getLogger("argus.research")
 _APPENDED = ("appended-asset", "appended-url")      # bot/history.py _sources_from_refs
 _RERANK_MAX = 40          # candidates one rerank call scores; keyword triage pre-selects them
 _EXCERPT_CHARS = 600
+_DRAIN_POLL_S = 0.5        # how often a fetch pool re-reads the drain while fetches run
 _STRONG = 3               # a "strong" note: relevance >= 3
 _MODE_LABEL = {"first": "first pass", "gap": "gap wave", "extend": "extend", "append": "appended sources"}
 _DEGRADE_LINE = re.compile(r"degrade: (\S+) → (\S+) \((.*)\)$", re.DOTALL)
@@ -368,24 +368,18 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
     calls). ``on_fetch(src, item | None)`` runs on the node thread as each
     fetch completes.
 
-    Once ``stop()`` is true, a fetch still in flight is waited on only until
-    its bound (``cfg.timeout_s`` from its start, the chain's own bound) and
-    then abandoned — a failed fetch with a timeout reason — so the digest of
-    what was fetched runs well inside the driver's drain cap (live check 12:
-    one URL ran 4.5 min and the cap cancelled the pass). Its thread is left
-    to finish on its own (the chain's bound ends it); its result is dropped."""
+    Once ``stop()`` is true (read again every ``_DRAIN_POLL_S`` while fetches
+    run, so a drain landing during a slow fetch is seen), research stops
+    waiting on the fetches still in flight at once: each is a failed fetch
+    "abandoned on cancel", and the digest of what was fetched runs (live check
+    12: one URL ran 4.5 min after the drain and the drain cap cancelled the
+    pass). Its thread is left to finish on its own; its result is dropped."""
     if not picked:
         return [], []
     workers = max(1, min(cfg.concurrency, len(picked)))
     queue = list(enumerate(picked))
     results: dict[int, tuple[dict | None, list[str]]] = {}
     unfunded = 0
-    started: dict[int, float] = {}
-
-    def run(i: int, src: dict):
-        started[i] = time.monotonic()
-        return fetch_one_source(src, cfg=cfg, ledger=ledger, exa_enabled=exa_on)
-
     ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="argus-fetch")
     abandoned = False
     try:
@@ -396,32 +390,24 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
                 if kind is not None and not _is_pinned(src) and not ledger.take(kind):
                     unfunded += 1
                     continue
-                running[ex.submit(run, i, src)] = i
+                running[ex.submit(fetch_one_source, src, cfg=cfg, ledger=ledger, exa_enabled=exa_on)] = i
             if not running:
                 break
-            draining = stop is not None and stop()
-            timeout = None
-            if draining:                           # wait no longer than the first in-flight fetch's bound
-                now = time.monotonic()
-                timeout = max(0.0, min(started.get(i, now) + cfg.timeout_s for i in running.values()) - now)
-            done, _ = wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
+            done, _ = wait(running, timeout=None if stop is None else _DRAIN_POLL_S, return_when=FIRST_COMPLETED)
             for fut in done:
                 i = running.pop(fut)
                 results[i] = fut.result()
                 if on_fetch is not None:
                     on_fetch(picked[i], results[i][0])
-            if draining and not done:
-                now = time.monotonic()
+            if running and stop is not None and stop():          # the drain: stop waiting at once
+                abandoned = True
                 for fut, i in list(running.items()):
-                    if i in started and now - started[i] >= cfg.timeout_s:
-                        del running[fut]
-                        abandoned = True
-                        msg = (f"fetch {picked[i].get('url')} failed: timeout: still running {cfg.timeout_s} s "
-                               "after it started; abandoned on drain")
-                        logger.warning(msg)
-                        results[i] = (None, [msg])
-                        if on_fetch is not None:
-                            on_fetch(picked[i], None)
+                    del running[fut]
+                    msg = f"fetch {picked[i].get('url')} failed: abandoned on cancel"
+                    logger.warning(msg)
+                    results[i] = (None, [msg])
+                    if on_fetch is not None:
+                        on_fetch(picked[i], None)
     finally:
         ex.shutdown(wait=not abandoned, cancel_futures=True)
     order = sorted(results)

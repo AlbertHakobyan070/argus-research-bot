@@ -289,7 +289,7 @@ Fix round 4: scripts and logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Ag
 
 ### Live-check fixes (Task 12 live check, 2026-10-21)
 
-The orchestrator's console live check of the real bot (run `34098f65`) found two driver defects. Both are fixed in one commit with the WP-B fetch bound (wp-b.md).
+The orchestrator's console live check of the real bot (run `34098f65`) found two driver defects. Both are fixed together with the WP-B drain fix (wp-b.md).
 
 - **The plan card always fits and parses** (`bot/research.py` `_format_plan`, `bot/common.py`). The live card (7 long sub-questions, 14 intents, 40 sources) failed twice. Its Markdown did not parse ("can't find end of the entity", byte offset 2821), because an escaped `_` inside an italic entity ends the entity: Telegram's legacy parser honours no escape inside one. The plain retry was then "Message is too long", and the run sat at its plan gate with no buttons.
   - The card is measured in UTF-16 code units, as Telegram counts them, on the source text, which is never shorter than the parsed text. It must fit `TG_LIMIT` (4096) less room for the note a gate edit appends (`_NOTE_ROOM`).
@@ -304,7 +304,9 @@ The orchestrator's console live check of the real bot (run `34098f65`) found two
   - The writes keep `next`. A resume of such a rest launches with no `_ROUTES` entry, so its writes take LangGraph's inference: the last node that ran, which is `extend_prep` or `panel`, each with its own edge to research.
   - A first pass stopped inside research is still the plan gate, as Task 10 decided: its research never wrote, so `pass_mode` is `first`.
 
-Not changed (outside this fix's files): `bot/app.py`'s restart reconcile still marks any run resting at `("research",)` `awaiting_plan`, including an Extend interrupted by a restart mid-research. The driver's `_gate` then answers "not at a gate" for it, so the row and the snapshot disagree. The fix is one line: use `runs._gate(nxt, values)` there. The Markdown messages in `bot/media.py` (`/find`, `/yt`) put `_md_escape`d text inside italic entities, so the same parse failure applies to them. They still go out, through `_safe_send`'s plain retry, but without formatting.
+- **The restart reconcile agrees** (`bot/app.py`, fix round 1, approved). `_reconcile_orphaned_runs` reads the gate through `runs._gate(nxt, values)`. An Extend or a gap wave interrupted mid-research is therefore `cancelled`, with the "mid-step" DM, not `awaiting_plan`.
+
+Parked for the final review (orchestrator): the Markdown messages in `bot/media.py` (`/find`, `/yt`) put `_md_escape`d text inside italic entities, so the same parse failure applies to them. They still go out, through `_safe_send`'s plain retry, but without formatting.
 
 Tests touched:
 
@@ -320,5 +322,7 @@ Tests touched:
   - `/continue` resumes their research pass to the report gate;
   - a fresh run at its first plan gate is one, tracked and untracked;
   - a refused plan card becomes the short card with its buttons.
+- `tests/test_orphan_reconcile.py` (fix round 1): an orphan at `("research",)` is `awaiting_plan` before its first pass, and `cancelled` for an Extend or a gap wave.
+- `tests/test_engines_cmd.py` (fix round 1, hermeticity): `_post_init` runs with the console disabled. The settings go to both `bot.app` and `webapp.server`, so the tests never bind the real console port or DM "console down". They used to fail whenever the live bot held 127.0.0.1:8787. Their assertions are unchanged.
 
-Verification: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\live12-fix\`. `red.log` holds the new tests against the unchanged code. `green-focused.log` holds the focused files. `suite-final.log` is the full suite.
+Verification: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\live12-fix\`. `red.log` holds the new tests against the unchanged code. `green-focused.log` holds the focused files. `suite-final.log` is the full suite. Fix round 1: `r1-red.log`, `r1-green.log`, `r1-suite.log`.

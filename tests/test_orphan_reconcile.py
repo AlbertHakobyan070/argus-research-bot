@@ -145,3 +145,24 @@ async def test_notify_failure_does_not_crash_reconcile(lib):
     # Must still update the registry status even if the DM fails.
     await _reconcile_orphaned_runs(app)
     assert (await lib.get_run("eeee5555"))["status"] == "awaiting_plan"
+
+
+@pytest.mark.parametrize("values,status", [
+    ({"plan": {}}, "awaiting_plan"),                                   # its first pass: the plan gate
+    ({"plan": {}, "extend_rounds": 1}, "cancelled"),                   # an Extend interrupted mid-research
+    ({"plan": {}, "research_rounds": 3, "coverage_gaps": [1]}, "cancelled"),   # a gap wave
+], ids=["first_pass", "extend", "gap_wave"])
+async def test_an_orphan_at_research_is_the_plan_gate_only_before_its_first_pass(lib, values, status):
+    """Live check 12: ("research",) is the plan gate only while research's next
+    pass would be the first (runs._gate) — the reconcile agrees with the driver."""
+    await _seed(lib, "eeee5555", 8, "running", "an extend")
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(return_value=SimpleNamespace(values=values, next=("research",)))
+    app = _app(lib, graph)
+
+    await _reconcile_orphaned_runs(app)
+
+    assert (await lib.get_run("eeee5555"))["status"] == status
+    text = app.bot.send_message.await_args.kwargs["text"]
+    assert ("at the plan step" in text) is (status == "awaiting_plan"), text
+    assert "/continue eeee5555" in text
