@@ -51,6 +51,7 @@ from ..engines import registry
 from ..engines.registry import EngineConfigError
 from ..engines.search import resolve_recency
 from ..graph.nodes import MAX_EXTEND_ROUNDS, MAX_REVISE_ROUNDS
+from ..graph.research import pass_mode
 from ..graph.run_config import PRESETS, RunConfig, ensure_in_checkpoint, require
 from ..graph.search_providers import exa_enabled
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS, ResearchBrief
@@ -69,6 +70,7 @@ _launch_closed = False            # drain_all stopped waiting for the claims mad
 
 PLAN, REPORT = "plan", "report"
 _GATES = {("research",): PLAN, ("fetcher",): PLAN, ("deliver",): REPORT}   # ("fetcher",): pre-v3 plan gate
+# ("research",) is the plan gate only for a run that has not passed it: read through _gate, never alone
 # A state write without as_node runs as the last node that ran (LangGraph reads versions_seen, which
 # an as_node write never updates) and re-runs that node's edges. Each resting state the driver's
 # as_node writes leave (the re-plan's intake; Send, the fork and an older bot's advance as deliver)
@@ -166,6 +168,19 @@ def console_url() -> str | None:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+
+def _gate(nxt: tuple, values: dict) -> str | None:
+    """The gate a run resting at ``nxt`` waits at, or None. ``("research",)`` is
+    the plan gate only while the run has not passed it — its research pass
+    would be the first (``research.pass_mode``, the node's own test). An
+    Extend, a gap wave or an append pass resting there (drained after
+    ``extend_prep``, force-cancelled inside research) is a stopped run, which
+    /continue resumes."""
+    kind = _GATES.get(nxt)
+    if kind == PLAN and nxt == ("research",) and pass_mode(values) != "first":
+        return None
+    return kind
+
 
 def _cut(text: str, n: int = 32) -> str:
     return text if len(text) <= n else text[:n - 1] + "…"
@@ -291,7 +306,7 @@ async def _attach(h: RunHandle, message_id: int | None, card: str | None) -> str
     at a gate (nothing is written then). The tapped message becomes the gate
     message only when its button belongs to this gate (``card``)."""
     snap = await h.graph.aget_state(h.cfg)
-    kind = _GATES.get(tuple(snap.next or ())) if snap.values else None
+    kind = _gate(tuple(snap.next or ()), snap.values) if snap.values else None
     if kind is None:
         return None
     active = await registry.active_snapshot()
@@ -543,7 +558,7 @@ async def _at_rest(h: RunHandle) -> None:
     drain still wins) or at the end."""
     snap = await h.graph.aget_state(h.cfg)
     values, nxt = snap.values or {}, tuple(snap.next or ())
-    kind = _GATES.get(nxt)
+    kind = _gate(nxt, values)
     if kind is not None and h.control.drain_requested:
         # a gate interrupt fires before the drain boundary (interrupt_after scout):
         # the cancel still wins over presenting the gate
@@ -590,20 +605,21 @@ async def _drained(h: RunHandle, reason: str) -> None:
     done = h.done_node
     note = f"cancelled after node {done} ({reason})" if done else f"cancelled before it started ({reason})"
     await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=done or h.route)
-    nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
+    snap = await h.graph.aget_state(h.cfg)
+    nxt = tuple(snap.next or ())
+    kind = _gate(nxt, snap.values or {})
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", done or h.stage, {"status": "cancelled", "summary": note})
     head = f"⏹ Cancelled after {done}" if done else "⏹ Cancelled before it started"
     # a quick /ask is never told to /continue: continue_run refuses it
-    await h.card.stop(head + ("." if h.quick else f" — {_drained_hint(h.run_id, nxt)}."))
+    await h.card.stop(head + ("." if h.quick else f" — {_drained_hint(h.run_id, nxt, kind)}."))
 
 
-def _drained_hint(run_id: str, nxt: tuple) -> str:
+def _drained_hint(run_id: str, nxt: tuple, kind: str | None) -> str:
     """What /continue does for a drained run resting at ``nxt`` (never empty:
-    a drain leaves a task): a gate's card is re-attached, where the action is
-    repeated; elsewhere the drive resumes."""
-    kind = _GATES.get(nxt)
+    a drain leaves a task) — at gate ``kind`` (``_gate``) its card is
+    re-attached, where the action is repeated; elsewhere the drive resumes."""
     if kind is not None:
         return f"/continue {run_id} re-attaches the {kind} card — repeat the action there"
     return f"/continue {run_id} resumes it from {nxt[0]}"
@@ -619,25 +635,27 @@ async def _abandoned(h: RunHandle) -> None:
     ``_drive`` re-raises the ``CancelledError``."""
     node = h.stage
     note = f"force-cancelled during node {node} ({h.control.drain_reason or 'cancel'}); the node was abandoned"
-    nxt = None
+    nxt = kind = None
     try:
         await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=h.done_node or h.route)
-        nxt = tuple((await h.graph.aget_state(h.cfg)).next or ())
+        snap = await h.graph.aget_state(h.cfg)
+        nxt = tuple(snap.next or ())
+        kind = _gate(nxt, snap.values or {})
     except Exception as e:
         logger.error("run %s: could not record the cancel note", h.run_id, exc_info=e)
         await _say(h.chat_id, f"⚠️ Run {h.run_id}: could not record the cancel note: {e}")
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", node, {"status": "cancelled", "summary": note})
-    hint = "" if h.quick else f" — {_continue_hint(h.run_id, nxt)}"     # continue_run refuses a quick /ask
+    hint = "" if h.quick else f" — {_continue_hint(h.run_id, nxt, kind)}"     # continue_run refuses a quick /ask
     await h.card.stop(f"⏹ Force-cancelled during {node}{hint}.")
 
 
-def _continue_hint(run_id: str, nxt: tuple | None) -> str:
-    """What /continue does for a run resting at ``nxt`` (None: unread)."""
+def _continue_hint(run_id: str, nxt: tuple | None, kind: str | None) -> str:
+    """What /continue does for a run resting at ``nxt`` (None: unread), at gate
+    ``kind`` (``_gate``) or none."""
     if nxt is None:
         return f"/continue {run_id} resumes it"
-    kind = _GATES.get(nxt)
     if kind == PLAN:
         return f"/continue {run_id} re-attaches the plan; ✅ Approve reruns {nxt[0]}"
     if kind == REPORT:
@@ -934,7 +952,8 @@ async def plan_payload(run_id: str) -> dict | None:
     h = RunHandle.of(row, row["chat_id"])             # a view, not registered
     snap = await h.graph.aget_state(h.cfg)
     values = snap.values or {}
-    if tuple(snap.next or ()) != ("research",) or not values.get("run_config"):
+    nxt = tuple(snap.next or ())
+    if nxt != ("research",) or _gate(nxt, values) != PLAN or not values.get("run_config"):
         return None
     _attached_choices(h, require(values), registry.current_config().active_profile)
     return await _payload(h, values)
@@ -944,7 +963,11 @@ async def _present_plan(h: RunHandle, values: dict) -> None:
     from . import research                          # lazy: research imports this module
     payload = await _payload(h, values)
     text = research._format_plan(payload)
-    msg = await _say(h.chat_id, text, mode=ParseMode.MARKDOWN, markup=research._plan_keyboard(payload))
+    # never silent: a card Telegram still refuses becomes a short one with the same buttons
+    fallback = (f"📋 Research plan for run {h.run_id} is ready, but Telegram refused the full card. "
+                "Approve, Edit or Cancel below; a knob tap re-renders it.")
+    msg = await _safe_send(_app.bot, h.chat_id, text, reply_markup=research._plan_keyboard(payload),
+                           parse_mode=ParseMode.MARKDOWN, fallback=fallback)
     h.gate_msg = (msg.message_id, text, ParseMode.MARKDOWN) if msg is not None else None
     await _status(h.run_id, "awaiting_plan")
     h.gate_kind = PLAN
@@ -1267,7 +1290,7 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                 raise ValueError("no checkpoint found — it may predate the v2 upgrade or its checkpoint DB "
                                  "was deleted")
             nxt = tuple(snap.next or ())
-            kind = _GATES.get(nxt)
+            kind = _gate(nxt, snap.values)
             sent = kind == REPORT and row.get("status") == "done"     # an older bot's Send left it at its gate
             if kind is None or sent:
                 refused = _claim(h)
@@ -1341,7 +1364,8 @@ async def snapshot(run_id: str) -> dict | None:
         h = RunHandle.of(row, row["chat_id"])         # an untracked view, not registered
     snap = await h.graph.aget_state(h.cfg)
     nxt = list(snap.next or ())
-    return {"run_id": run_id, "in_flight": h.live, "awaiting": None if h.live else _GATES.get(tuple(nxt)),
+    awaiting = None if h.live else _gate(tuple(nxt), snap.values or {})
+    return {"run_id": run_id, "in_flight": h.live, "awaiting": awaiting,
             "next": nxt, "stage": h.stage, "started_at": h.started_at or None, "last_seq": bus.last_seq(run_id),
             "values": snap.values or {}}
 

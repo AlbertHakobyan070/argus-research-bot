@@ -39,6 +39,7 @@ import logging
 import math
 import re
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -365,14 +366,29 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
     Each non-pinned source takes one ``kind`` unit from the ledger at
     submit; pinned sources never do (``kind=None``: no budget, for direct
     calls). ``on_fetch(src, item | None)`` runs on the node thread as each
-    fetch completes."""
+    fetch completes.
+
+    Once ``stop()`` is true, a fetch still in flight is waited on only until
+    its bound (``cfg.timeout_s`` from its start, the chain's own bound) and
+    then abandoned — a failed fetch with a timeout reason — so the digest of
+    what was fetched runs well inside the driver's drain cap (live check 12:
+    one URL ran 4.5 min and the cap cancelled the pass). Its thread is left
+    to finish on its own (the chain's bound ends it); its result is dropped."""
     if not picked:
         return [], []
     workers = max(1, min(cfg.concurrency, len(picked)))
     queue = list(enumerate(picked))
     results: dict[int, tuple[dict | None, list[str]]] = {}
     unfunded = 0
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="argus-fetch") as ex:
+    started: dict[int, float] = {}
+
+    def run(i: int, src: dict):
+        started[i] = time.monotonic()
+        return fetch_one_source(src, cfg=cfg, ledger=ledger, exa_enabled=exa_on)
+
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="argus-fetch")
+    abandoned = False
+    try:
         running: dict = {}
         while True:
             while queue and len(running) < workers and not (stop is not None and stop()):
@@ -380,15 +396,34 @@ def _parallel_fetch(picked: list[dict], *, cfg, ledger: SpendLedger, exa_on: boo
                 if kind is not None and not _is_pinned(src) and not ledger.take(kind):
                     unfunded += 1
                     continue
-                running[ex.submit(fetch_one_source, src, cfg=cfg, ledger=ledger, exa_enabled=exa_on)] = i
+                running[ex.submit(run, i, src)] = i
             if not running:
                 break
-            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            draining = stop is not None and stop()
+            timeout = None
+            if draining:                           # wait no longer than the first in-flight fetch's bound
+                now = time.monotonic()
+                timeout = max(0.0, min(started.get(i, now) + cfg.timeout_s for i in running.values()) - now)
+            done, _ = wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
             for fut in done:
                 i = running.pop(fut)
                 results[i] = fut.result()
                 if on_fetch is not None:
                     on_fetch(picked[i], results[i][0])
+            if draining and not done:
+                now = time.monotonic()
+                for fut, i in list(running.items()):
+                    if i in started and now - started[i] >= cfg.timeout_s:
+                        del running[fut]
+                        abandoned = True
+                        msg = (f"fetch {picked[i].get('url')} failed: timeout: still running {cfg.timeout_s} s "
+                               "after it started; abandoned on drain")
+                        logger.warning(msg)
+                        results[i] = (None, [msg])
+                        if on_fetch is not None:
+                            on_fetch(picked[i], None)
+    finally:
+        ex.shutdown(wait=not abandoned, cancel_futures=True)
     order = sorted(results)
     errors = [e for i in order for e in results[i][1]]
     if unfunded:
@@ -977,19 +1012,26 @@ class _Pass:
         return out
 
 
+def pass_mode(state) -> str:
+    """The pass research_node runs on ``state``: append · gap · first · extend.
+    Only ``first`` follows the plan gate, so a run resting at ``("research",)``
+    waits at its plan gate exactly when its pass would be ``first`` (the run
+    driver reads it so)."""
+    if state.get("append_only"):
+        return "append"
+    if state.get("coverage_gaps"):
+        return "gap"
+    if not int(state.get("research_rounds") or 0) and not int(state.get("extend_rounds") or 0):
+        return "first"
+    return "extend"
+
+
 def research_node(state, runtime: Runtime | None = None) -> dict:
     """One research pass (see the module doc); LangGraph injects ``runtime``."""
     rc = run_config.require(state)
     brief = ResearchBrief.model_validate(state.get("brief") or {})
     p = _Pass(state, rc, brief, runtime)
-    if state.get("append_only"):
-        mode = "append"
-    elif state.get("coverage_gaps"):
-        mode = "gap"
-    elif not int(state.get("research_rounds") or 0) and not int(state.get("extend_rounds") or 0):
-        mode = "first"
-    else:
-        mode = "extend"
+    mode = pass_mode(state)
     p.emit("stage", {"status": "start", "summary": _MODE_LABEL[mode]})
     if mode == "append":
         p.append_pass()
@@ -1002,6 +1044,6 @@ def research_node(state, runtime: Runtime | None = None) -> dict:
     return p.finish(mode)
 
 
-__all__ = ["research_node", "triage", "rerank", "RerankResult", "fetch_one_source", "digest_one",
+__all__ = ["research_node", "pass_mode", "triage", "rerank", "RerankResult", "fetch_one_source", "digest_one",
            "QuoteIndex", "quote_verified", "compute_coverage", "followup_queries",
            "DIGEST_SYSTEM", "RERANK_SYSTEM", "SOURCE_TYPES"]

@@ -324,3 +324,32 @@ The first cut's logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argu
 - A scratch smoke ran the node with `research.rerank` on (the preset default), the real fetch chain on a mock network and a scripted `llm.complete` (`t7\smoke_rerank_node.py`, not committed). It showed one rerank call, the fetches in rerank order, a 503 reported as its fetch line, `authority` 2 from the `official_doc` label, `quote_verified` on every claim, and the events in order.
 - Exa (`t7\exa-billing.log`, `t7\exa_billing_probe.py`): the one search and the one `/contents` call above. Field names and values only; the key was never printed.
 - The WP-B acceptance runs are the orchestrator's: one q010 medium/standard `live_check`, one `short` run with the `INTEL_*` paths unset, and `bench.compare` against the v3 baseline.
+
+### Live-check fixes (Task 12 live check, 2026-10-21): a bounded fetch under drain
+
+The orchestrator's console live check (run `34098f65`, an Extend) cancelled the run at 05:27:50. One fetch was still in flight, started at 05:27:39. It ended at 05:32:15 with `native: HTTP 403; exa_contents: no text (CRAWL_HTTP_403); intel_snatch: 403; intel_crawl: timeout after 120s; intel_stealth: camoufox not installed`. Research then digested what it had fetched. The driver's 300 s drain cap fired `task.cancel()` during that digest (05:32:50), and the pass was abandoned with its fetched items and digests. Native and `exa_contents` failed within seconds. The minutes went to the intel-stack rungs: each subprocess ran under the wrappers' own `ARGUS_TOOL_TIMEOUT` (120 s), with no bound across the chain.
+
+- **One wall-clock bound per fetch** (`engines/fetchers.py`). `FetchConfig.timeout_s` (default 30 s, an existing field, so no schema change) now bounds the whole chain of one fetch, not each request. Each rung gets what is left of it:
+  - the httpx client's timeout for `native` (including the pinned client of each hop) and for `exa_contents`;
+  - the subprocess timeout for the `intel_*` rungs, in place of the 120 s default.
+
+  `native` also checks the deadline on every redirect hop and on every body chunk, because httpx's timeout is per read and a server dripping chunks never trips it. A rung that starts with less than a second left is not started. It is recorded as `timeout: the fetch's <n> s bound is spent`, and the chain stops. So a fetch fails with a timeout reason at its bound, plus at most one in-flight read.
+- **A drain abandons a fetch at its bound** (`graph/research.py` `_parallel_fetch`). Once the drain is requested, the pool waits for each in-flight fetch only until `timeout_s` after its start. A fetch still running then is abandoned and recorded as `fetch <url> failed: timeout: still running <n> s after it started; abandoned on drain`, with a failed `fetch` event. The pool then shuts down without waiting for that thread, and the digest of what was fetched runs. The `cancelled:` line still counts the abandoned fetch among those done. Without a drain, the chain's own bound ends every fetch.
+- **`pass_mode(state)`**: research_node's pass selection, shared with the run driver. The driver's plan-gate test reads it (wp-e1.md).
+
+Known ceilings:
+
+- An abandoned thread keeps running until its chain bound or its subprocess timeout ends it. On Windows, a killed intel-stack subprocess whose grandchild (a browser) holds its pipes can outlive its timeout, because `subprocess.run` reads the pipes to EOF after the kill. The thread is not waited on, but interpreter exit joins it.
+- An abandoned fetch that later bills an Exa `/contents` page adds it to the ledger after the pass's `search_spend` snapshot, so that page is not counted.
+
+Behaviour change for handoff.md: a page that needs the intel-stack's browser rungs now gets them only within the fetch's 30 s bound, after `native` and `exa_contents`, where each rung used to get its own 120 s. Raise `fetch.timeout_s` (a console or bench override) for a run that needs longer.
+
+Tests touched:
+
+- `tests/test_fetchers.py`:
+  - the live chain on a fake clock: each rung gets what is left, and none starts once the bound is spent;
+  - `native` and `exa_contents` clients get the time left;
+  - a body still streaming at the bound is a timeout.
+- `tests/test_gap_mode.py`: a fetch blocking far past its bound, with a drain set mid-wave. Research returns within the bound plus slack. The slow item fails with the timeout reason, the fetched item is digested, and the `cancelled:` line is recorded.
+
+Verification: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\live12-fix\` (`red.log`, `green-focused.log`, `suite-final.log`).

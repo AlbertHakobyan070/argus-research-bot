@@ -387,3 +387,174 @@ async def test_hook_runner_runs_every_hook_and_reraises_the_first_failure():
 def test_the_run_driver_hooks_are_registered():
     from argus.bot import app as bot_app, runs
     assert runs.init in bot_app.POST_INIT_HOOKS and runs.drain_all in bot_app.POST_STOP_HOOKS
+
+# --- live check 12, item 1: the plan card always fits Telegram and parses --------
+
+_TG_LIMIT = 4096
+
+
+def _tg_len(text: str) -> int:
+    """Telegram counts UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _tg_legacy_markdown(text: str) -> str:
+    """Telegram's legacy Markdown parser (tdlib ``parse_markdown``), strict: the
+    parsed text, or ValueError where Telegram answers "Can't parse entities".
+    ``\\`` escapes only ``_ * ` [``; inside an entity nothing is escaped and the
+    entity ends at its first end character; a link's URL ends at its first ``)``."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n and text[i + 1] in "_*`[":
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if c not in "_*`[":
+            out.append(c)
+            i += 1
+            continue
+        begin, end, pre = i, "]" if c == "[" else c, False
+        i += 1
+        if c == "`" and text[i:i + 2] == "``":
+            pre, i = True, i + 2
+        while i < n and (text[i] != end or (pre and text[i + 1:i + 3] != "``")):
+            out.append(text[i])
+            i += 1
+        if i >= n:
+            raise ValueError(f"Can't find end of the entity starting at offset {begin}")
+        if c == "[" and text[i + 1:i + 2] == "(":
+            close = text.find(")", i + 2)
+            if close < 0:
+                raise ValueError(f"Can't find end of a URL at offset {i + 2}")
+            i = close
+        i += 3 if pre else 1
+    return "".join(out)
+
+
+def test_the_strict_checker_rejects_the_live_failure():
+    """The 05:18:22 card: an escaped ``_`` inside an italic entity ends it early."""
+    with pytest.raises(ValueError, match="Can't find end"):
+        _tg_legacy_markdown("- `web` — _LangGraph \\_\\_interrupt\\_\\_ field stream mode_")
+    assert _tg_legacy_markdown("a \\_b\\_ *c* [d](https://e.example/f_(g)") == "a _b_ c d"
+
+
+def _long_plan_payload() -> dict:
+    nasty = "LangGraph __interrupt__ *stream* mode [beta] `code` snake_case ] ) "
+    plan = {"summary": "Summary: " + nasty * 3,
+            "sub_questions": [f"Q{i}: " + nasty * 8 for i in range(7)],
+            "planned_sources": [{"kind": "web_search`x", "query": f"intent {i}: " + nasty * 3} for i in range(14)]}
+    sources = [{"title": f"T{i} " + nasty * 2, "url": f"https://en.wikipedia.org/wiki/Foo_(bar)_{i}?q=a_b"}
+               for i in range(40)]
+    return {"plan": plan, "sources": sources, "run_id": "abcd1234", "length": "medium", "depth": "standard",
+            "depth_auto": True, "archetype": "how_to", "recency": None, "recency_window": None,
+            "profile": "free_proxy", "profile_problem": "role panel_grounding: choose *a* model",
+            "exa_enabled": True, "exa_estimate_usd": 0.1234, "error": "bad_[thing]"}
+
+
+def test_a_long_plan_card_fits_telegram_and_its_markdown_parses():
+    """7 long sub-questions, 14 intents, 40 sources, entity characters in every
+    model-written field: the card fits 4096 (measured on the source, which is
+    never shorter than the parsed text) and parses; the header, the knobs and
+    the buttons survive, and every cut list says how much it left out."""
+    payload = _long_plan_payload()
+    text = _format_plan(payload)
+    assert _tg_len(text) <= _TG_LIMIT, _tg_len(text)
+    parsed = _tg_legacy_markdown(text)
+    assert parsed.splitlines()[0] == "📋 Research plan  ·  mode: Medium  ·  depth: standard (auto)"
+    for part in ("Archetype: how_to", "Recency: auto", "Engines: free_proxy", "role panel_grounding",
+                 "Exa: ≈ $0.123", "bad_[thing]"):
+        assert part in parsed, part
+    assert all(f"Q{i}:" in parsed for i in range(7)), "the sub-questions are cut last"
+    assert "__interrupt__" in parsed, "model text keeps its characters where it is not cut"
+    assert "more" in parsed and "…and" in parsed
+    labels = [b.text for row in _plan_keyboard(payload).inline_keyboard for b in row]
+    assert any("Approve" in t for t in labels) and any("Edit" in t for t in labels)
+
+
+def test_a_plan_card_with_a_gate_note_still_fits():
+    """The gate edits append a note (approved, redrafting, the Edit prompt)."""
+    from argus.bot import runs
+    text = _format_plan(_long_plan_payload())
+    for _gate, note in runs._REPLY_PROMPTS.values():
+        assert _tg_len(f"{text}\n\n{note}") <= _TG_LIMIT
+    _tg_legacy_markdown(f"{text}\n\n{runs._REPLY_PROMPTS['plan_edit'][1]}")
+
+
+def test_a_short_plan_card_is_not_cut():
+    payload = {"plan": {"summary": "s", "sub_questions": ["a_b?", "c*d?"],
+                        "planned_sources": [{"kind": "web", "query": "x_y"}]},
+               "sources": [{"title": "T_1", "url": "https://a.example/p_(1)"}]}
+    text = _format_plan(payload)
+    parsed = _tg_legacy_markdown(text)
+    assert "a_b?" in parsed and "c*d?" in parsed and "x_y" in parsed and "T_1" in parsed
+    assert "more" not in parsed
+
+
+class _RejectingBot:
+    """Rejects every send of a long text (Markdown and plain), accepts a short one."""
+
+    def __init__(self):
+        self.sent: list[tuple[str, object, object]] = []
+
+    async def send_message(self, chat_id=None, text="", reply_markup=None, parse_mode=None, **kw):
+        if len(text) > 200:
+            raise RuntimeError("Message is too long")
+        self.sent.append((text, parse_mode, reply_markup))
+        return SimpleNamespace(message_id=7)
+
+
+async def test_a_send_that_still_fails_is_never_silent_and_keeps_the_buttons():
+    bot, markup = _RejectingBot(), _plan_keyboard({"run_id": "abcd1234"})
+    msg = await _safe_send(bot, 1, "x" * 5000, reply_markup=markup, fallback="📋 Plan ready — tap below.")
+    assert msg is not None
+    assert bot.sent == [("📋 Plan ready — tap below.", None, markup)]
+    msg = await _safe_send(bot, 1, "y" * 5000, reply_markup=markup)
+    assert msg is not None and bot.sent[-1][2] is markup
+    assert bot.sent[-1][0].startswith("⚠️") and "Message is too long" in bot.sent[-1][0]
+
+
+def _preview_values(tmp_path, note_chars: int) -> dict:
+    md = tmp_path / "report.md"
+    md.write_text("# t\n\n## A\n\n" + "Body & <text> _x_. " * 400, encoding="utf-8")
+    errors = [f"[r1] skip: research.digest https://x.example/{i} ({'429 ' * (note_chars // 4)})" for i in range(8)]
+    return {"report_paths": {"md": str(md), "folder": str(tmp_path), "pdf": None}, "length": "medium",
+            "errors": errors, "panel_verdict": {"judged": 3, "total": 3}, "findings": []}
+
+
+@pytest.mark.parametrize("note_chars", [50, 900])
+def test_the_report_preview_always_fits_telegram(tmp_path, note_chars):
+    """Long degradation notes (error text) once pushed the preview's head past
+    4096 even with no excerpt left."""
+    from argus.bot.research import _preview_bodies
+    html_body, plain_body = _preview_bodies(_preview_values(tmp_path, note_chars))
+    for body in (html_body, plain_body):
+        assert _tg_len(body) + 200 <= _TG_LIMIT, _tg_len(body)     # room for a gate note
+    assert "Quality: judged 3/3" in html_body
+
+
+async def test_a_report_preview_that_cannot_be_sent_still_carries_its_buttons(tmp_path):
+    from argus.bot.research import _send_report_preview
+    bot = _RejectingBot()
+    msg, text, _mode = await _send_report_preview(bot, 1, "abcd1234", _preview_values(tmp_path, 50))
+    assert msg is not None
+    (sent, _pm, markup), = bot.sent
+    assert sent.startswith("⚠️") and markup is not None
+    assert [b.callback_data for row in markup.inline_keyboard for b in row][0] == "report:send:abcd1234"
+
+
+async def test_a_long_markdown_message_goes_out_cut_on_its_plain_retry():
+    """A long /ask answer: its Markdown send fails, the plain retry fits Telegram."""
+    sent: list[str] = []
+
+    class _Bot:
+        async def send_message(self, chat_id=None, text="", reply_markup=None, parse_mode=None, **kw):
+            if parse_mode is not None or _tg_len(text) > _TG_LIMIT:
+                raise RuntimeError("Message is too long")
+            sent.append(text)
+            return SimpleNamespace(message_id=1)
+
+    answer = "🧠 " + "a long answer with *markdown* " * 300
+    assert await _safe_send(_Bot(), 1, answer) is not None
+    (text,) = sent
+    assert _tg_len(text) <= _TG_LIMIT and text.endswith("…(cut)") and text.startswith("🧠 a long answer")

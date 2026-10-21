@@ -1987,3 +1987,100 @@ async def test_a_resume_that_runs_no_research_leaves_a_never_merged_append_pendi
     assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
     assert await _source_statuses(env, run_id) == {_SCOUTED: "pending"}
     u.message.reply_text.assert_not_awaited()                  # nothing marked failed
+
+
+# ---------------------------------------------------------------------------
+# Live check 12, item 3: ("research",) is the plan gate only before the run passed it
+# ---------------------------------------------------------------------------
+
+async def _an_extend_stopped_at_research(env, monkeypatch, ending: str) -> str:
+    """A report-gate Extend stopped resting at ("research",): drained right after
+    extend_prep, or force-cancelled inside research (the live check's run 34098f65)."""
+    hold = _Hold()
+    monkeypatch.setattr(graph_mod, "extend_prep_node", hold(graph_mod.extend_prep_node))
+    env.graph = env.app.bot_data["graph"] = graph_mod.build_graph(checkpointer=env.graph.checkpointer)
+    run_id = await _at_report_gate(env)
+    if ending == "drained":
+        hold.armed = True
+        assert (await runs.report_action(run_id, "extend")).code == "started"
+        h = common._inflight[run_id]
+        assert await asyncio.to_thread(hold.started.wait, 5)
+        assert (await runs.cancel_run(run_id)).code == "draining"
+        hold.release.set()
+        await h.task
+    else:
+        async def past(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(runs, "_sleep", past)
+        research = _blocking(env)                              # ignores the drain: only task.cancel() ends it
+        assert (await runs.report_action(run_id, "extend")).code == "started"
+        h = common._inflight[run_id]
+        assert await asyncio.to_thread(research.started.wait, 5)
+        assert (await runs.cancel_run(run_id)).code == "draining"
+        await asyncio.wait([h.task], timeout=10)
+        assert h.task.cancelled()
+        research.release.set()
+    env.state.research = Research(block=False)
+    snap = await _snap(env, run_id)
+    assert tuple(snap.next) == ("research",) and snap.values["extend_rounds"] == 1
+    return run_id
+
+
+@pytest.mark.parametrize("ending", ["drained", "force_cancelled"])
+async def test_a_stopped_extend_at_research_is_not_a_plan_gate(env, monkeypatch, ending):
+    run_id = await _an_extend_stopped_at_research(env, monkeypatch, ending)
+    assert (await env.lib.get_run(run_id))["status"] == "cancelled"
+    snap = await runs.snapshot(run_id)                         # the console's run view reads these two
+    assert snap["awaiting"] is None and snap["next"] == ["research"]
+    assert await runs.plan_payload(run_id) is None
+    hint = (f"/continue {run_id} resumes it from research" if ending == "drained"
+            else f"/continue {run_id} reruns research")
+    texts = _sent(env) + _edited(env)
+    assert any(hint in t for t in texts), texts[-3:]
+    assert not any("re-attaches the plan" in t for t in texts)
+    out = await runs.approve_plan(run_id)                      # an old plan card's Approve never attaches it
+    assert out.code == "not_found", out
+    assert run_id not in common._inflight
+
+
+@pytest.mark.parametrize("ending", ["drained", "force_cancelled"])
+async def test_continue_resumes_a_stopped_extends_research_pass(env, monkeypatch, ending):
+    run_id = await _an_extend_stopped_at_research(env, monkeypatch, ending)
+    calls = env.state.research.calls
+    out = await runs.continue_run(await env.lib.get_run(run_id), chat_id=CHAT)
+    assert out.code == "started" and f"from `research`" in out.text, out
+    await common._inflight[run_id].task
+    assert env.state.research.calls == calls + 1, "the Extend's research pass ran"
+    snap = await _snap(env, run_id)
+    assert tuple(snap.next) == ("deliver",) and snap.values["extend_rounds"] == 1, "extend_prep did not rerun"
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
+
+
+async def test_a_fresh_run_at_its_first_plan_gate_is_still_one(env):
+    run_id = await _at_plan_gate(env)
+    snap = await runs.snapshot(run_id)
+    assert snap["awaiting"] == "plan" and snap["next"] == ["research"]
+    assert (await runs.plan_payload(run_id))["run_id"] == run_id
+    common._inflight.clear()                                   # a restart: the untracked view agrees
+    assert (await runs.snapshot(run_id))["awaiting"] == "plan"
+    assert (await runs.plan_payload(run_id))["run_id"] == run_id
+
+
+async def test_a_plan_card_that_cannot_be_sent_gets_a_short_card_with_its_buttons(env):
+    """Live check 12, item 1: the card's Markdown send and its plain retry both
+    failed, and the run sat at its plan gate with no buttons in the chat."""
+    sends = env.bot.send_message.side_effect
+
+    def picky(**kw):
+        if str(kw.get("text", "")).startswith("📋 *Research plan*"):
+            raise BadRequest("Message is too long")
+        return sends(**kw)
+
+    env.bot.send_message.side_effect = picky
+    run_id = await _at_plan_gate(env)
+    last = env.bot.send_message.await_args_list[-1].kwargs
+    assert run_id in last["text"] and "Approve" in last["text"]
+    data = [b.callback_data for row in last["reply_markup"].inline_keyboard for b in row]
+    assert f"plan:approve:{run_id}" in data
+    assert common._inflight[run_id].gate_msg is not None, "the short card is the gate message"

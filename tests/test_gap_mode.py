@@ -395,3 +395,38 @@ def test_a_drain_before_the_pass_costs_no_querygen_call(fake, tmp_path, pass_):
     assert any(e.startswith("cancelled: research stopped") for e in out["errors"])
     if pass_ == "gap":
         assert out["gap_waves"] == 0, "no gap wave ran"
+
+
+def test_a_drain_abandons_a_fetch_still_running_at_its_bound(fake, tmp_path):
+    """Live check 12: one fetch ran 4.5 min after the drain, the 300 s drain cap
+    fired task.cancel() during the digest, and the pass was lost. Once a drain is
+    requested, a fetch still in flight is abandoned at its bound
+    (``fetch.timeout_s``) instead of waited on; what was fetched is digested."""
+    import threading
+    import time
+
+    control, release = RunControl(), threading.Event()
+
+    def on_fetch(src):
+        if src["url"].startswith("https://slow"):
+            release.wait(30)                       # blocks far past the bound
+        else:
+            control.request_drain("user cancel")
+
+    fake.on_fetch = on_fetch
+    state = _state(tmp_path, overrides={"fetch.concurrency": 2, "fetch.timeout_s": 1}, research_rounds=0,
+                   fetched=[], evidence=[], coverage={})
+    state["sources"] = [_src("https://slow.example/p", 0), _src("https://fast.example/p", 1)]
+    try:
+        t0 = time.monotonic()
+        out = research_mod.research_node(state, Runtime(control=control))
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+    assert elapsed < 4, f"research waited {elapsed:.1f} s for an abandoned fetch (bound 1 s)"
+    assert [f["url"] for f in out["fetched"]] == ["https://fast.example/p"]
+    assert len(out["evidence"]) == 1, "the fetched item is still digested"
+    assert ("fetch https://slow.example/p failed: timeout: still running 1 s after it started; "
+            "abandoned on drain") in out["errors"], out["errors"]
+    assert "cancelled: research stopped after 2/2 fetches in wave 1 (user cancel)" in out["errors"]
+    assert sorted(fake.fetches) == ["https://fast.example/p", "https://slow.example/p"]

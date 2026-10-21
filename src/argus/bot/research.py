@@ -17,7 +17,8 @@ from ..graph.report_builder_helpers import render_degradation_notes
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS
 from . import common, runs
 from .common import (
-    _LENGTH_LABELS, _allowed, _html_escape_for_tg, _md_escape, _parse_length, _safe_send,
+    _LENGTH_LABELS, TG_LIMIT, _allowed, _html_escape_for_tg, _md_escape, _parse_length, _safe_send, _tg_cut,
+    _tg_len,
 )
 
 logger = logging.getLogger("argus.bot")
@@ -27,6 +28,15 @@ _RECENCY_LABELS = {None: "auto", "d": "past day", "w": "past week", "m": "past m
 _KNOBS = {"len": "length", "dep": "depth", "prof": "profile", "rec": "recency"}
 _EXCERPT_CAP = 3000      # raw report chars in the preview; the full file follows on Send
 _MAX_NOTES = 8           # degradation notes in the preview; the report has them all
+_NOTE_ROOM = 200         # a gate edit appends a note (runs._REPLY_PROMPTS, "✅ approved from console", …)
+_PLAN_BUDGET = TG_LIMIT - _NOTE_ROOM
+_PREVIEW_BUDGET = TG_LIMIT - _NOTE_ROOM
+_HEAD_CHARS = 300        # one header fact (a profile problem, a rebuild error): the header always fits
+# The plan card's shortening steps, in order, until it fits: (limit, cap) caps a text; (limit, None)
+# drops a list's items from its end ("…and N more").
+_PLAN_STEPS = (("sq_chars", 200), ("intent_chars", 100), ("summary", 300),
+               ("sq_chars", 140), ("intent_chars", 70), ("summary", 150),
+               ("sources", None), ("intents", None), ("sq", None))
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +158,23 @@ def _recency_text(p: dict) -> str:
     return f"auto — {shown}" if recency is None else shown
 
 
+def _clip(text: str, n: int | None) -> str:
+    text = str(text)
+    return text if n is None or len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def _md_inside(text: str, end: str) -> str:
+    """Model or scraped text placed INSIDE a legacy-Markdown entity: Telegram
+    honours no escape there and ends the entity at its first ``end``, so that
+    character is dropped (the 05:18:22 card: ``\\_`` inside ``_…_`` closed the
+    italic early, and the next ``_`` opened one that never closed)."""
+    return str(text).replace(end, "")
+
+
+def _more(n: int) -> list[str]:
+    return [f"  _…and {n} more_"] if n > 0 else []
+
+
 def _format_plan(p: dict) -> str:
     """The plan card, from ``runs`` plan payload (keys optional).
 
@@ -155,6 +182,16 @@ def _format_plan(p: dict) -> str:
     live search (exa/ddgs/arxiv/github) before this gate. The brief
     never contains URLs — hallucinated links are structurally
     impossible at this stage.
+
+    The card always fits ``_PLAN_BUDGET`` (Telegram's limit less room for a
+    gate edit's note) and its Markdown always parses: model text sits outside
+    entities, escaped (``_md_escape``), or inside one with its end character
+    dropped (``_md_inside``); a URL's parentheses are percent-encoded. A card
+    too long is shortened step by step until it fits (``_PLAN_STEPS``): the
+    sub-question texts, then the intent texts and the summary (twice, each
+    time shorter), then the lists from their end — sources, intents,
+    sub-questions last — each cut list ending "…and N more". The header, the
+    knobs line and the buttons (``_plan_keyboard``) always survive.
     """
     plan = p.get("plan") or {}
     length = p.get("length") or DEFAULT_LENGTH
@@ -164,59 +201,78 @@ def _format_plan(p: dict) -> str:
     lines = [head]
     facts = []
     if p.get("archetype"):
-        facts.append(f"Archetype: {_md_escape(p['archetype'])}")
+        facts.append(f"Archetype: {_md_escape(_clip(p['archetype'], _HEAD_CHARS))}")
     if "recency" in p:
         facts.append(f"Recency: {_recency_text(p)}")
     if facts:
         lines.append(" · ".join(facts))
     facts = []
     if p.get("profile"):
-        facts.append(f"Engines: {_md_escape(p['profile'])}"
-                     + (f" — ⚠ {_md_escape(p['profile_problem'])}" if p.get("profile_problem") else ""))
+        facts.append(f"Engines: {_md_escape(_clip(p['profile'], _HEAD_CHARS))}"
+                     + (f" — ⚠ {_md_escape(_clip(p['profile_problem'], _HEAD_CHARS))}"
+                        if p.get("profile_problem") else ""))
     if "exa_enabled" in p:
         est = p.get("exa_estimate_usd")
         facts.append("Exa: " + ((f"≈ ${est:.3f}" if est is not None else "n/a") if p["exa_enabled"] else "off"))
     if facts:
         lines.append(" · ".join(facts))
     if p.get("error"):
-        lines.append(f"⚠️ {_md_escape(p['error'])}")
+        lines.append(f"⚠️ {_md_escape(_clip(p['error'], _HEAD_CHARS))}")
     lines.append("")
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
     intents = plan.get("planned_sources") or []
-    if summary:
-        lines += [f"_{_md_escape(summary)}_", ""]
-    if sub_qs:
-        lines.append("*Sub-questions:*")
-        for q in sub_qs:
-            lines.append(f"- {_md_escape(q)}")
-        lines.append("")
-    if intents:
-        lines.append(f"*Search intents ({len(intents)}):*")
-        for s in intents[:14]:
-            kind = s.get("kind", "search")
-            q = s.get("query")
-            intent = f"_{_md_escape(q)}_" if q else "_live search_"
-            lines.append(f"- `{_md_escape(kind)}` — {intent}")
-        lines.append("")
     sources = p.get("sources")
-    if sources is not None:
-        if sources:
-            shown = sources[:12]
-            lines.append(f"*Found sources ({len(sources)}, live search):*")
-            for s in shown:
-                title = (s.get("title") or "").strip()
-                url = s.get("url") or ""
-                if not title:
-                    title = url.split("//", 1)[-1][:60] or "(untitled)"
-                lines.append(f"- [{_md_escape(title[:70])}]({url})")
-            if len(sources) > len(shown):
-                lines.append(f"  _…and {len(sources) - len(shown)} more_")
-        else:
-            lines.append(
-                "⚠️ *Live search found no sources.* Approving will fetch "
-                "nothing — Edit the plan or Cancel.")
-    return "\n".join(lines)
+
+    def render(lim: dict) -> str:
+        out = list(lines)
+        if summary:
+            out += [_md_escape(_clip(summary, lim["summary"])), ""]
+        if sub_qs:
+            out.append("*Sub-questions:*")
+            out += [f"- {_md_escape(_clip(q, lim['sq_chars']))}" for q in sub_qs[:lim["sq"]]]
+            out += _more(len(sub_qs) - lim["sq"])
+            out.append("")
+        if intents:
+            out.append(f"*Search intents ({len(intents)}):*")
+            for s in intents[:lim["intents"]]:
+                kind = _md_inside(_clip(s.get("kind", "search"), _HEAD_CHARS), "`")
+                q = s.get("query")
+                intent = _md_escape(_clip(q, lim["intent_chars"])) if q else "_live search_"
+                out.append(f"- `{kind}` — {intent}")
+            out += _more(len(intents) - lim["intents"])
+            out.append("")
+        if sources is not None:
+            if sources:
+                out.append(f"*Found sources ({len(sources)}, live search):*")
+                for s in sources[:lim["sources"]]:
+                    title = (s.get("title") or "").strip()
+                    url = s.get("url") or ""
+                    if not title:
+                        title = url.split("//", 1)[-1][:60] or "(untitled)"
+                    url = url.replace("(", "%28").replace(")", "%29")     # a URL ends at its first ")"
+                    out.append(f"- [{_md_inside(title[:70], ']')}]({url})")
+                out += _more(len(sources) - lim["sources"])
+            else:
+                out.append(
+                    "⚠️ *Live search found no sources.* Approving will fetch "
+                    "nothing — Edit the plan or Cancel.")
+        return "\n".join(out)
+
+    lim = {"summary": None, "sq": len(sub_qs), "sq_chars": None, "intents": min(len(intents), 14),
+           "intent_chars": None, "sources": min(len(sources or []), 12)}
+    text = render(lim)
+    for key, value in _PLAN_STEPS:
+        if _tg_len(text) <= _PLAN_BUDGET:
+            break
+        if value is not None:                     # a text cap
+            lim[key] = value
+            text = render(lim)
+            continue
+        while lim[key] > 0 and _tg_len(text) > _PLAN_BUDGET:   # a list, from its end
+            lim[key] -= 1
+            text = render(lim)
+    return text
 
 
 def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
@@ -304,7 +360,8 @@ async def _send_report_preview(bot, chat_id: int, run_id: str, values: dict) -> 
     except Exception as plain_err:
         logger.exception("report preview plain-text send also failed")
         text = f"⚠️ report preview unavailable: {plain_err}"
-        return await _safe_send(bot, chat_id, text, parse_mode=None), text, None
+        # the gate's buttons travel with it: the run never rests at its gate without them
+        return await _safe_send(bot, chat_id, text, parse_mode=None, reply_markup=_report_keyboard(run_id)), text, None
 
 
 def _preview_bodies(values: dict) -> tuple[str, str]:
@@ -336,17 +393,20 @@ def _preview_bodies(values: dict) -> tuple[str, str]:
     )
 
     # HTML-escaping expands text (& → &amp;), so shrink the excerpt until
-    # the whole message fits Telegram's 4096-char cap.
+    # the whole message fits Telegram's cap (less a gate note); a head too
+    # long on its own (long degradation notes) is cut before it is escaped.
     def _fit(exc: str) -> str:
         return _html_escape_for_tg(text) + (
             ("\n\n<pre>" + _html_escape_for_tg(exc) + "</pre>")
             if exc else "")
     html_body = _fit(excerpt)
-    while excerpt and len(html_body) > 4000:
+    while excerpt and _tg_len(html_body) > _PREVIEW_BUDGET:
         excerpt = excerpt[:len(excerpt) - 200]
         html_body = _fit(excerpt)
-    plain_body = (text + ("\n\n```\n" + excerpt + "\n```"
-                          if excerpt else ""))[:4000]
+    while _tg_len(html_body) > _PREVIEW_BUDGET:
+        text = _tg_cut(text, _tg_len(text) - (_tg_len(html_body) - _PREVIEW_BUDGET))
+        html_body = _fit(excerpt)
+    plain_body = _tg_cut(text + ("\n\n```\n" + excerpt + "\n```" if excerpt else ""), _PREVIEW_BUDGET)
     return html_body, plain_body
 
 

@@ -828,3 +828,86 @@ def test_a_malformed_own_endpoint_is_one_config_error(net, monkeypatch, env, url
         research._parallel_fetch([{"url": "https://docs.example.org/a"}, {"url": "https://docs.example.org/b"}],
                                  cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)
     assert net.requests == []
+
+
+# ---------------------------------------------------------------------------
+# live check 12, item 2: one wall-clock bound (FetchConfig.timeout_s) over the whole chain
+# ---------------------------------------------------------------------------
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_the_whole_chain_shares_one_wall_clock_bound(net, monkeypatch, tmp_path):
+    """The live run's walled page: native 403, then three intel-stack rungs at their
+    own 120 s each (4.5 min for one URL). Each rung now gets only what is left of
+    ``timeout_s``; once it is spent no rung starts and the fetch fails as a timeout."""
+    from argus.tools import CrawlResult, SnatchResult
+    clock = _Clock()
+    monkeypatch.setattr(fetchers, "time", clock)
+    monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", True)
+    given: list[tuple[str, int]] = []
+
+    def snatch(url, **kw):
+        given.append(("stealth" if kw.get("stealth") else "snatch", kw["timeout"]))
+        clock.now += 22                        # the subprocess ran 22 s and failed
+        return SnatchResult(ok=False, url=url, error="403")
+
+    def crawl(url, **kw):
+        given.append(("crawl", kw["timeout"]))
+        clock.now += kw["timeout"]             # timed out at the bound it was given
+        return CrawlResult(ok=False, error=f"timeout after {kw['timeout']}s")
+
+    monkeypatch.setattr(fetchers, "snatch_url", snatch)
+    monkeypatch.setattr(fetchers, "crawl_url", crawl)
+    net.routes["https://walled.example/b"] = httpx.Response(403)
+    res = _fetch({"url": "https://walled.example/b"}, cfg=FetchConfig(timeout_s=30))
+    assert not res.ok
+    assert given == [("snatch", 30), ("crawl", 8)], "each rung gets what is left of the bound"
+    assert _rungs(res) == ["native", "intel_snatch", "intel_crawl", "intel_stealth"]
+    assert res.rungs_tried[-1]["error"] == "timeout: the fetch's 30 s bound is spent", res.rungs_tried
+    assert "timeout: the fetch's 30 s bound is spent" in res.error
+    assert res.ms == 30_000
+
+
+def test_native_and_exa_contents_get_what_is_left_of_the_bound(net, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(fetchers, "time", clock)
+    timeouts: list[float] = []
+    make = fetchers._http_client
+
+    def client(cfg, **kw):
+        timeouts.append(kw.get("timeout"))
+        clock.now += 12
+        return make(cfg, **kw)
+
+    monkeypatch.setattr(fetchers, "_http_client", client)
+    monkeypatch.setenv("EXA_API_KEY", "k")
+    net.routes["https://slow.example/a"] = httpx.Response(403)
+    net.routes[fetchers._EXA_CONTENTS] = httpx.Response(200, json={"costDollars": {"total": 0}, "results": []})
+    res = _fetch({"url": "https://slow.example/a"}, cfg=FetchConfig(timeout_s=30), exa=True)
+    assert not res.ok
+    assert timeouts[0] == 30 and all(t is not None and t <= 30 for t in timeouts), timeouts
+    assert timeouts[-1] < timeouts[0], "a later client gets less of the bound"
+
+
+def test_a_body_still_streaming_at_the_bound_is_a_timeout(net, monkeypatch):
+    """httpx's timeout is per read: a server dripping one chunk per read never
+    trips it. The body is read chunk by chunk against the fetch's deadline."""
+    clock = _Clock()
+    monkeypatch.setattr(fetchers, "time", clock)
+
+    def drip():
+        for _ in range(100):
+            clock.now += 1
+            yield b"<p>" + b"x" * 100 + b"</p>"
+
+    net.routes["https://drip.example/p"] = httpx.Response(200, headers={"content-type": "text/html"},
+                                                          content=drip())
+    res = _fetch({"url": "https://drip.example/p"}, cfg=FetchConfig(timeout_s=30, chain=["native"]))
+    assert not res.ok
+    assert res.rungs_tried == [{"rung": "native", "error": "timeout: the fetch's 30 s bound is spent"}]

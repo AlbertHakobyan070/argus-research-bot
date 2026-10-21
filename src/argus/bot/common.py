@@ -196,14 +196,38 @@ async def _send_md_doc(bot, chat_id: int, path: Path, caption: str = ""):
                                 filename=path.name, caption=caption[:1024])
 
 
+TG_LIMIT = 4096        # Telegram's message limit, in UTF-16 code units after entity parsing
+
+
+def _tg_len(text: str) -> int:
+    """``text``'s length as Telegram counts it (UTF-16 code units). Measured on
+    the source, it is never below the parsed length: parsing only removes."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _tg_cut(text: str, limit: int = TG_LIMIT) -> str:
+    """``text`` cut to ``limit`` (``_tg_len``), with a visible "…(cut)" mark."""
+    if _tg_len(text) <= limit:
+        return text
+    mark = "\n…(cut)"
+    keep = limit - _tg_len(mark)
+    while _tg_len(text[:keep]) > limit - _tg_len(mark):
+        keep -= 1
+    return text[:keep] + mark
+
+
 async def _safe_send(bot, chat_id: int, text: str, *, reply_markup=None,
-                     parse_mode=ParseMode.MARKDOWN):
+                     parse_mode=ParseMode.MARKDOWN, fallback: str | None = None):
     """send_message that never dies on a Telegram markdown parse error.
 
     Legacy-markdown mode chokes on raw dynamic content (file paths with ``_``,
     topics with ``*``/``[``, etc.) with "Can't parse entities". We try the
-    requested parse_mode first, then retry as plain text so the message always
-    goes out. Returns the sent Message (or None if even the plain send failed).
+    requested parse_mode first, then retry as plain text (cut to Telegram's
+    limit) so the message always goes out. A plain send that still fails is
+    never silent: ``fallback`` (or a "could not be shown" line naming the
+    error) is sent in its place, with the same ``reply_markup``, so a gate
+    card keeps its buttons. Returns the sent Message (None only when the
+    fallback failed too).
     """
     try:
         return await bot.send_message(chat_id=chat_id, text=text,
@@ -213,11 +237,17 @@ async def _safe_send(bot, chat_id: int, text: str, *, reply_markup=None,
         logger.warning("send (%s) failed (%s); retrying plain text",
                        parse_mode, e)
         try:
-            return await bot.send_message(chat_id=chat_id, text=text,
+            return await bot.send_message(chat_id=chat_id, text=_tg_cut(text),
                                           reply_markup=reply_markup)
-        except Exception:
-            logger.exception("plain-text send also failed")
-            return None
+        except Exception as plain_err:
+            logger.exception("plain-text send also failed; sending the fallback")
+            note = fallback or f"⚠️ This message could not be shown ({plain_err})."
+            try:
+                return await bot.send_message(chat_id=chat_id, text=_tg_cut(note),
+                                              reply_markup=reply_markup)
+            except Exception:
+                logger.exception("the fallback send failed too")
+                return None
 
 
 async def _safe_edit_cb(q, text: str, *, reply_markup=None,
@@ -289,9 +319,11 @@ def _md_escape(s: str) -> str:
     Only applies to DYNAMIC content; static formatting is left intact."""
     if not s:
         return ""
-    # Order matters: escape backslash first to avoid double-escaping.
-    out = s.replace("\\", "\\\\")
-    for ch in ("_", "*", "`", "[", "]"):
+    # Telegram's legacy parser honours "\" only before _ * ` [ (outside an
+    # entity; inside one nothing is escaped): a "\" or "]" escaped too would
+    # show its backslash.
+    out = s
+    for ch in ("_", "*", "`", "["):
         out = out.replace(ch, "\\" + ch)
     return out
 
