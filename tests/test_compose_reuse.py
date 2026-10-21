@@ -579,6 +579,33 @@ def _with_analysis(state: dict, out: dict, flagged=()) -> dict:
                               "flagged_finding_ids": [f["id"] for f in findings if flagged and flagged(f)]}}
 
 
+def test_a_repeated_outline_title_is_one_section_and_its_flagged_finding_is_cut(monkeypatch, tmp_path):  # final I1
+    """An outline written before the degrade path deduplicated titles: compose
+    merges the repeat into its first occurrence, writes it once, returns the
+    merged outline, and a flagged finding from either half is cut from the body
+    it is in — never listed as "still in body" while its text is gone."""
+    outline = {"sections": [{"title": "A", "focus": "", "sub_qs": [0], "note_ids": [1, 2]},
+                            {"title": "B", "focus": "", "sub_qs": [1], "note_ids": [3]},
+                            {"title": "A", "focus": "", "sub_qs": [2], "note_ids": [6]}],
+               "changed_sections": ["A", "B", "A"]}
+    state = _state(outline=outline)
+    seen = _llm(monkeypatch)
+    out = compose_node(state)
+    assert sorted(t for t, _ in _writes(seen)) == ["A", "B"]
+    assert [(s["title"], s["note_ids"]) for s in out["sections"]] == [("A", [1, 2, 6]), ("B", [3])]
+    assert out["outline"] == {"sections": [{"title": "A", "focus": "", "sub_qs": [0, 2], "note_ids": [1, 2, 6]},
+                                           {"title": "B", "focus": "", "sub_qs": [1], "note_ids": [3]}],
+                              "changed_sections": ["A", "B"]}
+    judged = _judged(state, out)
+    flagged = [f["id"] for f in out["findings"] if f["source_ids"] == [1]]
+    judged["panel_verdict"] = {**judged["panel_verdict"], "flagged_finding_ids": flagged}
+    md, _ = _report_md(monkeypatch, tmp_path, judged)
+    assert "still in body" not in md
+    shown = md.split("## ⚠ Flagged claims")[0]
+    assert "Graphs pause at interrupts [1]" not in shown and "Subgraphs restart from the top [6]." in shown
+    assert shown.count("\n## A\n") == 1
+
+
 def test_the_renamed_section_is_judged_cut_and_stripped_like_any_other(monkeypatch, tmp_path):
     outline = {"sections": [OUTLINE["sections"][0], {**OUTLINE["sections"][1], "title": "Analysis"},
                             OUTLINE["sections"][2]], "changed_sections": None}

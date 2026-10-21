@@ -21,7 +21,11 @@ When that re-write is skipped too, the neighbour keeps its version and the
 notes are reported as unwritten. A skipped re-write keeps the previous
 version; every section skipped raises. A section titled "Analysis" (casefold,
 whitespace aside — the analyst's title, reserved) is renamed "Evidence
-analysis", and compose returns the renamed outline. Flat lengths: one
+analysis", and compose returns the renamed outline. Sections are keyed by
+title, so a repeated title (case and whitespace aside: an outline written
+before titles were deduplicated, or the rename's) merges into its first
+occurrence before anything is written, and compose returns the merged
+outline. Flat lengths: one
 ``compose.flat`` call (``raise``; a reply under 40 chars or a JSON object
 fails its validate hook and is retried for the markdown text) writes the body
 that ``assemble_draft`` puts under ``## Findings``.
@@ -573,15 +577,18 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     outline = [OutlineSection.model_validate(s) for s in (state.get("outline") or {}).get("sections") or []]
     changed = (state.get("outline") or {}).get("changed_sections")
     renamed = [s for s in outline if _title_key(s.title) == _title_key(ANALYSIS_SECTION)]
-    if renamed:                 # "Analysis" is the analyst's title (§2.8 Allocation): the section is renamed
-        for s in renamed:
-            s.title = EVIDENCE_ANALYSIS
-        outline = _merge_repeated(outline)      # into an "Evidence analysis" (any case) it would repeat
-        if changed is not None:                 # each changed title as the title that survives the merge
-            alive = {_title_key(s.title): s.title for s in outline}
-            keys = (_title_key(EVIDENCE_ANALYSIS) if _title_key(t) == _title_key(ANALYSIS_SECTION) else _title_key(t)
-                    for t in changed)
-            changed = list(dict.fromkeys(alive[k] for k in keys if k in alive))
+    for s in renamed:           # "Analysis" is the analyst's title (§2.8 Allocation): the section is renamed
+        s.title = EVIDENCE_ANALYSIS
+    n_sections = len(outline)
+    # every section below is keyed by its title: a repeat (an older outline, or the rename's "Evidence
+    # analysis", any case) merges into its first occurrence, never collapses into one body
+    outline = _merge_repeated(outline)
+    merged = len(outline) < n_sections
+    if (renamed or merged) and changed is not None:     # each changed title as the title that survives the merge
+        alive = {_title_key(s.title): s.title for s in outline}
+        keys = (_title_key(EVIDENCE_ANALYSIS) if _title_key(t) == _title_key(ANALYSIS_SECTION) else _title_key(t)
+                for t in changed)
+        changed = list(dict.fromkeys(alive[k] for k in keys if k in alive))
     ctx = _Ctx(state, rc, brief, notes, revision_notes, len(outline))
     if not outline:
         return _flat(state, ctx, pv, runtime)
@@ -687,7 +694,7 @@ def compose_node(state, runtime: Runtime | None = None) -> dict:
     if emptied:                 # each merges into its neighbour as a skipped first write does, with no re-write
         merges = _merge_skipped(final, emptied, set(mds))
         final = [merges[s.title][0] if s.title in merges else s for s in final if s.title not in emptied]
-    if plan or legacy or renamed or emptied:     # the outline as it stands for the rest of the round
+    if plan or legacy or renamed or merged or emptied:     # the outline as it stands for the rest of the round
         gone = {*lost, *emptied}
         out["outline"] = {"sections": [s.model_dump() for s in final],
                           "changed_sections": None if changed is None else [t for t in changed if t not in gone]}

@@ -59,7 +59,7 @@ async def _seed(lib, run_id, chat_id, status, topic="t", mode="deep"):
 
 async def test_orphan_at_plan_gate_becomes_awaiting_plan_and_notifies(lib):
     await _seed(lib, "aaaa1111", 5, "running", "langchain vs langgraph")
-    graph = _graph_with_next({"tg:5:aaaa1111": ("fetcher",)})
+    graph = _graph_with_next({"tg:5:aaaa1111": ("research",)})   # the plan gate (pre-v3: ("fetcher",), retired)
     app = _app(lib, graph)
 
     await _reconcile_orphaned_runs(app)
@@ -137,7 +137,7 @@ async def test_terminal_runs_are_left_alone(lib):
 
 async def test_notify_failure_does_not_crash_reconcile(lib):
     await _seed(lib, "eeee5555", 9, "awaiting_plan")
-    graph = _graph_with_next({"tg:9:eeee5555": ("fetcher",)})
+    graph = _graph_with_next({"tg:9:eeee5555": ("research",)})
     app = _app(lib, graph)
     app.bot.send_message = AsyncMock(side_effect=RuntimeError("blocked by user"))
     # Must still update the registry status even if the DM fails.

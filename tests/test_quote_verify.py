@@ -164,6 +164,9 @@ PRESETS = ("Presets are the shipped defaults; the bench tunes them, and every kn
     ("100ms quoted as 100", "is 100"),
     ("8k quoted as 8", "used 8"),
     ("2nd quoted as nd", "nd place finisher"),
+    # final review M17: a decimal glued to its unit is one token, never split at its separator
+    ("2.5GHz quoted as 2", "faster on a CPU at 2"),
+    ("2.5GHz quoted from its fraction", "5GHz; its latency is 100ms"),
 ])
 def test_an_altered_quote_never_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is False, label
@@ -209,6 +212,7 @@ def test_an_altered_quote_never_verifies(label, quote):
     ("an amount with its magnitude suffix", "raised $50M"),
     ("an ordinal", "2nd place finisher"),
     ("a count with its unit", "70B parameters"),
+    ("a decimal glued to its unit", "10x faster on a CPU at 2.5GHz; its latency is 100ms"),         # final M17
 ])
 def test_a_legitimate_quote_verifies(label, quote):
     assert quote_verified(quote, PROSE_IDX) is True, label

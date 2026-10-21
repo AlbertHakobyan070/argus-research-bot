@@ -346,8 +346,9 @@ def degraded_run(model_calls: list[dict], errors: list[str], panel: dict) -> str
     grounding = [e.split(": ", 1)[1] for e in panel.get("skipped_judges") or [] if e.startswith("grounding batch")]
     if grounding:
         skips["panel.grounding"] = grounding
-        items["panel.grounding"] = (len(grounding), (panel.get("judge_verdicts") or {})["grounding_batches"]
-                                    - len(grounding))
+        # a verdict written before the batch count existed: its skipped batches are all it knew of
+        items["panel.grounding"] = (len(grounding), (panel.get("judge_verdicts") or {}).get(
+            "grounding_batches", len(grounding)) - len(grounding))
     parts = []
     for role, what in _ITEM_ROLES.items():
         k, n_ok = items[role]

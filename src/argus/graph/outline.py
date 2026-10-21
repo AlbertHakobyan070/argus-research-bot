@@ -100,7 +100,9 @@ def _evidence_summary_lines(brief: ResearchBrief,
 
 
 def default_outline(brief: ResearchBrief, length: str) -> list[OutlineSection]:
-    """Deterministic outline: group sub-questions into N sections."""
+    """Deterministic outline: group sub-questions into N sections. Two
+    sub-questions sharing their first 70 chars give one title: the repeat
+    merges into its first occurrence (``_merge_repeated``)."""
     n_target = max(2, min(_MODE_SECTIONS.get(length, 4),
                           len(brief.sub_questions)))
     idxs = list(range(len(brief.sub_questions)))
@@ -116,7 +118,7 @@ def default_outline(brief: ResearchBrief, length: str) -> list[OutlineSection]:
             numeral = ["I", "II", "III", "IV", "V", "VI", "VII"][c]
             title = f"Part {numeral} — {title}"
         out.append(OutlineSection(title=title, focus="", sub_qs=chunk))
-    return out
+    return _merge_repeated(out)
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -251,6 +252,21 @@ async def test_report_html_is_rendered_and_sanitised(client, app, fake):
     html = await r.text()
     assert "<h1>R</h1>" in html and 'data-n="1"' in html and "<script" not in html
     assert (await _json(await client.get("/api/runs/done0001/report?format=pdf", headers=auth()), 400))
+
+
+async def test_the_reports_trust_banners_are_served_as_top_level_quotes(client, app, fake):   # final review I2
+    """The console's header reads the banners from the served HTML (``:scope >
+    blockquote > p``) and ``degraded``/``panel`` from evidence.json."""
+    md = ("# R\n\n_Short · 2 findings_\n\n> ⚠ Not fact-checked — the grounding judge is off\n\n"
+          "> ⚠ Degraded run — 3 of 4 sources could not be digested (429)\n\n## A\n\nClaim [1].\n")
+    ev = {"schema": 1, "degraded": True, "panel": {"judged": 0, "total": 0, "verdict": "pass"}}
+    _report(app, fake, md=("report.md", md), evidence=("evidence.json", json.dumps(ev)))
+    html = await (await client.get("/api/runs/done0001/report", headers=auth())).text()
+    assert re.search(r"^<blockquote>\n<p>⚠ Not fact-checked — the grounding judge is off</p>\n"
+                     r"<p>⚠ Degraded run — 3 of 4 sources could not be digested \(429\)</p>\n</blockquote>$",
+                     html, re.M), html
+    body = await _json(await client.get("/api/runs/done0001/evidence", headers=auth()))
+    assert (body["degraded"], body["panel"]["judged"], body["panel"]["total"]) == (True, 0, 0)
 
 
 async def test_evidence_is_served(client, app, fake):

@@ -1706,6 +1706,41 @@ async def test_a_drained_runs_card_words_its_hint_from_next(env, monkeypatch):
     assert (await _snap(env, other)).values["cancel_note"] == "cancelled before it started (shutdown)"
 
 
+async def test_a_fresh_start_drained_before_its_first_node_ends_cancelled(env, monkeypatch):   # final review M3
+    """A /cancel in the instant after a launch drains the fresh drive before its
+    first node: no node ran, so no note is written (LangGraph cannot infer a
+    node to write as — "Ambiguous update"); the run ends cancelled, never error,
+    and its card says it never started and that nothing was kept."""
+    launch, launched = runs._launch, []
+
+    def launch_then_cancel(h, *a, **kw):
+        out = launch(h, *a, **kw)
+        launched.append(h)
+        runs._drain(h, "user cancel")                          # before the drive's first step
+        return out
+
+    monkeypatch.setattr(runs, "_launch", launch_then_cancel)
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="topic", length="short")
+    assert out.code == "started", out
+    (h,) = launched
+    await h.task
+    assert (await env.lib.get_run(out.run_id))["status"] == "cancelled"
+    assert not any(t.startswith("⚠️") for t in _sent(env)), _sent(env)
+    snap = await _snap(env, out.run_id)
+    assert tuple(snap.next) == ("__start__",) and "cancel_note" not in snap.values, "only its input checkpoint"
+    assert h.card.final == "⏹ Cancelled before it started — nothing was kept; start it again with /research."
+    again = await runs.continue_run(await env.lib.get_run(out.run_id), chat_id=CHAT)
+    assert again.code == "refused", "the card's word: there is nothing to continue"
+
+
+def test_no_gate_names_a_node_the_graph_does_not_have():                              # final review M4
+    """("fetcher",) was a pre-v3 plan gate; no graph has that node since, so a
+    checkpoint resting there is no gate whose Approve would resume nothing."""
+    nodes = set(graph_mod.build_graph(checkpointer=MemorySaver()).nodes)
+    assert all(set(nxt) <= nodes for nxt in runs._GATES), runs._GATES
+    assert runs._gate(("fetcher",), {}) is None
+
+
 async def test_a_reattached_runs_profile_gone_from_the_engines_file(env, monkeypatch):
     """M-2: after a restart whose engines file dropped the run's profile, the
     card shows the problem, the profile knob cycles from the first profile,
@@ -1986,7 +2021,8 @@ async def test_a_resume_that_runs_no_research_leaves_a_never_merged_append_pendi
             in _sent(env))
     assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
     assert await _source_statuses(env, run_id) == {_SCOUTED: "pending"}
-    u.message.reply_text.assert_not_awaited()                  # nothing marked failed
+    # nothing marked failed: a /continue resume reports through _say, so the chat holds no failure line
+    assert not [t for t in _sent(env) if "could not be ingested" in t], _sent(env)
 
 
 # ---------------------------------------------------------------------------

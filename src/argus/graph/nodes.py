@@ -227,7 +227,7 @@ def report_builder_node(state: ArgusState) -> dict:
         markdown_to_pdf(md_text, str(pdf_path), title=state["user_request"])
         pdf = str(pdf_path)
     except Exception as e:      # ReportLab has no fallback: recorded, and report.md still ships
-        logger.warning("PDF render failed: %s", e)
+        logger.warning("PDF render failed: %s", e, exc_info=True)
         new_errors.append(f"[r{rnd}] pdf: {type(e).__name__}: {e}")
         md_path.write_text(render(), encoding="utf-8")
         pdf = None

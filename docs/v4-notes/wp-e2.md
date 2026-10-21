@@ -205,7 +205,7 @@ Spec: the frontend half of §3 WP-E2, under §2.7's CSP. Built on the backend ab
     - Approve (also the Telegram MainButton, which shows its progress and ignores a second tap while the action runs) sends `{action: "approve", length, depth, engines_profile}`. Edit needs feedback, and Cancel asks for confirmation in a dialog;
     - when `snapshot.plan` is null (a legacy checkpoint), it shows "Plan not available" and keeps Approve (sending no knobs), Edit and Cancel.
   - the report:
-    - the fact-check line comes from `panel_verdict`. `judged < total` shows a "Not fact-checked" warning and is never shown as passed;
+    - the fact-check line follows the report's own banners (final review I2, see below): any "⚠ Not fact-checked" or "⚠ Degraded run" banner is a warning callout, and only an evidence.json that marks the run not degraded, with every finding judged, earns "Fact-checked". Nothing shows until the report and its evidence have loaded;
     - **Send to chat** has a checkbox for each file the run has and calls `POST …/send`;
     - at the report gate there are Deliver, Extend, Revise (needs feedback) and Cancel;
     - the reader puts the server-sanitised HTML into `article.prose`. At 390 px long URLs wrap and tables scroll inside themselves.
@@ -357,3 +357,21 @@ Evidence (`A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-43
   - the network view (`--gateway`): its only console line is Chromium's "502 (Bad Gateway)" log of the expected answer, in both.
 - `flows-fix1-regression.log`: every earlier flow passes again.
 - Full suite (`t12-fix1\suite.log`, `PYTHONPATH="" FREELLMAPI_BASE_URL=http://127.0.0.1:9/v1 ./venv/Scripts/python.exe -m pytest -q`): the only failures are the live-proxy tests in `tests/test_llm.py` and the `tests/test_graph.py` fixture, by design. No warnings summary.
+
+### Final review fixes (2026-10-21)
+
+- **I2: the report header follows the report's banners** (`views/run.js`). The header used to derive "Fact-checked: all N findings judged" from `panel_verdict.judged/total` alone, so it claimed a fact-check the report itself denied: a section citing `[n]` with no finding, or the grounding judge off (then `total` is 0 and the header said nothing), both raise "⚠ Not fact-checked"; and "⚠ Degraded run" was never shown. Now:
+  - the header waits for the report HTML and its evidence.json (`loadReport`) and shows nothing before both have settled;
+  - `trustHeader(quoted, evidence)` reads the report's own banners: the paragraphs of the report's top-level quotes (`:scope > blockquote > p`) that match `BANNER` ("⚠ Not fact-checked — …", "⚠ Degraded run — …"). Any banner is a trap callout that repeats each banner line. With no banner, an evidence.json with `degraded: true` is still a trap callout;
+  - only an evidence.json with `degraded: false` and `panel.judged == panel.total > 0` earns "Fact-checked: all N findings judged · panel verdict …". A run without evidence.json (an older one), an evidence.json that failed to load, or no finding judged shows no line at all;
+  - the server already serves both sources: `GET …/report` renders the banner lines as paragraphs of a top-level `<blockquote>` (adjacent `> ⚠` lines join one quote), and `GET …/evidence` returns evidence.json as written, with `degraded` and `panel`. No contract changed.
+- **M14: `refresh()` after an action never rejects unhandled.** A failed re-read goes to the problem panel (`showProblem(s.notice, e)`), as a failed poll tick does; polling stops, and the top bar's refresh starts it again. `refresh` is exported for the probe, as `tick` is.
+
+Tests:
+
+- `tests/test_webapp_render.py`: node probes of run.js (skipped when node is not installed). `trustHeader` never says "Fact-checked" beside a banner or with `degraded: true`, repeats the banner lines escaped, ignores other quoted lines, and claims nothing without evidence or with no finding judged; a `refresh` whose `GET` fails with a network error resolves and shows the panel.
+- `tests/test_webapp_api.py`: the served report HTML carries the banners as top-level quote paragraphs, and the evidence route serves `degraded` and `panel`.
+
+Not checked in a browser: the `:scope > blockquote > p` read itself. The API test pins the HTML shape it reads, and the node probe covers the logic after it.
+
+Verification: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\final-fix\` (`red.log`, `red-m14-exported.log`, `green-focused.log`, `suite.log`).

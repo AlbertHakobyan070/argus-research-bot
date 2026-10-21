@@ -436,8 +436,9 @@ _LIST_MARKER = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)  # an ordered-list mark
 _BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)    # blockquote markers at a line start: ">", ">>", "> >"
 # whole numbers (a sign only when no word character precedes it, . , : only between digits, a trailing %),
 # the comparison symbols, words: "0.5%" ≠ "5%", "-5%" ≠ "5%", "≤" ≠ "≥"; a number glued to letters is one
-# word ("50m", "2nd", "10x"), so "$50" ≠ "$50M"
-_TOKEN = re.compile(r"(?<!\w)[-+]?\d+(?:[.,:]\d+)*%?(?!\w)|[<>≤≥≠±=]|\w+")
+# word ("50m", "2nd", "10x"), so "$50" ≠ "$50M" — a decimal too, never split at its separator: "2.5ghz"
+# (atomic groups: a number that a letter follows never backtracks into a shorter one, so "at 2" ≠ "at 2.5GHz")
+_TOKEN = re.compile(r"(?<!\w)[-+]?(?>\d+(?:[.,:]\d+)*)%?(?!\w)|(?>\d+(?:[.,:]\d+)*)\w+|[<>≤≥≠±=]|\w+")
 _NEGATORS = frozenset("not never cannot cant dont doesnt isnt arent wasnt werent wont wouldnt shouldnt "
                       "couldnt didnt hasnt havent hadnt aint mustnt neednt mightnt shant oughtnt without"
                       .split())                           # the fold deletes apostrophes: don't → dont

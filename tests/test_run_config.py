@@ -195,14 +195,15 @@ def test_override_bounds(key, value, match):
 
 @pytest.mark.parametrize("key,floor,ceiling", BOUNDS)
 def test_inline_floors_and_ceilings(key, floor, ceiling):
+    step = 0.01 if isinstance(_knob(_rc("standard"), key), float) else 1     # a float bound: just past it
     if floor is not None:
         assert _knob(_rc("standard", **{key: floor}), key) == floor
         with pytest.raises(ValueError, match=f"{key} must be >= {floor}"):
-            _rc("standard", **{key: floor - 1})
+            _rc("standard", **{key: floor - step})
     if ceiling is not None:
         assert _knob(_rc("standard", **{key: ceiling}), key) == ceiling
         with pytest.raises(ValueError, match=f"{key} must be <= {ceiling}"):
-            _rc("standard", **{key: ceiling + 1})
+            _rc("standard", **{key: ceiling + step})
 
 
 def test_for_legacy_checkpoint_follows_the_checkpoint_length():

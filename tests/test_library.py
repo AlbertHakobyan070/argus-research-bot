@@ -490,3 +490,28 @@ async def test_exa_usd_month_to_date_sums_this_months_runs(lib: Library):
 
 async def test_exa_usd_month_to_date_is_zero_without_spend(lib: Library):
     assert await lib.exa_usd_month_to_date() == 0.0
+
+
+async def test_a_failed_open_closes_its_connection(tmp_path, monkeypatch):       # final review M1
+    """A migration (or schema script) that raises leaves no open aiosqlite
+    connection behind, and the library stays unopened."""
+    from argus import library as library_mod
+    conns: list = []
+    real = library_mod.aiosqlite.connect
+
+    def connect(*a, **k):
+        conns.append(real(*a, **k))
+        return conns[-1]
+
+    async def boom(db):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(library_mod.aiosqlite, "connect", connect)
+    monkeypatch.setattr(library_mod, "_migrate", boom)
+    lib = Library(tmp_path / "broken.sqlite")
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        await lib.open()
+    (conn,) = conns
+    assert conn._connection is None, "the connection was closed"
+    with pytest.raises(RuntimeError, match="not opened"):
+        lib._conn()

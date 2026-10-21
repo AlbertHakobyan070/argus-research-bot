@@ -206,6 +206,22 @@ def test_a_repeated_title_merges_into_its_first_occurrence(monkeypatch):
     assert out["outline"]["changed_sections"] == ["How X works", "Uses", "Limits", "Outlook"]
 
 
+def test_the_degraded_outline_never_repeats_a_title(monkeypatch):                     # final review I1
+    """Two sub-questions sharing their first 70 chars give ``default_outline`` the
+    same title twice; the repeat merges into its first occurrence."""
+    stem = "What does the long and carefully worded opening of this sub-question ask about"
+    subs = [f"{stem} costs?", "How does X work?", f"{stem} prices?", "What are X's limits?"]
+    assert subs[0].rstrip("?")[:70] == subs[2].rstrip("?")[:70]
+    assert len({_s.title for _s in outline.default_outline(
+        outline.ResearchBrief.model_validate(_brief(subs)), "medium")}) == 3
+    fake_llm(monkeypatch, lambda system, human: "no JSON here")
+    out = outline_node(_state(subs=subs))
+    titles = [s["title"] for s in out["outline"]["sections"]]
+    assert len(titles) == len(set(titles)) == 3
+    assert _layout(out)[0] == (subs[0].rstrip("?")[:70], [0, 2], [1, 2, 5, 6])
+    _assert_valid(out, range(1, 9))
+
+
 def test_the_round_tag_counts_user_rounds(monkeypatch):
     fake_llm(monkeypatch, lambda system, human: "no JSON here")
     out = outline_node(_state(revise_rounds=1, extend_rounds=1))

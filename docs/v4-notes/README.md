@@ -40,7 +40,7 @@ describes the code. The operator summary of all behaviour changes is in
     `wp-h.md`.
 - **Documented ceilings and known limits:**
   - `wp-b.md`: "Known limits after the fix rounds" (proxies, raw deflate,
-    links containing `]`, decimals glued to letters, degenerate documents),
+    links containing `]`, degenerate documents),
     the live-check "Known ceilings" (abandoned fetch threads, a late Exa page),
     and the `ponytail:` second-level-domain list;
   - `wp-c.md`: "The twin rule: live evidence and known limits";

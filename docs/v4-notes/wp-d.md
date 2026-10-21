@@ -109,3 +109,7 @@ Scripts and logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83
   - the second open changed nothing.
 - Review Focus 1 on real data (`migration.log`): `ensure_in_checkpoint` ran on a backup copy of the real `argus_checkpoints.sqlite`, made the same way and deleted afterwards. Every per-run thread got the legacy config for its own length, with one `errors` line, `require()` held, and the second call wrote nothing; their `next` was unchanged. The one per-chat thread from before per-run threads (`tg:<chat>`, no library row, so no entry point can reach it) had its `next` moved by the update with no `as_node` (from finished to `brief`); see the task report.
 - Static scan (WP-A's stdlib `ast` scanner, `static_scan.log`): no new findings. The unused imports it lists in edited older files were already there at the base commit.
+
+### Final review fix (2026-10-21): a failed `Library.open()` closes its connection (M1)
+
+`Library.open()` bound the aiosqlite connection to the library only after the schema script and the migration, so one that raised (a corrupt or read-only DB) left the connection and its worker thread open. A failure there now closes the connection and re-raises; the library stays unopened. Test: `tests/test_library.py`, a migration that raises leaves its connection closed and `_conn()` refusing. Logs: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\final-fix\`.

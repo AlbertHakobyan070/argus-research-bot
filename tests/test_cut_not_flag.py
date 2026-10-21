@@ -277,6 +277,15 @@ def test_the_degraded_run_banner_at_half_the_items(monkeypatch, tmp_path):
     assert meta["degraded"] is True and evidence["degraded"] is True
 
 
+@pytest.mark.parametrize("verdicts", [{"grounding": "unjudged"}, None])
+def test_a_panel_verdict_written_before_the_batch_count_still_gets_its_banner(verdicts):   # final review M2
+    """An older checkpoint's verdict has no ``grounding_batches``: its skipped
+    batches are all the batches it knew of, never a ``KeyError``."""
+    from argus.graph.report_builder_helpers import degraded_run
+    panel = {"skipped_judges": ["grounding batch 1: 429 Too Many Requests"], "judge_verdicts": verdicts}
+    assert degraded_run([], [], panel) == "1 of 1 grounding batches could not be judged (429 Too Many Requests)"
+
+
 def test_below_half_is_not_a_degraded_run(monkeypatch, tmp_path):
     calls, errors = _digests(15, 13)
     _, md, meta, *_ = _report(monkeypatch, tmp_path, _state(model_calls=calls, errors=errors))
@@ -339,10 +348,13 @@ def test_degradation_notes_show_this_round_and_count_the_earlier_ones(monkeypatc
     assert metrics.degradations_count(run) == 4 == metrics.degradations_count({**run, "evidence": None})
 
 
-def test_a_pdf_failure_is_an_error_line_and_a_degradation_note(monkeypatch, tmp_path):
+def test_a_pdf_failure_is_an_error_line_and_a_degradation_note(monkeypatch, tmp_path, caplog):
     def boom(*a, **k):
         raise RuntimeError("reportlab exploded")
-    out, md, meta, evidence, _ = _report(monkeypatch, tmp_path, _state(), pdf=boom)
+    with caplog.at_level("WARNING", logger=nodes_mod.logger.name):
+        out, md, meta, evidence, _ = _report(monkeypatch, tmp_path, _state(), pdf=boom)
+    (rec,) = [r for r in caplog.records if r.getMessage().startswith("PDF render failed")]
+    assert rec.exc_info and rec.exc_info[0] is RuntimeError, "the log carries the traceback (final review M6)"
     assert out["report_paths"]["pdf"] is None
     assert out["errors"] == ["[r1] pdf: RuntimeError: reportlab exploded"]
     assert "- [r1] pdf: RuntimeError: reportlab exploded" in md.split("## Degradation notes")[1]

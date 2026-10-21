@@ -172,12 +172,16 @@ class Library:
         if str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         db = await aiosqlite.connect(str(self.db_path))
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.executescript(_SCHEMA)
-        await db.commit()
-        await _migrate(db)
+        try:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.executescript(_SCHEMA)
+            await db.commit()
+            await _migrate(db)
+        except BaseException:           # a corrupt or read-only DB: no connection is left open
+            await db.close()
+            raise
         self._db = db
 
     async def close(self) -> None:

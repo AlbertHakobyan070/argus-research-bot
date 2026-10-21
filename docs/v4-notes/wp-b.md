@@ -225,7 +225,6 @@ Known limits after the fix rounds:
 - **Proxies.** Through an environment HTTP(S) proxy, the proxy resolves the name itself. The guard checks Argus's own resolution first, but the proxy's answer can differ: a rebinding resolver can answer the proxy differently, split-horizon DNS can give the proxy an internal address, and a proxy inside a private network can reach hosts Argus's resolver sees as public. That residual SSRF risk applies only when such a proxy is configured; none is configured on this host.
 - **Raw deflate.** A `deflate` body is decoded as the zlib format HTTP specifies; a server sending raw deflate fails that rung with a `zlib.error`.
 - **A link whose URL contains `]`** is not read as a link (the bounded link and footnote patterns stop at `]`): its text and URL stay in the normalised text. None of the 310 links in the 71 fetched documents on disk has one.
-- **A decimal glued to letters** (`2.5GHz`, `$1.5M`, `1,000x`) tokenises as its integer part and a word (`2`, `5ghz`): the number pattern backs off to the integer when letters follow. A quote that ends exactly at that integer ("runs at 2" for "runs at 2.5GHz") verifies; one that keeps the decimal ("at 2.5") or runs on ("raised $1 in") does not.
 - **Degenerate documents.** The occurrence scan is linear per segment in the occurrences of that segment. On a document of one token repeated 30 000 times, eight one-token segments take about 140 ms and one 100-token segment about 50 ms; real documents stay near 15 ms.
 
 ### Exa billing (Step 5, the one live search + one `/contents` call)
@@ -341,3 +340,10 @@ Known ceilings:
 Tests touched: `tests/test_gap_mode.py`. A fake fetch blocks while the drain is set and the node is waiting on it alone. Research returns promptly, the slow fetch is "abandoned on cancel", the fetched items are digested, and the `cancelled:` line is recorded.
 
 Verification: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\live12-fix\`. Round 1 is `r1-red.log` (the new tests against `f46ae07`'s `src`), `r1-green.log` and `r1-suite.log`.
+
+### Final review fix (2026-10-21): a decimal glued to its unit is one token (M17)
+
+The closeout left one quote-verification limit whose direction is a false pass: a decimal glued to letters (`2.5GHz`, `$1.5M`, `1,000x`) tokenised as its integer part and a word (`2`, `5ghz`), because the number pattern backed off to the integer when letters followed. So a quote cut at "at 2" verified against "at 2.5GHz", and "5GHz" against its fraction. `_TOKEN` now reads the number in atomic groups, `(?<!\w)[-+]?(?>\d+(?:[.,:]\d+)*)%?(?!\w)|(?>\d+(?:[.,:]\d+)*)\w+|[<>≤≥≠±=]|\w+` (the candidate parked at the Task 7 closeout): a number that a letter follows never backtracks into a shorter one, so `2.5ghz`, `1.5m` and `1,000x` are one word token each. The "Known limits" list above no longer carries this item.
+
+- Tests: `tests/test_quote_verify.py`. "faster on a CPU at 2" and "5GHz; its latency is 100ms" never verify against "… at 2.5GHz; its latency is 100ms", and the whole span still does.
+- The quote replay (`t7-fix4/replay.py`, both five-run sets of real quotes, before and after the change): no verdict changed (`final-fix/replay.log` in the scratchpad).

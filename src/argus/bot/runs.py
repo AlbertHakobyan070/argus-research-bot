@@ -69,7 +69,7 @@ _shutting_down = False            # drain_all began: no new claim (a claim made 
 _launch_closed = False            # drain_all stopped waiting for the claims made before it: nothing launches
 
 PLAN, REPORT = "plan", "report"
-_GATES = {("research",): PLAN, ("fetcher",): PLAN, ("deliver",): REPORT}   # ("fetcher",): pre-v3 plan gate
+_GATES = {("research",): PLAN, ("deliver",): REPORT}
 # ("research",) is the plan gate only for a run that has not passed it: read through _gate, never alone
 # A state write without as_node runs as the last node that ran (LangGraph reads versions_seen, which
 # an as_node write never updates) and re-runs that node's edges. Each resting state the driver's
@@ -601,19 +601,27 @@ async def _drained(h: RunHandle, reason: str) -> None:
     last node that ran, right for a resting state a real node produced.
     LangGraph's guess re-runs that node's edges, which took a re-plan, a fork
     or a resume of either, drained before its first node, back to its old
-    gate. The card's hint follows ``next``."""
+    gate. A fresh start drained before its first step rests at
+    ``("__start__",)`` with only its input checkpoint: no node ran, so there
+    is none to write the note as (LangGraph's "Ambiguous update") — no note,
+    and the card says nothing was kept. The card's hint follows ``next``."""
     done = h.done_node
     note = f"cancelled after node {done} ({reason})" if done else f"cancelled before it started ({reason})"
-    await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=done or h.route)
     snap = await h.graph.aget_state(h.cfg)
-    nxt = tuple(snap.next or ())
+    fresh = not done and h.route is None and tuple(snap.next or ()) == ("__start__",)   # only the input is saved
+    if not fresh:
+        await h.graph.aupdate_state(h.cfg, {"cancel_note": note}, as_node=done or h.route)
+        snap = await h.graph.aget_state(h.cfg)
+    nxt = () if fresh else tuple(snap.next or ())
     kind = _gate(nxt, snap.values or {})
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", done or h.stage, {"status": "cancelled", "summary": note})
     head = f"⏹ Cancelled after {done}" if done else "⏹ Cancelled before it started"
     # a quick /ask is never told to /continue: continue_run refuses it
-    await h.card.stop(head + ("." if h.quick else f" — {_drained_hint(h.run_id, nxt, kind)}."))
+    hint = ("nothing was kept; start it again with /research" if not nxt
+            else _drained_hint(h.run_id, nxt, kind))
+    await h.card.stop(head + ("." if h.quick else f" — {hint}."))
 
 
 def _drained_hint(run_id: str, nxt: tuple, kind: str | None) -> str:

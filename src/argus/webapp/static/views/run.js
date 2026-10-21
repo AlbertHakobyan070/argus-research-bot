@@ -81,13 +81,19 @@ export async function tick(s) {
   schedule(s);
 }
 
-async function refresh(s) {
-  const data = await get.run(s.id);
-  if (s.stopped) return;
-  s.data = data;
-  s.grace = GRACE_TICKS;
-  paint(s);
-  schedule(s);
+/** After a successful action: re-read the run. A failure is shown, never an unhandled rejection; polling
+ *  stops, as a failed tick does, and the top bar refresh starts it again. */
+export async function refresh(s) {
+  try {
+    const data = await get.run(s.id);
+    if (s.stopped) return;
+    s.data = data;
+    s.grace = GRACE_TICKS;
+    paint(s);
+    schedule(s);
+  } catch (e) {
+    showProblem(s.notice, e);
+  }
 }
 
 // ---- painting ------------------------------------------------------------------------------------
@@ -300,15 +306,11 @@ function paintReport(s) {
   const key = `${paths.md}|${snapshot.compose_runs}|${run.awaiting}|${run.in_flight}`;
   if (s.reportKey === key) return;
   s.reportKey = key;
-  const pv = snapshot.panel_verdict;
-  const checked = pv && pv.total ? (pv.judged < pv.total
-    ? `<aside class="callout" data-kind="trap"><h4>trap<i>Not fact-checked: ${esc(pv.judged)} of ${esc(pv.total)} findings judged</i></h4><p>Unjudged findings are not shown as passed.</p></aside>`
-    : `<p class="meta">Fact-checked: all ${esc(pv.total)} findings judged · panel verdict ${esc(pv.verdict)}.</p>`) : "";
   const files = ["md", "pdf", "evidence"].filter((k) => paths[k]);
   const atGate = run.awaiting === "report";
   sec.innerHTML = `<div class="sec-head"><span class="kicker">Report</span><h2>${atGate ? "The report is ready for review" : "The report"}</h2>
       <p>Tap a citation <span class="cite cite-demo">[n]</span> to see its source and the quotes behind it.</p></div>
-    ${checked}
+    <div id="report-check"></div>
     <div class="set-panel send-panel"><div class="set-row"><span class="set-l"><b>Send to chat</b><small>The bot sends the files to your Telegram chat.</small></span>
       <div class="row">${files.map((k) => `<label class="check"><input type="checkbox" name="send" value="${k}"${k !== "evidence" ? " checked" : ""}>${k === "md" ? "Markdown" : k === "pdf" ? "PDF" : "Evidence"}</label>`).join("")}
       <button class="btn" type="button" id="send-chat"><i data-icon="share-2"></i>Send to chat</button></div></div></div>
@@ -322,7 +324,28 @@ function paintReport(s) {
     if (r) toast(r.message, "cost", "Sent to chat");
   });
   if (atGate) wireReportActions(s, sec);
-  loadReport(s, $("#report-body", sec));
+  loadReport(s, $("#report-body", sec), $("#report-check", sec));
+}
+
+// The report's own trust banners (report_builder's title block: "> ⚠ Not fact-checked — …", "> ⚠ Degraded run — …").
+export const BANNER = /^⚠ (Not fact-checked|Degraded run) — /;
+
+/** The report header's fact-check line, from the report's banners (`quoted`: the text of each paragraph of
+ *  the report's top-level quotes; the `BANNER` ones count) and its evidence.json, read together with the
+ *  report: any banner, or an evidence.json that marks the run degraded, is the trap callout; only an
+ *  evidence.json that marks the run not degraded, with every finding judged, earns "Fact-checked". No
+ *  evidence (an older run, or one that failed to load) or no finding judged: no claim either way. */
+export function trustHeader(quoted, ev) {
+  const banners = quoted.filter((t) => BANNER.test(t));
+  const ok = ev && !ev.missing && !ev.error;
+  if (banners.length || (ok && ev.degraded === true)) {
+    const lines = banners.length ? banners.map((b) => `<p>${esc(b.replace(/^⚠ /, ""))}</p>`).join("")
+      : "<p>evidence.json marks this run degraded; the report's notes say why.</p>";
+    return `<aside class="callout" data-kind="trap"><h4>trap<i>Not a fully fact-checked report</i></h4>${lines}</aside>`;
+  }
+  const pv = ok && ev.degraded === false ? ev.panel || {} : {};
+  return pv.total && pv.judged === pv.total
+    ? `<p class="meta">Fact-checked: all ${esc(pv.total)} findings judged · panel verdict ${esc(pv.verdict)}.</p>` : "";
 }
 
 function reportActions() {
@@ -362,7 +385,7 @@ function wireReportActions(s, sec) {
   $('[data-report="cancel"]', sec).addEventListener("click", (e) => cancelRun(s, e.currentTarget));
 }
 
-async function loadReport(s, body) {
+async function loadReport(s, body, check) {
   const hasEvidence = Boolean(s.data.snapshot.report_paths?.evidence);   // older runs have none: not requested
   const [html, evidence] = await Promise.allSettled([get.report(s.id), hasEvidence ? get.evidence(s.id) : null]);
   if (s.stopped) return;
@@ -372,6 +395,8 @@ async function loadReport(s, body) {
     s.evidence = { error: evidence.reason };
     showProblem(s.notice, evidence.reason);  // the popovers say why too
   } else s.evidence = evidence.value || { missing: true };
+  // the header says what the report's own banners say; nothing is claimed before both have loaded
+  check.innerHTML = trustHeader($$(":scope > blockquote > p", body).map((p) => p.textContent.trim()), s.evidence);
   $$(".cite[data-n]", body).forEach((c) => {
     c.tabIndex = 0;
     c.setAttribute("role", "button");

@@ -120,6 +120,10 @@ The task review of `aef6bd0` asked for fixes; the orchestrator's rulings are in 
 
 Logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t8fix1\` (`red.log`, `green.log`, `full-suite.log`, the probe logs). The report is `.superpowers/sdd/2026-10-19-argus-v4/task-8-fix1-report.md`.
 
+### Final review fix (2026-10-21): the degraded outline never repeats a title (I1)
+
+`default_outline`, the `outline.plan` degrade path, titles each section by its first sub-question's first 70 characters, so two sub-questions that start alike gave two sections one title. It now ends with `_merge_repeated`, as the fresh reply and the extend path already did: the repeat merges into its first occurrence (sub-questions and notes unioned). Compose merges any repeat it still reads (wp-c.md). Test: `tests/test_outline.py`, a degraded outline of two sub-questions sharing their first 70 characters has unique titles, the merged section holding both sub-questions and their notes. Logs: `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\final-fix\`.
+
 ### Verification evidence (2026-10-19)
 
 Logs are in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t8\`. Every run used `FREELLMAPI_BASE_URL=http://127.0.0.1:9/v1`, so no LLM call left the machine, and no bot was started.
