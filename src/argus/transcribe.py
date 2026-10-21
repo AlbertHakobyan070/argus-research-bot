@@ -1,36 +1,42 @@
 """Unified transcription into the DS vault.
 
-Phase 3 of the v2 rebuild. One entry point, ``transcribe_url``:
+One entry point, ``transcribe_url``, driven by the engines config's
+``transcriber`` block (v4 WP-F: ``argus_engines.json``, with the
+``/engines transcriber`` choice persisted under the library key
+``engines.transcriber``):
 
-- **YouTube** → caption extraction (fast, no media download) via
-  ``tools.youtube_video_transcript`` with the vault ``out_dir``.
-- **Everything else** (X / Reddit / Instagram — no caption tracks), or
-  YouTube videos without captions → local **faster-whisper** ASR over
-  the downloaded media file (reused from the library when the media was
-  already fetched, downloaded otherwise).
+- **YouTube** runs the steps of ``transcriber.youtube`` in order —
+  ``captions`` (caption extraction via ``tools.youtube_video_transcript``,
+  no media download) and ``asr`` — until one succeeds. Only the listed
+  steps run. A step that failed before the one that served is recorded in
+  ``backend`` (``captions→faster_whisper:small``) and in the file header.
+- **Everything else** (X / Reddit / Instagram — no caption tracks) → ASR
+  over the downloaded media file (reused from the library when the media
+  was already fetched, downloaded otherwise).
 
-Whisper runs on CPU (int8, model size via ARGUS_WHISPER_MODEL, default
-"small"; first use downloads the model weights). Decoding happens
-through PyAV, so no system ffmpeg is required for ASR itself.
+ASR is the one engine ``transcriber.asr_engine`` names
+(``engines/transcribers.py``): ``faster_whisper`` (local) or
+``openai_audio`` (a provider's ``/audio/transcriptions``). There is no
+cross-engine fallback. The engine is built before any download, so a
+configuration error (a missing block, an unknown provider, a missing key)
+is reported without fetching the media.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import threading
 import time
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel
 
+from .engines import registry
+from .engines.registry import EngineConfigError
+from .engines.schema import EnginesConfig
+from .engines.transcribers import TranscribeError, asr_engine
 from .media import detect_platform, download_media
 
 logger = logging.getLogger("argus.transcribe")
-
-_ASR_LOCK = threading.Lock()
-_ASR_MODEL: Any | None = None
 
 
 class TranscriptResult(BaseModel):
@@ -41,56 +47,30 @@ class TranscriptResult(BaseModel):
     text: str = ""
     language: str = ""
     title: str = ""
-    backend: str = ""          # "captions" | "whisper"
+    # "captions" | "faster_whisper:<model>" | "openai_audio:<provider>/<model>",
+    # preceded by "<failed step>→" for each YouTube step that failed first
+    backend: str = ""
     error: str | None = None
     elapsed_s: float = 0.0
 
 
-def asr_available() -> bool:
+async def _engines_config(library) -> EnginesConfig:
+    """The registry's config, loaded now when startup did not load it (a
+    failing load raises the real problem)."""
     try:
-        import faster_whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _get_whisper_model():
-    """Lazily load ONE WhisperModel per process (thread-safe). The first
-    call downloads the model weights (hundreds of MB) — callers should
-    tell the user that may take a while."""
-    global _ASR_MODEL
-    with _ASR_LOCK:
-        if _ASR_MODEL is None:
-            from faster_whisper import WhisperModel
-            size = os.environ.get("ARGUS_WHISPER_MODEL", "small")
-            logger.info("loading faster-whisper model %r (cpu/int8)…", size)
-            _ASR_MODEL = WhisperModel(size, device="cpu",
-                                      compute_type="int8")
-        return _ASR_MODEL
-
-
-def _whisper_transcribe_file(media_path: Path) -> tuple[str, str]:
-    """Blocking ASR over one media file → (text, language). Runs inside
-    ``asyncio.to_thread`` from the async entry point.
-
-    Whisper segments can overlap-repeat just like YouTube rolling
-    captions (observed live on short clips), so the same word-overlap
-    dedup is applied to the segment stream."""
-    from .tools import _dedup_rolling_captions
-    model = _get_whisper_model()
-    segments, info = model.transcribe(str(media_path), vad_filter=True)
-    lines = [seg.text.strip() for seg in segments if seg.text.strip()]
-    lines = _dedup_rolling_captions(lines)
-    return "\n".join(lines), (getattr(info, "language", "") or "")
+        return registry.current_config()
+    except EngineConfigError:
+        return await registry.load_config(library=library)
 
 
 async def transcribe_url(
     url: str, *, transcripts_root: Path, media_root: Path,
-    quality: str = "auto", library=None,
+    quality: str = "auto", library=None, engines: EnginesConfig | None = None,
 ) -> TranscriptResult:
     """Produce a transcript for one media URL and persist it under
     ``transcripts_root/<platform>/``. Registers vault assets in the
-    library when one is provided. Fail-soft result."""
+    library when one is provided. ``engines`` defaults to the registry's
+    config. Fail-soft result: every failure is spelled out in ``error``."""
     t0 = time.monotonic()
     platform = detect_platform(url)
     if platform is None:
@@ -100,32 +80,62 @@ async def transcribe_url(
                   "media links only")
     out_dir = Path(transcripts_root) / platform
 
-    caption_err = ""
-    if platform == "youtube":
-        from .tools import youtube_video_transcript
-        r = await asyncio.to_thread(
-            youtube_video_transcript, url, timeout=90, out_dir=out_dir)
-        if r.ok:
-            result = TranscriptResult(
-                ok=True, source_url=url, platform=platform,
-                path=r.transcript_path or "", text=r.transcript_text,
-                language=r.language, title=r.title, backend="captions",
-                elapsed_s=time.monotonic() - t0)
+    def fail(error: str) -> TranscriptResult:
+        return TranscriptResult(ok=False, source_url=url, platform=platform, error=error,
+                                elapsed_s=time.monotonic() - t0)
+
+    try:
+        cfg = engines if engines is not None else await _engines_config(library)
+    except EngineConfigError as e:
+        return fail(f"transcriber configuration: {e}")
+
+    failed: list[tuple[str, str]] = []          # (step label, why) of the steps that failed
+    for step in (cfg.transcriber.youtube if platform == "youtube" else ["asr"]):
+        if step == "captions":
+            from .tools import youtube_video_transcript
+            r = await asyncio.to_thread(
+                youtube_video_transcript, url, timeout=90, out_dir=out_dir)
+            if r.ok:
+                result = TranscriptResult(
+                    ok=True, source_url=url, platform=platform,
+                    path=r.transcript_path or "", text=r.transcript_text,
+                    language=r.language, title=r.title,
+                    backend="→".join([*(label for label, _ in failed), "captions"]),
+                    elapsed_s=time.monotonic() - t0)
+                await _register(library, result)
+                return result
+            failed.append(("captions", r.error or "captions unavailable"))
+            logger.info("captions failed for %s (%s)", url, failed[-1][1])
+            continue
+        result = await _asr(url, platform, out_dir, cfg, failed, media_root=media_root,
+                            quality=quality, library=library, t0=t0)
+        if result.ok:
             await _register(library, result)
             return result
-        caption_err = r.error or "captions unavailable"
-        logger.info("captions failed for %s (%s); trying ASR", url,
-                    caption_err)
+        failed.append((result.backend or "asr", result.error or "ASR failed"))
 
-    # --- ASR path -----------------------------------------------------------
-    if not asr_available():
-        note = ("speech-to-text needs faster-whisper — install it with "
-                "`uv pip install faster-whisper` (the [asr] extra)")
-        if caption_err:
-            note = f"captions failed ({caption_err}) and {note}"
-        return TranscriptResult(ok=False, source_url=url, platform=platform,
-                                error=note,
-                                elapsed_s=time.monotonic() - t0)
+    if not failed:
+        return fail("transcriber.youtube lists no steps (captions, asr)")
+    error = "; ".join(why if label != "captions" else f"captions failed ({why})"
+                      for label, why in failed)
+    if platform == "youtube" and "asr" not in cfg.transcriber.youtube:
+        error += " and transcriber.youtube lists no asr step"
+    return fail(error)
+
+
+async def _asr(url: str, platform: str, out_dir: Path, cfg: EnginesConfig,
+               failed: list[tuple[str, str]], *, media_root: Path, quality: str,
+               library, t0: float) -> TranscriptResult:
+    """One ASR step: build the configured engine (before any download), get
+    the media, transcribe, write the vault file. ``ok=False`` carries why."""
+    def fail(error: str, backend: str = "") -> TranscriptResult:
+        return TranscriptResult(ok=False, source_url=url, platform=platform, backend=backend,
+                                error=error, elapsed_s=time.monotonic() - t0)
+
+    try:
+        engine = asr_engine(cfg.transcriber, cfg)
+    except EngineConfigError as e:
+        return fail(f"transcriber configuration: {e}")
 
     # Reuse already-downloaded media when the library knows about it.
     media_path: Path | None = None
@@ -142,10 +152,7 @@ async def transcribe_url(
     if media_path is None:
         dl = await download_media(url, dest_root=media_root, quality=quality)
         if not dl.ok:
-            return TranscriptResult(
-                ok=False, source_url=url, platform=platform,
-                error=f"media download for ASR failed: {dl.error}",
-                elapsed_s=time.monotonic() - t0)
+            return fail(f"media download for ASR failed: {dl.error}", engine.backend)
         media_path = Path(dl.path)
         title = dl.title
         if library is not None:
@@ -159,31 +166,24 @@ async def transcribe_url(
                 logger.exception("media asset registration failed")
 
     try:
-        text, language = await asyncio.to_thread(
-            _whisper_transcribe_file, media_path)
-    except Exception as e:
-        logger.exception("whisper ASR failed for %s", media_path)
-        return TranscriptResult(
-            ok=False, source_url=url, platform=platform,
-            error=f"ASR failed: {e}", elapsed_s=time.monotonic() - t0)
-    if not text.strip():
-        return TranscriptResult(
-            ok=False, source_url=url, platform=platform,
-            error="ASR produced no speech (silent or music-only video?)",
-            elapsed_s=time.monotonic() - t0)
+        text, language = await engine.transcribe(media_path)
+    except TranscribeError as e:
+        logger.warning("ASR failed for %s: %s", media_path, e)
+        return fail(f"ASR failed ({engine.backend}): {e}", engine.backend)
+    if not text.strip():                        # an engine must raise instead; never write an empty file
+        return fail(f"ASR failed ({engine.backend}): no speech in the result", engine.backend)
 
+    backend = "→".join([*(label for label, _ in failed), engine.backend])
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{media_path.stem}.txt"
     header = (f"# {title or url}\n# source: {url}\n"
-              f"# backend: whisper ({language or '?'})\n\n")
+              f"# backend: {backend} ({language or '?'})\n"
+              + "".join(f"# {label} failed: {why}\n" for label, why in failed) + "\n")
     out_path.write_text(header + text + "\n", encoding="utf-8")
-
-    result = TranscriptResult(
+    return TranscriptResult(
         ok=True, source_url=url, platform=platform, path=str(out_path),
-        text=text, language=language, title=title, backend="whisper",
+        text=text, language=language, title=title, backend=backend,
         elapsed_s=time.monotonic() - t0)
-    await _register(library, result)
-    return result
 
 
 async def _register(library, result: TranscriptResult) -> None:

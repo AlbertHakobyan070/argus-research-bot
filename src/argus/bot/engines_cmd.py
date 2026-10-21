@@ -19,7 +19,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, ContextTypes
 
 from ..config import get_settings
-from ..engines import registry
+from ..engines import registry, transcribers
 from ..engines.registry import EngineConfigError
 from ..engines.roles import ROLES
 from ..engines.schema import EngineSpec, EnginesConfig, ProfileOverrides
@@ -34,7 +34,8 @@ USAGE = """\
 /engines tier <cheap|strong|judge> <provider>/<model>
 /engines fallback <role> <provider>/<model>
 /engines reset [profile]
-/engines models <provider>"""
+/engines models <provider>
+/engines transcriber [faster_whisper|openai_audio [provider/model]]"""
 _TIERS = ("cheap", "strong", "judge")
 
 
@@ -110,7 +111,49 @@ async def _dispatch(args: list[str], lib, chat_id: int) -> str:
     if sub == "models" and len(rest) == 1:
         ids = await asyncio.to_thread(registry.live_models, rest[0])
         return f"{rest[0]}: {len(ids)} model(s)\n" + "\n".join(ids)
+    if sub == "transcriber" and len(rest) <= 2:
+        return await _transcriber(rest, lib)
     return USAGE
+
+
+_ASR_ENGINES = ("faster_whisper", "openai_audio")
+
+
+async def _transcriber(rest: list[str], lib) -> str:
+    """Show, or switch the ASR engine (and openai_audio's provider/model),
+    persisted under ``engines.transcriber``. The block is checked for use
+    here only to warn: a transcription is what fails on it."""
+    try:
+        cfg = registry.current_config()
+    except EngineConfigError:
+        cfg = await registry.load_config(library=lib)     # raises the real problem, shown to the user
+    t = cfg.transcriber
+    if rest:
+        engine = rest[0]
+        if engine not in _ASR_ENGINES:
+            raise ValueError(f"the ASR engine is faster_whisper or openai_audio, got {engine!r}")
+        update: dict = {"asr_engine": engine}
+        if len(rest) == 2:
+            if engine == "faster_whisper":
+                raise ValueError("faster_whisper takes no provider/model "
+                                 "(its model is transcriber.faster_whisper.model in argus_engines.json)")
+            spec = _spec(rest[1])
+            if spec.provider not in cfg.providers:
+                raise ValueError(f"provider {spec.provider!r} is not configured "
+                                 f"(known: {', '.join(cfg.providers)})")
+            update["openai_audio"] = {**t.openai_audio, "provider": spec.provider, "model": spec.model}
+        t = t.model_copy(update=update)
+        await registry.set_transcriber(t)
+        cfg = registry.current_config()
+    try:
+        backend, problem = transcribers.asr_engine(t, cfg).backend, ""
+    except EngineConfigError as e:
+        oa = t.openai_audio
+        backend = (f"openai_audio:{oa.get('provider', '?')}/{oa.get('model', '?')}" if t.asr_engine == "openai_audio"
+                   else f"faster_whisper:{t.faster_whisper.get('model', '?')}")
+        problem = f"\n⚠ {e} — transcriptions fail until it is fixed"
+    head = "✅ transcriber" if rest else "🎙 Transcriber"
+    return f"{head}: {backend}\nYouTube: {' → '.join(t.youtube) or '(no steps)'}{problem}"
 
 
 def _fmt(spec: EngineSpec) -> str:

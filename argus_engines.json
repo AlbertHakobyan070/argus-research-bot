@@ -736,6 +736,12 @@
       }
     }
   },
+  "transcriber": {
+    "youtube": ["captions", "asr"],
+    "asr_engine": "faster_whisper",
+    "faster_whisper": {"model": "small", "device": "cpu", "compute_type": "int8"},
+    "openai_audio": {"provider": "groq", "model": "whisper-large-v3-turbo", "chunk_seconds": 600, "language": null}
+  },
   "pricing": {
     "exa": {
       "price_per_search_usd": 0.007,

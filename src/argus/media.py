@@ -525,6 +525,42 @@ async def download_media(
 
 
 # ---------------------------------------------------------------------------
+# Audio chunks for cloud speech-to-text (v4 WP-F, the openai_audio engine)
+# ---------------------------------------------------------------------------
+
+def extract_audio_chunks(src: Path | str, out_dir: Path | str, *, chunk_seconds: int,
+                         ffmpeg: str | None = None, timeout_s: float = 3600) -> list[Path]:
+    """Blocking: the audio of ``src`` as 16 kHz mono MP3 files of at most
+    ``chunk_seconds`` each (``out_dir/chunk_000.mp3`` …), in order.
+
+    Raises ``RuntimeError`` naming the cause: no ffmpeg, ffmpeg failing
+    (its stderr tail), the timeout, or no output at all."""
+    ffmpeg = ffmpeg or resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("audio extraction needs ffmpeg (set ARGUS_FFMPEG or install imageio-ffmpeg)")
+    import subprocess
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "48k",
+           "-f", "segment", "-segment_time", str(int(chunk_seconds)), "-reset_timestamps", "1",
+           str(out / "chunk_%03d.mp3")]
+    kw: dict[str, Any] = {} if os.name == "nt" else {"start_new_session": True}
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout_s, **kw)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ffmpeg timed out after {timeout_s:.0f}s extracting audio") from e
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed ({p.returncode}): {(p.stderr or '').strip()[-500:]}")
+    chunks = sorted(out.glob("chunk_*.mp3"))
+    if not chunks:
+        raise RuntimeError("ffmpeg produced no audio (does the media have an audio track?)")
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # Reddit search (public search.json — no auth, real UA, fail-soft)
 # ---------------------------------------------------------------------------
 
