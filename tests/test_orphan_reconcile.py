@@ -11,7 +11,6 @@ has no checkpoint, and DMs the user either way. A quick /ask (which
 """
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 

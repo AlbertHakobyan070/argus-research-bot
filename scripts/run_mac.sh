@@ -50,17 +50,26 @@ fi
 
 # A hard-killed bot can leave its cloudflared child running (seen on
 # Windows: the old tunnel kept serving the console port). Stop every
-# cloudflared whose argv[0] is this repo's binary (tools/bin/cloudflared) or
-# the ARGUS_CLOUDFLARED path exactly as the bot spawns it (resolved by the
-# bot's own code, .env included), then assert none is left. A cloudflared
-# started from any other path is never touched.
-CF_PATHS="$("$PYBIN" -c "from argus.config import _PROJECT_ROOT as r; from argus.webapp import tunnel; print(r / 'tools' / 'bin' / 'cloudflared'); print(tunnel.binary())")"
+# cloudflared that is
+#   (a) this repo's binary (argv[0] = tools/bin/cloudflared), whatever its args, or
+#   (b) the ARGUS_CLOUDFLARED binary exactly as the bot spawns it, ONLY with
+#       the bot's own argv (webapp/tunnel.py command():
+#       tunnel --url http://127.0.0.1:<ARGUS_WEBAPP_PORT> --no-autoupdate),
+# then assert none is left. Paths and argv come from the bot's own code
+# (.env included). Any other cloudflared — another path, or the same shared
+# binary running someone else's tunnel — is never touched.
+CF_TARGETS="$("$PYBIN" -c "import os; from argus.config import _PROJECT_ROOT as r, Settings; from argus.webapp import tunnel; port = int(os.environ.get('ARGUS_WEBAPP_PORT') or Settings.webapp_port); print(r / 'tools' / 'bin' / 'cloudflared'); print(tunnel.binary()); print(' '.join(tunnel.command(tunnel.binary(), port)[1:]))")"
+{ IFS= read -r CF_REPO; IFS= read -r CF_BIN; IFS= read -r CF_ARGS; } <<< "$CF_TARGETS"
+if [ -z "$CF_REPO" ] || [ -z "$CF_BIN" ] || [ -z "$CF_ARGS" ]; then
+  echo "FATAL: pre-flight could not resolve this repo's cloudflared targets." >&2
+  exit 1
+fi
+cf_ere() { printf '%s' "$1" | sed 's/[][\.*^$()+?{}|]/\\&/g'; }   # regex metacharacters escaped
 cf_pids() {
-  # each path as an anchored ERE (regex metacharacters escaped), then pgrep -f
-  printf '%s\n' "$CF_PATHS" | sort -u | while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    pgrep -f "^$(printf '%s' "$p" | sed 's/[][\.*^$()+?{}|]/\\&/g')( |\$)" || true
-  done | sort -u
+  # anchored EREs over the full command line (pgrep -f)
+  { pgrep -f "^$(cf_ere "$CF_REPO")( |\$)" || true
+    pgrep -f "^$(cf_ere "$CF_BIN $CF_ARGS")\$" || true
+  } | sort -u
 }
 echo "[run_mac.sh] pre-flight: killing any orphaned cloudflared of this repo…"
 CF_PIDS="$(cf_pids)"

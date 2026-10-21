@@ -5,6 +5,8 @@
 # live search) to prove the research path — the grounded plan gate, research
 # and digest, compose, analyst, the judged panel and the report — actually
 # works, not just the hermetic suite.
+# Needs a valid .env, TELEGRAM_BOT_TOKEN included: the proxy URL is read
+# through get_settings(), which refuses a missing or malformed token.
 set -e
 cd "$(dirname "$0")/.."
 export PYTHONPATH=""

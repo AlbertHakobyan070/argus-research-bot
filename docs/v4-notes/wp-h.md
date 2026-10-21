@@ -48,18 +48,25 @@ Code (Step 1 and pointers 1–5, 10):
   bot_mod` is gone (pointer 4).
 - **Run-script pre-flight (pointer 5, ruling).** After the `argus.bot` poller
   kill and its assertion, both scripts stop every cloudflared that is **this
-  repo's binary** and assert none is left:
+  repo's binary**, or the `ARGUS_CLOUDFLARED` binary running **the bot's own
+  tunnel command line** (narrowed in fix round 1, below), and assert none is
+  left:
   - The targets come from the bot's own code, run in the venv:
-    `_PROJECT_ROOT/tools/bin/cloudflared(.exe)` and `webapp.tunnel.binary()`
-    (which reads `ARGUS_CLOUDFLARED`, `.env` included).
+    `_PROJECT_ROOT/tools/bin/cloudflared(.exe)`, `webapp.tunnel.binary()`
+    (which reads `ARGUS_CLOUDFLARED`, `.env` included) and the argv of
+    `webapp.tunnel.command()` for the configured port.
   - `run.sh` (Windows): `Win32_Process.ExecutablePath`, normalised with
     `GetFullPath` and compared case-insensitively against the resolved
-    targets; `Stop-Process -Force`, then the count must be 0. An empty count
-    (PowerShell or WMI unavailable) is fatal, like the poller check.
-  - `run_mac.sh` (macOS/Linux): `pgrep -f` with each target as an anchored,
-    regex-escaped ERE `^<path>( |$)` — the spawn's `argv[0]` is
-    `str(tunnel.binary())` exactly — then TERM, KILL, and the count must be 0.
-  - A cloudflared started from any other binary or path is never matched.
+    targets (the `ARGUS_CLOUDFLARED` arm also needs `CommandLine` to end with
+    the bot's argv); `Stop-Process -Force`, then the count must be 0. A
+    failed query (`-ErrorAction Stop`) or an empty count is fatal, like the
+    poller check.
+  - `run_mac.sh` (macOS/Linux): `pgrep -f` with anchored, regex-escaped EREs
+    — `^<repo binary>( |$)`, and `^<ARGUS_CLOUDFLARED> <bot argv>$` — the
+    spawn's `argv[0]` is `str(tunnel.binary())` exactly — then TERM, KILL,
+    and the count must be 0.
+  - A cloudflared started from any other binary or path, or from the
+    `ARGUS_CLOUDFLARED` binary with any other arguments, is never matched.
 - **`Settings.engines_file` / `engines_local_file` removed (pointer 10).**
   Nothing read them; the registry's `default_paths()` is the one, authoritative
   reader of `ARGUS_ENGINES_FILE` / `ARGUS_ENGINES_LOCAL_FILE` (relative paths
@@ -130,10 +137,11 @@ panel, inline `[uncited]` markers, the LLM bench judge.
   to `ROLES`.
 - **The pre-flight resolves its targets through the bot's code** rather than
   re-implementing `ARGUS_CLOUDFLARED` and `.env` parsing in shell.
-- **`ARGUS_CLOUDFLARED` is a target as ruled**, so pointing it at a shared
-  system binary (e.g. Homebrew's) would let the pre-flight stop other
-  cloudflared processes of that binary. `handoff.md` says to point it only at
-  a binary Argus alone uses, or to copy it into `tools/bin/`.
+- **`ARGUS_CLOUDFLARED` is a target only with the bot's argv** (fix round 1;
+  the first cut matched the binary alone, so a shared system binary such as
+  Homebrew's would have let the pre-flight stop other tunnels). Ceiling:
+  another quick tunnel to the console's own port on that same binary would
+  be taken for the bot's.
 
 ### Known ceilings
 
@@ -220,3 +228,39 @@ No bot, cloudflared or live service was started, stopped, signalled or called.
   kill (checked with a failing import), and an empty list is fatal too.
 - `demo_closed_port.log`: `scripts/demo_run.py` imports and stops at the
   engines resolution with the proxy's `EngineConfigError` on a closed port.
+
+### Fix round 1 (review of 794f14b)
+
+- **`.env.example` comments on their own lines.** python-dotenv reads
+  `KEY=   # text` as the value `# text` when the value is blank, so a fresh
+  `cp .env.example .env` gave the blank keys comment text as values (Exa
+  switched on with a junk key; `int()` failing on the user id). Every comment
+  now sits on its own line, and every key, active or commented out, is `KEY=`
+  or `KEY=<placeholder>` with nothing after it. New `tests/test_env_example.py`
+  parses the file with `dotenv_values` (and every `# KEY=…` line as it would
+  read uncommented): no value starts with `#`, every blank key parses as `""`,
+  and no uncommented value carries trailing text.
+- **The `ARGUS_CLOUDFLARED` arm is narrowed, not dropped** (see the pre-flight
+  bullet and the decision above). The port is `ARGUS_WEBAPP_PORT`, else
+  `Settings.webapp_port`, as `Settings.load()` reads it.
+- **A failed WMI query is fatal.** `Get-CimInstance … -ErrorAction Stop` in
+  the `argus.bot` poller count and in the cloudflared filter (kill and count
+  share it); the kill call aborts with a FATAL line, and the count reads empty
+  → FATAL. Before, a query error read as a count of `0`.
+- **`verify_live.sh` needs a valid `.env`, `TELEGRAM_BOT_TOKEN` included** (it
+  reads the proxy URL through `get_settings()`): said in its header and in
+  `handoff.md`. No code change.
+- `bench/metrics.py`: the `degradations_count` docstring now says stored
+  `legacy.*` records come from the removed wrappers.
+- `tests/test_orphan_reconcile.py`: the unused `Path` import is gone.
+
+Verification (`scratchpad\t14\fix1\`): `red.log` (the new test fails on the
+shipped file), `green_env.log` after the rewrite. `preflight_dryrun.log`:
+run.sh's resolution and `CF_FILTER`, extracted from the script at run time,
+list-only — each arm matches the live repo tunnel; the same binary with
+another port or another tunnel's argv, and a foreign binary, match nothing;
+a bad WMI class makes the filter error and the count read empty, for both
+queries, where the old query read `0`. `preflight_mac_dryrun.log`: `cf_ere`
+/ `cf_pids` extracted from `run_mac.sh` against a fake `pgrep -f` — a Homebrew
+or bare-name `ARGUS_CLOUDFLARED` matches only the bot's argv. Both scripts
+pass `bash -n`; neither was run.

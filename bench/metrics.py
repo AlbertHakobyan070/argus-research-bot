@@ -57,8 +57,9 @@ alike:
   routed_via_captured_ratio  ok call records with a non-empty routed_via / ok records
   degradations_count    evidence.json degradations, else the facade's skip / degrade / legacy
                         lines in ``errors``; "n/a" without evidence.json and without a call
-                        record of a v4 role (``legacy.*`` wrappers raise, and the v3 nodes'
-                        fallbacks write no such line)
+                        record of a v4 role (stored ``legacy.*`` records come from the
+                        removed Phase 1–2 wrappers, which raised instead of writing such
+                        a line, and the v3 nodes' fallbacks wrote none either)
   json_parse_failures   records that failed the validate hook ("unparseable:") + error lines
                         quoting the JSON parser ("no useful JSON object found", not an exhaustion)
   exa_spend             ``search_spend``: searches, text_pages, contents_pages, usd

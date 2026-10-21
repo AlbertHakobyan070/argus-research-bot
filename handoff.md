@@ -150,7 +150,9 @@ New ones are in `.env.example`.
 **Scripts**
 - `scripts/live_check.py` (graph-direct, prints an acceptance table, exits
   non-zero on any failed check) replaces `tests/manual_e2e.py`;
-  `scripts/verify_live.sh` runs it after the live tests. The old opt-in
+  `scripts/verify_live.sh` runs it after the live tests. `verify_live.sh`
+  needs a valid `.env`, `TELEGRAM_BOT_TOKEN` included: it reads the proxy URL
+  through `get_settings()`, which refuses a missing or malformed token. The old opt-in
   `tests/test_e2e_research.py` is gone.
 - `python -m bench.metrics` / `python -m bench.compare` measure runs
   deterministically; bench runs write under `bench/results/` (gitignored).
@@ -362,7 +364,8 @@ Startup log should show `ffmpeg: …`, `yt-dlp: …`, and
 console is disabled. In Telegram, paste any YouTube/X link → you get a
 download menu → tap `⬇ 1` → the file lands in the vault and (if under
 Telegram's bot upload cap) is sent back to you. With an engine available,
-`scripts/verify_live.sh` then checks research end to end.
+`scripts/verify_live.sh` then checks research end to end (it needs the same
+valid `.env`, bot token included).
 
 ---
 
@@ -372,14 +375,19 @@ Telegram's bot upload cap) is sent back to you. With an engine available,
 cd ~/Agents/argus && ./scripts/run_mac.sh      # Windows: ./scripts/run.sh (Git Bash)
 ```
 
-The pre-flight kills any existing `argus.bot` poller **and any cloudflared
-running this repo's binary** (`tools/bin/cloudflared(.exe)`, or the
-`ARGUS_CLOUDFLARED` path), asserts none is left, then execs the new bot. A
+The pre-flight kills any existing `argus.bot` poller **and any orphaned
+cloudflared of this bot**, asserts none is left, then execs the new bot. A
 bot that was hard-killed leaves its cloudflared child behind (seen on
-Windows: the old tunnel kept serving the console port), which is why. A
-cloudflared started from any other binary is never touched — so point
-`ARGUS_CLOUDFLARED` only at a binary Argus alone uses (or copy it into
-`tools/bin/`). If the script refuses to start it tells you what is still alive.
+Windows: the old tunnel kept serving the console port), which is why. "Of
+this bot" means either this repo's binary (`tools/bin/cloudflared(.exe)`,
+whatever its arguments), or the `ARGUS_CLOUDFLARED` binary **only when it runs
+the bot's own command line** (`tunnel --url http://127.0.0.1:<ARGUS_WEBAPP_PORT>
+--no-autoupdate`). So a shared `ARGUS_CLOUDFLARED` (say, Homebrew's) running
+your other tunnels is left alone; only a quick tunnel to the console's own
+port on that binary would be taken for the bot's. Any other cloudflared is
+never touched. A failed process query (WMI on Windows) stops the script
+instead of reading as "none left". If the script refuses to start it tells
+you what is still alive.
 
 ### One bot per token
 
@@ -447,8 +455,9 @@ INTEL_PYTHON=~/Agents/intel-stack/venv/bin/python
 ### 3. cloudflared — the console's tunnel
 
 `tools/bin/` is gitignored, so the binary does not come with the repo. Put a
-macOS `cloudflared` at `tools/bin/cloudflared` (or set `ARGUS_CLOUDFLARED`,
-keeping the caveat under [Running day to day](#running-day-to-day) in mind).
+macOS `cloudflared` at `tools/bin/cloudflared` (or set `ARGUS_CLOUDFLARED`;
+the pre-flight then stops that binary only when it runs the bot's own
+command line, see [Running day to day](#running-day-to-day)).
 Without it the console reports "cloudflared not found" and the chat works as
 before; `ARGUS_WEBAPP_TUNNEL=none` keeps the console local only, and
 `ARGUS_WEBAPP_ENABLED=false` turns it off. **UNVERIFIED ON MAC.**
