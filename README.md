@@ -1,8 +1,5 @@
 # Argus
 
-[![ci](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/ci.yml)
-[![docs](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/docs.yml/badge.svg)](https://alberthakobyan070.github.io/argus-research-bot/)
-
 A single-user Telegram bot for research you can check, and for saving media.
 
 Ask it a question and it plans the research with you, searches live (Exa,
