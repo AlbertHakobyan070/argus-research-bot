@@ -363,7 +363,9 @@ async def test_shipped_engines_file_validates_without_io(no_network):
     fp = cfg.providers["freellmapi"]
     assert (fp.base_url_env, fp.api_key_env, fp.token_param, fp.rpm_limit, fp.models_endpoint,
             fp.supports_json_mode) == ("FREELLMAPI_BASE_URL", "FREELLMAPI_API_KEY",
-                                       "max_completion_tokens", 100, True, False)
+                                       "max_tokens", 100, True, False)
+    # the proxy ignores max_completion_tokens (probed 2026-10-25); the floor keeps reasoning headroom
+    assert (fp.min_max_tokens, fp.quota_wait_s) == (2048, 120)
     for tier, prefs in fp.model_preferences.items():
         assert prefs and prefs[-1] == "auto" and prefs.count("auto") == 1, tier
     assert all(spec == EngineSpec(provider="freellmapi", model_from_preferences=tier)

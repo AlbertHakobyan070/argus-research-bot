@@ -4,7 +4,8 @@ Every call names a role; its binding (primary, fallbacks, failure policy)
 comes from an ``EnginesSnapshot``. On each engine: connection errors, 5xx
 and 429 (also as the code of an error object in a 200 body) get up to three
 tries with backoff, honouring ``Retry-After`` up to the provider's
-``retry_after_cap_s``; a timeout is retried at most ``timeout_retry_max``
+``retry_after_cap_s``; a 429 then keeps waiting (≤ 30 s a step) while the
+provider's ``quota_wait_s`` lasts; a timeout is retried at most ``timeout_retry_max``
 times; any other error fails that engine (the SDK itself never retries).
 Then tagged reasoning blocks are stripped; a JSON role cut off at the token
 limit gets one retry with double the budget (4096 when it had none); a
@@ -65,8 +66,9 @@ class CallRecord:
     reasoning_tokens: int = 0
     finish_reason: str = ""
     json_mode: bool = False
-    retry_reason: str = ""          # "transient" | "timeout" | "retry_after" | "truncated" | "unparseable" | "diversity_rerun"
+    retry_reason: str = ""          # "transient" | "timeout" | "retry_after" | "quota_wait" | "truncated" | "unparseable" | "diversity_rerun"
     item: str = ""
+    started_at: str = ""            # UTC ISO time the attempt was sent
     cached: bool = False
     extra: dict = field(default_factory=dict)
 
@@ -117,6 +119,7 @@ def strip_reasoning(text: str) -> str:
 
 
 _TRANSIENT_TRIES = 3
+_QUOTA_STEP_S = 30.0                # one wait while a provider's quota_wait_s lasts
 _TRUNCATION_CAP = 4096
 _NUDGE = "Reply with only the JSON object."
 _MD_NUDGE = "Reply with only the complete markdown text."      # a markdown role's validate retry
@@ -188,11 +191,13 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
                temperature: float | None, max_tokens: int | None, json_mode: bool | None,
                expect_json: bool, validate: Callable[[str], Any] | None, item: str) -> LLMResult | None:
     """Every attempt on one engine: its LLMResult, or None when it failed."""
+    started = [_now()]
+
     def record(**kw) -> CallRecord:
         rec = CallRecord(**{"role": role, "tier": binding.tier, "profile": profile,
                             "provider": engine.provider, "requested_model": engine.model or "",
                             "served_model": "", "routed_via": "", "fallback_rank": rank,
-                            "item": item, **kw})
+                            "item": item, "started_at": started[0], **kw})
         records.append(rec)
         return rec
 
@@ -206,13 +211,17 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
                      else role in JSON_ROLES and provider.supports_json_mode)
     temperature = temperature if temperature is not None else engine.temperature
     budget = max_tokens if max_tokens is not None else engine.max_tokens
+    if budget is not None and provider.min_max_tokens:
+        budget = max(budget, provider.min_max_tokens)
     msgs = list(messages)
     attempt = transient = timeouts = 0
+    quota_waited = 0.0
     reason = ""
     truncated = nudged = False
     while True:
         attempt += 1
         _limiter.wait(provider)
+        started[0] = _now()
         t0 = time.monotonic()
         try:
             resp = _driver.complete(engine, provider, msgs, temperature=temperature,
@@ -231,11 +240,19 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
                     reason = "timeout"
                     continue
                 return None
-            if _is_transient(e) and transient < _TRANSIENT_TRIES - 1:
+            if not _is_transient(e):
+                return None
+            wait = _retry_after(e, provider)
+            if transient < _TRANSIENT_TRIES - 1:
                 transient += 1
-                wait = _retry_after(e, provider)
                 reason = "transient" if wait is None else "retry_after"
                 _sleep(min(8.0, 2.0 ** (transient - 1)) if wait is None else wait)
+                continue
+            if _code(e) == 429 and quota_waited < provider.quota_wait_s:   # an exhausted quota refills by waiting
+                step = min(_QUOTA_STEP_S if wait is None else wait, provider.quota_wait_s - quota_waited)
+                quota_waited += step
+                reason = "quota_wait"
+                _sleep(step)
                 continue
             return None
         rec = record(attempt=attempt, latency_ms=_ms(t0), json_mode=json_mode, retry_reason=reason,
@@ -267,11 +284,20 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
         return LLMResult(text=text, parsed=parsed, record=rec, records=list(records))
 
 
+def _code(e: Exception) -> int | None:
+    code = e.code if isinstance(e, DriverError) else getattr(e, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
 def _is_transient(e: Exception) -> bool:
     if isinstance(e, openai.APIConnectionError):
         return True
-    code = e.code if isinstance(e, DriverError) else getattr(e, "status_code", None)
-    return isinstance(code, int) and (code == 429 or code >= 500)
+    code = _code(e)
+    return code is not None and (code == 429 or code >= 500)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _redact(text: str, provider: ProviderSpec) -> str:

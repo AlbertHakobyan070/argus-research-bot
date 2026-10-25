@@ -321,6 +321,13 @@ def test_the_title_block_says_when_the_judge_shares_the_writers_family(monkeypat
     assert "· judge diversity ⚠ ·" in md.split("---")[0]
 
 
+def test_the_title_block_shows_no_diversity_verdict_when_nothing_was_judged(monkeypatch, tmp_path):
+    """Run 104a2cb1: every grounding batch failed, and the line still said 'judge diversity ok'."""
+    pv = {**_state()["panel_verdict"], "judged": 0, "judge_not_diverse": False}
+    _, md, *_ = _report(monkeypatch, tmp_path, _state(panel_verdict=pv))
+    assert "· judge diversity n/a · judged 0/" in md.split("---")[0]
+
+
 def test_degradation_notes_show_this_round_and_count_the_earlier_ones(monkeypatch, tmp_path):
     errors = ["[r1] skip: research.digest https://x.example/p (role research.digest: every engine failed after "
               "3 attempts (last: DriverError: 429))",
