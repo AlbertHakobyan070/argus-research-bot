@@ -273,7 +273,8 @@ async def test_openai_audio_extraction_failure_is_a_transcribe_error(tmp_path, m
 # ---------------------------------------------------------------------------
 
 async def test_faster_whisper_maps_the_block_onto_whisper_model(tmp_path, monkeypatch):
-    import faster_whisper
+    import sys
+    import types
     made: list[tuple] = []
 
     class FakeModel:
@@ -285,7 +286,10 @@ async def test_faster_whisper_maps_the_block_onto_whisper_model(tmp_path, monkey
             segs = [type("S", (), {"text": t}) for t in (" hello ", "", "world")]
             return iter(segs), type("I", (), {"language": "en"})
 
-    monkeypatch.setattr(faster_whisper, "WhisperModel", FakeModel)
+    # A stand-in module, so the test needs no optional `asr` extra installed.
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = FakeModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
     monkeypatch.setattr(transcribers, "_ASR_MODEL", None)
     monkeypatch.setattr(transcribers, "asr_available", lambda: True)
     cfg = _cfg(faster_whisper={"model": "tiny", "device": "cuda", "compute_type": "float16"})
@@ -416,14 +420,17 @@ async def test_cancelled_openai_audio_leaves_no_temp_folder(tmp_path, monkeypatc
     assert not list(tmp_path.glob("argus_audio_*"))
 
 
-def test_asr_available_does_not_import_faster_whisper():
+def test_asr_available_does_not_import_faster_whisper(tmp_path):
     """Review Minor 3: the check runs on the event loop, so it must not pay
-    the package import."""
+    the package import. An empty stand-in package on PYTHONPATH makes it
+    findable whether or not the optional `asr` extra is installed."""
     import sys
+    (tmp_path / "faster_whisper").mkdir()
+    (tmp_path / "faster_whisper" / "__init__.py").write_text("", encoding="utf-8")
     code = ("import sys; from argus.engines import transcribers; "
             "print(transcribers.asr_available(), 'faster_whisper' in sys.modules)")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
-                         env={**__import__("os").environ, "PYTHONPATH": ""}).stdout.split()
+                         env={**__import__("os").environ, "PYTHONPATH": str(tmp_path)}).stdout.split()
     assert out == ["True", "False"]
 
 
