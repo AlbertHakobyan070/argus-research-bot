@@ -365,7 +365,7 @@ _TG_MEDIA_WRITE_TIMEOUT_S = float(
 
 _STATUS_GLYPHS = {
     "planning": "🧠", "awaiting_plan": "📋", "running": "🔄",
-    "awaiting_report": "📝", "done": "✅", "cancelled": "❌", "error": "⚠️",
+    "awaiting_report": "📝", "done": "✅", "cancelled": "❌", "paused": "⏸", "error": "⚠️",
 }
 
 

@@ -140,7 +140,7 @@ const host = (url) => { try { return new URL(url).host; } catch { return url || 
 function describe(e) {
   const d = e.data || {};
   switch (e.kind) {
-    case "stage": return [["error", "cancelled", "draining"].includes(d.status) ? "trap" : "",
+    case "stage": return [["error", "cancelled", "draining", "paused"].includes(d.status) ? "trap" : "",
       `${d.status}${d.summary ? ` — ${d.summary}` : ""}`];
     case "search": return ["", `search wave ${d.wave} (${d.mode}): ${count(d.queries)} queries, ${count(d.hits)} hits`
       + (d.errors?.length ? `, ${d.errors.length} errors` : "")];

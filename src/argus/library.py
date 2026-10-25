@@ -49,6 +49,7 @@ VALID_RUN_STATUSES: tuple[str, ...] = (
     "awaiting_report",  # paused at the report-preview HITL gate
     "done",             # delivered (or report exists and run closed)
     "cancelled",
+    "paused",           # every engine of a call ran out of quota; /continue reruns the node
     "error",
 )
 
