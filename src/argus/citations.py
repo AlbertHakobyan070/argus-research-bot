@@ -8,6 +8,10 @@ require every URL in the final report to resolve to a URL that was
 actually fetched by a researcher tool — anything else is stripped along
 with its inline citation.
 
+In v3 the writers cite ``[n]`` source ids and compose builds the
+## Sources block from ``fetched``, so every Sources URL resolves; this
+pass is now the backstop for URLs a writer inlines anyway.
+
 This module is lifted from NVIDIA AI-Q Blueprint's
 ``src/aiq_agent/common/citation_verification.py`` (Apache-2.0, NVIDIA).
 We keep the core algorithms but rewrite the integration surface to match
@@ -399,7 +403,8 @@ def sanitize_report(report_text: str) -> SanitizationResult:
 
     # Post-pass: drop orphan IP-address tokens that may have been left in
     # display text after a link was removed. Real research reports never
-    # contain raw IPs.
+    # contain raw IPs. Caveat (probe-verified): a bare 4-part version with
+    # 1-3 digit parts matches too — "OpenSSL 1.1.1.4" loses its version.
     cleaned = _IPV4_RE.sub("", cleaned)
 
     return SanitizationResult(cleaned_text=cleaned, removed=removed)

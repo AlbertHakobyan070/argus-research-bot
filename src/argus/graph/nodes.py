@@ -73,9 +73,9 @@ def report_builder_node(state: ArgusState) -> dict:
     """T7 — mode-aware report builder.
 
     Responsibilities:
-    1. Pick the markdown template based on ``state["length"]``
-       (delegated to ``_draft_md_from_findings`` if the synthesizer
-       failed and returned no draft_md).
+    1. Use compose's ``draft_md`` as the body (``# (empty draft)`` when
+       missing); ``state["length"]`` selects the mode label, the title
+       block and whether the lecture appendix is added.
     2. Prepend a T7 title-page block (mode, date, quality summary,
        per-section confidence) so the user can see what they're getting
        before scrolling.
@@ -86,8 +86,9 @@ def report_builder_node(state: ArgusState) -> dict:
        adversarial pass.
     5. Write ``metadata.json`` sidecar with the same fields + the full
        validated_assessment + lecture_appendix blobs.
-    6. Render markdown -> PDF via ReportLab (fast, no browser) with
-       fallback to intel-stack Chromium for the styled HTML route.
+    6. Render markdown -> PDF via ``tools.markdown_to_pdf`` (ReportLab
+       first, intel-stack Chromium in-process second), with a
+       last-resort subprocess render under the intel-stack venv.
     7. Trigger the report-preview HITL gate.
     """
     from ..config import get_settings
@@ -160,10 +161,12 @@ def report_builder_node(state: ArgusState) -> dict:
                 )
                 n_quarantined = len(q)
                 n_still_unmatched = len(unmatched)
-                # Append the structured appendix. The body itself is
-                # left intact (the synthesizer already wrote it from
-                # the surviving findings); the appendix is the only
-                # place where flagged claims appear.
+                # Append the structured appendix; the body is left
+                # intact. In v3 that means the flagged claims are STILL
+                # in the body — compose extracts findings FROM prose it
+                # already wrote — while the appendix text says they
+                # "were removed from the body" (probe-verified). Only
+                # the legacy string path below actually cuts sentences.
                 if q:
                     body = body + _render_quarantine_appendix(q)
                 used_structured_quarantine = True
@@ -295,9 +298,10 @@ def report_builder_node(state: ArgusState) -> dict:
 
     pdf_ok = False
     try:
-        # markdown_to_pdf uses playwright via the intel-stack helper. That
-        # helper imports playwright at runtime, so if it isn't in the
-        # argus venv we delegate to the intel-stack venv python.
+        # markdown_to_pdf tries ReportLab first and only falls back to
+        # intel-stack's _common.py (Chromium/playwright) in-process. If
+        # that import fails in the argus venv, the except-branch below
+        # re-runs the helper under the intel-stack venv's python.
         try:
             # NB: pass the raw human-readable topic (not the filesystem
             # slug) — the renderer uses this only for PDF metadata /
@@ -444,7 +448,8 @@ def revise_prep_node(state: ArgusState) -> dict:
     ``compose`` runs in user-revision mode (rewrite every section with
     the user's notes) rather than a leftover targeted panel revision.
     The user's feedback is already in ``revision_notes`` (the bot
-    appended it before resuming).
+    appended it before resuming) — LAST, after any panel notes, which
+    matters because the writers read only the first 8 notes.
     """
     rnd = int(state.get("revise_rounds") or 0) + 1
     return {

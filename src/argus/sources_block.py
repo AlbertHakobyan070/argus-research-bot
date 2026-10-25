@@ -17,6 +17,11 @@ Findings that referenced ``[2]`` or ``[7]`` are left pointing at nothing.
 This module sits between :func:`citations.verify_citations` and the
 markdown write. It is pure (no I/O, no LLM) so it is unit-testable.
 
+v3 note (probe-verified): compose.build_sources_block writes Sources
+lines as ``N. [title](url)``, which the ``[N] …`` line parser below does
+not match — so on v3 reports this pass finds no dangling slot and
+returns the text unchanged. It still guards v2-format drafts.
+
 Algorithm
 ---------
 1. Locate the ``## Sources`` (or ``## References`` for lecture mode)

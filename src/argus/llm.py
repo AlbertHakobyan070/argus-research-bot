@@ -3,7 +3,8 @@
 FreeLLMAPI exposes an OpenAI-compatible /v1/models endpoint behind a single
 Bearer token. We:
 
-  1. Resolve the live model ID list at startup (never assume a fixed list).
+  1. Resolve the live model ID list on first use, then cache it for the
+     process (never assume a fixed list).
   2. Map three tiers (cheap / strong / judge) onto concrete model IDs,
      preferring specific names but falling back to ``auto`` if a preferred
      model disappears.
@@ -79,7 +80,10 @@ PREFERRED: dict[Tier, list[str]] = {
     ],
 }
 
-# Cache resolved choices per process. Invalidated when /v1/models changes.
+# Cache resolved choices per process. NOT refreshed automatically: only a
+# ``force=True`` call re-reads /v1/models, and nothing in src/ passes one
+# (tests/test_llm.py does), so a tier keeps its model until the bot
+# restarts even if the proxy stops serving it.
 _resolved_cache: dict[Tier, str] = {}
 _model_list_cache: list[str] = []
 _cache_signature: tuple[str, int] | None = None
@@ -169,9 +173,17 @@ def pick_strong_and_judge(force: bool = False) -> tuple[str, str]:
     """Pick strong + judge model IDs such that they are from different families.
 
     Family is approximated by the leading path segment (``openai/``,
-    ``gemini``, ``qwen``, ``deepseek``, ``meta-llama``, etc.). If the chosen
-    strong model and the chosen judge share a family, walk the judge
-    preference list to find a different family.
+    ``qwen/``, ``meta-llama/``, …). If the chosen strong model and the
+    chosen judge share a family, walk the judge preference list to find
+    a different family.
+
+    Blind spot: an id WITHOUT a slash is its own family (minus any
+    ``:tag``), so ``gemini-3.5-flash`` and ``gemini-2.5-flash`` count as
+    different families, as do ``DeepSeek-V3.2`` and ``deepseek-ai/…`` —
+    the diversity guarantee only holds between slash-prefixed ids.
+
+    Side effect: overwrites the process-wide strong/judge cache, so later
+    ``chat_for_tier("judge")`` calls get the diversified judge too.
     """
     ids = fetch_live_models(force=force)
     strong = _first_present(PREFERRED["strong"], ids) or "auto"

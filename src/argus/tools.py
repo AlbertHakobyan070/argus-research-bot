@@ -1,7 +1,9 @@
-"""LangGraph tool wrappers around the intel-stack scripts.
+"""Subprocess wrappers around the intel-stack scripts, plus search, PDF
+and YouTube helpers — plain functions the graph nodes and the bot call
+(not LangChain ``@tool`` objects).
 
 These wrap, do not reimplement:
-  - harvest.py  (primary-source harvester / intel-radar)
+  - harvest.py  (primary-source harvester / intel-radar; no v3 caller)
   - snatch.py   (universal downloader / web-hunter)
   - crawl.py    (crawl4ai wrapper)
   - article_convert.py (URL/local file -> clean markdown)
@@ -53,7 +55,10 @@ except Exception:  # pragma: no cover
 # Re-export under a stable name so tests can ``monkeypatch.setattr(tools, "DDGS", ...)``.
 DDGS = _DDGS
 
-INTEL_STACK_DIR = Path(r"A:\Hermes\Agents\intel-stack\scripts")
+INTEL_STACK_DIR = Path(os.environ.get(
+    "INTEL_STACK_DIR",
+    r"A:\Hermes\Agents\intel-stack\scripts",
+)).expanduser()
 PYTHON_BIN = Path(sys.executable)  # the argus venv's python
 
 # Some intel-stack scripts need their own venv (feedparser, crawl4ai,
@@ -62,7 +67,7 @@ PYTHON_BIN = Path(sys.executable)  # the argus venv's python
 INTEL_PYTHON_BIN = Path(os.environ.get(
     "INTEL_PYTHON",
     r"A:\Hermes\Agents\intel-stack\venv\Scripts\python.exe",
-))
+)).expanduser()
 
 DEFAULT_TIMEOUT_S = int(os.environ.get("ARGUS_TOOL_TIMEOUT", "120"))
 
@@ -147,7 +152,7 @@ def _run_script(script: str, args: list[str], *, timeout: int = DEFAULT_TIMEOUT_
         )
 
 def _parse_json_field(out: str, field: str) -> str:
-    """Extract ``field`` from the last JSON-looking line of stdout.
+    r"""Extract ``field`` from the last JSON-looking line of stdout.
 
     Several intel-stack scripts (snatch.py, crawl.py) print a single
     JSON object on stdout like ``{"ok": true, "folder": "A:\..."}``.
@@ -178,7 +183,7 @@ def _parse_json_field(out: str, field: str) -> str:
 
 
 def _parse_article_convert_path(out: str, *, prefer: str = "md") -> str | None:
-    """Extract the artifact path from ``article_convert.py`` stdout.
+    r"""Extract the artifact path from ``article_convert.py`` stdout.
 
     The script prints lines like ``md: A:\path\file.md`` or
     ``pdf: A:\path\file.pdf`` as its last data line. ``prefer``
@@ -620,7 +625,7 @@ def _strip_emoji(text: str) -> str:
 
 
 def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
-    """Old-money editorial PDF via ReportLab (Chromium-free fallback path).
+    """Old-money editorial PDF via ReportLab (Chromium-free primary path).
 
     Design: warm ivory page, a single hairline frame, one serif type
     system throughout (Cardo for display/headings, Crimson Text for
@@ -1015,6 +1020,10 @@ def _render_pdf_reportlab(md_text: str, pdf_path: str, *, title: str) -> None:
 #
 # Both fail soft: any exception (network, parse, library bug) degrades to
 # [] + a warning. The graph never crashes because a search backend is down.
+#
+# v3: the research engine reaches only ``ddgs_search`` (through
+# graph/search_providers.py); ``search_web`` / ``perplexity_search`` have
+# no caller in src/ and are kept for their tests.
 
 PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search"
 PERPLEXITY_MODEL = "sonar"
@@ -1120,7 +1129,8 @@ def _validate_timelimit(timelimit: str | None) -> str | None:
 
 def ddgs_search(query: str, *, max_results: int = 8,
                 timelimit: str | None = None) -> list[dict[str, str]]:
-    """Search DuckDuckGo via the ``duckduckgo_search`` library (DDGS).
+    """Search DuckDuckGo via DDGS — the ``ddgs`` package, with the legacy
+    ``duckduckgo_search`` name as fallback (see the import block at top).
 
     Returns ``[]`` (with a logged warning) if the library is not installed
     or DDGS raises. The mapping from DDGS's ``{href,title,body}`` to our
@@ -1206,14 +1216,21 @@ def search_web(
 # ---------------------------------------------------------------------------
 
 def _run_yt_dlp(args: list[str], *, timeout: int = 60) -> tuple[int, str, str]:
-    """Run ``python -m yt_dlp`` in the intel-stack venv (which has yt-dlp).
+    """Run ``python -m yt_dlp`` in the ARGUS venv.
 
-    PYTHONPATH is cleared so the intel-stack interpreter doesn't inherit the
-    argus venv / Hermes path leak (same rule as ``_run_script``).
+    This used to borrow the intel-stack interpreter, which made /find and
+    YouTube transcripts depend on a sibling repo that only exists on the
+    Windows box. yt-dlp is a declared argus dependency (pyproject), so the
+    argus venv already has it and is the correct interpreter — unlike
+    ``_run_script``, whose scripts really do need intel-stack's extras
+    (feedparser / crawl4ai / markitdown).
+
+    PYTHONPATH is cleared for the same reason as ``_run_script``: the
+    parent Hermes venv leaks an incompatible pydantic_core.
     """
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
-    cmd = [str(INTEL_PYTHON_BIN), "-m", "yt_dlp", *args]
+    cmd = [str(PYTHON_BIN), "-m", "yt_dlp", *args]
     logger.debug("exec: %s", " ".join(cmd))
     try:
         proc = subprocess.run(
@@ -1448,7 +1465,9 @@ def youtube_video_transcript(
     all English variants — en-US, en-GB, etc.). The smoke-test video
     produced ``jNQXAC9IVRw.en-en.vtt``; we accept any ``*.vtt``.
 
-    The result's ``transcript_path`` points at the on-disk ``.txt`` (also
+    The result's ``transcript_path`` points at the on-disk ``.txt`` /
+    ``.srt`` deliverable — in ``out_dir`` (the vault) when given, else in
+    the tempdir cache ``argus_ytt_out`` that cache_cleanup ages out (also
     readable via transcript_text). Caller can attach the ``.txt`` to a
     Telegram chat directly — ~10-20 kB for a 10-min video.
     """

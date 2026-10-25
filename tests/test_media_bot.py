@@ -248,3 +248,57 @@ async def test_media_button_on_expired_pool_says_so():
     assert not ctx.application.created_tasks
     note = str(ctx.application.bot.send_message.await_args_list[-1])
     assert "expired" in note
+
+
+# ---------------------------------------------------------------------------
+# file delivery: timeouts and failure reporting
+# ---------------------------------------------------------------------------
+
+
+def test_application_configures_upload_timeouts():
+    """PTB's defaults (write 5s, media_write 20s, read 5s) cannot push a
+    40 MB video off a home uplink, so send_video raised TimedOut, the
+    document fallback timed out too, and the user got "✅ Saved <path>"
+    with no file. Regression guard: the action client must be patient."""
+    from argus.bot import build_application
+
+    app = build_application()
+    req = app.bot.request
+    t = req._client.timeout
+    assert req._media_write_timeout >= 600, (
+        "media uploads need minutes, not PTB's default 20s")
+    assert t.read >= 60, "Telegram transcodes video before it replies"
+    assert t.write >= 60
+    assert t.connect >= 15
+    assert t.pool >= 10
+
+
+async def test_user_is_told_when_telegram_delivery_fails(monkeypatch,
+                                                         tmp_path):
+    """Both sends failing used to be logged only — the user saw '✅ Saved'
+    and silently never got the file."""
+    from argus import media as media_mod
+
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"z" * 1024)
+
+    async def _fake_download(url, **kw):
+        return media_mod.MediaResult(
+            ok=True, url=url, platform="x", path=str(vid),
+            title="Clip", size_bytes=1024, duration_s=3.0)
+
+    monkeypatch.setattr(bot_mod, "download_media", _fake_download)
+
+    app = MagicMock()
+    app.bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=7))
+    app.bot.edit_message_text = AsyncMock()
+    app.bot.send_video = AsyncMock(side_effect=TimeoutError("upload timed out"))
+    app.bot.send_document = AsyncMock(side_effect=TimeoutError("also timed out"))
+    app.bot_data = {}
+
+    await bot_mod._fetch_one_media(app, 42, "https://x.com/u/status/1")
+
+    said = " ".join(str(c) for c in app.bot.send_message.await_args_list)
+    assert "delivery" in said.lower(), (
+        "a failed upload must be reported, not just logged")
