@@ -1,23 +1,39 @@
 # Argus
 
-Single-user Telegram research + media bot. The research engine (LangGraph)
-scopes a request, searches live (Exa / DDGS / arXiv / GitHub), fetches and
-**reads** every source into cited evidence notes, writes a sectioned
-report, analyses it, has a grounding judge check every finding against the
-quotes it cites, **cuts** what fails, and delivers markdown + PDF + an
-`evidence.json` — with two human-in-the-loop gates (plan, report preview).
-A Telegram Mini App console (menu button) shows the same runs, plans and
-reports. The media side downloads YouTube / X / Reddit / Instagram media
-into the vault and transcribes it.
+[![ci](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/ci.yml)
+[![docs](https://github.com/AlbertHakobyan070/argus-research-bot/actions/workflows/docs.yml/badge.svg)](https://alberthakobyan070.github.io/argus-research-bot/)
 
-Which models do the work is configuration: **engines profiles** in
-`argus_engines.json` bind every pipeline role to a provider and model (the
-default profile uses a local **FreeLLMAPI** proxy; others use paid APIs or
-local servers). See `/engines` and `docs/help.md`.
+A single-user Telegram bot for research you can check, and for saving media.
 
-Optional: set `EXA_API_KEY` in `.env` to enable Exa neural search (search +
-page text in one call). Without it, DDGS takes its queries; with it, a
-per-run Exa budget (from the depth preset) applies.
+Ask it a question and it plans the research with you, searches live (Exa,
+DDGS, arXiv, GitHub), reads every source into notes with verbatim quotes,
+writes a cited report, has a separate judge check each claim against the
+quotes it cites, and **cuts** what fails. You get Markdown, a PDF and an
+`evidence.json`.
+
+**Documentation: <https://alberthakobyan070.github.io/argus-research-bot/>**
+([user guide](https://alberthakobyan070.github.io/argus-research-bot/help/) ·
+[how it works](https://alberthakobyan070.github.io/argus-research-bot/how-it-works/))
+
+## What it does
+
+- **Two checkpoints with you.** A plan gate over the real sources before
+  anything is fetched (approve, edit, set length, depth, engines and recency),
+  and a report gate before delivery (send, extend, revise, cancel).
+- **Trust first.** Links come only from live search, quotes are checked word
+  for word, unsupported claims leave the body for an appendix, and anything
+  unchecked is announced at the top of the report.
+- **Swappable engines.** `argus_engines.json` binds every pipeline role to a
+  provider and model: the free FreeLLMAPI proxy (default), paid APIs
+  (OpenAI-compatible, Anthropic, Gemini, Groq, OpenRouter) or local servers
+  (Ollama, LM Studio). Switch with `/engines`; each report records which model
+  actually served each call.
+- **A console in Telegram.** The Argus menu button opens a Mini App, served
+  from your machine through a cloudflared quick tunnel: runs, live progress,
+  plan controls, a report reader with tap-to-verify citations, and engines
+  settings.
+- **Media.** YouTube, X, Reddit and Instagram downloads into your vault, with
+  transcription (local faster-whisper or an OpenAI-compatible audio API).
 
 ## Quick start
 
@@ -26,7 +42,7 @@ per-run Exa budget (from the depth preset) applies.
 cp .env.example .env
 # Edit .env: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID (your numeric
 #   Telegram id), and the key of the engines profile you use
-#   (FREELLMAPI_API_KEY for the default profile).
+#   (FREELLMAPI_API_KEY for the default profile). EXA_API_KEY is optional.
 
 # 2) install (from the repo root)
 uv venv --python 3.12 venv
@@ -36,207 +52,33 @@ VIRTUAL_ENV=venv uv pip install -e ".[dev]"     # add ",asr" for local faster-wh
 ./scripts/run.sh
 ```
 
-Then in Telegram: `/research <topic>` (deep) or `/ask <question>` (quick, no
-search). Every run gets its own SQLite checkpoint thread (`tg:<chat>:<run8>`),
-is registered in the library DB (`argus_library.sqlite`), and its report
-folder lands in the vault research-history folder (override with
-`ARGUS_REPORTS_ROOT` / `ARGUS_VAULT_ROOT`).
+Then in Telegram: `/research <topic>`, or `/ask <question>` for a quick
+answer without search. `/help` lists every command.
 
-The bot starts without any LLM server reachable: media, `/find` and `/runs`
-work, engines problems are logged and DM'd once, and a run that needs a
-missing engine is refused with the reason.
+For the console, put the cloudflared binary in `tools/bin/` (gitignored) or
+set `ARGUS_CLOUDFLARED`; without it the chat keeps working and the console
+reports "cloudflared not found".
 
-## ⚠ PYTHONPATH gotcha (read this or nothing will start)
+> **PYTHONPATH:** the argus venv must run with an empty `PYTHONPATH` (a parent
+> venv's `site-packages` breaks `pydantic_core`). The `scripts/run*.sh`
+> scripts clear it; if you bypass them, `unset PYTHONPATH` first.
 
-The parent Hermes venv exports a `PYTHONPATH` that prepends its own
-`site-packages` (different `pydantic_core` ABI). The argus venv must run
-with a **clean** `PYTHONPATH`, otherwise pydantic_core fails to import
-and the whole bot explodes on startup.
+## More
 
-`scripts/run.sh`, `scripts/run_mac.sh`, `scripts/run_tests.sh` and
-`scripts/run_demo.sh` all start with `export PYTHONPATH=""`. Use them. If you
-bypass the scripts, do `set PYTHONPATH=` (cmd) or `unset PYTHONPATH` (bash)
-first.
+- Running, the console and tunnel, migration and troubleshooting: `handoff.md`.
+- The v4 design and what each work package built: `docs/argus-v4-design.md`,
+  `docs/v4-notes/`.
+- Tests: `./scripts/run_tests.sh -q`. Green tests are not a working bot;
+  `scripts/verify_live.sh` drives the real graph end to end.
+- Secrets live in `.env` only (gitignored); `argus_engines.json` holds env var
+  names, never values.
 
-## Architecture
-
-```
-   Telegram chat (single user)            Mini App console (menu button)
-              │                                        │  aiohttp on 127.0.0.1,
-              ▼                                        ▼  cloudflared quick tunnel
-   python-telegram-bot (async) ──► run driver (bot/runs.py) ◄── webapp/api.py
-                                     one live drive per run · cancel by drain
-                                     · event bus → progress card / console
-                                          │
-                                          ▼
-   intake → brief → scout ══╣ PLAN GATE ╠══ research → outline → compose → analyst → panel
-   panel → research         (a coverage gap: a targeted, bounded gap wave, then outline in extend mode)
-   panel → compose          (a targeted, bounded rewrite of the weak sections)
-   panel → report_builder ══╣ REPORT GATE ╠══ deliver → end
-                                                     | Extend → extend_prep → research
-                                                     | Revise → revise_prep → compose
-   quick path (/ask):  intake → quick_answer → deliver
-```
-
-The two gates are LangGraph interrupts: after `scout` (plan approval over the
-real sources live search found) and before `deliver` (report preview). The
-run driver resumes them; it treats a gate as one only while no drive holds
-the run.
-
-### What each stage does
-
-| Stage | Job |
-|---|---|
-| `intake` | classify quick vs deep, refine the request |
-| `brief` | sub-questions, success criteria, archetype, time sensitivity, entities — no URLs, so hallucinated links are structurally impossible |
-| `scout` | one live discovery wave per sub-question across the search providers; decides the recency window |
-| **PLAN GATE** | Approve / Edit / Cancel over the real found sources, with length, depth, engines-profile and recency knobs |
-| `research` | waves of rerank → fetch (an SSRF-guarded native fetcher, Exa text, optional intel-stack rungs) → digest (an LLM reads each document into claims with verbatim-checked quotes) under one spend ledger; gap waves and Extend passes are targeted and budgeted |
-| `outline` | sections with allocated evidence notes, shaped by the archetype; an Extend keeps the titles |
-| `compose` | parallel section writers over their own notes (plain markdown), then finding extraction per section |
-| `analyst` | takeaways with confidence labels, disagreements and scenarios, from the findings |
-| `panel` | batched grounding judge (every finding judged against its cited quotes), coverage review, deterministic precision scan; routes to a gap wave, a targeted rewrite or the report |
-| `report_builder` | cuts rejected claims, compiles the TL;DR from kept findings, banners and degradation notes, Sources, PDF, `metadata.json`, `evidence.json` |
-| **REPORT GATE** | Send / Extend / Revise / Cancel |
-| `deliver` | ends the run, or routes to Extend / Revise |
-
-Design docs: `docs/argus-v4-design.md` (the v4 spec), `docs/v4-notes/` (what
-each work package built and why), `docs/research-engine-v3.md` (the engine v4
-builds on).
-
-### Engines
-
-- `engines/roles.py` — the pipeline roles and their failure-policy classes.
-- `engines/schema.py` / `argus_engines.json` — providers (base URL, key env
-  var name, capabilities), profiles (tier engines + per-role bindings with
-  fallbacks and `on_exhausted` = `raise` / `skip_item` / `degrade`), the
-  transcriber block, dated prices.
-- `engines/registry.py` — merges the defaults file, the optional
-  `argus_engines.local.json` (gitignored) and the library's `/engines`
-  choices; validates the schema at startup (no network) and the active
-  profile at run start; resolves it into the snapshot every run carries.
-- `llm.py` — the one facade, `complete(role, …)`: retries, fallbacks, the
-  declared policy, and a `CallRecord` per attempt (requested vs served model,
-  routing) in `state["model_calls"]` and `metadata.json["engines"]`.
-- A declared fallback is never silent: it is a `degrade:` / `skip:` line in
-  the report's degradation notes and, past a threshold, a "⚠ Degraded run"
-  banner.
-
-### Run configuration
-
-Each run carries a `RunConfig` (`graph/run_config.py`): length, depth preset
-(`quick` / `standard` / `deep` / `exhaustive`), recency, the research /
-search / fetch / compose / panel knobs, and the engines snapshot. The
-presets are the table in `PRESETS`; the console accepts dotted overrides.
-Pre-v4 checkpoints resume with their length's legacy preset, recorded in the
-run's errors and notes.
-
-## Project layout
-
-```
-argus/
-├── README.md, handoff.md       (this file; operations and migration notes)
-├── pyproject.toml
-├── argus_engines.json          (engine providers, profiles, transcriber, prices)
-├── .env.example                (NEVER commit .env)
-├── docs/
-│   ├── help.md                 (the /help full command guide)
-│   ├── argus-v4-design.md      (v4 build spec)
-│   ├── v4-notes/               (one note per work package)
-│   └── research-engine-v3.md   (the v3 engine design)
-├── src/argus/
-│   ├── config.py               (Settings, .env loader)
-│   ├── llm.py                  (the LLM facade)
-│   ├── engines/                (roles, schema, registry, driver, ledger,
-│   │                            URLs, fetchers, search, transcribers)
-│   ├── graph/                  (state, run_config, the nodes, assembly,
-│   │                            evidence export, precision, quarantine)
-│   ├── bot/                    (the Telegram package; run driver, progress)
-│   ├── webapp/                 (Mini App: server, auth, API, render, tunnel, static/)
-│   ├── library.py              (run + asset registry, aiosqlite)
-│   ├── tools.py                (intel-stack wrappers, search, PDF and YouTube helpers)
-│   ├── media.py, transcribe.py (media downloads, transcription into the vault)
-│   └── quarantine.py, citations.py, sources_block.py, cache_cleanup.py
-├── bench/                      (runner, deterministic metrics, compare, queries)
-├── scripts/
-│   ├── run.sh / run_mac.sh     (pre-flight, then the bot)
-│   ├── run_tests.sh, run_demo.sh, demo_run.py
-│   ├── live_check.py, verify_live.sh   (live end-to-end checks)
-│   ├── engines_probe.py        (probe a provider's request shapes)
-│   ├── webapp_dev_url.py, sync_arsenal.py  (console dev URL, kit snapshot)
-│   └── reconcile_vault.py
-├── tests/                      (hermetic suite + live-proxy tests)
-├── tools/bin/                  (gitignored: cloudflared)
-├── argus_checkpoints.sqlite    (LangGraph checkpoints, one thread per run)
-└── argus_library.sqlite        (run + asset registry)
-```
-
-## Tests
+### Building the docs locally
 
 ```bash
-./scripts/run_tests.sh -q       # the whole suite; the live-proxy tests need the proxy
-# hermetic only, as CI runs it: see the --ignore list in .github/workflows/ci.yml
+VIRTUAL_ENV=venv uv pip install "mkdocs-material>=9.5,<10" "mkdocs>=1.6,<2"
+./venv/Scripts/mkdocs serve      # macOS/Linux: ./venv/bin/mkdocs serve
 ```
 
-`tests/test_llm.py` and `tests/test_graph.py` are the live-proxy tests
-(the shipped engines config resolved against the live proxy; a
-network-deterministic graph drive where the LLM reads a controlled source).
-Shared test helpers live in `tests/helpers.py`.
-
-**Verification rule:** green tests ≠ a working bot. For research changes,
-drive the real graph end-to-end: `scripts/verify_live.sh` (proxy check, the
-live tests, then `scripts/live_check.py`, which prints an acceptance table and
-exits non-zero on any failed check). The proxy re-routes models, so also
-check `served_model` in a run's `metadata.json`. `python -m bench.metrics` and
-`python -m bench.compare` measure runs deterministically.
-
-## Demo
-
-```bash
-./scripts/run_demo.sh
-```
-
-Drives the **full graph** on the active engines profile. The search wave and
-page fetches are stubbed to a small controlled corpus so the run is
-network-deterministic, but the LLM does the real work — it digests the corpus
-into evidence notes, composes and analyses a sectioned report, and the panel
-judges it. Output lands in `demo_output/`: the report folder (`report.md`,
-`report.pdf`, `metadata.json`, `evidence.json`) and `demo_transcript.json`.
-The demo prints, for every LLM call, the role, the **requested** model and
-the **served** one.
-
-## Operational notes
-
-- See `handoff.md` for running the bot, the console and tunnel, migration,
-  and troubleshooting.
-- **Rate limits**: the free proxy throttles per IP and per key, and a run makes
-  many per-source calls. Only one run researches at a time; depth presets and
-  the per-run Exa budget bound the spend, and `/engines` shows this month's Exa
-  cost.
-- **Cancel** drains: the run finishes its current step, keeps its checkpoint,
-  and `/continue` resumes it.
-- **Source provenance**: every fetched item keeps its `markdown_path` on disk;
-  `metadata.json` and `evidence.json` list the models, sources, quotes and
-  verdicts.
-- **Trust, not a guarantee**: the judge only sees the notes' quotes; a claim
-  it cannot locate stays in the body and is listed as such, and an unjudged
-  finding marks the report "⚠ Not fact-checked".
-
-## Secret handling
-
-- API keys (`FREELLMAPI_API_KEY`, the paid providers' keys, `EXA_API_KEY`) and
-  `TELEGRAM_BOT_TOKEN` are read from the environment / `.env` only.
-  `argus_engines.json` holds env var **names**, never values. Never logged,
-  never hardcoded, never committed (`.env` is gitignored).
-- `TELEGRAM_ALLOWED_USER_ID` gates the bot (and the console's signed
-  `initData`) to a single Telegram user; unset, every user is refused.
-
-## Where outputs live
-
-Demo runs are written to `demo_output/` inside the project. Real Telegram
-reports default to the vault research-history folder; override the
-location with `ARGUS_REPORTS_ROOT` (and the vault root with
-`ARGUS_VAULT_ROOT`) in `.env`. The run + asset registry and the LangGraph
-checkpoints stay in the project dir (`argus_library.sqlite` /
-`argus_checkpoints.sqlite`), never in a synced vault. The console's tunnel log
-is `logs/cloudflared.log`.
+The site publishes itself to GitHub Pages on every push to `main` that touches
+`docs/` or `mkdocs.yml` (`.github/workflows/docs.yml`).
