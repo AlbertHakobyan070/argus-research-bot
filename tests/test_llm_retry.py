@@ -40,6 +40,7 @@ class _Driver:
 
     def complete(self, engine, provider, messages, **kw):
         self.calls += 1
+        self.kw = kw
         o = self.outcomes.pop(0)
         if isinstance(o, BaseException):
             raise o
@@ -116,6 +117,45 @@ def test_retry_after_is_honoured_up_to_the_cap(env, header, cap, slept):
     out = llm.complete("brief.draft", MSGS, engines=_snap())
     assert env.sleeps == [slept]
     assert out.records[1].retry_reason == "retry_after"
+
+
+def test_a_429_keeps_waiting_while_quota_wait_lasts(env):
+    env.providers["p"] = ProviderSpec(name="p", base_url="http://p/v1", quota_wait_s=70)
+    d = env.drive(*[_rate_limited()] * 5, _ok())
+    out = llm.complete("brief.draft", MSGS, engines=_snap())
+    assert d.calls == 6 and out.text == "ok"
+    assert env.sleeps == [1.0, 2.0, 30.0, 30.0, 10.0], "quick tries, then 30 s steps up to quota_wait_s"
+    assert [r.retry_reason for r in out.records][-3:] == ["quota_wait"] * 3
+
+
+def test_quota_wait_is_off_by_default_and_never_applies_to_5xx(env):
+    d = env.drive(*[_rate_limited()] * 5)
+    with pytest.raises(llm.EngineError):
+        llm.complete("brief.draft", MSGS, engines=_snap())
+    assert d.calls == 3
+
+    env.providers["p"] = ProviderSpec(name="p", base_url="http://p/v1", quota_wait_s=120)
+    err = openai.InternalServerError("500", response=httpx.Response(500, request=_REQ), body=None)
+    d = env.drive(*[err] * 5)
+    with pytest.raises(llm.EngineError):
+        llm.complete("brief.draft", MSGS, engines=_snap())
+    assert d.calls == 3, "a provider error is not an empty quota"
+
+
+@pytest.mark.parametrize("asked, sent", [(200, 2048), (9000, 9000), (None, None)])
+def test_min_max_tokens_floors_the_requested_budget(env, asked, sent):
+    env.providers["p"] = ProviderSpec(name="p", base_url="http://p/v1", min_max_tokens=2048)
+    d = env.drive(_ok())
+    llm.complete("brief.draft", MSGS, engines=_snap(), max_tokens=asked)
+    assert d.kw["max_tokens"] == sent
+
+
+def test_every_attempt_records_when_it_was_sent(env):
+    from datetime import datetime
+    env.drive(_rate_limited(), _ok())
+    out = llm.complete("brief.draft", MSGS, engines=_snap())
+    stamps = [datetime.fromisoformat(r.started_at) for r in out.records]
+    assert len(stamps) == 2 and stamps[0] <= stamps[1] and stamps[0].tzinfo is not None
 
 
 def test_rpm_limit_waits_for_the_sliding_window(env, monkeypatch):

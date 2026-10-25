@@ -8,7 +8,9 @@
       "base_url_env": "FREELLMAPI_BASE_URL",
       "api_key_env": "FREELLMAPI_API_KEY",
       "supports_json_mode": false,
-      "token_param": "max_completion_tokens",
+      "token_param": "max_tokens",
+      "min_max_tokens": 2048,
+      "quota_wait_s": 120,
       "models_endpoint": true,
       "model_preferences": {
         "cheap": [

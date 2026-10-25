@@ -281,8 +281,10 @@ def build_sidecar_metadata(*, topic: str, thread_id: str | None,
 def info_lines(*, state, rc, panel: dict, reroute_rate: float | None) -> list[str]:
     """The title block's v4 lines: engines, recency (when applied), research counters."""
     reroute = "n/a" if reroute_rate is None else f"{reroute_rate * 100:.0f} %"
+    judged = int(panel.get("judged") or 0)
+    diversity = "n/a" if not judged else "⚠" if panel.get("judge_not_diverse") else "ok"   # nothing judged: nothing to compare
     lines = [f"_Engines: {rc.engines.profile} · reroute {reroute} · judge diversity "
-             f"{'⚠' if panel.get('judge_not_diverse') else 'ok'} · judged {int(panel.get('judged') or 0)}/"
+             f"{diversity} · judged {judged}/"
              f"{int(panel.get('total') or 0)} · warnings {len(rc.engines.warnings)}_"]
     recency = (state.get("search_spend") or {}).get("recency")
     if recency:

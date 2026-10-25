@@ -44,6 +44,8 @@ class ProviderSpec(BaseModel):
     timeout_s: float = 60.0                                          # paid providers set ≥ 300 in argus_engines.json (R7)
     timeout_retry_max: int = 1                                       # a timed-out request is retried at most once
     retry_after_cap_s: float = 30.0                                  # Retry-After is honoured up to this bound
+    quota_wait_s: float = 0.0                                        # after the 3 quick tries, a 429 keeps waiting (≤ 30 s a step) up to this total
+    min_max_tokens: int | None = None                                # floor under every requested max_tokens (reasoning-model headroom)
     notes: str = ""                                                  # caveats shown in /engines and the console
 
     @model_validator(mode="after")
