@@ -129,8 +129,8 @@ def test_a_failed_batch_is_unjudged_never_passed(monkeypatch, tmp_path, failure)
 
     def reply(system, human):
         if "[f5]" in human:
-            if failure == "skipped":
-                raise DriverError("provider fake: 429 Too Many Requests", code=429)
+            if failure == "skipped":                      # a 503, not a 429: an exhausted quota pauses the run
+                raise DriverError("provider fake: 503 overloaded", code=503)
             return "the judge rambles without JSON"
         return _judge(lambda fid: True)(system, human)
 
@@ -150,7 +150,7 @@ def test_a_failed_batch_is_unjudged_never_passed(monkeypatch, tmp_path, failure)
              "errors": out["errors"], "model_calls": out["model_calls"]}
     rb = nodes_mod.report_builder_node(state)
     md = Path(rb["report_paths"]["md"]).read_text(encoding="utf-8")
-    reason = "429" if failure == "skipped" else "unparseable"
+    reason = "503" if failure == "skipped" else "unparseable"
     assert f"> ⚠ Not fact-checked — 4 of 8 findings were not judged ({reason})" in md
     meta = json.loads((Path(rb["report_paths"]["folder"]) / "metadata.json").read_text(encoding="utf-8"))
     assert meta["degraded"] is True
@@ -223,7 +223,7 @@ def test_grounding_is_counted_over_its_last_panel_pass(monkeypatch, tmp_path):
 
     def reply(system, human):
         if down["on"]:
-            raise DriverError("provider fake: 429 Too Many Requests", code=429)
+            raise DriverError("provider fake: 503 overloaded", code=503)
         return _judge()(system, human)
 
     monkeypatch.setattr("argus.llm._sleep", lambda s: None)

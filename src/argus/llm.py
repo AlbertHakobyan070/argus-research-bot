@@ -14,8 +14,11 @@ JSON object." (a JSON role) or "Reply with only the complete markdown text."
 (a markdown role). Then the next fallback, then the binding's ``on_exhausted``:
 ``raise`` → ``EngineError``, ``skip_item`` → ``EngineSkipped``, ``degrade`` →
 ``EngineDegraded``, each with the message "role <id>: every engine failed
-after <n> attempts (last: …)". Every attempt is a ``CallRecord``; recorded
-and logged errors never contain the provider's key.
+after <n> attempts (last: …)" — unless every engine ended on a 429: then
+``QuotaExhausted`` whatever the policy (no node skips past it; the run
+pauses), and each such provider is latched out for ``_QUOTA_LATCH_S``, so
+parallel calls to it fail at once instead of each waiting. Every attempt is
+a ``CallRecord``; recorded and logged errors never contain the provider's key.
 """
 from __future__ import annotations
 
@@ -109,6 +112,11 @@ class EngineDegraded(EngineError):
         self.degradation = degradation
 
 
+class QuotaExhausted(EngineError):
+    """Every engine of a role ended on a 429 (an exhausted quota): caught
+    only by the run driver, which pauses the run at the node."""
+
+
 _REASONING_BLOCK = re.compile(r"<(think|thinking|reasoning|analysis)>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
 
@@ -120,6 +128,8 @@ def strip_reasoning(text: str) -> str:
 
 _TRANSIENT_TRIES = 3
 _QUOTA_STEP_S = 30.0                # one wait while a provider's quota_wait_s lasts
+_QUOTA_LATCH_S = 60.0               # a provider found out of quota fails at once this long
+_quota_out: dict[str, float] = {}   # provider name -> time.monotonic() its latch ends
 _TRUNCATION_CAP = 4096
 _NUDGE = "Reply with only the JSON object."
 _MD_NUDGE = "Reply with only the complete markdown text."      # a markdown role's validate retry
@@ -170,14 +180,21 @@ def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot
     if expect_json is None:
         expect_json = role in JSON_ROLES
     records: list[CallRecord] = []
-    for rank, engine in enumerate([binding.primary, *binding.fallbacks]):
-        result = _on_engine(role, binding, engine, rank, messages, engines.profile, records,
+    out_of_quota: list[int] = []
+    chain = [binding.primary, *binding.fallbacks]
+    for rank, engine in enumerate(chain):
+        result = _on_engine(role, binding, engine, rank, messages, engines.profile, records, out_of_quota,
                             temperature=temperature, max_tokens=max_tokens, json_mode=json_mode,
                             expect_json=expect_json, validate=validate, item=item)
         if result is not None:
             return result
     n = len(records)
-    msg = f"role {role}: every engine failed after {n} attempt{'s' if n != 1 else ''} (last: {records[-1].error})"
+    attempts = f"{n} attempt{'s' if n != 1 else ''} (last: {records[-1].error})"
+    if len(out_of_quota) == len(chain):
+        msg = f"role {role}: every engine is out of quota after {attempts}"
+        logger.warning("llm %s", msg)
+        raise QuotaExhausted(msg, role=role, attempts=records)
+    msg = f"role {role}: every engine failed after {attempts}"
     logger.warning("llm %s", msg)
     if binding.on_exhausted == "skip_item":
         raise EngineSkipped(msg, role=role, attempts=records)
@@ -187,10 +204,11 @@ def complete(role: str, messages: list[BaseMessage], *, engines: EnginesSnapshot
 
 
 def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: int,
-               messages: list[BaseMessage], profile: str, records: list[CallRecord], *,
+               messages: list[BaseMessage], profile: str, records: list[CallRecord], out_of_quota: list[int], *,
                temperature: float | None, max_tokens: int | None, json_mode: bool | None,
                expect_json: bool, validate: Callable[[str], Any] | None, item: str) -> LLMResult | None:
-    """Every attempt on one engine: its LLMResult, or None when it failed."""
+    """Every attempt on one engine: its LLMResult, or None when it failed
+    (``rank`` appended to ``out_of_quota`` when it ended on a 429)."""
     started = [_now()]
 
     def record(**kw) -> CallRecord:
@@ -205,6 +223,11 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
         provider = registry.provider(engine.provider)
     except EngineConfigError as e:
         record(ok=False, error=str(e))
+        return None
+    latched = _quota_out.get(provider.name, 0.0) - time.monotonic()
+    if latched > 0:
+        record(ok=False, error=f"provider {provider.name} is out of quota (latched for {latched:.0f} s more)")
+        out_of_quota.append(rank)
         return None
     if json_mode is None:
         json_mode = (engine.json_mode if engine.json_mode is not None
@@ -254,6 +277,9 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
                 reason = "quota_wait"
                 _sleep(step)
                 continue
+            if _code(e) == 429:
+                _quota_out[provider.name] = time.monotonic() + _QUOTA_LATCH_S
+                out_of_quota.append(rank)
             return None
         rec = record(attempt=attempt, latency_ms=_ms(t0), json_mode=json_mode, retry_reason=reason,
                      served_model=resp.served_model, routed_via=resp.routed_via,

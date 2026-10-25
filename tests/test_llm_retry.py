@@ -47,12 +47,15 @@ class _Driver:
         return o
 
 
-def _snap(fallback: bool = False) -> EnginesSnapshot:
-    b = ResolvedBinding(role="brief.draft", tier="strong", primary=EngineSpec(provider="p", model="m"),
+_POLICY_ROLE = {"raise": "brief.draft", "skip_item": "research.digest", "degrade": "research.rerank"}
+
+
+def _snap(fallback: bool = False, on_exhausted: str = "raise") -> EnginesSnapshot:
+    role = _POLICY_ROLE[on_exhausted]
+    b = ResolvedBinding(role=role, tier="strong", primary=EngineSpec(provider="p", model="m"),
                         fallbacks=[EngineSpec(provider="f", model="m")] if fallback else [],
-                        on_exhausted="raise", retry_on_truncation=True)
-    return EnginesSnapshot(profile="t", resolved_at="2026-10-19T00:00:00+00:00",
-                           roles={"brief.draft": b})
+                        on_exhausted=on_exhausted, retry_on_truncation=True)
+    return EnginesSnapshot(profile="t", resolved_at="2026-10-19T00:00:00+00:00", roles={role: b})
 
 
 @pytest.fixture
@@ -134,12 +137,43 @@ def test_quota_wait_is_off_by_default_and_never_applies_to_5xx(env):
         llm.complete("brief.draft", MSGS, engines=_snap())
     assert d.calls == 3
 
+    llm._quota_out.clear()
     env.providers["p"] = ProviderSpec(name="p", base_url="http://p/v1", quota_wait_s=120)
     err = openai.InternalServerError("500", response=httpx.Response(500, request=_REQ), body=None)
     d = env.drive(*[err] * 5)
     with pytest.raises(llm.EngineError):
         llm.complete("brief.draft", MSGS, engines=_snap())
     assert d.calls == 3, "a provider error is not an empty quota"
+
+
+@pytest.mark.parametrize("policy", ["raise", "skip_item", "degrade"])
+def test_every_engine_out_of_quota_raises_quota_exhausted_whatever_the_policy(env, policy):
+    env.drive(*[_rate_limited()] * 6)
+    with pytest.raises(llm.QuotaExhausted) as ei:
+        llm.complete(_POLICY_ROLE[policy], MSGS, engines=_snap(fallback=True, on_exhausted=policy))
+    assert not isinstance(ei.value, (llm.EngineSkipped, llm.EngineDegraded)), "no node may skip past it"
+    assert "out of quota" in str(ei.value) and len(ei.value.attempts) == 6
+
+
+def test_a_fallback_that_fails_otherwise_keeps_the_binding_policy(env):
+    bad = openai.BadRequestError("400", response=httpx.Response(400, request=_REQ), body=None)
+    env.drive(*[_rate_limited()] * 3, bad)
+    with pytest.raises(llm.EngineSkipped):
+        llm.complete("research.digest", MSGS, engines=_snap(fallback=True, on_exhausted="skip_item"))
+
+
+def test_an_out_of_quota_provider_fails_fast_until_the_latch_expires(env, monkeypatch):
+    clock = SimpleNamespace(t=1000.0)
+    monkeypatch.setattr(llm.time, "monotonic", lambda: clock.t)
+    d = env.drive(*[_rate_limited()] * 3, _ok())
+    with pytest.raises(llm.QuotaExhausted):
+        llm.complete("brief.draft", MSGS, engines=_snap())
+    with pytest.raises(llm.QuotaExhausted) as ei:       # a parallel item: no call, no wait
+        llm.complete("brief.draft", MSGS, engines=_snap())
+    assert d.calls == 3 and len(env.sleeps) == 2 and "out of quota" in ei.value.attempts[0].error
+    clock.t += llm._QUOTA_LATCH_S
+    assert llm.complete("brief.draft", MSGS, engines=_snap()).text == "ok"
+    assert d.calls == 4
 
 
 @pytest.mark.parametrize("asked, sent", [(200, 2048), (9000, 9000), (None, None)])

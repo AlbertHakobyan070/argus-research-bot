@@ -186,6 +186,10 @@ named to you with the reasons, and `/append`ing it again queues it again.
   re-attaches and re-shows that gate.
 - If the run **stopped** mid-way (cancelled, interrupted by a restart, or
   failed), it resumes from its last saved step.
+- If the run **paused** (⏸) because every model engine ran out of quota, it
+  reruns the step that paused once the quota resets — the run stops there
+  rather than skipping item after item into an empty report. The pause
+  message says exactly what `/continue` will do.
 - If the run **finished**: with appended sources queued it does an *append-only*
   pass (ingests exactly your sources, no new searches); otherwise it runs a
   fresh search pass to deepen the report. Either way it ends at a new preview.

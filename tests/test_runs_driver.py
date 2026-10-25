@@ -23,6 +23,7 @@ from telegram import InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter
 
+from argus import llm
 from argus.bot import app as bot_app
 from argus.bot import common, history, progress, runs
 from argus.bot import media as bot_media
@@ -495,6 +496,28 @@ async def test_a_drive_failure_is_reported_to_the_chat(env):
     assert _events(run_id, "stage")[-1].data == {"status": "error",
                                                  "summary": "RuntimeError: digest pool exploded"}
     assert run_id not in common._inflight
+
+
+async def test_an_exhausted_quota_pauses_the_run_and_continue_reruns_the_node(env):
+    env.state.research = Research(block=False, fail=llm.QuotaExhausted(
+        "role research.digest: every engine is out of quota after 3 attempts (last: 429)",
+        role="research.digest", attempts=[]))
+    run_id = await _at_plan_gate(env)
+    assert (await runs.approve_plan(run_id)).code == "started"
+    await common._inflight[run_id].task
+    assert (await env.lib.get_run(run_id))["status"] == "paused"
+    assert any("out of quota" in t and f"/continue {run_id} re-attaches the plan; ✅ Approve reruns research" in t
+               for t in _sent(env))
+    assert not any("Research failed" in t for t in _sent(env))
+    assert _events(run_id, "stage")[-1].data["status"] == "paused"
+    assert tuple((await _snap(env, run_id)).next) == ("research",)
+
+    env.state.research.fail = None                              # the quota refilled
+    assert (await runs.continue_run(await env.lib.get_run(run_id), chat_id=CHAT)).code == "attached"
+    assert (await runs.approve_plan(run_id)).code == "started"
+    await common._inflight[run_id].task
+    assert (await env.lib.get_run(run_id))["status"] == "awaiting_report"
+    assert env.state.research.calls == 2, "the paused node ran again"
 
 
 @pytest.mark.parametrize("end", ["report_gate", "cancelled", "error"])

@@ -471,16 +471,16 @@ def test_an_unusable_body_fails_the_engine_and_goes_to_the_fallback(monkeypatch,
     assert out.text == "PONG" and out.record.ok
 
 
-def test_error_bodies_everywhere_raise_by_policy_never_an_empty_success(monkeypatch, sleeps):
+def test_429_error_bodies_everywhere_raise_quota_exhausted_never_an_empty_success(monkeypatch, sleeps):
     snap = fake_engines_snapshot()
     _hosts(monkeypatch, fake=[_error_body("All models exhausted", 429)] * 6)
-    with pytest.raises(llm.EngineError) as ei:
+    with pytest.raises(llm.QuotaExhausted) as ei:
         llm.complete("quick.answer", MSGS, engines=snap)
-    assert type(ei.value) is llm.EngineError and len(ei.value.attempts) == 3
-    assert str(ei.value).startswith("role quick.answer: every engine failed after 3 attempts")
-    with pytest.raises(llm.EngineDegraded) as ei:
+    assert len(ei.value.attempts) == 3 and all("All models exhausted" in a.error for a in ei.value.attempts)
+    assert str(ei.value).startswith("role quick.answer: every engine is out of quota after 3 attempts")
+    with pytest.raises(llm.QuotaExhausted) as ei:         # a degradable role too: nothing degrades past it
         llm.complete("scout.querygen", MSGS, engines=snap, validate=json.loads)
-    assert all(not a.ok and "All models exhausted" in a.error for a in ei.value.attempts)
+    assert all(not a.ok and "out of quota" in a.error for a in ei.value.attempts)
 
 
 # Shapes the SDK lets through unvalidated (re-review round 3): each must be a
@@ -579,8 +579,8 @@ DIGEST_OK = '{"relevance": 3, "stance": "supports", "claims": []}'
 
 
 def test_exhausted_digests_count_as_calls_in_the_report_metadata(monkeypatch, tmp_path, sleeps):
-    """Review risk 9: two digests exhaust their engine (429 three times
-    each) and one succeeds after a 429, through the real call site and the
+    """Review risk 9: two digests exhaust their engine (503 three times
+    each) and one succeeds after a 503, through the real call site and the
     facade. Since WP-B the call site is research.digest on llm.complete: it
     appends every attempt record and writes the skip line quoting the
     facade's message, so the summary report_builder writes counts three
@@ -591,7 +591,7 @@ def test_exhausted_digests_count_as_calls_in_the_report_metadata(monkeypatch, tm
     from argus.graph.run_config import RunConfig
     from argus.graph.state import ResearchBrief, SubQuestion
 
-    _drive(monkeypatch, fake=[_status(429)] * 7 + [_resp(DIGEST_OK)])
+    _drive(monkeypatch, fake=[_status(503)] * 7 + [_resp(DIGEST_OK)])     # a 429 would pause the run
     rc = RunConfig.from_preset(length="medium", engines=fake_engines_snapshot(), origin="telegram")
     doc = tmp_path / "doc.md"
     doc.write_text("Retrieval augmented generation. " * 40, encoding="utf-8")

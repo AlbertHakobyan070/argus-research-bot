@@ -46,6 +46,7 @@ from langgraph.types import Command
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
+from .. import llm
 from ..config import get_settings
 from ..engines import registry
 from ..engines.registry import EngineConfigError
@@ -482,6 +483,8 @@ async def _drive(h: RunHandle, resume_input: Any) -> None:
     except asyncio.CancelledError:
         await _abandoned(h)
         raise
+    except llm.QuotaExhausted as e:
+        await _paused(h, e)
     except Exception as e:
         await _failed(h, e)
     finally:
@@ -678,6 +681,25 @@ async def _failed(h: RunHandle, e: Exception) -> None:
     await h.card.stop(f"⚠️ Failed at {h.stage or 'start'}.")
     await _status(h.run_id, "error")
     await _say(h.chat_id, f"⚠️ Research failed: {e}")
+
+
+async def _paused(h: RunHandle, e: llm.QuotaExhausted) -> None:
+    """Every engine of a call is out of quota: the node raised, so the
+    checkpoint is the one before it and /continue reruns it — never the
+    hollow report skipping item after item would give."""
+    h.gate_kind = None
+    logger.warning("run %s: paused at %s: %s", h.run_id, h.stage, e)
+    bus.publish(h.run_id, "stage", h.stage, {"status": "paused", "summary": str(e)})
+    await h.card.stop(f"⏸ Paused at {h.stage or 'start'}: the model quota ran out.")
+    await _status(h.run_id, "paused")
+    if h.quick:                                     # continue_run refuses a quick /ask
+        again = "ask again"
+    else:
+        snap = await h.graph.aget_state(h.cfg)
+        nxt = tuple(snap.next or ())
+        again = _continue_hint(h.run_id, nxt, _gate(nxt, snap.values or {}))
+    await _say(h.chat_id, f"⏸ Run {h.run_id} paused: every model engine is out of quota ({e.role}). "
+                          f"Once the quota resets, {again}.")
 
 
 async def _record_spend(h: RunHandle) -> None:
