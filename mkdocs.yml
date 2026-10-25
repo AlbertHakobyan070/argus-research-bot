@@ -1,0 +1,59 @@
+site_name: Argus
+site_description: A single-user Telegram research and media bot with cited, fact-checked reports.
+site_url: https://alberthakobyan070.github.io/argus-research-bot/
+repo_url: https://github.com/AlbertHakobyan070/argus-research-bot
+repo_name: argus-research-bot
+edit_uri: edit/main/docs/
+
+# docs/ also holds the build spec, plan and work-package notes; the site
+# publishes only the pages in nav. The rest stays readable on GitHub.
+exclude_docs: |
+  argus-v4-design.md
+  research-engine-v3.md
+  superpowers/
+  v4-notes/
+
+nav:
+  - Home: index.md
+  - User guide: help.md
+  - How it works: how-it-works.md
+
+theme:
+  name: material
+  font: false                      # faces come from extra.css (house type)
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom              # colours come from extra.css
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.highlight
+    - content.code.copy
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
