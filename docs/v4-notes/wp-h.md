@@ -287,18 +287,36 @@ to.
   before logging is touched. It is read from `os.environ` at logging setup, like
   `ARGUS_LOG`; that holds the `.env` values because `argus.config` loads `.env`
   when it is imported and `bot/app.py` imports it.
+- **Uncaught exceptions** (review fix): Python's own `sys.excepthook` prints a
+  traceback straight to stderr, past every handler, and an exception that
+  escapes `main()` can be python-telegram-bot's `InvalidToken`, whose message
+  carries the bare token. `_configure_logging()` therefore also sets
+  `sys.excepthook` and `threading.excepthook` to two module-level functions
+  that log at CRITICAL on the `argus` logger with the traceback (and the
+  thread's name for a thread), so the redacting formatter applies.
+  `KeyboardInterrupt` still goes to `sys.__excepthook__`, and a thread's
+  `SystemExit` stays silent, as today. A second call sets the same two
+  functions again; they are never wrapped.
 
-Behaviour change for handoff.md: with `ARGUS_LOG_HTTP` off, a second poller
-shows as `telegram.error.Conflict` in the log, not as a `409 Conflict` request
-line. Docs: `.env.example`, `handoff.md` (Tuning knobs), spec §7.
+Behaviour changes for handoff.md: with `ARGUS_LOG_HTTP` off, the httpx
+`409 Conflict` request line is gone, but a second poller still logs the bot's
+own warning on every retry (`_on_error`: `Telegram 409 Conflict — another bot
+instance is polling this token`), so the Troubleshooting row keeps working. A
+crash that escapes `main()` or ends a thread ends in a CRITICAL record with its
+traceback instead of a bare traceback on stderr. Docs: `.env.example`,
+`handoff.md` (Tuning knobs), spec §7, the index table in this folder's
+`README.md`.
 
 New env var: `ARGUS_LOG_HTTP`. Test file: `tests/test_log_redaction.py`
-(hermetic: synthetic tokens, httpx on a `MockTransport`, the logging state put
-back after each test).
+(hermetic: synthetic tokens, httpx on a `MockTransport`, the logging state and
+the two excepthooks put back after each test; one test runs the shipped
+`main()` in a child process with `getMe` answering 401 on a `MockTransport` and
+host lookups disabled, so no request can leave).
 
 Ceiling: only handlers on the root logger carry the formatter. A handler added
 to another logger, or to the root after `_configure_logging()` ran, would log
-unredacted; the bot has none.
+unredacted; the bot has none. The same goes for the two excepthooks: code that
+assigns them later undoes the routing; nothing in `src/` does.
 
 Verification (`scratchpad\logredact\`; no bot, tunnel or live service was
 started, stopped, signalled or called): `red.log` (first with
@@ -309,3 +327,11 @@ python-dotenv patched to read a temp `.env`: its `ARGUS_LOG_HTTP` and token
 reached the setup), `leak_check.log` (the logging state after the new tests
 equals the state without them, and the caplog tests pass before and after
 them), `full_suite.log`.
+
+Fix round 1 of the review (uncaught exceptions, the 409 wording, the index row;
+same folder, same rules): `red_round1.log` (the new hook tests against the
+unfixed `main()`: Python's own hook printed the traceback with the bare
+synthetic token, and the child process's stderr ended with it),
+`green_round1.log`, `e2e_child_after.log` (that stderr after the fix: a
+CRITICAL record, no synthetic secret in it), `mutants_round1.log` (every hook
+mutant caught), `full_suite_round1.log`.

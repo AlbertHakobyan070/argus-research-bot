@@ -62,6 +62,7 @@ New or changed in v4 (names; defaults live in `src/argus/config.py`,
 | `ARGUS_CANCEL_DRAIN_TIMEOUT_S`, `ARGUS_SHUTDOWN_DRAIN_S` | `Settings` → the run driver | `wp-d.md`, `wp-e1.md` |
 | `FREELLMAPI_BASE_URL` | the `freellmapi` provider (`base_url_env`), the SSRF guard, `verify_live.sh` | existing |
 | `ARGUS_REPORTS_ROOT`, `ARGUS_BENCH_LOG` | set or read by the bench runner and the live check | `wp-g.md` |
+| `ARGUS_LOG_HTTP` | the bot's logging setup (`_configure_logging()` in `bot/app.py`) | `wp-h.md` |
 
 Removed, each with one startup WARNING if still set (the list is
 `REMOVED_ENV_KNOBS` in `src/argus/engines/registry.py`): `ARGUS_TIMEOUT`,

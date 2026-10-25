@@ -4,27 +4,40 @@ Telegram puts the token in every API URL and httpx logs each request at INFO,
 so `HTTP Request: POST https://api.telegram.org/bot<token>/getUpdates` used to
 land, token included, in the console and in any file it is redirected to.
 
+Python's own excepthooks print an uncaught traceback straight to stderr, past
+every handler, and an exception that escapes main() can be python-telegram-bot's
+InvalidToken, whose message carries the bare token. `_configure_logging()`
+therefore routes both hooks (main thread and threads) through logging as well.
+
 Hermetic: synthetic tokens only (the real value from .env is removed from the
 environment for every test), no network (httpx runs on a MockTransport).
 `_configure_logging()` runs on a handler-less root logger inside
-`_clean_logging()`, which puts the root's handlers and levels back afterwards,
-so other tests' caplog keeps working."""
+`_clean_logging()`, which puts the root's handlers and levels and the two
+excepthooks back afterwards, so other tests' caplog keeps working."""
 from __future__ import annotations
 
 import contextlib
 import io
 import logging
+import os
 import re
+import subprocess
+import sys
+import threading
+from pathlib import Path
 
 import httpx
 import pytest
+from telegram.error import InvalidToken
 
 from argus.bot import app as bot_app
 
 TOKEN = "123456789:AAEexampleexampleexampleexample_x1"      # synthetic, token-shaped
 SECRET = TOKEN.split(":")[1]
 URL = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+REJECTED = f"The token `{TOKEN}` was rejected by the server."      # python-telegram-bot's InvalidToken text
 LOGGERS = ["httpx", "telegram.ext.Application", "argus.bot", "apscheduler.scheduler"]
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 @pytest.fixture(autouse=True)
@@ -41,10 +54,12 @@ def _clean_logging():
     as at process start. pytest keeps its capture handlers on the root, which
     makes basicConfig a no-op, and puts them back at the start of the test body,
     so a fixture cannot empty the root: this has to run inside the test.
-    Handlers and levels are put back on exit."""
+    Handlers, levels and the two excepthooks that _configure_logging() sets are
+    put back on exit."""
     root = logging.getLogger()
     quiet = [logging.getLogger(name) for name in ("httpx", "httpcore")]
     handlers, level, levels = root.handlers[:], root.level, [lg.level for lg in quiet]
+    hooks = sys.excepthook, threading.excepthook
     root.handlers[:] = []
     for lg in quiet:
         lg.setLevel(logging.NOTSET)
@@ -57,6 +72,7 @@ def _clean_logging():
         root.setLevel(level)
         for lg, lvl in zip(quiet, levels):
             lg.setLevel(lvl)
+        sys.excepthook, threading.excepthook = hooks
 
 
 def _configured() -> io.StringIO:
@@ -228,6 +244,142 @@ def test_with_the_knob_off_request_lines_stop_but_warnings_still_show(monkeypatc
 def test_a_garbage_knob_value_raises_before_logging_is_touched(monkeypatch):
     monkeypatch.setenv("ARGUS_LOG_HTTP", "maybe")
     with _clean_logging():
+        hooks = sys.excepthook, threading.excepthook
         with pytest.raises(ValueError, match="ARGUS_LOG_HTTP"):
             bot_app._configure_logging()
         assert logging.getLogger().handlers == []
+        assert (sys.excepthook, threading.excepthook) == hooks
+
+
+# ---- uncaught exceptions ------------------------------------------------------------------
+
+# The shipped main() with python-telegram-bot's getMe answering 401 (a rejected token), run in
+# a child process exactly as `python -m argus.bot` leaves an escaping exception. Everything is
+# on an httpx MockTransport; socket.getaddrinfo fails, so a real request cannot even start; the
+# real .env is never read; build_application and the temp-cache cleanup are the only stubs.
+_CHILD_MAIN = '''\
+import os
+import socket
+
+import dotenv
+
+dotenv.load_dotenv = lambda *args, **kwargs: False      # the real .env is never read
+
+
+def _offline(*args, **kwargs):
+    raise RuntimeError("the network is off in this test")
+
+
+socket.getaddrinfo = _offline
+
+import httpx
+from telegram.ext import Application
+from telegram.request import HTTPXRequest
+
+from argus.bot import app as bot_app
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+
+def getme_is_rejected(request):
+    return httpx.Response(401, json={"ok": False, "error_code": 401, "description": "Unauthorized"})
+
+
+def build_application():
+    transport = httpx.MockTransport(getme_is_rejected)
+    return (Application.builder().token(TOKEN)
+            .request(HTTPXRequest(httpx_kwargs={"transport": transport}))
+            .get_updates_request(HTTPXRequest(httpx_kwargs={"transport": transport}))
+            .build())
+
+
+bot_app.build_application = build_application
+bot_app.cleanup_argus_ytt_cache = lambda: 0
+bot_app.main()
+'''
+
+
+def test_an_uncaught_exception_is_logged_redacted_and_not_printed(monkeypatch, capsys):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    with _clean_logging():
+        out = _configured()
+        try:
+            raise InvalidToken(REJECTED)
+        except InvalidToken:
+            sys.excepthook(*sys.exc_info())
+        text = out.getvalue()
+    assert "CRITICAL argus: Uncaught exception" in text
+    assert "Traceback (most recent call last)" in text
+    assert "InvalidToken: The token `<redacted>` was rejected by the server." in text
+    assert TOKEN not in text and SECRET not in text
+    assert SECRET not in capsys.readouterr().err        # nothing was printed around the handler either
+
+
+def test_keyboard_interrupt_still_goes_to_the_default_hook(monkeypatch):
+    seen = []
+    monkeypatch.setattr(sys, "__excepthook__", lambda *exc: seen.append(exc[0]))
+    with _clean_logging():
+        out = _configured()
+        sys.excepthook(KeyboardInterrupt, KeyboardInterrupt(), None)
+        text = out.getvalue()
+    assert seen == [KeyboardInterrupt]
+    assert text == ""
+
+
+def test_a_thread_exception_is_logged_with_the_thread_name_and_redacted(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+
+    def boom():
+        raise InvalidToken(REJECTED)
+
+    with _clean_logging():
+        out = _configured()
+        worker = threading.Thread(target=boom, name="redact-probe")
+        worker.start()
+        worker.join()
+        text = out.getvalue()
+    assert "CRITICAL argus: Uncaught exception in thread redact-probe" in text
+    assert "InvalidToken: The token `<redacted>` was rejected by the server." in text
+    assert TOKEN not in text and SECRET not in text
+
+
+def test_a_thread_that_calls_sys_exit_stays_silent():
+    with _clean_logging():
+        out = _configured()
+        worker = threading.Thread(target=sys.exit)
+        worker.start()
+        worker.join()
+        text = out.getvalue()
+    assert text == ""
+
+
+def test_configuring_twice_does_not_chain_the_hooks():
+    with _clean_logging():
+        out = _configured()
+        bot_app._configure_logging()
+        try:
+            raise RuntimeError("main thread")
+        except RuntimeError:
+            sys.excepthook(*sys.exc_info())
+        worker = threading.Thread(target=lambda: 1 / 0, name="second-thread")
+        worker.start()
+        worker.join()
+        text = out.getvalue()
+    assert text.count("Uncaught exception") == 2        # one record per exception, not one per call
+
+
+def test_the_shipped_main_never_prints_a_rejected_token_when_it_dies(tmp_path):
+    script = tmp_path / "child_main.py"
+    script.write_text(_CHILD_MAIN, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in ("TELEGRAM_BOT_TOKEN", "ARGUS_LOG", "ARGUS_LOG_HTTP")}
+    env.update(TELEGRAM_BOT_TOKEN=TOKEN, PYTHONPATH=str(SRC), PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path, env=env, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=120)
+    err = proc.stderr
+    assert proc.returncode != 0                                          # the InvalidToken escaped main()
+    assert "Argus bot starting" in err                                   # ... the shipped main() ran
+    assert "POST https://api.telegram.org/bot<redacted>/getMe" in err    # ... through the real httpx line
+    assert "CRITICAL argus: Uncaught exception" in err                   # and the crash went through logging
+    assert "InvalidToken: The token `<redacted>` was rejected by the server." in err
+    assert TOKEN not in err and SECRET not in err
+    assert TOKEN not in proc.stdout and SECRET not in proc.stdout

@@ -7,7 +7,9 @@ import asyncio
 import logging
 import os
 import re
-from types import SimpleNamespace
+import sys
+import threading
+from types import SimpleNamespace, TracebackType
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -376,14 +378,39 @@ class _RedactingFormatter(logging.Formatter):
         return text.replace(token, "<redacted>") if token else text
 
 
+def _log_uncaught(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> None:
+    """sys.excepthook: log what escapes main() instead of letting Python print
+    it past the formatter (python-telegram-bot's InvalidToken message carries the
+    bare token). Ctrl-C keeps Python's own handling."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logging.getLogger("argus").critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+
+
+def _log_uncaught_in_thread(args: threading.ExceptHookArgs) -> None:
+    """threading.excepthook: the same for an exception that ends a thread.
+    SystemExit stays silent, as in threading's own hook."""
+    if args.exc_type is SystemExit:
+        return
+    name = args.thread.name if args.thread is not None else "unknown"
+    logging.getLogger("argus").critical(
+        "Uncaught exception in thread %s", name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
 def _configure_logging() -> None:
     """Root logging for main(): the ARGUS_LOG level, one format, the bot token
     redacted from every line of every logger (always), and ARGUS_LOG_HTTP=false
     to stop the httpx/httpcore request lines (their warnings and errors stay).
+    An exception that escapes main() or ends a thread is logged too, not left to
+    Python's own excepthooks, which print past the formatter.
 
     Both knobs come from os.environ, which argus.config has already filled from
     .env: it loads at import, and this module imports it. Safe to call twice:
-    basicConfig adds no second handler and setFormatter replaces the formatter."""
+    basicConfig adds no second handler, setFormatter replaces the formatter, and
+    the hooks are module-level functions, set again and never wrapped."""
     log_http = _bool_env("ARGUS_LOG_HTTP", True)      # a garbage value raises before logging is touched
     logging.basicConfig(level=os.environ.get("ARGUS_LOG", "INFO"), format=_LOG_FORMAT)
     formatter = _RedactingFormatter(_LOG_FORMAT)
@@ -392,6 +419,8 @@ def _configure_logging() -> None:
     if not log_http:
         for name in ("httpx", "httpcore"):
             logging.getLogger(name).setLevel(logging.WARNING)
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_uncaught_in_thread
 
 
 def main():
