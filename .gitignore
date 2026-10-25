@@ -34,3 +34,6 @@ docs/v4-notes/.scratch/
 
 # v4 WP-E2: runtime logs (cloudflared stderr)
 logs/
+
+# MkDocs build output
+site/

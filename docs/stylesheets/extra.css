@@ -1,0 +1,72 @@
+/* House style (arsenal "Ledger" tokens: warm parchment, amber accent) mapped
+   onto Material's variables. Values copied from the console's vendored
+   src/argus/webapp/static/vendor/arsenal/tokens/tokens.css; regenerate both
+   from the arsenal tokens if the house palette changes. */
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Fraunces:opsz,wght@9..144,600&display=swap");
+
+:root {
+  --ag-disp: "IBM Plex Sans Condensed", "Helvetica Neue", "Arial Narrow", Arial, sans-serif;
+  --ag-serif: Fraunces, Georgia, "Times New Roman", serif;
+  --md-text-font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --md-code-font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #FAF6ED;
+  --md-default-fg-color: #2E2619;
+  --md-default-fg-color--light: #6C6051;
+  --md-default-fg-color--lighter: #8E8170;
+  --md-default-fg-color--lightest: #D6CAB4;
+  --md-primary-fg-color: #F2ECDF;
+  --md-primary-bg-color: #2E2619;
+  --md-primary-bg-color--light: #6C6051;
+  --md-accent-fg-color: #B26E10;
+  --md-typeset-color: #2E2619;
+  --md-typeset-a-color: #B26E10;
+  --md-code-bg-color: #F2ECDF;
+  --md-code-fg-color: #2E2619;
+  --md-footer-bg-color: #EDE5D4;
+  --md-footer-fg-color: #2E2619;
+  --md-footer-fg-color--light: #6C6051;
+  --ag-line: #D6CAB4;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 35;
+  --md-default-bg-color: #161310;
+  --md-default-fg-color: #EDE6DA;
+  --md-default-fg-color--light: #A99F8F;
+  --md-default-fg-color--lighter: #7D7465;
+  --md-default-fg-color--lightest: #3A332A;
+  --md-primary-fg-color: #221E19;
+  --md-primary-bg-color: #EDE6DA;
+  --md-primary-bg-color--light: #A99F8F;
+  --md-accent-fg-color: #E8A33D;
+  --md-typeset-color: #EDE6DA;
+  --md-typeset-a-color: #E8A33D;
+  --md-code-bg-color: #100E0B;
+  --md-code-fg-color: #EDE6DA;
+  --md-footer-bg-color: #1B1714;
+  --md-footer-fg-color: #EDE6DA;
+  --md-footer-fg-color--light: #A99F8F;
+  --ag-line: #3A332A;
+}
+
+/* Hierarchy from type and hairlines, not boxes. */
+.md-header { box-shadow: none; border-bottom: 1px solid var(--ag-line); }
+.md-header__topic:first-child { font-family: var(--ag-serif); font-weight: 600; }
+.md-typeset h1, .md-typeset h2, .md-typeset h3 {
+  font-family: var(--ag-disp);
+  color: var(--md-default-fg-color);
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+}
+.md-typeset h1 { font-weight: 600; }
+.md-typeset h2 { font-weight: 600; border-top: 1px solid var(--ag-line); padding-top: .6em; }
+.md-typeset hr + h2 { border-top: 0; padding-top: 0; }
+.md-typeset table:not([class]) { border: 1px solid var(--ag-line); box-shadow: none; border-radius: 5px; }
+.md-typeset table:not([class]) th { font-family: var(--ag-disp); font-weight: 600; }
+.md-typeset code { border-radius: 3px; }
+.md-search__input { background-color: var(--md-default-bg-color); border: 1px solid var(--ag-line); border-radius: 5px; }
+.md-search__input::placeholder, .md-search__icon { color: var(--md-default-fg-color--light); }
+.md-typeset a:focus-visible, .md-nav__link:focus-visible { outline: 2px solid var(--md-accent-fg-color); outline-offset: 2px; }
