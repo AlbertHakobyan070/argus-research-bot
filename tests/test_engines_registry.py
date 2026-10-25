@@ -366,8 +366,8 @@ async def test_shipped_engines_file_validates_without_io(no_network):
                                        "max_tokens", 100, True, False)
     # the proxy ignores max_completion_tokens (probed 2026-10-25); the floor keeps reasoning headroom
     assert (fp.min_max_tokens, fp.quota_wait_s) == (2048, 120)
-    for tier, prefs in fp.model_preferences.items():
-        assert prefs and prefs[-1] == "auto" and prefs.count("auto") == 1, tier
+    # FreeLLMAPI v0.16+ pins a named model (no failover): every tier lets the proxy route
+    assert fp.model_preferences == {"cheap": ["auto"], "strong": ["auto"], "judge": ["auto"]}
     assert all(spec == EngineSpec(provider="freellmapi", model_from_preferences=tier)
                for tier, spec in cfg.profiles["free-proxy"].tiers.items())
     assert cfg.providers["openai"].token_param == "max_completion_tokens"

@@ -13,35 +13,12 @@
       "quota_wait_s": 120,
       "models_endpoint": true,
       "model_preferences": {
-        "cheap": [
-          "llama-3.1-8b-instant",
-          "gemini-2.5-flash-lite",
-          "gemini-3.1-flash-lite-preview",
-          "Meta-Llama-3.3-70B-Instruct",
-          "groq/compound-mini",
-          "auto"
-        ],
-        "strong": [
-          "qwen/qwen3-coder:free",
-          "deepseek-ai/deepseek-v4-flash",
-          "nvidia/nemotron-3-super-120b-a12b:free",
-          "gemini-3.5-flash",
-          "DeepSeek-V3.2",
-          "meta-llama/llama-3.1-70b-instruct",
-          "mistral-large-latest",
-          "auto"
-        ],
-        "judge": [
-          "openai/gpt-oss-120b:free",
-          "gemini-3.5-flash",
-          "gemini-2.5-flash",
-          "Llama-4-Maverick-17B-128E-Instruct",
-          "cogito-2.1:671b",
-          "auto"
-        ]
+        "cheap": ["auto"],
+        "strong": ["auto"],
+        "judge": ["auto"]
       },
       "rpm_limit": 100,
-      "notes": "local FreeLLMAPI proxy; it may route a request to another upstream model, so each call records the served model and routed_via"
+      "notes": "local FreeLLMAPI proxy; every tier asks for 'auto': since v0.16 a named model pins routing to that one model (no failover), so a named free model jams on its own daily cap. Each call records the served model and routed_via"
     },
     "groq": {
       "name": "groq",
