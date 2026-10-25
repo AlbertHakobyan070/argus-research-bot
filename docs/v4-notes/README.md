@@ -46,7 +46,7 @@ describes the code. The operator summary of all behaviour changes is in
   - `wp-c.md`: "The twin rule: live evidence and known limits";
   - `wp-e1.md`: the `_launch` ceiling at shutdown, and what a forced
     `task.cancel()` cannot stop;
-  - `wp-h.md`: the pre-flight's ceilings.
+  - `wp-h.md`: the pre-flight's ceilings, and the log redaction's.
 
 ## Environment variables (merged)
 

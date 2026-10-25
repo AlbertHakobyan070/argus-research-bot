@@ -313,10 +313,20 @@ the two excepthooks put back after each test; one test runs the shipped
 `main()` in a child process with `getMe` answering 401 on a `MockTransport` and
 host lookups disabled, so no request can leave).
 
-Ceiling: only handlers on the root logger carry the formatter. A handler added
-to another logger, or to the root after `_configure_logging()` ran, would log
-unredacted; the bot has none. The same goes for the two excepthooks: code that
-assigns them later undoes the routing; nothing in `src/` does.
+Ceilings:
+- Only handlers on the root logger carry the formatter. A handler added to
+  another logger, or to the root after `_configure_logging()` ran, would log
+  unredacted; the bot has none.
+- Code that assigns either excepthook later undoes the routing; nothing in
+  `src/` does.
+- `KeyboardInterrupt` is left to the default hook, which also prints the
+  exception it interrupted. A Ctrl-C landing inside PTB's shutdown right after
+  a rejected token (`InvalidToken` carries the token) would therefore print it.
+  Ctrl-C during polling or start-up never gets there: PTB catches it.
+- `logging`'s own failure path (`Handler.handleError`, when a handler cannot
+  write) prints a record's raw message and arguments outside any formatter.
+  `warnings` and `sys.unraisablehook` print outside it too. None of the three
+  has a known path to the token.
 
 Verification (`scratchpad\logredact\`; no bot, tunnel or live service was
 started, stopped, signalled or called): `red.log` (first with
