@@ -515,6 +515,13 @@ uplink), the console and run-driver knobs: see `.env.example`, which says what
 each does. Research depth is not an env knob any more: it is the depth preset
 on the plan card (or the console's overrides).
 
+Logging: `ARGUS_LOG` sets the level. The bot token is redacted from every log
+line, always (the httpx request lines read `bot<redacted>`). `ARGUS_LOG_HTTP=false`
+also stops those httpx/httpcore request lines; their warnings and errors still
+show. With it off, a second poller no longer leaves a `409 Conflict` request
+line (see Troubleshooting): look for `telegram.error.Conflict` in the log
+instead.
+
 ---
 
 ## Git state

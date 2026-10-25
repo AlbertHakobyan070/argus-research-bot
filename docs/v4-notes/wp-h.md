@@ -264,3 +264,48 @@ queries, where the old query read `0`. `preflight_mac_dryrun.log`: `cf_ere`
 / `cf_pids` extracted from `run_mac.sh` against a fake `pgrep -f` — a Homebrew
 or bare-name `ARGUS_CLOUDFLARED` matches only the bot's argv. Both scripts
 pass `bash -n`; neither was run.
+
+### Token redaction in logs and `ARGUS_LOG_HTTP` (after the final review)
+
+httpx logs every Telegram API call at INFO with the URL, and the bot token is
+in that URL, so it reached the console and any file the console is redirected
+to.
+
+- **`bot/app.py`**: the logging setup moved out of `main()` into
+  `_configure_logging()` (same `ARGUS_LOG` level and format). It installs
+  `_RedactingFormatter` on the root logger's handlers, so every logger is
+  covered (`httpx`, `telegram`, `argus.*`, `apscheduler`). The formatter works
+  on the finished text, so tracebacks and stack text are covered too:
+  `bot<id>:<secret>` becomes `bot<redacted>`, and the configured
+  `TELEGRAM_BOT_TOKEN` is replaced wherever it stands bare (python-telegram-bot's
+  `InvalidToken` message carries it that way). There is no switch to turn the
+  redaction off.
+- **`ARGUS_LOG_HTTP`** (default `true`) keeps the httpx/httpcore request lines,
+  now redacted. A false value (`0`/`false`/`no`/`off`, parsed by
+  `config._bool_env`) sets `httpx` and `httpcore` to WARNING: request lines
+  stop, their warnings and errors stay. A garbage value raises at startup,
+  before logging is touched. It is read from `os.environ` at logging setup, like
+  `ARGUS_LOG`; that holds the `.env` values because `argus.config` loads `.env`
+  when it is imported and `bot/app.py` imports it.
+
+Behaviour change for handoff.md: with `ARGUS_LOG_HTTP` off, a second poller
+shows as `telegram.error.Conflict` in the log, not as a `409 Conflict` request
+line. Docs: `.env.example`, `handoff.md` (Tuning knobs), spec §7.
+
+New env var: `ARGUS_LOG_HTTP`. Test file: `tests/test_log_redaction.py`
+(hermetic: synthetic tokens, httpx on a `MockTransport`, the logging state put
+back after each test).
+
+Ceiling: only handlers on the root logger carry the formatter. A handler added
+to another logger, or to the root after `_configure_logging()` ran, would log
+unredacted; the bot has none.
+
+Verification (`scratchpad\logredact\`; no bot, tunnel or live service was
+started, stopped, signalled or called): `red.log` (first with
+`_configure_logging` missing, then with the setup only moved out of `main()`:
+a real httpx request line over a `MockTransport` still showed the synthetic
+token), `green_focused.log`, `env_dotenv.log` (the real import order with
+python-dotenv patched to read a temp `.env`: its `ARGUS_LOG_HTTP` and token
+reached the setup), `leak_check.log` (the logging state after the new tests
+equals the state without them, and the caplog tests pass before and after
+them), `full_suite.log`.

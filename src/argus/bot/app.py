@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from types import SimpleNamespace
 
 from telegram import Update
@@ -15,7 +16,7 @@ from telegram.ext import (
 )
 
 from ..cache_cleanup import cleanup_argus_ytt_cache
-from ..config import get_settings
+from ..config import _bool_env, get_settings
 from ..engines import registry
 from ..engines.registry import EngineConfigError
 from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
@@ -356,11 +357,45 @@ def build_application() -> Application:
     return app
 
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Telegram puts the token in every API URL: https://api.telegram.org/bot<id>:<secret>/<method>.
+_BOT_TOKEN_URL = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+class _RedactingFormatter(logging.Formatter):
+    """The usual line with the bot token scrubbed from all of it: the message
+    and any traceback or stack text, since httpx logs every request URL at INFO
+    and exception texts carry URLs too."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = _BOT_TOKEN_URL.sub("bot<redacted>", super().format(record))
+        # The bare token, without its "bot" prefix (python-telegram-bot's
+        # InvalidToken message has it). Read per line, and never "": an empty
+        # string would make str.replace insert the marker between every character.
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        return text.replace(token, "<redacted>") if token else text
+
+
+def _configure_logging() -> None:
+    """Root logging for main(): the ARGUS_LOG level, one format, the bot token
+    redacted from every line of every logger (always), and ARGUS_LOG_HTTP=false
+    to stop the httpx/httpcore request lines (their warnings and errors stay).
+
+    Both knobs come from os.environ, which argus.config has already filled from
+    .env: it loads at import, and this module imports it. Safe to call twice:
+    basicConfig adds no second handler and setFormatter replaces the formatter."""
+    log_http = _bool_env("ARGUS_LOG_HTTP", True)      # a garbage value raises before logging is touched
+    logging.basicConfig(level=os.environ.get("ARGUS_LOG", "INFO"), format=_LOG_FORMAT)
+    formatter = _RedactingFormatter(_LOG_FORMAT)
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
+    if not log_http:
+        for name in ("httpx", "httpcore"):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main():
-    logging.basicConfig(
-        level=os.environ.get("ARGUS_LOG", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_logging()
     app = build_application()
     logger.info("Argus bot starting; long-polling…")
     # Age out the legacy tempdir transcript cache (current callers write
