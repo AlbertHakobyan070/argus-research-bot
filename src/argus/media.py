@@ -525,6 +525,82 @@ async def download_media(
 
 
 # ---------------------------------------------------------------------------
+# Audio chunks for cloud speech-to-text (v4 WP-F, the openai_audio engine)
+# ---------------------------------------------------------------------------
+
+_PCM_RATE = 16000
+_PCM_BYTES_PER_S = _PCM_RATE * 2          # mono s16le
+
+
+async def extract_audio_chunks(src: Path | str, out_dir: Path | str, *, chunk_seconds: int,
+                               ffmpeg: str | None = None, timeout_s: float = 3600) -> list[Path]:
+    """The audio of ``src`` as 16 kHz mono MP3 files of ``chunk_seconds``
+    each (the last one shorter): ``out_dir/chunk_000.mp3`` …, in order.
+
+    Contiguous with nothing lost: the audio is decoded once to raw PCM, cut
+    at exact sample offsets, and each cut is encoded on its own, so each
+    chunk decodes alone to exactly its share (a segment muxer over one MP3
+    stream loses a little at every boundary). No overlap, so no word is sent
+    twice. ``timeout_s`` bounds each ffmpeg run. A cancel kills and awaits
+    the running ffmpeg, so no child outlives the call holding files open.
+
+    Raises ``RuntimeError`` naming the cause: no ffmpeg, ffmpeg failing (its
+    stderr tail), the timeout, or no audio at all."""
+    ffmpeg = ffmpeg or resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("audio extraction needs ffmpeg (set ARGUS_FFMPEG or install imageio-ffmpeg)")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    pcm = out / "audio.pcm"
+    base = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    await _run_ffmpeg([*base, "-i", str(src), "-vn", "-ac", "1", "-ar", str(_PCM_RATE),
+                       "-f", "s16le", str(pcm)], timeout_s=timeout_s)
+    try:
+        size = pcm.stat().st_size
+        if size == 0:
+            raise RuntimeError("ffmpeg produced no audio (does the media have an audio track?)")
+        step = int(chunk_seconds) * _PCM_BYTES_PER_S
+        chunks = []
+        for i, offset in enumerate(range(0, size, step)):
+            data = await asyncio.to_thread(_read_slice, pcm, offset, step)
+            chunk = out / f"chunk_{i:03d}.mp3"
+            await _run_ffmpeg([*base, "-f", "s16le", "-ar", str(_PCM_RATE), "-ac", "1", "-i", "pipe:0",
+                               "-c:a", "libmp3lame", "-b:a", "48k", str(chunk)],
+                              stdin=data, timeout_s=timeout_s)
+            chunks.append(chunk)
+        return chunks
+    finally:
+        pcm.unlink(missing_ok=True)
+
+
+def _read_slice(path: Path, offset: int, n: int) -> bytes:
+    with path.open("rb") as f:
+        f.seek(offset)
+        return f.read(n)
+
+
+async def _run_ffmpeg(cmd: list[str], *, stdin: bytes | None = None, timeout_s: float) -> None:
+    """Run one ffmpeg to completion. On a cancel or the timeout the child is
+    killed and awaited before the error propagates."""
+    kw: dict[str, Any] = {} if os.name == "nt" else {"start_new_session": True}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, **kw)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(stdin), timeout_s)
+    except BaseException as e:                  # cancel, timeout: never leave the child running
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        if isinstance(e, TimeoutError):
+            raise RuntimeError(f"ffmpeg timed out after {timeout_s:.0f}s extracting audio") from e
+        raise
+    if proc.returncode != 0:
+        tail = (err or b"").decode("utf-8", "replace").strip()[-500:]
+        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {tail}")
+
+
+# ---------------------------------------------------------------------------
 # Reddit search (public search.json — no auth, real UA, fail-soft)
 # ---------------------------------------------------------------------------
 

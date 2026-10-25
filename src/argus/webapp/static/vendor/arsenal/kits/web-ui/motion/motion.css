@@ -1,0 +1,75 @@
+/* motion.css — restrained, CSS-first motion. Every effect: runs once (never loops for decoration),
+   uses the token easings/durations, and is switched off by prefers-reduced-motion (base.css kills
+   durations; the scroll-driven rules below are also gated). Opt in per element with a class.
+   Libraries (Motion, auto-animate, Lenis) are vendored for the cases CSS cannot cover. */
+
+:root{
+  /* spring-like settle, as a CSS linear() curve (overshoots ~4%, then rests) */
+  --kit-ease-spring:linear(0,.006,.025 2.8%,.101 6.1%,.539 18.9%,.721 25.3%,.849 31.5%,.937 38.1%,.968 41.8%,.991 45.7%,1.006 50.1%,1.015 55%,1.017 63.9%,1.001 85.9%,1);
+  --kit-rise:14px;
+}
+
+/* ---- enter on first paint: <div class="enter"> (uses @starting-style, no JS) ---------------- */
+.enter{transition:opacity var(--t-slow) var(--ease),translate var(--t-slow) var(--ease)}
+@starting-style{.enter{opacity:0;translate:0 var(--kit-rise)}}
+.enter-stagger > *{transition:opacity var(--t-slow) var(--ease),translate var(--t-slow) var(--ease)}
+@starting-style{.enter-stagger > *{opacity:0;translate:0 var(--kit-rise)}}
+.enter-stagger > :nth-child(2){transition-delay:50ms} .enter-stagger > :nth-child(3){transition-delay:100ms}
+.enter-stagger > :nth-child(4){transition-delay:150ms} .enter-stagger > :nth-child(5){transition-delay:200ms}
+.enter-stagger > :nth-child(6){transition-delay:250ms} .enter-stagger > :nth-child(n+7){transition-delay:300ms}
+
+/* ---- reveal while scrolling into view: <section class="reveal"> (scroll-driven, no JS) ------- */
+@supports (animation-timeline: view()){
+  @media (prefers-reduced-motion: no-preference){
+    .reveal{animation:kit-reveal linear both;animation-timeline:view();animation-range:entry 0% cover 24%}
+    .reveal-x{animation:kit-reveal-x linear both;animation-timeline:view();animation-range:entry 0% cover 24%}
+    /* reading progress: <div class="read-progress" aria-hidden="true"></div> as the first child of <body> */
+    .read-progress{position:fixed;inset:0 0 auto 0;height:2px;z-index:80;background:var(--accent);transform-origin:0 50%;
+      animation:kit-grow linear both;animation-timeline:scroll(root)}
+  }
+}
+@keyframes kit-reveal{from{opacity:0;translate:0 var(--kit-rise)}}
+@keyframes kit-reveal-x{from{opacity:0;translate:calc(var(--kit-rise) * -1) 0}}
+@keyframes kit-grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+.read-progress{display:none}
+@supports (animation-timeline: scroll()){ .read-progress{display:block} }
+
+/* ---- collapse to/from auto height: <div class="collapse" data-open><div>…</div></div> ---------- */
+.collapse{display:grid;grid-template-rows:0fr;transition:grid-template-rows var(--t-med) var(--ease)}
+.collapse[data-open]{grid-template-rows:1fr}
+.collapse > *{overflow:hidden;min-height:0}
+
+/* ---- draw an SVG stroke once: <path class="draw" pathLength="1" …> --------------------------- */
+.draw{stroke-dasharray:1;stroke-dashoffset:1;animation:kit-draw 1.4s var(--ease-io) .1s forwards}
+@keyframes kit-draw{to{stroke-dashoffset:0}}
+@supports (animation-timeline: view()){
+  @media (prefers-reduced-motion: no-preference){
+    .draw-on-scroll{stroke-dasharray:1;stroke-dashoffset:1;animation:kit-draw linear forwards;animation-timeline:view();animation-range:entry 10% cover 45%}
+  }
+}
+
+/* ---- integer ticker, pure CSS: <span class="tick" style="--to:1204"></span>; set .go to run ---- */
+@property --kit-n{syntax:"<integer>";inherits:false;initial-value:0}
+.tick{--kit-n:0;counter-reset:kit-n var(--kit-n);transition:--kit-n 1.2s var(--ease);font-variant-numeric:tabular-nums}
+.tick.go{--kit-n:var(--to)}
+.tick::after{content:counter(kit-n)}
+
+/* ---- micro-interactions --------------------------------------------------------------------- */
+.press{transition:transform var(--t-fast) var(--ease)}
+.press:active{transform:scale(.97)}
+.link-slide{text-decoration:none;background:linear-gradient(currentColor,currentColor) 0 100%/0 1px no-repeat;
+  transition:background-size var(--t-med) var(--ease)}
+.link-slide:hover,.link-slide:focus-visible{background-size:100% 1px}
+.lift{transition:border-color var(--t-fast) var(--ease),translate var(--t-med) var(--ease)}
+.lift:hover{translate:0 -2px;border-color:var(--accent-line)}
+.spring{transition-timing-function:var(--kit-ease-spring)!important}
+
+/* ---- View Transitions (same-document): UI.vt(() => mutateDom()) from ui.js --
+   Give moving elements a unique view-transition-name (style="view-transition-name:row-3"). */
+::view-transition-old(root),::view-transition-new(root){animation-duration:var(--t-med);animation-timing-function:var(--ease)}
+::view-transition-group(*){animation-duration:var(--t-med);animation-timing-function:var(--ease)}
+.vt-item{view-transition-class:item}
+::view-transition-group(*.item){animation-timing-function:var(--kit-ease-spring);animation-duration:var(--t-slow)}
+@media (prefers-reduced-motion: reduce){
+  ::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none!important}
+}

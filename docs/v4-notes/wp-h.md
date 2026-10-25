@@ -1,0 +1,347 @@
+# WP-H — hardening and docs (Task 14)
+
+Spec: `docs/argus-v4-design.md` §3 WP-H, with §6 (migration), §7 (env vars,
+removed knobs), §2.5 (cancel semantics), §2.7 (the console) and the engines
+sections, which the docs now describe. The Task 14 pointers (items earlier
+reviews parked here) are part of the scope, including two controller rulings:
+delete `tests/test_e2e_research.py`, and the approved `scripts/run.sh` /
+`run_mac.sh` pre-flight edit.
+
+### What changed
+
+Code (Step 1 and pointers 1–5, 10):
+
+- **The Phase 1–2 wrappers are gone.** `llm.py` loses `chat_for_tier`,
+  `invoke_with_retry`, `record_from_response`, `resolve_tier`,
+  `pick_strong_and_judge` and their private types; `complete()` accepts
+  `ROLES` only. `engines/roles.py` loses `LEGACY_ROLES`. `engines/registry.py`
+  binds and resolves `ROLES` only, and `current_snapshot_cached()` is replaced
+  by `cached_snapshot()`, which returns the cached active snapshot or `None`
+  and never resolves or raises. Its one caller outside tests is the plan
+  card's render (`bot/runs.py` `_payload`), which must not validate: with no
+  snapshot cached it now shows the problem "not validated yet — Approve
+  validates it" (it showed the old developer text "no engines snapshot
+  resolved: every drive entry must …"). `/engines set` no longer mentions the
+  `legacy.*` roles.
+- **The `run_query_wave` alias is gone.** `graph/scout.py` and
+  `graph/research.py` import `engines.search.run_wave`; `graph/search_providers.py`
+  no longer imports or exports it (the lazy import in `run_wave` stays, now
+  because the `argus.graph` package imports `engines.search`).
+- **Old snapshots stay loadable (pointer 1).** `EnginesSnapshot` drops the
+  retired `legacy.<tier>` keys before validation (a `mode="before"` validator
+  in `engines/schema.py`), so a run config checkpointed during the v4 build,
+  whose `engines.roles` still binds them, loads and resumes. Any other unknown
+  role still raises. The library never held them: `/engines set` and
+  `PUT /api/engines` always refused `legacy.*` roles in overrides.
+  `summarize_calls` keeps counting stored records under `legacy.<tier>` (v3
+  records, and wrapper records in runs from the build), so `/engines` and the
+  bench still read those runs; `_WRITER_ROLES` / `_JUDGE_ROLES` keep the two
+  names for the family check.
+- **Dependencies (pointer 2).** Nothing in `src/`, `tests/`, `scripts/` or
+  `bench/` imports `langchain_openai` or `tenacity`, so both leave
+  `pyproject.toml` (the venv is untouched; `tenacity` still arrives through
+  `langchain-core`). There is no lock file.
+- **`tests/test_e2e_research.py` deleted (pointer 3, ruling)**, and its entry
+  removed from the `--ignore` list in `.github/workflows/ci.yml`. The live
+  end-to-end path is `scripts/verify_live.sh` → `scripts/live_check.py`.
+- **`tests/test_orphan_reconcile.py`**: the unused `from argus import bot as
+  bot_mod` is gone (pointer 4).
+- **Run-script pre-flight (pointer 5, ruling).** After the `argus.bot` poller
+  kill and its assertion, both scripts stop every cloudflared that is **this
+  repo's binary**, or the `ARGUS_CLOUDFLARED` binary running **the bot's own
+  tunnel command line** (narrowed in fix round 1, below), and assert none is
+  left:
+  - The targets come from the bot's own code, run in the venv:
+    `_PROJECT_ROOT/tools/bin/cloudflared(.exe)`, `webapp.tunnel.binary()`
+    (which reads `ARGUS_CLOUDFLARED`, `.env` included) and the argv of
+    `webapp.tunnel.command()` for the configured port.
+  - `run.sh` (Windows): `Win32_Process.ExecutablePath`, normalised with
+    `GetFullPath` and compared case-insensitively against the resolved
+    targets (the `ARGUS_CLOUDFLARED` arm also needs `CommandLine` to end with
+    the bot's argv); `Stop-Process -Force`, then the count must be 0. A
+    failed query (`-ErrorAction Stop`) or an empty count is fatal, like the
+    poller check.
+  - `run_mac.sh` (macOS/Linux): `pgrep -f` with anchored, regex-escaped EREs
+    — `^<repo binary>( |$)`, and `^<ARGUS_CLOUDFLARED> <bot argv>$` — the
+    spawn's `argv[0]` is `str(tunnel.binary())` exactly — then TERM, KILL,
+    and the count must be 0.
+  - A cloudflared started from any other binary or path, or from the
+    `ARGUS_CLOUDFLARED` binary with any other arguments, is never matched.
+- **`Settings.engines_file` / `engines_local_file` removed (pointer 10).**
+  Nothing read them; the registry's `default_paths()` is the one, authoritative
+  reader of `ARGUS_ENGINES_FILE` / `ARGUS_ENGINES_LOCAL_FILE` (relative paths
+  from the repo root). `config._repo_path_env`, their only user, went with them.
+- **`scripts/verify_live.sh`** checks the proxy at the configured
+  `FREELLMAPI_BASE_URL` (through `get_settings()`, so `.env` applies) instead
+  of a hardcoded port, and its header describes the v4 path. It never called a
+  removed knob or the deleted test.
+- **`scripts/demo_run.py` (v4 refresh)**: patches `run_wave`, prints the
+  active profile and the engine each tier resolved to (and the snapshot's
+  warnings) instead of `resolve_tier`, prints `judged/total` and the
+  `evidence.json` path, and lists calls by role.
+
+Stale prose (pointer 7): `citations.py` (no `perplexity_search`), the
+`ResearchBrief` docstring (no `ResearchPlan`), the `state.py` comment that
+named `bot.py`, the `bot/` package docstring (rewritten for the v4 modules
+and hooks), test docstrings and assert messages that named `bot.py` /
+`bot._…` / `manual_e2e.py`, and the one test docstring that said "intel-stack
+Chromium". The comments the pointer named in `compose.py` and
+`report_builder_helpers.py` were already fixed by WP-C. The two historical
+`tonight/HANDOFF-2026-07-09-*.md` files get a one-line "Historical" note at
+the top and are otherwise unchanged.
+
+Docs (Step 2, pointers 6, 8, 9):
+
+- `HELP_TEXT` (`bot/common.py`) lists `/engines transcriber`, the console
+  (the **Argus** menu button), `/status` (with the console link), `/cancel`
+  (stop after the current step) and `/continue` (resume, re-attach or
+  extend); it stays under the existing length guard. `/ask` says "no search".
+- `docs/help.md`: the plan-gate knobs (depth, profile, recency) and card
+  lines, the preview's quality line, what the report guarantees (cut-not-flag,
+  the deterministic TL;DR, the Analysis, both banners, degradation notes,
+  `evidence.json`), `/ask` as a no-search answer, the console, cancel by
+  drain and the busy rule, `/continue` on a stopped run, `/status`,
+  `/append` always ingested, the transcription engines, and every `/engines`
+  subcommand.
+- `README.md`: rewritten for v4, structure only — the graph, the stages,
+  engines, run configuration, the layout, tests, demo, operations, secrets.
+  No Chromium fallback, `manual_e2e`, `fetch_live_models`, removed knobs or
+  `bot.py` remain.
+- `.env.example` folds in `.env.mac.example` (deleted): placeholders only,
+  grouped by area, every variable the code reads, the removed knobs pointing
+  at `REMOVED_ENV_KNOBS`. No default values are copied: a commented line keeps
+  the code's default.
+- `handoff.md`: a merged "What v4 changed" (the notes' behaviour changes,
+  deduplicated), the setup steps updated (`cp .env.example .env`, startup
+  without the proxy, the verify step without counts, cloudflared on a new
+  machine), the pre-flight, and troubleshooting rows for the console and
+  engines. The 2026-08-07 download-fix table stays as a dated history section.
+- `docs/research-engine-v3.md`: the superseded note at the top.
+- `docs/v4-notes/`: `README.md` (new) indexes the notes, points to the API
+  routes, the resting-run route table, the security notes and the documented
+  ceilings where they live, and merges the env-var lists; every note
+  statement WP-H made untrue carries an inline *"WP-H: …"* marker. No fact,
+  table or limit was removed from any note.
+
+Not built (spec: optional / later): the digest cache, `compose.editor`, a
+`TimeoutPolicy` on research, a between-item drain in compose / analyst /
+panel, inline `[uncited]` markers, the LLM bench judge.
+
+### Decisions where the spec is silent
+
+- **`cached_snapshot()` instead of no accessor.** The plan card needs a sync,
+  non-validating look at the active profile's state, so a renamed accessor with
+  an honest contract (`None`, no raise) replaces the wrapper one.
+- **Drop, not map, the retired roles.** No call names them any more, so a
+  mapped binding would never be used; dropping keeps the snapshot's keys equal
+  to `ROLES`.
+- **The pre-flight resolves its targets through the bot's code** rather than
+  re-implementing `ARGUS_CLOUDFLARED` and `.env` parsing in shell.
+- **`ARGUS_CLOUDFLARED` is a target only with the bot's argv** (fix round 1;
+  the first cut matched the binary alone, so a shared system binary such as
+  Homebrew's would have let the pre-flight stop other tunnels). Ceiling:
+  another quick tunnel to the console's own port on that same binary would
+  be taken for the bot's.
+
+### Known ceilings
+
+- The pre-flight runs the venv's Python once to resolve the targets; a broken
+  venv stops the script there (loudly, under `set -e`), as the bot would fail
+  anyway.
+- `run_mac.sh` matches the command line's start, so a cloudflared launched by
+  hand with a different spelling of the same path (a symlink, `./tools/…`
+  from another directory) is not matched. The bot always spawns
+  `str(tunnel.binary())`, which is what is matched.
+- `ExecutablePath` is empty for processes Windows does not let the user read;
+  those are never matched (a cloudflared of this repo runs as the user).
+
+### Behaviour changes for handoff.md
+
+- `run.sh` / `run_mac.sh` also stop an orphaned cloudflared of this repo
+  before starting the bot.
+- The plan card of a run whose active profile has no cached snapshot (an
+  untracked run viewed after a restart) shows "not validated yet — Approve
+  validates it".
+- `verify_live.sh` probes the configured proxy URL.
+- `/help` and `/help full` describe the v4 commands.
+
+### New env vars
+
+None. `ARGUS_CLOUDFLARED` is now also read (through `webapp.tunnel.binary()`)
+by the run-script pre-flight.
+
+### Test files touched
+
+- RED-first for pointer 1: `tests/test_engines_schema.py`
+  (`test_a_stored_snapshot_naming_the_retired_legacy_roles_still_loads`) and
+  `tests/test_run_config.py`
+  (`test_require_loads_a_checkpointed_config_naming_the_retired_legacy_roles`).
+- Minimal edits for the deletions: `tests/helpers.py` (`ROLES` only),
+  `tests/test_engines_schema.py`, `tests/test_engines_registry.py`,
+  `tests/test_engines_cmd.py`, `tests/test_llm_facade.py` (the wrapper test
+  deleted; `quick.answer` as the non-JSON role), `tests/test_llm.py` (live),
+  `tests/test_graph.py` (live), `tests/test_live_check.py`;
+  `run_query_wave` → `run_wave` in `tests/test_extend.py`,
+  `tests/test_continue_extend.py`, `tests/test_gap_mode.py`,
+  `tests/test_reflexion.py`, `tests/test_research_depth.py`,
+  `tests/test_search_providers.py` (the alias test deleted); the dead
+  `search_providers` guards in `test_extend.py` / `test_continue_extend.py`
+  repointed to `research.run_wave` or dropped.
+- `tests/test_run_config.py`: the `Settings` knob tests check
+  `registry.default_paths()` for the engines files, and that `Settings` has no
+  `engines_file` / `engines_local_file`.
+- `tests/test_bot.py`: `HELP_TEXT` and `docs/help.md` must name the v4
+  commands and the console.
+- Docstrings / messages only: `tests/test_bot_markdown_fallback.py`,
+  `tests/test_transcript.py`, `tests/test_pdf_render.py`.
+- Deleted: `tests/test_e2e_research.py`. Unused import removed:
+  `tests/test_orphan_reconcile.py`.
+
+### Verification evidence (2026-10-21)
+
+Logs in `A:\DS_Vault\caches\tmp\claude\A--Hermes-Agents-argus\83d80941-f0f5-432e-a15e-8b7a5e0143b7\scratchpad\t14\`.
+No bot, cloudflared or live service was started, stopped, signalled or called.
+
+- `baseline.log`: the full suite at `2cc328d` with the closed proxy port —
+  only the live-proxy tests (`test_llm.py`, `test_graph.py`) fail.
+- `red.log`: with `LEGACY_ROLES` deleted and no loader fix, both new tests
+  fail with `unknown role 'legacy.cheap'` (and `.strong`, `.judge`) — a stored
+  snapshot could not load. `green_focused.log`: green after the validator.
+- `focused1.log`: every touched test file, green.
+- `full_suite.log`: the full suite with `FREELLMAPI_BASE_URL` on a closed
+  port — only the live-proxy tests fail, no warnings summary.
+- `greps.log`: the brief's `src/` grep is empty; the wider greps show only
+  removed-knob listings (`REMOVED_ENV_KNOBS`, `.env.example`, `handoff.md`,
+  the warning test), the spec, the plan, the notes' history, and tests of
+  stored record shapes (`legacy.<tier>` records in the bench and
+  `summarize_calls` tests).
+- `preflight_dryrun.log`: the Windows pre-flight's resolution and filter,
+  listing only — it matches exactly the running cloudflared of this repo's
+  `tools/bin/`, the assertion's count reads it, and a target list naming only
+  a non-existent binary matches nothing. `preflight_mac_dryrun.log`:
+  `run_mac.sh`'s `cf_pids`, copied verbatim, against a fake `pgrep -f` over a
+  fixture process table (paths with spaces, dots and parentheses; a sibling
+  `cloudflared-old`; another user's Homebrew cloudflared; the path appearing
+  as an argument of another program): only the repo binary's processes match.
+  Both scripts pass `bash -n`. The target resolution is a plain assignment
+  (no pipe), so a failing Python stops the script under `set -e` before any
+  kill (checked with a failing import), and an empty list is fatal too.
+- `demo_closed_port.log`: `scripts/demo_run.py` imports and stops at the
+  engines resolution with the proxy's `EngineConfigError` on a closed port.
+
+### Fix round 1 (review of 794f14b)
+
+- **`.env.example` comments on their own lines.** python-dotenv reads
+  `KEY=   # text` as the value `# text` when the value is blank, so a fresh
+  `cp .env.example .env` gave the blank keys comment text as values (Exa
+  switched on with a junk key; `int()` failing on the user id). Every comment
+  now sits on its own line, and every key, active or commented out, is `KEY=`
+  or `KEY=<placeholder>` with nothing after it. New `tests/test_env_example.py`
+  parses the file with `dotenv_values` (and every `# KEY=…` line as it would
+  read uncommented): no value starts with `#`, every blank key parses as `""`,
+  and no uncommented value carries trailing text.
+- **The `ARGUS_CLOUDFLARED` arm is narrowed, not dropped** (see the pre-flight
+  bullet and the decision above). The port is `ARGUS_WEBAPP_PORT`, else
+  `Settings.webapp_port`, as `Settings.load()` reads it.
+- **A failed WMI query is fatal.** `Get-CimInstance … -ErrorAction Stop` in
+  the `argus.bot` poller count and in the cloudflared filter (kill and count
+  share it); the kill call aborts with a FATAL line, and the count reads empty
+  → FATAL. Before, a query error read as a count of `0`.
+- **`verify_live.sh` needs a valid `.env`, `TELEGRAM_BOT_TOKEN` included** (it
+  reads the proxy URL through `get_settings()`): said in its header and in
+  `handoff.md`. No code change.
+- `bench/metrics.py`: the `degradations_count` docstring now says stored
+  `legacy.*` records come from the removed wrappers.
+- `tests/test_orphan_reconcile.py`: the unused `Path` import is gone.
+
+Verification (`scratchpad\t14\fix1\`): `red.log` (the new test fails on the
+shipped file), `green_env.log` after the rewrite. `preflight_dryrun.log`:
+run.sh's resolution and `CF_FILTER`, extracted from the script at run time,
+list-only — each arm matches the live repo tunnel; the same binary with
+another port or another tunnel's argv, and a foreign binary, match nothing;
+a bad WMI class makes the filter error and the count read empty, for both
+queries, where the old query read `0`. `preflight_mac_dryrun.log`: `cf_ere`
+/ `cf_pids` extracted from `run_mac.sh` against a fake `pgrep -f` — a Homebrew
+or bare-name `ARGUS_CLOUDFLARED` matches only the bot's argv. Both scripts
+pass `bash -n`; neither was run.
+
+### Token redaction in logs and `ARGUS_LOG_HTTP` (after the final review)
+
+httpx logs every Telegram API call at INFO with the URL, and the bot token is
+in that URL, so it reached the console and any file the console is redirected
+to.
+
+- **`bot/app.py`**: the logging setup moved out of `main()` into
+  `_configure_logging()` (same `ARGUS_LOG` level and format). It installs
+  `_RedactingFormatter` on the root logger's handlers, so every logger is
+  covered (`httpx`, `telegram`, `argus.*`, `apscheduler`). The formatter works
+  on the finished text, so tracebacks and stack text are covered too:
+  `bot<id>:<secret>` becomes `bot<redacted>`, and the configured
+  `TELEGRAM_BOT_TOKEN` is replaced wherever it stands bare (python-telegram-bot's
+  `InvalidToken` message carries it that way). There is no switch to turn the
+  redaction off.
+- **`ARGUS_LOG_HTTP`** (default `true`) keeps the httpx/httpcore request lines,
+  now redacted. A false value (`0`/`false`/`no`/`off`, parsed by
+  `config._bool_env`) sets `httpx` and `httpcore` to WARNING: request lines
+  stop, their warnings and errors stay. A garbage value raises at startup,
+  before logging is touched. It is read from `os.environ` at logging setup, like
+  `ARGUS_LOG`; that holds the `.env` values because `argus.config` loads `.env`
+  when it is imported and `bot/app.py` imports it.
+- **Uncaught exceptions** (review fix): Python's own `sys.excepthook` prints a
+  traceback straight to stderr, past every handler, and an exception that
+  escapes `main()` can be python-telegram-bot's `InvalidToken`, whose message
+  carries the bare token. `_configure_logging()` therefore also sets
+  `sys.excepthook` and `threading.excepthook` to two module-level functions
+  that log at CRITICAL on the `argus` logger with the traceback (and the
+  thread's name for a thread), so the redacting formatter applies.
+  `KeyboardInterrupt` still goes to `sys.__excepthook__`, and a thread's
+  `SystemExit` stays silent, as today. A second call sets the same two
+  functions again; they are never wrapped.
+
+Behaviour changes for handoff.md: with `ARGUS_LOG_HTTP` off, the httpx
+`409 Conflict` request line is gone, but a second poller still logs the bot's
+own warning on every retry (`_on_error`: `Telegram 409 Conflict — another bot
+instance is polling this token`), so the Troubleshooting row keeps working. A
+crash that escapes `main()` or ends a thread ends in a CRITICAL record with its
+traceback instead of a bare traceback on stderr. Docs: `.env.example`,
+`handoff.md` (Tuning knobs), spec §7, the index table in this folder's
+`README.md`.
+
+New env var: `ARGUS_LOG_HTTP`. Test file: `tests/test_log_redaction.py`
+(hermetic: synthetic tokens, httpx on a `MockTransport`, the logging state and
+the two excepthooks put back after each test; one test runs the shipped
+`main()` in a child process with `getMe` answering 401 on a `MockTransport` and
+host lookups disabled, so no request can leave).
+
+Ceilings:
+- Only handlers on the root logger carry the formatter. A handler added to
+  another logger, or to the root after `_configure_logging()` ran, would log
+  unredacted; the bot has none.
+- Code that assigns either excepthook later undoes the routing; nothing in
+  `src/` does.
+- `KeyboardInterrupt` is left to the default hook, which also prints the
+  exception it interrupted. A Ctrl-C landing inside PTB's shutdown right after
+  a rejected token (`InvalidToken` carries the token) would therefore print it.
+  Ctrl-C during polling or start-up never gets there: PTB catches it.
+- `logging`'s own failure path (`Handler.handleError`, when a handler cannot
+  write) prints a record's raw message and arguments outside any formatter.
+  `warnings` and `sys.unraisablehook` print outside it too. None of the three
+  has a known path to the token.
+
+Verification (`scratchpad\logredact\`; no bot, tunnel or live service was
+started, stopped, signalled or called): `red.log` (first with
+`_configure_logging` missing, then with the setup only moved out of `main()`:
+a real httpx request line over a `MockTransport` still showed the synthetic
+token), `green_focused.log`, `env_dotenv.log` (the real import order with
+python-dotenv patched to read a temp `.env`: its `ARGUS_LOG_HTTP` and token
+reached the setup), `leak_check.log` (the logging state after the new tests
+equals the state without them, and the caplog tests pass before and after
+them), `full_suite.log`.
+
+Fix round 1 of the review (uncaught exceptions, the 409 wording, the index row;
+same folder, same rules): `red_round1.log` (the new hook tests against the
+unfixed `main()`: Python's own hook printed the traceback with the bare
+synthetic token, and the child process's stderr ended with it),
+`green_round1.log`, `e2e_child_after.log` (that stderr after the fix: a
+CRITICAL record, no synthetic secret in it), `mutants_round1.log` (every hook
+mutant caught), `full_suite_round1.log`.

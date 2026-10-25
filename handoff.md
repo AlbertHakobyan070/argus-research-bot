@@ -1,37 +1,185 @@
-# Argus — MacBook handoff
+# Argus — handoff (running it, moving it, what v4 changed)
 
 Argus is a personal Telegram bot with two jobs: **downloading video** from
 YouTube / X / Reddit / Instagram into a local vault, and running **multi-agent
-research** (LangGraph) that produces Markdown + PDF reports.
+research** (LangGraph) that produces Markdown + PDF reports with an
+`evidence.json`. A Telegram Mini App console (the chat's **Argus** menu
+button) shows the same runs.
 
-This document moves it from the Windows box to a MacBook. The Windows instance
-will be **off** while the Mac one runs — that is required, not optional (see
+This document covers running it day to day, moving it to another machine
+(it was written for the Windows → MacBook move and still follows that
+order), and what the v4 rebuild changed for an operator. Only one machine
+may run the bot at a time — that is required, not optional (see
 [One bot per token](#one-bot-per-token)).
 
 > **If you are Claude Code reading this cold:** work through
 > [Setup](#setup) in order. Do not skip [Step 5](#step-5--verify) — it is the
-> only thing that distinguishes "installed" from "working". Everything stated
-> here was verified on the Windows machine on 2026-08-07; things marked
+> only thing that distinguishes "installed" from "working". Items marked
 > **UNVERIFIED ON MAC** could not be tested from Windows and need a real check.
 
 ---
 
-## What changed right before this handoff
+## What v4 changed (operator view)
 
-A round of download fixes landed (uncommitted in the working tree — see
-[Git state](#git-state)). Context, because the symptoms will look familiar:
+The design is `docs/argus-v4-design.md`; what each work package built, with
+its decisions and evidence, is in `docs/v4-notes/` (start at its
+`README.md`). In short:
+
+**Engines (which model does what)**
+- Every LLM call names a pipeline role; `argus_engines.json` binds each role
+  to a provider and model through **profiles**, with explicit fallbacks and a
+  declared failure policy (`raise` / `skip_item` / `degrade`). The default
+  profile reproduces the old FreeLLMAPI setup; others use paid APIs (keys by
+  env var name) or local servers. `/engines` and the console show and change
+  the bindings; provider definitions stay file-only.
+- The bot starts with the proxy down or `FREELLMAPI_API_KEY` unset: engines
+  problems are logged and DM'd once; media, `/find` and `/runs` keep working;
+  `/research`, `/ask`, the gate buttons and `/continue` answer with the
+  engines error until it is fixed. A malformed key now shows at a run's first
+  call, not at startup.
+- Each engine gets a few tries with backoff (honouring `Retry-After` up to a
+  cap) and the SDK itself never retries, so under a quota burst a call gives
+  up sooner than in v3. `model_calls` records role, requested vs served model,
+  routing, attempt and retry reason; `metadata.json["engines"]` summarises
+  them, and `/engines` shows the last run's served models and the
+  judge/writer family check.
+- `argus_engines.json` and the local file must be UTF-8 (a BOM is fine);
+  anything else is a startup problem naming the file.
+
+**Research depth**
+- Depth presets (`quick` / `standard` / `deep` / `exhaustive`, chosen on the
+  plan card or Auto from the length) drive the waves, fetches, the
+  per-sub-question quota, the first-pass cap, the gap reserve and the per-run
+  Exa budget. Each user Extend gets a fresh allowance. All spend goes through
+  one ledger, and the run's Exa cost lands in the library (`/engines` shows
+  the month to date).
+- Research no longer needs the intel-stack: a native fetcher reads HTML,
+  PDFs, arXiv and GitHub READMEs. It refuses private and loopback targets
+  (the proxy and the console included), connects only to the address it
+  checked (or by name through an environment HTTP(S) proxy), and stops a
+  download at the configured byte cap. The intel-stack rungs still join the
+  chain when both `INTEL_*` paths exist.
+- Duplicate URL forms are fetched once; candidates are reranked before they
+  are fetched; long documents are digested in parts; every quote is checked
+  verbatim against its document (`quote_verified`).
+- `/append` sources are always ingested, outside every budget; one that
+  cannot be fetched is named with the rungs tried, and appending it again
+  queues it again.
+- A run whose fetched sources all fail to digest stops with an error instead
+  of shipping an ungrounded report.
+
+**Trust (the report)**
+- A grounding judge checks every finding, in batches, against the full
+  quotes of the notes it cites. Rejected claims are **cut** (whole sentences)
+  and listed; an unlocated flag stays and is listed as such. Any unjudged
+  finding gives "⚠ Not fact-checked"; a per-item step that skipped a large
+  share of its items gives "⚠ Degraded run". Every declared fallback is a
+  line in "## Degradation notes".
+- The TL;DR is compiled deterministically from kept takeaways or findings;
+  no model writes it. An analyst step adds "## Analysis" with confidence
+  labels. "## Uncited specifics" lists numeric sentences without a citation.
+- The panel can send a run back for a targeted gap wave, or rewrite only the
+  weak sections, within the preset's bounds.
+- New report files: `evidence.json` beside `report.md`; `metadata.json` gains
+  `run_config`, `degradations`, `degraded`, `exa_usd`, `engines`.
+- A missing bundled font fails the PDF (the markdown still ships, with a
+  `pdf:` note); there is no Chromium fallback.
+
+**Runs (cancel, continue, status)**
+- One live drive per run, and one researching run at a time: a second start
+  or resume answers "busy" naming the running one; a second tap on a running
+  run answers "already running".
+- `/cancel` **drains**: the run finishes its current step, saves its
+  checkpoint and stops (research stops between fetches and keeps what it
+  read); `/continue <id>` resumes it. Only after `ARGUS_CANCEL_DRAIN_TIMEOUT_S`
+  is the task cancelled outright (logged). A run at a gate is cancelled at once.
+- Shutdown drains live drives for at most `ARGUS_SHUTDOWN_DRAIN_S`; new
+  actions are refused meanwhile. A drained run is `cancelled` and resumable.
+- Buttons on messages sent before a restart keep working (the run attaches on
+  the tap). A run interrupted mid-step by a restart is marked `cancelled` and
+  DM'd with the `/continue` hint.
+- `/research` and `/ask` show a live progress card. The plan card has depth,
+  engines-profile and recency knobs and an Exa estimate; the preview opens
+  with a quality line, the banners and the degradation notes. Send finishes
+  the run, so `/continue` on a sent run extends it.
+- `/status` shows each run's stage and last event, and the console's URL and
+  health.
+
+**Console (Mini App)**
+- The bot serves it on `127.0.0.1:${ARGUS_WEBAPP_PORT}` and, with the default
+  quick tunnel, starts `tools/bin/cloudflared(.exe)` (or `ARGUS_CLOUDFLARED`),
+  registers the chat's **Argus** menu button and logs the tunnel URL;
+  cloudflared's output goes to `logs/cloudflared.log`. The URL changes on every
+  start; the menu button follows it.
+- It is optional: a taken port, a missing cloudflared, a dead tunnel or a
+  failed menu button is logged, DM'd ("⚠️ Console down — …") and shown in
+  `/status`, and chat keeps working. A killed cloudflared is restarted with
+  backoff and the new URL DM'd. Every API call is authenticated with
+  Telegram's signed `initData` for `TELEGRAM_ALLOWED_USER_ID` only; report
+  HTML is sanitised, and the CSP allows no inline script.
+- To refresh the UI kit snapshot: `./venv/Scripts/python.exe
+  scripts/sync_arsenal.py`, then commit `src/argus/webapp/static/vendor/arsenal/`.
+
+**Transcription**
+- The engine is configured in `argus_engines.json` `transcriber`: local
+  faster-whisper (model, device and compute type in its block) or an
+  OpenAI-compatible audio API (`/engines transcriber openai_audio groq/<model>`,
+  needs `GROQ_API_KEY`). YouTube tries captions, then ASR, in the configured
+  order. Transcript headers name the engine (`faster_whisper:<model>`,
+  `openai_audio:<provider>/<model>`, `captions→…`).
+
+**Removed env knobs** (a startup WARNING names each one still set; the list
+is `REMOVED_ENV_KNOBS` in `src/argus/engines/registry.py`): `ARGUS_TIMEOUT`,
+`ARGUS_LLM_RETRIES`, `ARGUS_RESEARCH_WAVES`, `ARGUS_FETCH_PER_WAVE`,
+`ARGUS_TOTAL_FETCH_CAP`, `ARGUS_EXA_MAX_CALLS`, `ARGUS_MAX_REVISIONS`,
+`ARGUS_FETCH_CONCURRENCY`, `ARGUS_DIGEST_CONCURRENCY`,
+`ARGUS_COMPOSE_CONCURRENCY`, `ARGUS_WHISPER_MODEL`, `PERPLEXITY_API_KEY`.
+New ones are in `.env.example`.
+
+**Migration and compatibility**
+- The first start on v4 adds the new library columns (existing rows are
+  untouched). Checkpoints keep loading: a pre-v4 run resumed through any
+  button or `/continue` gets its length's legacy preset (`origin="legacy"`),
+  recorded once in its errors and its report's notes. A run config stored
+  during the v4 build that still names the retired `legacy.*` roles loads with
+  them dropped. Older-topology (v2) checkpoints can be re-attached and sent,
+  not resumed.
+- Report file names are unchanged; `evidence.json` is new. The vault layout
+  is unchanged.
+
+**Scripts**
+- `scripts/live_check.py` (graph-direct, prints an acceptance table, exits
+  non-zero on any failed check) replaces `tests/manual_e2e.py`;
+  `scripts/verify_live.sh` runs it after the live tests. `verify_live.sh`
+  needs a valid `.env`, `TELEGRAM_BOT_TOKEN` included: it reads the proxy URL
+  through `get_settings()`, which refuses a missing or malformed token. The old opt-in
+  `tests/test_e2e_research.py` is gone.
+- `python -m bench.metrics` / `python -m bench.compare` measure runs
+  deterministically; bench runs write under `bench/results/` (gitignored).
+- `scripts/engines_probe.py` checks a provider's request shapes;
+  `scripts/webapp_dev_url.py` prints a signed local console URL (never the
+  token).
+- `scripts/run.sh` / `run_mac.sh` pre-flight now also stops this repo's
+  cloudflared (see [Running day to day](#running-day-to-day)).
+
+---
+
+## History: the 2026-08-07 download fixes
+
+Dated record of the fixes made right before the first Mac handoff (the
+numbers are what was measured then):
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Bot said "✅ Saved <path>" but no video ever arrived in Telegram | python-telegram-bot defaults: `write_timeout` 5s, `media_write_timeout` 20s, `read_timeout` 5s. A 40 MB upload cannot finish in 20s; both `send_video` and the `send_document` fallback timed out and only logged | Generous timeouts on `Application.builder()`; both-sends-failed is now reported to the user instead of swallowed |
-| Long X/Twitter videos died partway, leaving `.part` files | X serves long video as HLS with 800+ fragments, downloaded **serially**. A 72-min tweet needed ~40 min; the blanket 900s timeout killed it at fragment 871 | `--concurrent-fragments 8` (**measured 4.5× faster**: 30.1 MB → 135.9 MB in the same 45s window) + a *stall* timeout that measures silence, not total elapsed time |
+| Bot said "✅ Saved <path>" but no video ever arrived in Telegram | python-telegram-bot's default write/read timeouts were far too short for a large upload; both `send_video` and the `send_document` fallback timed out and only logged | Generous timeouts on `Application.builder()`; both-sends-failed is now reported to the user instead of swallowed |
+| Long X/Twitter videos died partway, leaving `.part` files | X serves long video as HLS with hundreds of fragments, downloaded **serially**, and a blanket timeout killed it | Concurrent fragments (measured several times faster) + a *stall* timeout that measures silence, not total elapsed time |
 | Completed videos on disk that the bot didn't know about | On timeout, `proc.kill()` killed yt-dlp but not its **ffmpeg child**, which kept writing after Argus reported failure | `_kill_tree()` (taskkill /T on Windows, `killpg` on macOS/Linux) + a finished file is now kept even if the exit code is non-zero |
-| Vertical videos downloaded at reduced quality | The `auto` quality filter capped `height<=1080`, which rejects a normal 1080p **portrait** video (1080×1922) — i.e. most Reels/Shorts. Verified: a 1080×1222 tweet came down as 720×814 | Cap the **short side** via yt-dlp's `res` sort (`min(width,height)`); verified 1080×1222 and 1080×1440 now |
+| Vertical videos downloaded at reduced quality | The `auto` quality filter capped the height, which rejects a normal full-HD **portrait** video (most Reels/Shorts) | Cap the **short side** via yt-dlp's `res` sort (`min(width,height)`) |
 | Unhelpful errors | Raw yt-dlp stderr ("No video could be found in this tweet") with no next step | `explain_error()` appends actionable hints (cookies, `/quality auto`, resume) |
 | `/find` needed a sibling repo | `_run_yt_dlp` shelled out to the `intel-stack` venv's yt-dlp although argus declares yt-dlp itself | Uses the argus venv — **this is why `/find` works on the Mac at all** |
 
-New maintenance tool: `scripts/reconcile_vault.py` (see
-[Step 4](#step-4--bring-the-vault-across-optional)).
+Maintenance tool from that round: `scripts/reconcile_vault.py` (see
+[Step 4b](#step-4b--bring-the-vault-across-optional)).
 
 ---
 
@@ -39,15 +187,16 @@ New maintenance tool: `scripts/reconcile_vault.py` (see
 
 | Thing | Why | Check |
 |---|---|---|
-| **Python 3.12** (not 3.13) | `pyproject.toml` pins `>=3.12,<3.13` | `python3.12 -V` |
+| **Python 3.12** (not 3.13) | `pyproject.toml` pins the 3.12 series | `python3.12 -V` |
 | **uv** | package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **git** | repo | `git --version` |
-| **ffmpeg** | merging video+audio | Comes free — `imageio-ffmpeg` ships an arm64 macOS wheel (verified on PyPI). Homebrew's is optional. |
-| **FreeLLMAPI server** | `/research` and `/ask` only | ⚠️ See [Known gaps](#known-gaps-on-mac) |
-| Telegram bot token | the bot | already in the Windows `.env` |
+| **ffmpeg** | merging video+audio | Comes free — `imageio-ffmpeg` ships a macOS wheel. Homebrew's is optional. |
+| **An LLM engine** | `/research` and `/ask` only | the default profile needs the FreeLLMAPI server — ⚠️ see [Known gaps](#known-gaps-on-mac); or switch to a profile you have keys for |
+| **cloudflared** | the console's tunnel only | optional — see [Known gaps](#known-gaps-on-mac) |
+| Telegram bot token | the bot | in the old machine's `.env` |
 
-Media downloads need **none** of the LLM stack. If FreeLLMAPI never gets set
-up on the Mac, `/fetch` and link-pasting still work.
+Media downloads need **none** of the LLM stack. If no engine is ever set up,
+`/fetch`, `/find` and link-pasting still work.
 
 ---
 
@@ -57,7 +206,7 @@ up on the Mac, `/fetch` and link-pasting still work.
 
 ```bash
 mkdir -p ~/Agents && cd ~/Agents
-tar -xzf ~/Downloads/argus-macbook-handoff.tar.gz
+tar -xzf ~/Downloads/argus-macbook-handoff.tar.gz     # or git clone
 cd argus
 ```
 
@@ -71,29 +220,30 @@ uv venv venv --python 3.12
 VIRTUAL_ENV=venv uv pip install -e '.[dev,asr]'
 ```
 
-`asr` pulls `faster-whisper`, needed for transcripts of X / Reddit / Instagram
-video (YouTube uses captions instead). Drop it if you don't want a ~1 GB
-model download on first use.
+`asr` pulls `faster-whisper`, needed for local transcripts of X / Reddit /
+Instagram video (YouTube uses captions first). Drop it if you don't want a
+model download on first use, and switch `/engines transcriber` to an API.
 
 ### Step 3 — secrets
 
-The archive deliberately contains **no secrets**. Copy the five values from the
-Windows `.env` (they are not reconstructible from anything in the archive):
+The archive deliberately contains **no secrets**. Copy the values from the
+old machine's `.env` (they are not reconstructible from anything in the
+archive):
 
 ```bash
-cp .env.mac.example .env
+cp .env.example .env
 ```
 
-Then fill in, from the Windows machine's `A:\Hermes\Agents\argus\.env`:
+Then fill in, from the old `.env`:
 
-- `FREELLMAPI_API_KEY` — starts `freellmapi-`
 - `TELEGRAM_BOT_TOKEN` — `<id>:<secret>`
 - `TELEGRAM_ALLOWED_USER_ID` — your numeric Telegram id
-- `EXA_API_KEY` — neural search (optional; falls back to DDGS)
-- `FREELLMAPI_BASE_URL` — usually `http://127.0.0.1:3001/v1`
+- `FREELLMAPI_API_KEY` and `FREELLMAPI_BASE_URL` — for the default profile
+- `EXA_API_KEY` — Exa search (optional; DDGS takes its queries without it)
+- any paid-provider key a profile you use binds (`GROQ_API_KEY`, …)
 
-The bot refuses to start if the API key or bot token is missing or malformed,
-and answers **only** `TELEGRAM_ALLOWED_USER_ID`.
+The bot refuses to start only without a well-formed bot token. It answers
+**only** `TELEGRAM_ALLOWED_USER_ID` (unset, it answers nobody).
 
 ### Step 4 — where downloads land 📁
 
@@ -107,12 +257,12 @@ $ARGUS_VAULT_ROOT/
 │   ├── x/
 │   ├── reddit/
 │   └── instagram/
-├── transcripts/      ← whisper + caption text
-└── research history/ ← reports (Markdown + PDF)
+├── transcripts/      ← speech-to-text + caption text
+└── research history/ ← reports (Markdown + PDF + evidence.json)
 ```
 
-A leading `~` **is** expanded (that was fixed for this handoff — an
-unexpanded `~` used to create a literal `~` folder inside the repo).
+A leading `~` **is** expanded (an unexpanded `~` used to create a literal `~`
+folder inside the repo).
 
 ```bash
 # .env — mirrors the Windows layout, so a copied vault drops straight in
@@ -135,12 +285,12 @@ them off synced folders too.
 
 ### Step 4b — bring the vault across (optional)
 
-Only if you want the existing ~3.4 GB of downloads and past reports. The
-library database in the archive already lists them with **Windows** paths, so
-after copying you must remap:
+Only if you want the existing downloads and past reports. The library
+database in the archive lists them with the **old machine's** paths, so after
+copying you must remap:
 
 ```bash
-# 1. copy the media/transcripts/reports from the Windows box (rsync/USB/etc.)
+# 1. copy the media/transcripts/reports from the old box (rsync/USB/etc.)
 #    into whatever you set as ARGUS_VAULT_ROOT
 
 # 2. rewrite the stored paths (old root -> new root)
@@ -156,10 +306,10 @@ adopts it) and any library row whose file is gone. If you are **not** bringing
 the vault, skip all of this — just delete `argus_library.sqlite` for a clean
 slate, or keep it and let the reconciler show the old rows as missing.
 
-`argus_checkpoints.sqlite` is **not** in the archive (53 MB of in-flight
-LangGraph state that does not travel meaningfully). Any research run that was
-mid-flight on Windows is gone; the bot recreates the file on first start and
-tells you about orphaned runs.
+`argus_checkpoints.sqlite` does not travel meaningfully (in-flight LangGraph
+state). Without it, a research run that was mid-flight on the old machine is
+gone; the bot recreates the file on first start and tells you about orphaned
+runs.
 
 ### Step 5 — verify
 
@@ -170,10 +320,11 @@ Run these in order. Do not report success before all four pass.
 PYTHONPATH="" ./venv/bin/python -m pytest -q
 ```
 
-Expect **~489 passed**. The 6 `test_llm.py` / `test_graph.py` failures are
-expected **iff** the FreeLLMAPI server isn't running — they are live-LLM tests
-and fail with `httpx.ConnectError` to `127.0.0.1:3001`. Any *other* failure is
-real and must be fixed before continuing.
+Everything must pass except the live-proxy tests (`tests/test_llm.py`,
+`tests/test_graph.py`) when the FreeLLMAPI server isn't running — they resolve
+the shipped engines config against it and fail with an `EngineConfigError`
+("cannot list models at …"). Any *other* failure is real and must be fixed
+before continuing.
 
 ```bash
 # 2. downloader + ffmpeg resolve
@@ -208,27 +359,42 @@ print('%.2f MB in %.1fs' % (r.size_bytes/1e6, r.elapsed_s))"
 ```
 
 Startup log should show `ffmpeg: …`, `yt-dlp: …`, and
-`Argus bot starting; long-polling…`. In Telegram, paste any YouTube/X link →
-you get a download menu → tap `⬇ 1` → the file lands in the vault and (if
-under 50 MB) is sent back to you.
+`Argus bot starting; long-polling…`, plus the console lines
+(`webapp: listening on 127.0.0.1:<port>`, then the tunnel URL) unless the
+console is disabled. In Telegram, paste any YouTube/X link → you get a
+download menu → tap `⬇ 1` → the file lands in the vault and (if under
+Telegram's bot upload cap) is sent back to you. With an engine available,
+`scripts/verify_live.sh` then checks research end to end (it needs the same
+valid `.env`, bot token included).
 
 ---
 
 ## Running day to day
 
 ```bash
-cd ~/Agents/argus && ./scripts/run_mac.sh
+cd ~/Agents/argus && ./scripts/run_mac.sh      # Windows: ./scripts/run.sh (Git Bash)
 ```
 
-`run_mac.sh` kills any existing `argus.bot` poller, asserts it is gone, then
-execs the new one. If it refuses to start it will tell you what is still alive.
+The pre-flight kills any existing `argus.bot` poller **and any orphaned
+cloudflared of this bot**, asserts none is left, then execs the new bot. A
+bot that was hard-killed leaves its cloudflared child behind (seen on
+Windows: the old tunnel kept serving the console port), which is why. "Of
+this bot" means either this repo's binary (`tools/bin/cloudflared(.exe)`,
+whatever its arguments), or the `ARGUS_CLOUDFLARED` binary **only when it runs
+the bot's own command line** (`tunnel --url http://127.0.0.1:<ARGUS_WEBAPP_PORT>
+--no-autoupdate`). So a shared `ARGUS_CLOUDFLARED` (say, Homebrew's) running
+your other tunnels is left alone; only a quick tunnel to the console's own
+port on that binary would be taken for the bot's. Any other cloudflared is
+never touched. A failed process query (WMI on Windows) stops the script
+instead of reading as "none left". If the script refuses to start it tells
+you what is still alive.
 
 ### One bot per token
 
 Telegram allows exactly one long-poller per token. A second instance makes
 Telegram answer one and return **409 Conflict** to the other — and the loser
 may be the one you just fixed, so a change appears not to take effect. Before
-starting on the Mac, confirm the Windows bot is stopped. Never run both.
+starting on a new machine, confirm the old bot is stopped. Never run both.
 
 ### Useful commands
 
@@ -238,22 +404,21 @@ starting on the Mac, confirm the Windows bot is stopped. Never run both.
 | `/fetch <url…>` | download directly |
 | `/find <query>` | search YouTube, pick from results |
 | `/quality auto\|min\|max\|<height>` | download quality (see below) |
-| `/research <topic>` | full multi-agent report (needs FreeLLMAPI) |
-| `/ask <question>` | quick answer (needs FreeLLMAPI) |
-| `/transcript`, `/transcripts` | speech-to-text |
-| `/runs`, `/status`, `/delete` | manage runs and stored assets |
+| `/research <topic>` | full multi-agent report (needs an engine) |
+| `/ask <question>` | quick answer, no search (needs an engine) |
+| `/transcript`, `/transcripts` | captions / speech-to-text |
+| `/runs`, `/status`, `/cancel`, `/continue`, `/delete` | manage runs and stored assets |
+| `/engines` | engines profiles, roles, the transcriber |
+| menu button **Argus** | the console |
 | `/help full` | the detailed guide (`docs/help.md`) |
 
 ### About `/quality`
 
-Currently set to **`max`** (it is stored in the library DB and travels with it).
-`max` takes the largest available stream, which is why past downloads hit
-647 MB and 676 MB. Telegram's bot upload cap is 50 MB, so at `max` most long
-videos are saved to the vault but **cannot** be delivered in chat — that is
-expected, not a bug, and the bot now says so explicitly.
-
-`/quality 720` or `/quality auto` keeps most clips deliverable. `auto` caps
-the short side at 1080 and is orientation-aware.
+The setting is stored in the library DB and travels with it. `max` takes the
+largest available stream, so long videos are saved to the vault but often
+**cannot** be delivered in chat (Telegram's bot upload cap) — expected, not a
+bug, and the bot says so explicitly. `/quality 720` or `/quality auto` keeps
+most clips deliverable; `auto` caps the short side and is orientation-aware.
 
 ---
 
@@ -261,42 +426,43 @@ the short side at 1080 and is orientation-aware.
 
 Read this before concluding something is broken.
 
-### 1. FreeLLMAPI server — `/research` and `/ask` will not work without it
+### 1. FreeLLMAPI server — the default profile needs it
 
-`.env` points at `http://127.0.0.1:3001/v1`, a **local** server that is not
-part of this repo and is **not** in the archive. How it is installed on the
-Windows box is not recorded anywhere in this project, so it could not be
-documented here.
+The default engines profile points at `FREELLMAPI_BASE_URL`, a **local**
+server that is not part of this repo and is **not** in the archive. How it is
+installed on the Windows box is not recorded anywhere in this project.
 
-- **Impact:** all LLM features. Media download and `/find` are unaffected.
-- **Action:** find how FreeLLMAPI was installed on Windows and repeat it, or
-  point `FREELLMAPI_BASE_URL`/`FREELLMAPI_API_KEY` at any OpenAI-compatible
-  endpoint. The bot only needs a well-formed key string to *start*; it needs a
-  live server to actually answer.
+- **Impact:** research and `/ask` on the default profile. Media download and
+  `/find` are unaffected; the bot starts and DMs the engines problem.
+- **Action:** repeat the FreeLLMAPI install, point `FREELLMAPI_BASE_URL` at
+  any OpenAI-compatible endpoint, or switch profile (`/engines use
+  <profile>`) to one whose provider keys you have. `scripts/engines_probe.py
+  --provider <name>` checks a provider before you rely on it.
 - **UNVERIFIED ON MAC.**
 
-### 2. `intel-stack` — degrades research source-fetching
+### 2. `intel-stack` — optional
 
-`src/argus/tools.py` shells out to a sibling repo at
-`A:\Hermes\Agents\intel-stack` for three scripts: `snatch.py`, `crawl.py`,
-`article_convert.py` (plus `harvest.py`). Those live in their own venv with
-`crawl4ai` / `markitdown` / `feedparser`.
+Research fetches pages with its own native fetcher. The intel-stack sibling
+repo (`snatch.py`, `crawl.py`, `article_convert.py`, in their own venv) only
+adds extra fetch rungs for pages the native one cannot read. To use it, port
+it and set both in `.env`:
 
-- **Works anyway:** all media downloads, `/find`, YouTube transcripts, DDGS and
-  Exa web search, PDF rendering (ReportLab, in-venv).
-- **Degraded:** `/research` fetches source *pages* through
-  `snatch_url` / `crawl_url` / `normalize_to_markdown`. Without intel-stack
-  these fail, and the research engine falls back to search-result snippets
-  instead of full page text — thinner reports, not a crash.
-- **Action if you want full research:** port `intel-stack` too, then set both
-  in `.env`:
-  ```bash
-  INTEL_STACK_DIR=~/Agents/intel-stack/scripts
-  INTEL_PYTHON=~/Agents/intel-stack/venv/bin/python
-  ```
-  (Both are env-overridable as of this handoff; they used to be hardcoded.)
+```bash
+INTEL_STACK_DIR=~/Agents/intel-stack/scripts
+INTEL_PYTHON=~/Agents/intel-stack/venv/bin/python
+```
 
-### 3. Login-walled content
+### 3. cloudflared — the console's tunnel
+
+`tools/bin/` is gitignored, so the binary does not come with the repo. Put a
+macOS `cloudflared` at `tools/bin/cloudflared` (or set `ARGUS_CLOUDFLARED`;
+the pre-flight then stops that binary only when it runs the bot's own
+command line, see [Running day to day](#running-day-to-day)).
+Without it the console reports "cloudflared not found" and the chat works as
+before; `ARGUS_WEBAPP_TUNNEL=none` keeps the console local only, and
+`ARGUS_WEBAPP_ENABLED=false` turns it off. **UNVERIFIED ON MAC.**
+
+### 4. Login-walled content
 
 Private X videos, some Instagram posts and age-restricted YouTube need cookies.
 Set **one** of these in `.env`:
@@ -306,16 +472,19 @@ ARGUS_YTDLP_COOKIES_BROWSER=chrome     # or firefox / edge / safari / brave
 ARGUS_YTDLP_COOKIES=~/argus-cookies.txt
 ```
 
-macOS specifics: Safari is supported by yt-dlp (verified in the installed
-version). Chrome **locks its cookie database while running** — quit it first.
-Reading Safari's cookies may prompt for Full Disk Access for your terminal.
-The bot now tells you when an error looks cookie-shaped.
+macOS specifics: Safari is supported by yt-dlp. Chrome **locks its cookie
+database while running** — quit it first. Reading Safari's cookies may prompt
+for Full Disk Access for your terminal. The bot tells you when an error looks
+cookie-shaped.
 
-### 4. Whisper on Apple Silicon
+### 5. Whisper on Apple Silicon
 
-`faster-whisper` is configured for **CPU int8** (`transcribe.py`). It works on
-Apple Silicon but does not use the GPU, so long audio is slow. First run
-downloads the model (`ARGUS_WHISPER_MODEL`, default `small`).
+`faster-whisper` runs on the CPU here; it does not use the GPU, so long audio
+is slow. First run downloads the model. The model, device and compute type
+come from `transcriber.faster_whisper` in `argus_engines.json` (override them
+in the gitignored `argus_engines.local.json`); `/engines transcriber` picks
+the engine (an audio API such as Groq's Whisper is the fast alternative).
+`ARGUS_WHISPER_MODEL` is no longer read; startup warns if it is set.
 **UNVERIFIED ON MAC.**
 
 ---
@@ -324,50 +493,55 @@ downloads the model (`ARGUS_WHISPER_MODEL`, default `small`).
 
 | Symptom | Do this |
 |---|---|
-| `409 Conflict` in the log | Another poller has the token. Stop the Windows bot, and any second Mac terminal. |
+| `409 Conflict` in the log | Another poller has the token. Stop the other machine's bot, and any second terminal. |
+| Console still answers after the bot died | An orphaned cloudflared from a hard-killed bot. `run.sh` / `run_mac.sh` stop it on the next start. |
+| "⚠️ Console down — …" DM | The reason follows the dash, and `/status` repeats it; the chat is unaffected. `logs/cloudflared.log` has the tunnel's output. |
+| `/research` answers with an engines error | The active profile cannot run (no key, no model, proxy down). `/engines` shows the problem; fix it or `/engines use` another profile. |
 | Bot starts, downloads nothing, `ffmpeg: None` in log | `VIRTUAL_ENV=venv uv pip install -U imageio-ffmpeg`, or set `ARGUS_FFMPEG=/opt/homebrew/bin/ffmpeg` |
-| "No video could be found in this tweet" | Post is deleted/protected, or needs login → set `ARGUS_YTDLP_COOKIES_BROWSER`. The error message now says this. |
+| "No video could be found in this tweet" | Post is deleted/protected, or needs login → set `ARGUS_YTDLP_COOKIES_BROWSER`. The error message says this. |
 | A platform suddenly stops working | yt-dlp lags platform changes. `VIRTUAL_ENV=venv uv pip install -U --pre yt-dlp` (`--pre` gets nightlies, which is where extractor fixes land first). |
-| Download "stalled — no progress for 300s" | Connection dropped. Re-send the same link: yt-dlp **resumes** from the `.part` file. |
-| Big file saved but not sent to Telegram | Over the 50 MB bot cap. Expected. Use `/quality 720`, or open it from the vault. |
+| Download "stalled — no progress for …" | Connection dropped. Re-send the same link: yt-dlp **resumes** from the `.part` file. |
+| Big file saved but not sent to Telegram | Over Telegram's bot upload cap. Expected. Use `/quality 720`, or open it from the vault. |
 | Vault and library disagree | `./venv/bin/python scripts/reconcile_vault.py` (add `--register` to adopt orphans) |
-| `.part` files piling up | Same tool lists them with age. `--prune-partials --older-than 7` deletes them — this destroys resume capability, so only for downloads you have abandoned. |
+| `.part` files piling up | Same tool lists them with age. `--prune-partials --older-than <days>` deletes them — this destroys resume capability, so only for downloads you have abandoned. |
 | `pydantic_core` import explosion | A foreign `PYTHONPATH` leaked in. `run_mac.sh` clears it; if running python directly, prefix `PYTHONPATH=""`. |
 
 ### Tuning knobs (all optional, all in `.env`)
 
-```bash
-ARGUS_MEDIA_FRAGMENTS=8         # parallel HLS fragments (the 4.5x win)
-ARGUS_MEDIA_CONCURRENCY=2       # simultaneous downloads
-ARGUS_MEDIA_STALL_TIMEOUT=300   # kill after N seconds of silence
-ARGUS_MEDIA_TIMEOUT=5400        # absolute ceiling per download
-ARGUS_TG_MEDIA_WRITE_TIMEOUT=1800   # raise on a slow uplink
-```
+The media knobs (`ARGUS_MEDIA_FRAGMENTS`, `ARGUS_MEDIA_CONCURRENCY`,
+`ARGUS_MEDIA_STALL_TIMEOUT`, `ARGUS_MEDIA_TIMEOUT`), the Telegram client
+timeouts (`ARGUS_TG_*_TIMEOUT`; raise `ARGUS_TG_MEDIA_WRITE_TIMEOUT` on a slow
+uplink), the console and run-driver knobs: see `.env.example`, which says what
+each does. Research depth is not an env knob any more: it is the depth preset
+on the plan card (or the console's overrides).
+
+Logging: `ARGUS_LOG` sets the level. The bot token is redacted from every log
+line, always (the httpx request lines read `bot<redacted>`). A crash that
+escapes `main()`, or ends a thread, is logged at CRITICAL with its traceback
+through the same redaction, not printed bare. `ARGUS_LOG_HTTP=false` also stops
+the httpx/httpcore request lines; their warnings and errors still show. With it
+off, the httpx `409 Conflict` request line is gone, but a second poller still
+logs the bot's own warning `Telegram 409 Conflict — another bot instance is
+polling this token` on every retry, so the `409 Conflict` row under
+Troubleshooting keeps working.
 
 ---
 
 ## Git state
 
-The download fixes described above are **uncommitted** in the working tree of
-the archive. `git status` on the Mac will show modified `src/argus/*.py`,
-`tests/*.py` and new files (`scripts/run_mac.sh`,
-`scripts/reconcile_vault.py`, `.env.mac.example`, `handoff.md`).
-
-`git log` still ends at `3e8c8eb fix(argus): PDF cosmetics + old-money
-editorial redesign (#17)`. Commit them on the Mac once you have confirmed
-Step 5 passes there — that way the commit records a state actually verified on
-the machine it runs on.
+Check `git status` / `git log` on the machine itself. Commit only a state
+verified on the machine it runs on (Step 5).
 
 ## What is NOT in the archive, and why
 
 | Excluded | Why |
 |---|---|
-| `.env` | live secrets; copy the 5 values by hand (Step 3) |
-| `venv/` | Windows binaries; rebuilt in Step 2 |
-| `argus_checkpoints.sqlite` | 53 MB of in-flight run state, not portable |
-| `media/`, `transcripts/`, `research history/` | the 3.4 GB vault — copy separately if you want it (Step 4b) |
-| `__pycache__/`, `.pytest_cache/`, `demo_output/` | build/run artifacts |
+| `.env` | live secrets; copy the values by hand (Step 3) |
+| `venv/` | platform binaries; rebuilt in Step 2 |
+| `tools/bin/` | platform binaries (cloudflared); see Known gaps |
+| `argus_checkpoints.sqlite` | in-flight run state, not portable |
+| `media/`, `transcripts/`, `research history/` | the vault — copy separately if you want it (Step 4b) |
+| `__pycache__/`, `.pytest_cache/`, `demo_output/`, `logs/`, `bench/results/` | build/run artifacts |
 
-`argus_library.sqlite` (94 KB, 56 assets / 13 runs) **is** included — it is
-your history and your `/quality` setting. Its WAL was checkpointed and
-integrity-checked before packing.
+`argus_library.sqlite` **is** included — it is your history and your
+`/quality` setting. Checkpoint its WAL and check its integrity before packing.

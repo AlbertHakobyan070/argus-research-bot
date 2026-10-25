@@ -6,9 +6,9 @@ Covers:
   - ``tools.youtube_video_transcript`` — fail-soft on bad URL, fail-soft
     on no-vtt, success path. We monkeypatch ``_run_yt_dlp`` and the on-disk
     reads so the suite is hermetic (no network, no real yt-dlp invocations).
-  - ``bot._parse_indices`` — comma/space separators, ranges, ``all``,
+  - ``bot.common._parse_indices`` — comma/space separators, ranges, ``all``,
     bad tokens silently dropped, command prefix.
-  - ``bot._pool_put`` / ``_pool_get`` — basic round-trip and TTL expiry.
+  - ``bot.media._pool_put`` / ``_pool_get`` — basic round-trip and TTL expiry.
 
 No Telegram bot is started; we exercise the parsers and the tool layer
 directly. The bot's glue (transcript_cmd) is shaped identically to other
@@ -24,7 +24,9 @@ from unittest.mock import patch
 
 import pytest
 
-from argus import bot, tools
+from argus import tools
+from argus.bot import common as bot_common
+from argus.bot import media as bot_media
 
 
 # ---------------------------------------------------------------------------
@@ -274,19 +276,19 @@ def test_youtube_video_transcript_format_invalid_raises():
 
 def test_parse_indices_ignores_format_flag():
     """`/transcript 2 format=srt` -> indices=[2], the flag is dropped."""
-    indices = bot._parse_indices("2 format=srt")
+    indices = bot_common._parse_indices("2 format=srt")
     assert indices == [2]
 
 
 def test_parse_indices_with_format_flag_and_range():
     """`/transcript 1-3 format=txt` -> indices=[1,2,3]."""
-    indices = bot._parse_indices("1-3 format=txt")
+    indices = bot_common._parse_indices("1-3 format=txt")
     assert indices == [1, 2, 3]
 
 
 def test_parse_indices_format_only_no_indices():
     """`/transcript format=srt` -> empty list (caller surfaces usage hint)."""
-    indices = bot._parse_indices("format=srt")
+    indices = bot_common._parse_indices("format=srt")
     assert indices == []
 
 
@@ -346,7 +348,7 @@ def test_youtube_video_transcript_fails_when_no_vtt(monkeypatch, tmp_path: Path)
     ("abc,def",    []),
 ])
 def test_parse_indices(text, expected):
-    assert bot._parse_indices(text) == expected
+    assert bot_common._parse_indices(text) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -354,37 +356,37 @@ def test_parse_indices(text, expected):
 # ---------------------------------------------------------------------------
 
 def test_pool_round_trip():
-    bot._video_pool.clear()
+    bot_media._video_pool.clear()
     results = [{"url": "https://example/v=1", "title": "A"}]
-    bot._pool_put("tg:1", results)
-    assert bot._pool_get("tg:1") == results
+    bot_media._pool_put("tg:1", results)
+    assert bot_media._pool_get("tg:1") == results
 
 
 def test_pool_ttl_expiry(monkeypatch):
-    bot._video_pool.clear()
-    bot._pool_put("tg:2", [{"url": "u", "title": "t"}])
+    bot_media._video_pool.clear()
+    bot_media._pool_put("tg:2", [{"url": "u", "title": "t"}])
     # Pretend 31 minutes have passed
     base = time.time()
-    monkeypatch.setattr(bot.time, "time", lambda: base + 31 * 60)
-    assert bot._pool_get("tg:2") is None
+    monkeypatch.setattr(bot_media.time, "time", lambda: base + 31 * 60)
+    assert bot_media._pool_get("tg:2") is None
     # And the entry is now removed
-    assert "tg:2" not in bot._video_pool
+    assert "tg:2" not in bot_media._video_pool
 
 
 def test_pool_replaces_on_new_search():
-    bot._video_pool.clear()
-    bot._pool_put("tg:3", [{"url": "old", "title": "old"}])
-    bot._pool_put("tg:3", [{"url": "new", "title": "new"}])
-    res = bot._pool_get("tg:3")
+    bot_media._video_pool.clear()
+    bot_media._pool_put("tg:3", [{"url": "old", "title": "old"}])
+    bot_media._pool_put("tg:3", [{"url": "new", "title": "new"}])
+    res = bot_media._pool_get("tg:3")
     assert res and res[0]["url"] == "new"
 
 
 def test_pool_isolates_threads():
-    bot._video_pool.clear()
-    bot._pool_put("tg:a", [{"url": "A", "title": "A"}])
-    bot._pool_put("tg:b", [{"url": "B", "title": "B"}])
-    assert bot._pool_get("tg:a")[0]["url"] == "A"
-    assert bot._pool_get("tg:b")[0]["url"] == "B"
+    bot_media._video_pool.clear()
+    bot_media._pool_put("tg:a", [{"url": "A", "title": "A"}])
+    bot_media._pool_put("tg:b", [{"url": "B", "title": "B"}])
+    assert bot_media._pool_get("tg:a")[0]["url"] == "A"
+    assert bot_media._pool_get("tg:b")[0]["url"] == "B"
 
 
 # ---------------------------------------------------------------------------

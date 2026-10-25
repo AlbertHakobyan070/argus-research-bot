@@ -18,19 +18,25 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
-from argus import bot as bot_mod
-from argus.bot import _inflight, append_cmd, continue_cmd
+from argus.bot import common as bot_common
+from argus.bot import history as bot_history
+from argus.bot import runs
+from argus.bot.history import append_cmd, continue_cmd
 from argus.config import Settings
+from argus.engines import registry
+from argus.engines.ledger import SpendLedger
 from argus.graph import graph as graph_mod
 from argus.graph import nodes as nodes_mod
 from argus.graph import research as research_mod
-from argus.graph import search_providers as sp_mod
+from argus.graph.run_config import FetchConfig
+
+from helpers import fake_engines_snapshot, make_run_config, settle_runs
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +75,7 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(graph_mod, "compose_node",
                         lambda s: {"draft_md": "d", "findings": [],
                                    "sections": []})
+    monkeypatch.setattr(graph_mod, "analyst_node", lambda s: {"analysis": None})
     monkeypatch.setattr(graph_mod, "panel_node",
                         lambda s: {"panel_verdict": {"verdict": "pass"},
                                    "review_verdict": {"verdict": "pass"}})
@@ -104,7 +111,7 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
             "append_only /continue must NOT run fresh searches")
 
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
-    monkeypatch.setattr(sp_mod, "run_query_wave", _boom)
+    monkeypatch.setattr(research_mod, "run_wave", _boom)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont1"}}
@@ -136,23 +143,19 @@ def test_finished_run_extend_fork_append_only(monkeypatch):
 
 
 def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
+    """A plain /continue (no appends) reaches research as an Extend pass:
+    append_only False, extend_rounds bumped. v4 (option B): research_node
+    runs the fresh search wave itself — asserted where it runs,
+    tests/test_gap_mode.py::test_plain_continue_extend_pass_runs_a_fresh_search_wave."""
     _stub_pipeline(monkeypatch)
-    calls: list = []
+    seen: list[dict] = []
+    stub_research = graph_mod.research_node
 
-    def fake_followups(brief, gaps, prior):
-        calls.append(1)
-        return ([{"query": "widened q", "provider": "ddgs",
-                  "sub_qs": [0]}], [])
+    def research(s):
+        seen.append({"append_only": s.get("append_only"), "extend_rounds": s.get("extend_rounds")})
+        return stub_research(s)
 
-    def fake_wave(queries, **kw):
-        return ([{"kind": "web", "title": "New",
-                  "url": "https://new.example/y", "snippet": "",
-                  "provider": "ddgs", "sub_qs": [0], "text": "",
-                  "published": "", "source": "web-search",
-                  "summary": ""}], [])
-
-    monkeypatch.setattr(research_mod, "followup_queries", fake_followups)
-    monkeypatch.setattr(sp_mod, "run_query_wave", fake_wave)
+    monkeypatch.setattr(graph_mod, "research_node", research)
 
     g = graph_mod.build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "t:cont2"}}
@@ -167,9 +170,8 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
 
     snap = g.get_state(cfg)
     assert snap.next == ("deliver",)
-    assert calls, "plain /continue must run a fresh search wave"
-    urls = [s.get("url") for s in snap.values.get("sources") or []]
-    assert "https://new.example/y" in urls
+    assert seen[-1] == {"append_only": False, "extend_rounds": 1}, (
+        "plain /continue must reach research as a fresh-search Extend pass")
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +180,8 @@ def test_finished_run_plain_continue_runs_fresh_search(monkeypatch):
 
 
 def _fetch(sources: list[dict]) -> tuple[list[dict], list[str]]:
-    return research_mod._parallel_fetch(sources)
+    return research_mod._parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}),
+                                        exa_on=False)
 
 
 def test_fetch_ingests_local_md(tmp_path):
@@ -220,15 +223,16 @@ def test_fetch_missing_local_file_is_loud(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _clear_inflight():
-    _inflight.clear()
+async def _clear_inflight():
+    bot_common._inflight.clear()
     yield
-    _inflight.clear()
+    await settle_runs()
+    bot_common._inflight.clear()
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_history, "_allowed", lambda _s, _uid: True)
 
 
 @pytest.fixture(autouse=True)
@@ -242,9 +246,18 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         media_root=Path("vault/media"),
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"), ffmpeg_path=None,
-        request_timeout_seconds=60.0, max_revision_rounds=3,
     )
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_history, "get_settings", lambda: dummy)
+
+
+@pytest.fixture(autouse=True)
+async def _engines_resolved(monkeypatch: pytest.MonkeyPatch):
+    """/continue first awaits registry.active_snapshot() (v4 WP-A); a
+    re-attached plan card names the shipped engines file's profiles."""
+    monkeypatch.setattr(registry, "_state", registry._State())
+    await registry.load_config()
+    monkeypatch.setattr(registry, "active_snapshot",
+                        AsyncMock(return_value=fake_engines_snapshot()))
 
 
 class _FakeLib:
@@ -274,6 +287,9 @@ class _FakeLib:
 
     async def set_run_status(self, run_id, status, report_dir=None):
         self.statuses.append((run_id, status))
+        return True
+
+    async def update_run(self, run_id, **cols):
         return True
 
     async def list_runs(self, chat_id=None, limit=10):
@@ -318,19 +334,70 @@ async def test_append_queues_urls_and_asset_refs():
     assert ("asset:7", "asset") in kinds
 
 
-class _FakeGraph:
-    """Finished-run double: empty snap.next, records update/stream calls."""
+async def test_append_again_requeues_a_ref_continue_marked_failed():
+    """WP-B fix round 3 (N1), the bot's flow on the real Library: /append, a
+    /continue that could not ingest the ref (marked ``failed``, the user told to
+    /append it again), then that /append — the ref is pending again and the
+    reply counts it."""
+    from argus.library import Library
 
-    def __init__(self, values, nxt=()):
+    lib = Library(":memory:")
+    await lib.open()
+    try:
+        await lib.create_run(run_id="ab12cd34", thread_id="tg:5:ab12cd34", chat_id=5, topic="topic",
+                             config_json="{}", depth="quick", origin="telegram")
+        ref = "https://walled.example/b"
+        first = _update()
+        await append_cmd(first, _ctx(["ab12cd34", ref], lib))
+        assert "(1 pending total)" in first.message.reply_text.await_args.args[0]
+        await lib.mark_sources("ab12cd34", [ref], "failed")      # what _mark_appended does
+        retry = _update()
+        await append_cmd(retry, _ctx(["ab12cd34", ref], lib))
+        assert "(1 pending total)" in retry.message.reply_text.await_args.args[0]
+        assert [p["ref"] for p in await lib.pending_sources("ab12cd34")] == [ref]
+    finally:
+        await lib.close()
+
+
+class _FakeGraph:
+    """Finished-run double (empty snap.next by default): records update and
+    stream calls; a drive runs ``on_drive(values)`` and stops at the report
+    preview."""
+
+    def __init__(self, values, nxt=(), on_drive=None):
         self.values = values
         self.nxt = tuple(nxt)
         self.updates: list[tuple] = []
+        self.streams: list = []
+        self.on_drive = on_drive or (lambda values: None)
+        self.nodes: dict = {}
+        self.checkpointer = SimpleNamespace(aget_tuple=AsyncMock(return_value=None))
 
     async def aget_state(self, cfg):
-        return SimpleNamespace(values=self.values, next=self.nxt)
+        return SimpleNamespace(values=self.values, next=self.nxt,
+                               created_at="2026-10-19T00:00:00+00:00")
 
     async def aupdate_state(self, cfg, payload, as_node=None):
         self.updates.append((payload, as_node))
+        self.values = {**self.values, **payload}
+
+    def astream(self, resume, cfg, **_kw):
+        self.streams.append(resume)
+        self.on_drive(self.values)
+        self.nxt = ("deliver",)
+
+        async def _gen():
+            return
+            yield
+
+        return _gen()
+
+
+async def _continue(update, ctx) -> None:
+    """/continue, then wait for the drive it started (if any)."""
+    await runs.init(ctx.application)
+    await continue_cmd(update, ctx)
+    await settle_runs()
 
 
 async def test_continue_finished_run_forks_with_full_sources():
@@ -338,19 +405,15 @@ async def test_continue_finished_run_forks_with_full_sources():
     lib.pending = [{"ref": "asset:7", "kind": "asset", "status": "pending"}]
     old_sources = [{"kind": "web", "title": "Old",
                     "url": "https://old.example/o"}]
-    graph = _FakeGraph(values={"sources": old_sources, "length": "short"})
+    def research_ingests(values):
+        from argus.graph.research import _local_url
+        values["fetched"] = [{"url": _local_url(r"V:\t.txt"), "title": "T"}]   # research ingested it
 
-    async def fake_resume(ctx, info, resume_input=...):
-        assert resume_input is None, (
-            "a fork (no pending interrupt) must resume with None, not "
-            "Command(resume=True)")
-        info["awaiting"] = "report_preview"
+    graph = _FakeGraph(values={"sources": old_sources, "length": "short"}, on_drive=research_ingests)
+    await _continue(_update(), _ctx(["ab12"], lib, graph))
 
-    with patch.object(bot_mod, "_resume_after_plan",
-                      side_effect=fake_resume) as rp:
-        await continue_cmd(_update(), _ctx(["ab12"], lib, graph))
-
-    assert rp.call_count == 1
+    assert graph.streams == [None], (
+        "a fork (no pending interrupt) must resume with None, not Command(resume=True), exactly once")
     payload, as_node = graph.updates[-1]
     assert as_node == "deliver", "fork must be positioned after deliver"
     assert payload["extend_requested"] is True
@@ -361,7 +424,33 @@ async def test_continue_finished_run_forks_with_full_sources():
         "merged list, never a delta")
     assert any(u.startswith("file:///") for u in urls)
     # Ingested bookkeeping happened after the successful resume.
-    assert lib.marked and lib.marked[0][2] == "ingested"
+    assert lib.marked == [("ab12cd34", ("asset:7",), "ingested")]
+
+
+async def test_continue_marks_only_fetched_appends_ingested_and_names_the_failures():
+    """Spec §2.4 Trust fix (WP-B review): a pinned ref is ``ingested`` only when
+    research fetched it; a failed one is marked ``failed`` and the user sees a line
+    naming the URL and the rungs tried (v3/v4-first marked every pending ref)."""
+    lib = _FakeLib(run=dict(_RUN))
+    lib.pending = [{"ref": "https://ok.example/a", "kind": "url", "status": "pending"},
+                   {"ref": "https://walled.example/b", "kind": "url", "status": "pending"}]
+    line = ("fetch https://walled.example/b failed: native: HTTP 403; exa_contents: no EXA_API_KEY "
+            "(rungs tried: native, exa_contents)")
+
+    def research_fetches(values):
+        values.update(fetched=[{"url": "https://ok.example/a", "title": "A"}],
+                      errors=["an earlier, unrelated line", line])
+
+    graph = _FakeGraph(values={"sources": [], "length": "short"}, on_drive=research_fetches)
+    update = _update()
+    await _continue(update, _ctx(["ab12"], lib, graph))
+
+    assert lib.marked == [("ab12cd34", ("https://ok.example/a",), "ingested"),
+                          ("ab12cd34", ("https://walled.example/b",), "failed")]
+    text = update.message.reply_text.await_args_list[-1].args[0]
+    assert "1 appended source(s) could not be ingested" in text
+    assert f"• https://walled.example/b: {line}" in text, "the URL and the rungs tried are visible"
+    assert "ok.example" not in text
 
 
 async def test_continue_reattaches_plan_gate_paused_run():
@@ -374,12 +463,13 @@ async def test_continue_reattaches_plan_gate_paused_run():
     update = _update()
     ctx = _ctx(["ab12"], lib, graph)
 
-    await continue_cmd(update, ctx)
+    await _continue(update, ctx)
 
-    assert "ab12cd34" in _inflight
-    info = _inflight["ab12cd34"]
-    assert info["awaiting"] == "plan_approval"
-    assert info["length"] == "long"
+    assert "ab12cd34" in bot_common._inflight
+    h = bot_common._inflight["ab12cd34"]
+    assert not h.live and h.gate_kind == runs.PLAN
+    assert (await runs.plan_payload("ab12cd34"))["length"] == "long"
+    assert graph.streams == [], "a re-attach drives nothing"
     # Plan message re-rendered with the run-scoped keyboard.
     sends = ctx.application.bot.send_message.await_args_list
     markup = next((c.kwargs.get("reply_markup") for c in sends
@@ -475,14 +565,14 @@ def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
         raise AssertionError("append_only must NOT run search waves")
 
     monkeypatch.setattr(research_mod, "followup_queries", _boom)
-    monkeypatch.setattr(research_mod, "run_query_wave", _boom)
+    monkeypatch.setattr(research_mod, "run_wave", _boom)
 
-    def fake_digest(item, source_id, brief, user_request):
+    def fake_digest(item, source_id, brief, user_request, **kw):
         return ({"source_id": source_id, "source_url": item["url"],
                  "title": item["title"], "sub_qs": [],
                  "relevance": 3, "stance": "background",
                  "claims": [{"text": "c", "quote": "", "confidence":
-                             "medium"}]}, None, "")
+                             "medium"}]}, [], [])
 
     monkeypatch.setattr(research_mod, "digest_one", fake_digest)
     monkeypatch.setattr(research_mod, "score_fetched",
@@ -490,6 +580,7 @@ def test_research_node_append_only_skips_search_waves(monkeypatch, tmp_path):
 
     out = research_mod.research_node({
         "user_request": "topic",
+        "run_config": make_run_config("short"),
         "append_only": True,
         "brief": {"sub_questions": [{"q": "q?", "kind": "web"}],
                   "must_have_keywords": ["topic"]},

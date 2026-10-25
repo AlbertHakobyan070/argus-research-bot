@@ -15,6 +15,8 @@ dropped; the research triage demotes them softly instead.
 """
 from __future__ import annotations
 
+import pytest
+
 from argus.graph.credibility import (
     CREDIBILITY_FLOOR,
     DomainTrust,
@@ -443,3 +445,69 @@ def test_score_fetched_does_not_flag_legitimate_arxiv():
     )
     out = score_fetched([item], user_request="deep research agents")
     assert out[0].credibility_flag != "fabricated_path"
+
+
+# ---------------------------------------------------------------------------
+# (e) v4: the official-doc prior and the authority scale (spec §3 WP-B)
+# ---------------------------------------------------------------------------
+
+def test_official_docs_get_a_credibility_prior():
+    """Official documentation outranks an unknown blog on the same title."""
+    from argus.graph.credibility import CREDIBILITY_FLOOR, is_official_doc
+    title = "LangGraph interrupts"
+    docs = credibility_score(FetchedItem(url="https://docs.langchain.com/oss/python/langgraph/interrupts",
+                                         title=title), user_request="langgraph interrupts")
+    blog = credibility_score(FetchedItem(url="https://someblog.example/langgraph-interrupts", title=title),
+                             user_request="langgraph interrupts")
+    assert docs > blog and docs >= CREDIBILITY_FLOOR
+    for url in ("https://docs.python.org/3/library/asyncio.html", "https://developer.mozilla.org/en-US/docs/Web",
+                "https://pydantic.readthedocs.io/en/latest/", "https://example.com/docs/guide"):
+        assert is_official_doc(url), url
+    assert is_official_doc("https://example.com/post", kind="official_doc"), "the search hit's kind counts"
+    assert not is_official_doc("https://someblog.example/langgraph-interrupts")
+
+
+def test_authority_prior_scale():
+    """0 = low-credibility, 1 = unknown, 2 = trusted / official docs by URL heuristics,
+    3 = the curated primary tier (WP-B review: a heuristic is not a curated list)."""
+    from argus.graph.credibility import authority_prior
+    assert authority_prior("https://thetechbriefs.com/best-rag-models-2025") == 0
+    assert authority_prior("https://someblog.example/post") == 1
+    assert authority_prior("https://github.com/langchain-ai/langgraph") == 2
+    assert authority_prior("https://arxiv.org/abs/2406.12793") == 3
+    assert authority_prior("https://docs.langchain.com/oss/python/langgraph/interrupts") == 2
+    assert authority_prior("https://example.com/docs/guide") == 2
+    assert authority_prior("https://example.com/post", kind="official_doc") == 2
+    assert authority_prior("https://arxiv.org/abs/2603.01234") == 3, (
+        "a fetched page is real: the year heuristic's known false positive must not zero it")
+    assert authority_prior("file:///V/transcripts/clip.txt") == 2, "the user's own material"
+
+
+@pytest.mark.parametrize("url", [
+    "https://docs.google.com/document/d/abc/edit", "https://sites.google.com/view/x/docs",
+    "https://acme.notion.site/docs/setup", "https://www.notion.so/docs/setup",
+    "https://someone.substack.com/p/docs", "https://medium.com/docs/how-to",
+])
+def test_user_content_hosts_are_never_official_docs(url):
+    from argus.graph.credibility import authority_prior, is_official_doc
+    assert not is_official_doc(url), "anyone can publish a 'docs' page there"
+    assert authority_prior(url) <= 2
+
+
+def test_official_docs_still_reach_authority_two():
+    """The WP-B acceptance rule 'official docs authority >= 2' on the q010 sources:
+    the docs host by its prior, the project's GitHub Pages site by the digest's
+    official_doc label."""
+    from argus.graph.credibility import authority_prior, note_authority
+    docs = authority_prior("https://docs.langchain.com/oss/python/langgraph/interrupts")
+    pages = authority_prior("https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/")
+    assert note_authority(docs, "official_doc") >= 2 and note_authority(docs, "other") >= 2
+    assert note_authority(pages, "official_doc") >= 2
+
+
+def test_note_authority_trusts_an_official_doc_label_only_above_zero():
+    from argus.graph.credibility import note_authority
+    assert note_authority(1, "official_doc") == 2
+    assert note_authority(3, "official_doc") == 3
+    assert note_authority(0, "official_doc") == 0, "a content farm can't promote itself"
+    assert note_authority(1, "blog") == 1

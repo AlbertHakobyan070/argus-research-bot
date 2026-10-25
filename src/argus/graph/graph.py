@@ -1,6 +1,6 @@
 """Argus LangGraph: build_graph() + helpers.
 
-v3 research engine — Deep Research
+v4 research engine — Deep Research
 
 intake
   │
@@ -14,19 +14,24 @@ scout (LIVE multi-query discovery: Exa/DDGS/arXiv/GitHub)
 [HITL: Plan Approval — real live sources shown]
   │
   ▼
-research (waves: triage → parallel fetch → per-source LLM digest
-          → coverage check → targeted follow-up queries)
+research (waves: rerank → parallel fetch → per-source LLM digest
+          → coverage check → targeted follow-up queries; a gap wave
+          when the panel sends the run back)
   │
   ▼
-outline
+outline (fresh, or extended with the notes that arrived)
   │
   ▼
-compose (parallel section writers from EvidenceNotes; markdown-native)
+compose (section writers on their allocated notes; reuse rule)
   │
   ▼
-panel (tripartite judges: grounding / coverage / precision)
-  ├── pass ──────────────────────────────► report_builder
-  └── revise ─► compose (section-targeted revision loop)
+analyst (what the evidence means; omitted when off or degraded)
+  │
+  ▼
+panel (batched grounding / coverage / precision → panel_verdict.next)
+  ├── research ──► research (a gap wave, while the gap reserve lasts)
+  ├── compose ───► compose (a rewrite, while the revision budget lasts)
+  └── report_builder (cuts, TL;DR, banners, evidence.json)
 
 report_builder
   │
@@ -54,6 +59,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .brief import brief_node
 from .compose import compose_node, outline_node
+from .insight import analyst_node
 from .nodes import (
     deliver_node, extend_prep_node, intake_node, quick_answer_node,
     report_builder_node, revise_prep_node, route_after_deliver,
@@ -67,7 +73,7 @@ logger = logging.getLogger("argus.graph")
 
 
 def build_graph(*, checkpointer=None) -> CompiledStateGraph:
-    """Construct the deep-research LangGraph (v3 engine).
+    """Construct the deep-research LangGraph (v4 engine).
 
     Pass ``checkpointer=None`` for an in-memory saver (tests). For prod,
     pass the shared ``AsyncSqliteSaver`` (see ``async_sqlite_saver_cm``),
@@ -81,6 +87,7 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     g.add_node("research", research_node)
     g.add_node("outline", outline_node)
     g.add_node("compose", compose_node)
+    g.add_node("analyst", analyst_node)
     g.add_node("panel", panel_node)
     g.add_node("report_builder", report_builder_node)
     g.add_node("deliver", deliver_node)
@@ -96,11 +103,12 @@ def build_graph(*, checkpointer=None) -> CompiledStateGraph:
     g.add_edge("scout", "research")
     g.add_edge("research", "outline")
     g.add_edge("outline", "compose")
-    g.add_edge("compose", "panel")
+    g.add_edge("compose", "analyst")
+    g.add_edge("analyst", "panel")
     g.add_conditional_edges(
         "panel",
         route_after_panel,
-        {"compose": "compose", "report_builder": "report_builder"},
+        {"research": "research", "compose": "compose", "report_builder": "report_builder"},
     )
     g.add_edge("report_builder", "deliver")
     # After the report-preview gate: finish, extend (more sources →

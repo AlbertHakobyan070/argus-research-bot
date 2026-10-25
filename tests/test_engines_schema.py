@@ -1,0 +1,240 @@
+"""v4 WP-0 — engines schema validators (spec §2.1-2.2)."""
+import pytest
+
+from argus.engines.roles import (
+    ALL_SKIPPED_RAISES, DEGRADABLE_ROLES, JSON_ROLES,
+    MUST_RAISE_ROLES, ROLE_TIERS, ROLES, SKIPPABLE_ROLES)
+from argus.engines.schema import (
+    EngineSpec, EnginesConfig, EnginesSnapshot, ProviderSpec, ResolvedBinding,
+    TranscriberConfig)
+from helpers import fake_engines_snapshot
+
+_TIER = {"provider": "freellmapi", "model_from_preferences": "cheap"}
+
+
+def _config(**changes) -> dict:
+    """Minimal valid EnginesConfig input; each test breaks one rule."""
+    cfg = {
+        "providers": {"freellmapi": {"name": "freellmapi",
+                                     "base_url": "http://127.0.0.1:3001/v1"}},
+        "profiles": {"free-proxy": {"name": "free-proxy",
+                                    "tiers": {"cheap": _TIER, "strong": _TIER,
+                                              "judge": _TIER}}},
+        "active_profile": "free-proxy",
+    }
+    cfg.update(changes)
+    return cfg
+
+
+def _with_roles(roles: dict) -> dict:
+    cfg = _config()
+    cfg["profiles"]["free-proxy"]["roles"] = roles
+    return cfg
+
+
+def _binding(on_exhausted: str, **extra) -> dict:
+    return {"primary": _TIER, "on_exhausted": on_exhausted, **extra}
+
+
+def test_role_tables_are_consistent():
+    assert set(ROLE_TIERS) == set(ROLES)
+    assert JSON_ROLES <= set(ROLES)
+    # The three failure-policy classes partition ROLES, so every role has
+    # exactly one shipped on_exhausted policy.
+    classes = [SKIPPABLE_ROLES, set(DEGRADABLE_ROLES), MUST_RAISE_ROLES]
+    assert sum(len(c) for c in classes) == len(ROLES)
+    assert set().union(*classes) == set(ROLES)
+    assert ALL_SKIPPED_RAISES <= SKIPPABLE_ROLES   # only a skippable role can be all-skipped
+    assert not any(r.startswith("legacy.") for r in ROLES)   # the Phase 1–2 wrapper roles are gone (WP-H)
+
+
+@pytest.mark.parametrize("role", ["compose.tldr", "panel.precision"])
+def test_removed_roles_are_absent_from_every_table(role):
+    # v4 has no LLM TL;DR and no LLM precision scan (spec §2.1).
+    assert role not in ROLES
+    for table in (ROLE_TIERS, JSON_ROLES, SKIPPABLE_ROLES, DEGRADABLE_ROLES,
+                  MUST_RAISE_ROLES, ALL_SKIPPED_RAISES):
+        assert role not in table
+
+
+def test_fix_round_role_table_entries():
+    assert ROLE_TIERS["research.extend_querygen"] == "cheap"
+    assert "research.extend_querygen" in JSON_ROLES
+    assert DEGRADABLE_ROLES["research.extend_querygen"] == "skip_extend_wave"
+    # A failed rerank degrades to keyword triage instead of skipping.
+    assert "research.rerank" not in SKIPPABLE_ROLES
+    assert DEGRADABLE_ROLES["research.rerank"] == "keyword_triage"
+    assert ALL_SKIPPED_RAISES == {"research.digest", "compose.section",
+                                  "compose.findings_extract"}
+
+
+def test_minimal_config_and_allowed_policies_validate():
+    cfg = EnginesConfig.model_validate(_with_roles({
+        "research.digest": _binding("skip_item"),
+        "intake.classify": _binding("degrade"),
+        "research.rerank": _binding("degrade"),
+        "research.extend_querygen": _binding("degrade"),
+        "brief.draft": _binding("raise"),
+    }))
+    assert cfg.active_profile == "free-proxy"
+    assert cfg.transcriber.youtube == ["captions", "asr"]
+
+
+@pytest.mark.parametrize("where", ["tier", "role primary", "role fallback",
+                                   "override tier"])
+def test_unknown_provider_rejected(where):
+    bad = {"provider": "nope", "model": "m"}
+    if where == "tier":
+        cfg = _config()
+        cfg["profiles"]["free-proxy"]["tiers"]["judge"] = bad
+    elif where == "role primary":
+        cfg = _with_roles({"panel.grounding": {"primary": bad,
+                                               "on_exhausted": "skip_item"}})
+    elif where == "role fallback":
+        cfg = _with_roles({"panel.grounding": _binding("skip_item",
+                                                       fallbacks=[bad])})
+    else:
+        cfg = _config(overrides={"free-proxy": {"tiers": {"cheap": bad}}})
+    with pytest.raises(ValueError, match="unknown provider 'nope'"):
+        EnginesConfig.model_validate(cfg)
+
+
+@pytest.mark.parametrize("role", ["intake.classify", "research.rerank"])
+def test_skip_item_on_non_skippable_role_rejected(role):
+    with pytest.raises(ValueError, match="skip_item"):
+        EnginesConfig.model_validate(_with_roles({role: _binding("skip_item")}))
+
+
+def test_degrade_on_non_degradable_role_rejected():
+    with pytest.raises(ValueError, match="degrade"):
+        EnginesConfig.model_validate(_with_roles(
+            {"research.digest": _binding("degrade")}))
+
+
+def test_must_raise_role_with_skip_item_rejected():
+    with pytest.raises(ValueError, match="must be 'raise'"):
+        EnginesConfig.model_validate(_with_roles(
+            {"brief.draft": _binding("skip_item")}))
+
+
+def test_active_profile_missing_rejected():
+    with pytest.raises(ValueError, match="active_profile 'gone'"):
+        EnginesConfig.model_validate(_config(active_profile="gone"))
+
+
+def test_overrides_for_unknown_profile_rejected():
+    with pytest.raises(ValueError, match="unknown profile"):
+        EnginesConfig.model_validate(_config(overrides={"gone": {}}))
+
+
+@pytest.mark.parametrize("in_overrides", [False, True])
+@pytest.mark.parametrize("role", ["compose.editor",       # optional/later, not a role
+                                  "compose.tldr", "panel.precision"])   # removed
+def test_unknown_role_rejected(role, in_overrides):
+    roles = {role: _binding("raise")}
+    cfg = (_config(overrides={"free-proxy": {"roles": roles}}) if in_overrides
+           else _with_roles(roles))
+    with pytest.raises(ValueError, match=f"unknown role {role!r}"):
+        EnginesConfig.model_validate(cfg)
+
+
+def test_model_preferences_keys_must_be_tiers():
+    ProviderSpec(name="p", base_url="http://x",
+                 model_preferences={"cheap": ["a", "auto"]})
+    with pytest.raises(ValueError, match="model_preferences"):
+        ProviderSpec(name="p", base_url="http://x",
+                     model_preferences={"fast": ["a"]})
+
+
+def test_engine_spec_sets_at_most_one_of_model_and_preferences():
+    EngineSpec(provider="p", model="m")
+    EngineSpec(provider="p", model_from_preferences="cheap")
+    EngineSpec(provider="p")              # unresolved until a model is chosen
+    with pytest.raises(ValueError, match="not both"):
+        EngineSpec(provider="p", model="m", model_from_preferences="cheap")
+
+
+def test_profile_tiers_must_be_exactly_the_three_tiers():
+    cfg = _config()
+    del cfg["profiles"]["free-proxy"]["tiers"]["judge"]
+    with pytest.raises(ValueError, match="missing.*judge"):
+        EnginesConfig.model_validate(cfg)
+    cfg = _config()
+    cfg["profiles"]["free-proxy"]["tiers"]["fast"] = _TIER   # not a tier
+    with pytest.raises(ValueError, match="fast"):
+        EnginesConfig.model_validate(cfg)
+    # Overrides stay partial: one tier is enough there.
+    EnginesConfig.model_validate(_config(
+        overrides={"free-proxy": {"tiers": {"cheap": _TIER}}}))
+
+
+def test_fix_round_fields_have_spec_defaults():
+    p = ProviderSpec(name="p", base_url="http://x")
+    assert (p.token_param, p.timeout_retry_max, p.retry_after_cap_s) == (
+        "max_tokens", 1, 30.0)
+    assert ProviderSpec(name="o", base_url="http://x",
+                        token_param="max_completion_tokens"
+                        ).token_param == "max_completion_tokens"
+    with pytest.raises(ValueError, match="token_param"):
+        ProviderSpec(name="p", base_url="http://x", token_param="max_new_tokens")
+    e = EngineSpec(provider="p")
+    assert (e.extra_body, e.supports_temperature) == ({}, None)
+    t = TranscriberConfig()                 # the data lives in argus_engines.json (WP-F)
+    assert (t.faster_whisper, t.openai_audio) == ({}, {})
+
+
+def test_pricing_defaults_to_none_and_validates_exa_prices():
+    assert EnginesConfig.model_validate(_config()).pricing.exa is None   # estimates show "n/a"
+    prices = {"price_per_search_usd": 0.007, "price_per_page_usd": 0.001,
+              "prices_as_of": "2026-10-18"}
+    cfg = EnginesConfig.model_validate(_config(pricing={"exa": prices}))
+    assert cfg.pricing.exa.model_dump() == prices
+    undated = {k: v for k, v in prices.items() if k != "prices_as_of"}
+    with pytest.raises(ValueError, match="prices_as_of"):
+        EnginesConfig.model_validate(_config(pricing={"exa": undated}))
+
+
+def test_resolved_binding_checks_role_and_policy():
+    spec = {"provider": "fake", "model": "m"}
+    ResolvedBinding(role="quick.answer", tier="cheap", primary=spec,
+                    fallbacks=[], on_exhausted="raise", retry_on_truncation=True)
+    for role, policy, match in [("nope.role", "raise", "unknown role"),
+                                ("legacy.judge", "raise", "unknown role"),   # retired by WP-H
+                                ("quick.answer", "skip_item", "skip_item"),
+                                ("panel.grounding", "ignore", "on_exhausted")]:
+        with pytest.raises(ValueError, match=match):
+            ResolvedBinding(role=role, tier="judge", primary=spec, fallbacks=[],
+                            on_exhausted=policy, retry_on_truncation=True)
+
+
+def test_snapshot_role_keys_must_match_bindings():
+    snap = fake_engines_snapshot().model_dump()
+    snap["roles"]["quick.answer"] = snap["roles"]["brief.draft"]
+    with pytest.raises(ValueError, match="quick.answer"):
+        EnginesSnapshot.model_validate(snap)
+
+
+def test_a_stored_snapshot_naming_the_retired_legacy_roles_still_loads():
+    """WP-H removed the Phase 1–2 ``legacy.<tier>`` roles. A snapshot stored
+    before (a checkpoint's run_config) still names them: it loads with them
+    dropped, while any other unknown role still raises."""
+    snap = fake_engines_snapshot().model_dump()
+    for tier in ("cheap", "strong", "judge"):
+        role = f"legacy.{tier}"
+        snap["roles"][role] = {"role": role, "tier": tier, "primary": {"provider": "fake", "model": "m"},
+                               "fallbacks": [], "on_exhausted": "raise", "retry_on_truncation": True}
+    assert set(EnginesSnapshot.model_validate(snap).roles) == set(ROLES)
+    snap["roles"]["nope.role"] = {**snap["roles"]["quick.answer"], "role": "nope.role"}
+    with pytest.raises(ValueError, match="unknown role 'nope.role'"):
+        EnginesSnapshot.model_validate(snap)
+
+
+def test_fake_snapshot_binds_every_role_to_fake_provider():
+    snap = fake_engines_snapshot()
+    assert set(snap.roles) == set(ROLES)
+    assert {b.primary.provider for b in snap.roles.values()} == {"fake"}
+    assert snap.roles["compose.section"].tier == "strong"
+    assert snap.roles["panel.grounding"].on_exhausted == "skip_item"
+    assert snap.roles["research.rerank"].on_exhausted == "degrade"
+    assert snap.roles["research.extend_querygen"].on_exhausted == "degrade"
+    assert snap.roles["compose.flat"].on_exhausted == "raise"

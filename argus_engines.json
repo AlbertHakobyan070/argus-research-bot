@@ -1,0 +1,752 @@
+{
+  "version": 1,
+  "active_profile": "free-proxy",
+  "providers": {
+    "freellmapi": {
+      "name": "freellmapi",
+      "base_url": "http://127.0.0.1:3001/v1",
+      "base_url_env": "FREELLMAPI_BASE_URL",
+      "api_key_env": "FREELLMAPI_API_KEY",
+      "supports_json_mode": false,
+      "token_param": "max_completion_tokens",
+      "models_endpoint": true,
+      "model_preferences": {
+        "cheap": [
+          "llama-3.1-8b-instant",
+          "gemini-2.5-flash-lite",
+          "gemini-3.1-flash-lite-preview",
+          "Meta-Llama-3.3-70B-Instruct",
+          "groq/compound-mini",
+          "auto"
+        ],
+        "strong": [
+          "qwen/qwen3-coder:free",
+          "deepseek-ai/deepseek-v4-flash",
+          "nvidia/nemotron-3-super-120b-a12b:free",
+          "gemini-3.5-flash",
+          "DeepSeek-V3.2",
+          "meta-llama/llama-3.1-70b-instruct",
+          "mistral-large-latest",
+          "auto"
+        ],
+        "judge": [
+          "openai/gpt-oss-120b:free",
+          "gemini-3.5-flash",
+          "gemini-2.5-flash",
+          "Llama-4-Maverick-17B-128E-Instruct",
+          "cogito-2.1:671b",
+          "auto"
+        ]
+      },
+      "rpm_limit": 100,
+      "notes": "local FreeLLMAPI proxy; it may route a request to another upstream model, so each call records the served model and routed_via"
+    },
+    "groq": {
+      "name": "groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "supports_json_mode": true,
+      "rpm_limit": 25,
+      "notes": "reasoning controls go into EngineSpec.extra_body only after engines_probe.py confirms the API accepts them"
+    },
+    "openrouter": {
+      "name": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "headers": {
+        "HTTP-Referer": "https://github.com/AlbertHakobyan070/argus-research-bot",
+        "X-Title": "Argus"
+      }
+    },
+    "gemini": {
+      "name": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "api_key_env": "GEMINI_API_KEY",
+      "notes": "beta compatibility layer"
+    },
+    "openai": {
+      "name": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "supports_json_mode": true,
+      "token_param": "max_completion_tokens",
+      "timeout_s": 300
+    },
+    "anthropic": {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com/v1/",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "models_endpoint": false,
+      "known_models": [
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5"
+      ],
+      "supports_temperature": false,
+      "supports_json_mode": false,
+      "timeout_s": 300,
+      "notes": "OpenAI-compatible layer, positioned for testing and comparison: temperature/top_p are omitted (400 on Claude 4.7+/5), response_format is ignored, system messages are hoisted, n must be 1, no prompt caching; thinking is on by default and not returned, so budget it per role via EngineSpec.extra_body {\"thinking\": ...}"
+    },
+    "ollama": {
+      "name": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "supports_json_mode": true
+    },
+    "lmstudio": {
+      "name": "lmstudio",
+      "base_url": "http://127.0.0.1:1234/v1"
+    }
+  },
+  "profiles": {
+    "free-proxy": {
+      "name": "free-proxy",
+      "description": "FreeLLMAPI for every tier (the v3 behaviour)",
+      "tiers": {
+        "cheap": {
+          "provider": "freellmapi",
+          "model_from_preferences": "cheap"
+        },
+        "strong": {
+          "provider": "freellmapi",
+          "model_from_preferences": "strong"
+        },
+        "judge": {
+          "provider": "freellmapi",
+          "model_from_preferences": "judge"
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "judge"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    },
+    "proxy+direct-judge": {
+      "name": "proxy+direct-judge",
+      "description": "FreeLLMAPI writes; the grounding judge runs on Gemini directly (choose its model with /engines tier judge gemini/<model>), with an OpenRouter fallback once its model is chosen",
+      "tiers": {
+        "cheap": {
+          "provider": "freellmapi",
+          "model_from_preferences": "cheap"
+        },
+        "strong": {
+          "provider": "freellmapi",
+          "model_from_preferences": "strong"
+        },
+        "judge": {
+          "provider": "gemini",
+          "model": null
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "gemini",
+            "model": null
+          },
+          "on_exhausted": "skip_item",
+          "fallbacks": [
+            {
+              "provider": "openrouter",
+              "model": null
+            }
+          ]
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    },
+    "max-quality": {
+      "name": "max-quality",
+      "description": "Anthropic for cheap, strong and judge; the per-item roles (digest, findings extraction, rerank) stay on FreeLLMAPI. Writer and judge share one model family until a non-Anthropic judge is bound",
+      "tiers": {
+        "cheap": {
+          "provider": "anthropic",
+          "model": "claude-haiku-5-5"
+        },
+        "strong": {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5-5"
+        },
+        "judge": {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5"
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-haiku-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-haiku-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-haiku-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-haiku-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-opus-5-5"
+          },
+          "on_exhausted": "skip_item",
+          "fallbacks": [
+            {
+              "provider": "gemini",
+              "model": null
+            }
+          ]
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5"
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    },
+    "local-ollama": {
+      "name": "local-ollama",
+      "description": "Ollama for every tier (choose its models with /engines tier)",
+      "tiers": {
+        "cheap": {
+          "provider": "ollama",
+          "model": null
+        },
+        "strong": {
+          "provider": "ollama",
+          "model": null
+        },
+        "judge": {
+          "provider": "ollama",
+          "model": null
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    },
+    "local-lmstudio": {
+      "name": "local-lmstudio",
+      "description": "LM Studio for every tier (choose its models with /engines tier)",
+      "tiers": {
+        "cheap": {
+          "provider": "lmstudio",
+          "model": null
+        },
+        "strong": {
+          "provider": "lmstudio",
+          "model": null
+        },
+        "judge": {
+          "provider": "lmstudio",
+          "model": null
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "lmstudio",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    },
+    "hybrid-local": {
+      "name": "hybrid-local",
+      "description": "The per-item roles (digest, findings extraction, rerank) on Ollama, everything else on FreeLLMAPI",
+      "tiers": {
+        "cheap": {
+          "provider": "freellmapi",
+          "model_from_preferences": "cheap"
+        },
+        "strong": {
+          "provider": "freellmapi",
+          "model_from_preferences": "strong"
+        },
+        "judge": {
+          "provider": "freellmapi",
+          "model_from_preferences": "judge"
+        }
+      },
+      "roles": {
+        "intake.classify": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "scout.querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.rerank": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "degrade"
+        },
+        "outline.plan": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.followup_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.extend_querygen": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "cheap"
+          },
+          "on_exhausted": "degrade"
+        },
+        "compose.analyst": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "degrade"
+        },
+        "research.digest": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.findings_extract": {
+          "primary": {
+            "provider": "ollama",
+            "model": null
+          },
+          "on_exhausted": "skip_item"
+        },
+        "compose.section": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.grounding": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "judge"
+          },
+          "on_exhausted": "skip_item"
+        },
+        "panel.coverage": {
+          "primary": {
+            "provider": "freellmapi",
+            "model_from_preferences": "strong"
+          },
+          "on_exhausted": "skip_item"
+        }
+      }
+    }
+  },
+  "transcriber": {
+    "youtube": ["captions", "asr"],
+    "asr_engine": "faster_whisper",
+    "faster_whisper": {"model": "small", "device": "cpu", "compute_type": "int8"},
+    "openai_audio": {"provider": "groq", "model": "whisper-large-v3-turbo", "chunk_seconds": 600, "language": null}
+  },
+  "pricing": {
+    "exa": {
+      "price_per_search_usd": 0.007,
+      "price_per_page_usd": 0.001,
+      "prices_as_of": "2026-10-18"
+    }
+  }
+}

@@ -26,3 +26,11 @@ WAKEUP-README.md
 WAKEUP-*.md
 # Demo/run artifacts (generated at runtime)
 demo_output/
+# v4: local binaries (cloudflared), local engine overrides, bench output, WP scratch
+tools/bin/
+argus_engines.local.json
+bench/results/
+docs/v4-notes/.scratch/
+
+# v4 WP-E2: runtime logs (cloudflared stderr)
+logs/

@@ -1,13 +1,15 @@
-"""v3 scout node — the discovery wave behind the grounded plan gate.
+"""v4 scout node — the discovery wave behind the grounded plan gate.
 
 For every brief sub-question, plan 1-2 targeted queries (one cheap
-batched LLM call, deterministic fallback) and run them in parallel
-across providers (Exa / DDGS / arXiv / GitHub). Search-API only — no
-page fetching happens before the user approves the plan.
+batched LLM call, ``scout.querygen``; degrade → the sub-question text
+queries) and run them as one search wave (``engines/search.run_wave``,
+first-pass budget) across Exa / DDGS / arXiv / GitHub. Search-API only —
+no page fetching happens before the user approves the plan.
 
 Output feeds the plan gate: ``sources`` (real, live URLs tagged with the
-sub-questions they serve) + an updated ``plan`` whose search intents
-reflect the actual executed queries.
+sub-questions they serve, deduped by canonical URL) + an updated ``plan``
+whose search intents reflect the actual executed queries, and the run's
+``search_spend`` (with the recency window decided here, once).
 """
 from __future__ import annotations
 
@@ -15,11 +17,16 @@ import logging
 import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.runtime import Runtime
 
 from .. import llm
+from ..engines.ledger import SpendLedger
+from ..engines.search import resolve_recency, run_wave
+from ..engines.urls import canonical_url
+from . import run_config
 from .brief import brief_to_plan
 from .jsonx import parse_json_obj
-from .search_providers import exa_enabled, run_query_wave
+from .search_providers import exa_enabled
 from .state import ResearchBrief
 
 logger = logging.getLogger("argus.scout")
@@ -46,13 +53,21 @@ def _provider_for_kind(kind: str) -> str:
 
 
 def _web_provider() -> str:
-    """Web queries prefer Exa when a key is configured (budget-capped in
-    run_query_wave), else DDGS."""
+    """Web queries prefer Exa when a key is configured (budget-capped by
+    the run's SpendLedger in run_wave), else DDGS."""
     return "exa" if exa_enabled() else "ddgs"
 
 
+def _subquestion_query(i: int, brief: ResearchBrief) -> dict:
+    sq = brief.sub_questions[i]
+    prov = _provider_for_kind(sq.kind)
+    return {"query": " ".join(re.sub(r"[?\"']", "", sq.q).split()[:9]),
+            "provider": _web_provider() if prov == "web" else prov, "sub_qs": [i]}
+
+
 def fallback_queries(brief: ResearchBrief) -> list[dict]:
-    """Deterministic per-sub-question queries when the LLM call fails."""
+    """Deterministic per-sub-question queries (the ``subquestion_text_queries``
+    degradation of ``scout.querygen``)."""
     queries: list[dict] = []
     kw = " ".join(brief.must_have_keywords[:3])
     for i, sq in enumerate(brief.sub_questions):
@@ -69,29 +84,26 @@ def fallback_queries(brief: ResearchBrief) -> list[dict]:
     return queries
 
 
-def plan_queries(brief: ResearchBrief) -> tuple[list[dict], list[dict], list[str]]:
-    """One batched cheap-LLM call → per-sub-question queries.
-
-    Returns (queries, model_calls, errors); falls back deterministically.
-    """
+def plan_queries(brief: ResearchBrief, *, rc: run_config.RunConfig, rnd: int,
+                 runtime: Runtime | None = None) -> tuple[list[dict], list[dict], list[str]]:
+    """``scout.querygen``: one batched call → per-sub-question queries
+    ``{query, provider, sub_qs}``; a sub-question the reply skipped gets its
+    deterministic query. Returns ``(queries, model_calls, errors)``; degrade
+    → ``fallback_queries``, the ``degrade:`` line with every attempt, and a
+    ``degrade`` event."""
+    n_subs = len(brief.sub_questions)
     numbered = "\n".join(f"{i}. [{sq.kind}] {sq.q}"
                          for i, sq in enumerate(brief.sub_questions))
+    academic = ("\nThe topic is academic: prefer arxiv for paper-like sub-questions.\n"
+                if brief.is_academic_topic else "")
     human = (f"Research summary: {brief.summary}\n"
-             f"Keywords: {', '.join(brief.must_have_keywords)}\n\n"
+             f"Keywords: {', '.join(brief.must_have_keywords)}\n{academic}\n"
              f"Sub-questions:\n{numbered}\n\nReturn the queries JSON.")
-    try:
-        chat = llm.chat_for_tier("cheap", temperature=0.2, max_tokens=800)
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content=QUERYGEN_SYSTEM),
-            HumanMessage(content=human[:6000]),
-        ])
-        rec = llm.record_from_response("cheap", llm.resolve_tier("cheap"),
-                                       resp)
-        data = parse_json_obj(resp.content, require_any=("queries",))
+
+    def validate(text: str) -> list[dict]:
         out: list[dict] = []
         per_subq: dict[int, int] = {}
-        n_subs = len(brief.sub_questions)
-        for item in data.get("queries") or []:
+        for item in parse_json_obj(text, require_any=("queries",)).get("queries") or []:
             if not isinstance(item, dict):
                 continue
             q = str(item.get("q") or "").strip()
@@ -99,9 +111,7 @@ def plan_queries(brief: ResearchBrief) -> tuple[list[dict], list[dict], list[str
                 idx = int(item.get("sub_q", -1))
             except (TypeError, ValueError):
                 idx = -1
-            if not q or not (0 <= idx < n_subs):
-                continue
-            if per_subq.get(idx, 0) >= 2:
+            if not q or not (0 <= idx < n_subs) or per_subq.get(idx, 0) >= 2:
                 continue
             prov = str(item.get("provider") or "web")
             if prov not in ("web", "arxiv", "github"):
@@ -110,38 +120,56 @@ def plan_queries(brief: ResearchBrief) -> tuple[list[dict], list[dict], list[str
                         "provider": _web_provider() if prov == "web" else prov,
                         "sub_qs": [idx]})
             per_subq[idx] = per_subq.get(idx, 0) + 1
-        # Any sub-question the LLM skipped gets a deterministic query.
-        for i, sq in enumerate(brief.sub_questions):
-            if i not in per_subq:
-                prov = _provider_for_kind(sq.kind)
-                out.append({
-                    "query": " ".join(re.sub(r"[?\"']", "", sq.q).split()[:9]),
-                    "provider": _web_provider() if prov == "web" else prov,
-                    "sub_qs": [i]})
         if not out:
             raise ValueError("querygen returned no usable queries")
-        return out, [rec.model_dump()], []
-    except Exception as e:
-        logger.warning("query generation failed (%s); deterministic "
-                       "fallback", e)
-        return fallback_queries(brief), [], [f"scout: querygen failed ({e})"]
+        return out
+
+    try:
+        res = llm.complete("scout.querygen", [SystemMessage(content=QUERYGEN_SYSTEM),
+                                              HumanMessage(content=human[:6000])],
+                           engines=rc.engines, temperature=0.2, max_tokens=800, validate=validate)
+    except llm.EngineDegraded as e:
+        logger.warning("scout.querygen degraded (%s); sub-question text queries", e)
+        _emit(runtime, "degrade", {"role": e.role, "degradation": e.degradation, "reason": str(e)})
+        return (fallback_queries(brief), [a.model_dump() for a in e.attempts],
+                [f"[r{rnd}] degrade: scout.querygen → {e.degradation} ({e})"])
+    queries = list(res.parsed)
+    covered = {i for q in queries for i in q["sub_qs"]}
+    queries += [_subquestion_query(i, brief) for i in range(n_subs) if i not in covered]
+    return queries, [r.model_dump() for r in res.records], []
 
 
-def scout_node(state) -> dict:
+def _emit(runtime: Runtime | None, kind: str, data: dict) -> None:
+    if runtime is not None:
+        runtime.stream_writer({"kind": kind, "node": "scout", "data": data})
+
+
+def scout_node(state, runtime: Runtime | None = None) -> dict:
     """Run the discovery wave. Pauses at the plan gate right after."""
+    rc = run_config.require(state)
     brief = ResearchBrief.model_validate(state.get("brief") or {})
-    queries, calls, errors = plan_queries(brief)
+    rnd = 1 + int(state.get("revise_rounds") or 0) + int(state.get("extend_rounds") or 0)
+    _emit(runtime, "stage", {"status": "start", "summary": "discovery wave"})
+    queries, calls, errors = plan_queries(brief, rc=rc, rnd=rnd, runtime=runtime)
 
     # Exa category hint for paper-flavoured web queries.
     for q in queries:
         if q["provider"] == "exa":
             idx = (q.get("sub_qs") or [None])[0]
-            if idx is not None and idx < len(brief.sub_questions) \
-                    and brief.sub_questions[idx].kind == "paper":
+            if idx is not None and idx < len(brief.sub_questions) and (
+                    brief.sub_questions[idx].kind == "paper"
+                    or (brief.is_academic_topic and brief.sub_questions[idx].kind == "mixed")):
                 q["category"] = "research paper"
 
-    hits, wave_errors = run_query_wave(queries)
+    ledger = SpendLedger.for_run(rc, state.get("search_spend"))
+    recency, note = resolve_recency(rc, brief)
+    if note:
+        errors.append(note)
+    ledger.set_recency(recency)
+    hits, wave_errors = run_wave(queries, cfg=rc.search, ledger=ledger, recency=recency, mode="first")
     errors.extend(wave_errors)
+    _emit(runtime, "search", {"wave": 1, "mode": "first", "queries": len(queries), "hits": len(hits),
+                              "errors": len(wave_errors)})
 
     # Pre-seeded sources (demos / deterministic tests / appended) first.
     # This also catches a plan-edit re-run: bot._replan_after_edit does
@@ -149,32 +177,36 @@ def scout_node(state) -> dict:
     # slots (and their sub_qs tags, which index the old brief). When that
     # wave already filled SCOUT_SOURCE_CAP, no new-wave hit survives the
     # cap below.
+    # A pinned (appended) copy wins the dedupe over an unpinned one (spec §2.8);
+    # a source whose URL canonical_url rejects is dropped with an errors line.
+    from .research import _is_pinned          # lazy: research imports this module
+    seeded = sorted(state.get("sources") or [], key=lambda s: not _is_pinned(s))
     seen: set[str] = set()
     final: list[dict] = []
-    for s in state.get("sources") or []:
-        url = s.get("url", "")
-        if url and url not in seen:
+    for s in [*seeded, *hits]:
+        try:
+            key = canonical_url(s.get("url") or "") or str(s.get("local_path") or "")
+        except ValueError as e:
+            errors.append(f"scout: dropped source with a malformed URL {s.get('url')!r} ({e})")
+            continue
+        if key and key not in seen:
             final.append(dict(s))
-            seen.add(url)
-    for h in hits:
-        if h["url"] not in seen:
-            final.append(h)
-            seen.add(h["url"])
+            seen.add(key)
     final = final[:SCOUT_SOURCE_CAP]
 
     plan = brief_to_plan(brief, queries)
-    out = {
+    message = (f"🔎 Scout: {len(final)} candidate source(s) from {len(queries)} live "
+               "queries — awaiting your approval.")
+    _emit(runtime, "stage", {"status": "end", "summary": message})
+    return {
         "sources": final,
         "queries": queries,
         "plan": plan,
         "errors": errors,
         "model_calls": calls,
-        "messages": [{"role": "assistant",
-                      "content": (f"🔎 Scout: {len(final)} candidate "
-                                  f"source(s) from {len(queries)} live "
-                                  "queries — awaiting your approval.")}],
+        "search_spend": ledger.snapshot(),
+        "messages": [{"role": "assistant", "content": message}],
     }
-    return out
 
 
 __all__ = ["scout_node", "plan_queries", "fallback_queries",

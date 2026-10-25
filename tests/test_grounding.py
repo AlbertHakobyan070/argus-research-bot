@@ -1,228 +1,157 @@
-"""Tests for src/argus/graph/grounding.py (P5: grounding check).
+"""Tests for src/argus/graph/grounding.py (v4 spec §3 WP-B).
+
+"Mentions the entity" means the FULL entity phrase from ``brief.entities``
+(normalised, case-insensitive) occurs in the fetched text — never a single
+query token: baseline b5, a nonexistent entity, passed v3's gate because any
+one of six generic tokens counted. A source counts only when its digest note
+is relevant (relevance ≥ 3) and not of authority 0.
 
 Run with:
-    PYTHONPATH=./' ./venv/Scripts/python.exe -m pytest tests/test_grounding.py -q
+    PYTHONPATH='' ./venv/Scripts/python.exe -m pytest tests/test_grounding.py -q
 """
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
 from argus.graph.grounding import (
     DEFAULT_GROUNDING_THRESHOLD,
     GroundingResult,
     check_grounding,
-    extract_entity_tokens,
     grounding_banner,
     grounding_warning_prompt,
+    normalise,
 )
 
 
-# --- Token extraction -------------------------------------------------
-
-def test_extract_tokens_dedupes_and_orders():
-    tokens = extract_entity_tokens("GLM 5.2 GLM GLM 4 4 4 4")
-    assert "glm" in tokens
-    # First mention comes first, dupes dropped.
-    assert tokens.index("glm") == 0
-
-
-def test_extract_tokens_filters_short_and_stopwords():
-    """Common glue words and length-mode names must NOT be entities."""
-    tokens = extract_entity_tokens("research the model is approach")
-    # All in the stop set; result is empty.
-    assert tokens == []
+def _state(tmp_path: Path, entities: list[str], docs: list[str], *, relevance=4, authority=1) -> dict:
+    fetched, evidence = [], []
+    for i, text in enumerate(docs):
+        md = tmp_path / f"doc{i}.md"
+        md.write_text(text, encoding="utf-8")
+        url = f"https://site{i}.example/p"
+        fetched.append({"url": url, "title": f"Doc {i}", "markdown_path": str(md), "excerpt": text[:600]})
+        evidence.append({"source_id": i + 1, "source_url": url, "relevance": relevance,
+                         "authority": authority, "claims": []})
+    return {"user_request": "anything", "brief": {"entities": entities}, "fetched": fetched,
+            "evidence": evidence}
 
 
-def test_extract_tokens_preserves_multi_word_signals():
-    """Each meaningful word comes through."""
-    tokens = extract_entity_tokens("metacognitive reinforcement learning transformers")
-    assert tokens == ["metacognitive", "reinforcement", "learning", "transformers"]
-
-
-# --- Grounding scoring -----------------------------------------------
-
-def test_check_grounding_with_no_user_request_is_grounded():
-    """No entity to look for => trivially grounded (no warning)."""
-    r = check_grounding({"user_request": "", "fetched": []})
-    assert r.grounded is True
-    assert r.entity_tokens == []
-
-
-def test_check_grounding_skips_low_credibility_items():
-    """A farm item below the floor must NOT count as a mention.
-    The grounding signal is only as good as the credibility filter."""
-    state = {
-        "user_request": "GLM 5.2",
-        "fetched": [
-            # Two farms mentioning GLM 5.2 - excluded from credible count.
-            {"title": "GLM 5.2!!! tech brief",
-             "credibility_score": 0.18},
-            {"title": "GLM 5.2 - hottest model 2026",
-             "credibility_score": 0.12},
-        ],
-    }
+def test_entity_phrase_not_tokens(tmp_path):
+    """A document matching only single tokens of the entity is not a mention."""
+    tokens_only = ("Quantum computing is advancing. Llama models are popular. "
+                   "Version 9 of the toolkit shipped this week.")
+    state = _state(tmp_path, ["Quantum Llama 9"], [tokens_only] * 3)
     r = check_grounding(state)
-    # Only 0 credible items, 0 mentions, NOT grounded.
-    assert r.n_credible == 0
-    assert r.mention_count == 0
-    assert r.grounded is False
+    assert (r.n_credible, r.mention_count, r.grounded) == (3, 0, False)
+    assert r.entity_tokens == ["quantum llama 9"]
+
+    named = "The Quantum-Llama 9 release notes describe the new model in detail."
+    r = check_grounding(_state(tmp_path, ["Quantum Llama 9"], [named, named, tokens_only]))
+    assert (r.mention_count, r.grounded) == (2, True), "the phrase, normalised and case-insensitive"
 
 
-def test_check_grounding_grounds_well_known_topic():
-    """Transformer architecture: many credible arxiv + .edu mentions."""
-    state = {
-        "user_request": "transformer attention mechanism",
-        "fetched": [
-            {"title": "Attention Is All You Need - revisited",
-             "credibility_score": 0.9},
-            {"title": "Transformer architecture survey",
-             "credibility_score": 0.85},
-            {"title": "Multi-head attention explained",
-             "credibility_score": 0.8},
-            {"title": "Sequence modeling with transformers",
-             "credibility_score": 0.8},
-        ],
-    }
-    r = check_grounding(state)
-    assert r.n_credible == 4
-    assert r.mention_count >= 3
-    assert r.grounded is True
+def test_the_phrase_is_searched_in_the_full_fetched_text(tmp_path):
+    body = "Background. " * 400 + "Late in the text, GLM 5.2 is finally named."
+    r = check_grounding(_state(tmp_path, ["GLM 5.2"], [body, body]))
+    assert r.mention_count == 2 and r.grounded, "not only the title and the 600-char excerpt"
 
 
-def test_check_grounding_obscure_entity_low_grounding():
-    """P5 reproducer: GLM 5.2 with 1 direct credible mention."""
-    state = {
-        "user_request": "GLM 5.2",
-        "fetched": [
-            {"title": "GLM 5.2 technical overview",
-             "excerpt": "GLM 5.2 release notes",
-             "credibility_score": 0.8},  # mentions -> ground count
-            {"title": "AI news brief",
-             "excerpt": "weekly coverage",
-             "credibility_score": 0.8},  # no GLM 5.2 -> noise
-        ],
-    }
-    r = check_grounding(state)
-    assert r.n_credible == 2
-    assert r.mention_count == 1
-    assert r.grounded is False
-    assert "glm" in r.entity_tokens
+def test_a_longer_version_does_not_match_a_shorter_entity(tmp_path):
+    r = check_grounding(_state(tmp_path, ["GLM 5"], ["GLM 5.2 is out.", "GLM 5.2 again."]))
+    assert r.mention_count == 0 and not r.grounded
+    r = check_grounding(_state(tmp_path, ["GLM 5.2"], ["glm-5.2 is out.", "GLM 5.2."]))
+    assert r.mention_count == 2 and r.grounded
 
 
-def test_check_grounding_threshold_can_be_lowered():
-    """Threshold is a hyperparameter; lower it and the same state grounds."""
-    state = {
-        "user_request": "GLM 5.2",
-        "fetched": [
-            {"title": "GLM 5.2 technical overview",
-             "credibility_score": 0.8},
-        ],
-    }
-    r_default = check_grounding(state)
-    r_lower = check_grounding(state, threshold=1)
-    assert r_default.grounded is False
-    assert r_lower.grounded is True
+def test_a_possessive_s_is_dropped_on_both_sides(tmp_path):
+    assert normalise("Bitcoin's price") == normalise("Bitcoin’s price") == "bitcoin price"
+    assert normalise("O'Sullivan's books") == "o sullivan books", "only an 's at a word end"
+    docs = ["Bitcoin's price could reach new highs.", "Bitcoin’s price and ETF flows."]
+    r = check_grounding(_state(tmp_path, ["Bitcoin price"], docs))
+    assert (r.mention_count, r.grounded) == (2, True)
 
 
-def test_check_grounding_accepts_object_items():
-    """Tolerates FetchedItem objects (not just dicts)."""
-    from argus.graph.state import FetchedItem
-    item = FetchedItem(
-        url="https://arxiv.org/abs/2506.00001",
-        title="Attention mechanism overview",
-        credibility_score=0.9,
-    )
-    r = check_grounding({
-        "user_request": "attention mechanism",
-        "fetched": [item],
-    })
-    assert r.grounded is False  # threshold=3, only 1 mention
-    assert r.n_credible == 1
+def test_a_phrase_spelled_without_its_spaces_matches_whole_tokens(tmp_path):
+    """"CrewAI" ↔ "Crew AI", "Hugging Face" ↔ "HuggingFace": the phrase without its
+    spaces equals a run of whole tokens; never part of a token."""
+    r = check_grounding(_state(tmp_path, ["CrewAI", "Hugging Face"],
+                               ["Crew AI on HuggingFace.", "crew-ai and hugging-face."]))
+    assert (r.mention_count, r.grounded) == (2, True)
+    r = check_grounding(_state(tmp_path, ["Crew AI"], ["CrewAI crews.", "The crewai package."]))
+    assert (r.mention_count, r.grounded) == (2, True)
+    r = check_grounding(_state(tmp_path, ["CrewAI"], ["A screw aims true.", "Crew aims high.", "Crew AIs."]))
+    assert r.mention_count == 0, "a token's part is never a mention"
+    r = check_grounding(_state(tmp_path, ["GLM 5"], ["GLM5.2 is out.", "glm 5.2 again."]))
+    assert r.mention_count == 0, "a longer version still does not match"
 
 
-def test_check_grounding_collects_sample_titles():
-    """Sample titles surface in GroundingResult for the warning UI."""
-    state = {
-        "user_request": "transformer survey",
-        "fetched": [
-            {"title": "A Survey of Transformers",
-             "credibility_score": 0.9},
-            {"title": "Transformer-X paper",
-             "credibility_score": 0.85},
-            {"title": "Transformers in vision",
-             "credibility_score": 0.85},
-            {"title": "Other",
-             "credibility_score": 0.85},
-        ],
-    }
-    r = check_grounding(state, threshold=3)
-    # Grounded: 3 mentions of "transformer/survey".
-    assert r.grounded is True
-    # Samples capped at 3.
-    assert len(r.sample_evidence_titles) == 3
+def test_only_relevant_authoritative_sources_count(tmp_path):
+    named = "LangGraph interrupts pause a graph."
+    weak = check_grounding(_state(tmp_path, ["LangGraph"], [named] * 3, relevance=2))
+    assert (weak.n_credible, weak.grounded) == (0, False), "digest relevance < 3 does not count"
+    farm = check_grounding(_state(tmp_path, ["LangGraph"], [named] * 3, authority=0))
+    assert (farm.n_credible, farm.grounded) == (0, False), "authority-0 sources do not count"
+
+
+def test_every_entity_needs_the_threshold(tmp_path):
+    docs = ["Mamba and the Transformer compared.", "Transformer only.", "Transformer again."]
+    r = check_grounding(_state(tmp_path, ["Mamba", "Transformer"], docs))
+    assert (r.mention_count, r.grounded) == (1, False), "the least-supported entity decides"
+    r = check_grounding(_state(tmp_path, ["Mamba", "Transformer"], docs[:1] * 2))
+    assert (r.mention_count, r.grounded) == (2, True)
+
+
+def test_no_entities_means_nothing_to_check(tmp_path):
+    r = check_grounding(_state(tmp_path, [], ["anything"]))
+    assert r.grounded is True and r.entity_tokens == []
+    assert check_grounding({"user_request": "GLM 5.2", "fetched": []}).grounded is True, (
+        "the request's tokens are never the entity")
+
+
+def test_entities_but_nothing_fetched_is_not_grounded():
+    r = check_grounding({"brief": {"entities": ["GLM 5.2"]}, "fetched": [], "evidence": []})
+    assert (r.grounded, r.n_credible, r.mention_count) == (False, 0, 0)
+
+
+def test_threshold_can_be_lowered(tmp_path):
+    state = _state(tmp_path, ["GLM 5.2"], ["GLM 5.2 overview"])
+    assert check_grounding(state).grounded is False
+    assert check_grounding(state, threshold=1).grounded is True
+
+
+def test_sample_titles_are_collected(tmp_path):
+    r = check_grounding(_state(tmp_path, ["Transformer"], ["Transformer"] * 5))
+    assert r.sample_evidence_titles == ["Doc 0", "Doc 1", "Doc 2"]
 
 
 # --- Warning prompt + banner -----------------------------------------
 
 def test_warning_prompt_empty_when_grounded():
-    """The caller does NOT prepend anything when grounded."""
-    r = GroundingResult(
-        grounded=True, entity_tokens=["transformer"],
-        mention_count=5, n_credible=5, threshold=3,
-    )
-    out = grounding_warning_prompt(r, "transformer survey")
-    assert out == ""
+    r = GroundingResult(grounded=True, entity_tokens=["transformer"], mention_count=5, n_credible=5, threshold=3)
+    assert grounding_warning_prompt(r, "transformer survey") == ""
 
 
 def test_warning_prompt_non_empty_when_not_grounded():
-    """When NOT grounded, the warning block lists the entity + a
-    conservative-action list."""
-    r = GroundingResult(
-        grounded=False, entity_tokens=["glm"],
-        mention_count=1, n_credible=2, threshold=3,
-    )
+    r = GroundingResult(grounded=False, entity_tokens=["glm 5.2"], mention_count=1, n_credible=2, threshold=3)
     out = grounding_warning_prompt(r, "GLM 5.2")
     assert "GROUNDING WARNING" in out
     assert "GLM 5.2" in out
     assert "strictly conservative" in out.lower()
     assert "insufficient direct evidence" in out.lower()
-    assert "1" in out and "2" in out  # mention_count + n_credible
+    assert "1" in out and "2" in out
 
 
 def test_banner_empty_when_grounded():
-    r = GroundingResult(
-        grounded=True, entity_tokens=["x"],
-        mention_count=5, n_credible=5, threshold=3,
-    )
+    r = GroundingResult(grounded=True, entity_tokens=["x"], mention_count=5, n_credible=5, threshold=3)
     assert grounding_banner(r) == ""
 
 
 def test_banner_non_empty_with_counts_when_not_grounded():
-    r = GroundingResult(
-        grounded=False, entity_tokens=["unicorns"],
-        mention_count=0, n_credible=2, threshold=3,
-    )
+    r = GroundingResult(grounded=False, entity_tokens=["unicorns"], mention_count=0, n_credible=2, threshold=3)
     out = grounding_banner(r)
     assert "Limited direct evidence" in out
-    # Counts are visible.
     assert "0" in out and "2" in out
 
 
-# --- Behavioural / threshold defaults --------------------------------
-
 def test_default_threshold_constant_matches_documented():
-    """DEFAULT_GROUNDING_THRESHOLD=2 after the 2026-07-12 depth rebalance
-    (was 3). Threshold-3 over-fired the strict-conservatism warning on
-    normal topics; 2 still catches genuinely thin entities (0-1 credible
-    mentions) while letting well-covered topics synthesize freely."""
     assert DEFAULT_GROUNDING_THRESHOLD == 2
-
-
-def test_empty_state_grounds_trivially():
-    """An empty fetched list with a real query = no evidence, NOT
-    grounded. The warning fires so the synthesizer is told the web
-    returned nothing."""
-    r = check_grounding({"user_request": "GLM 5.2", "fetched": []})
-    assert r.grounded is False
-    assert r.n_credible == 0
-    assert r.mention_count == 0

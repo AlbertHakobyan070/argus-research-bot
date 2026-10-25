@@ -1,30 +1,36 @@
-"""v3 brief node — scoping (replaces v2 planner + planner_reflect).
+"""Brief node — scoping (replaces v2 planner + planner_reflect).
 
 Turns the user request into a ResearchBrief: sub-questions with
-source-kind hints, keywords, success criteria. NO URLs — the scout
+source-kind hints, keywords, success criteria, and (v4, spec §3 WP-I) the
+report archetype, time sensitivity with a recency hint, the academic flag
+and the entity phrases the grounding check looks for. NO URLs — the scout
 searches live, so the LLM never gets a chance to invent links (the v2
 hallucinated-URL bug class is structurally impossible here).
 
 A v2-compatible ``plan`` dict is emitted alongside the brief so the
 Telegram plan-gate renderer (``_format_plan``) works unchanged.
 
-Quality gate: deterministic checks (sub-question count, no verbatim
-echo of the request, keyword coverage) with ONE bounded re-draft —
-the v2 planner_reflect behaviour, folded into the node.
+``brief.draft`` runs through ``llm.complete``; the parser is its validate
+hook, so an unparseable reply is nudged, retried and recorded, and a role
+whose engines are exhausted raises (spec §2.1: ``brief.draft`` must raise —
+there is no generic fallback brief). Quality gate: deterministic checks
+(sub-question count, no verbatim echo of the request, keyword coverage)
+with ONE bounded re-draft — the v2 planner_reflect behaviour, folded into
+the node.
 """
 from __future__ import annotations
 
 import json
-import logging
 import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .. import llm
+from . import run_config
+from .archetypes import DEFAULT_ARCHETYPE, TEMPLATES
+from .grounding import normalise
 from .jsonx import parse_json_obj
 from .state import ResearchBrief, SubQuestion
-
-logger = logging.getLogger("argus.brief")
 
 BRIEF_SYSTEM = """You are Argus's research scoper.
 
@@ -42,6 +48,26 @@ Rules:
   filtering.
 - success_criteria: 2-4 statements describing what a COMPLETE answer
   must contain.
+- archetype: the report shape that fits the request best, one of
+  "explainer" (how something works / what it is), "definition" (what a
+  term means), "comparison" (X vs Y, differences, which is better),
+  "forecast" (outlook, prediction, future prices or trends), "sota_review"
+  (state of the art: approaches and results), "howto" (steps to do or
+  build something), "news_update" (what happened recently), "decision"
+  (which option to choose for a goal).
+- time_sensitive: true when the answer depends on recent events or data
+  (prices, news, releases, "latest", "this month"), else false.
+- recency_hint: when time_sensitive, how recent the sources must be —
+  "d" (a day), "w" (a week), "m" (a month) or "y" (a year); else null.
+- is_academic_topic: true when peer-reviewed research is the main
+  evidence (science, medicine, ML research); false for products, markets,
+  news and how-tos.
+- entities: up to 6 proper names the request is about — products,
+  models, organisations, people, projects, places — copied as written in
+  the request. Never a date, period, price, metric or generic noun:
+  "Bitcoin price outlook for Q4" → ["Bitcoin"];
+  "LangGraph vs CrewAI" → ["LangGraph", "CrewAI"];
+  a general topic that names nothing specific ("causes of inflation") → [].
 - Do NOT include URLs anywhere. Live search finds the sources.
 
 Return ONLY JSON:
@@ -49,9 +75,20 @@ Return ONLY JSON:
   "sub_questions": [{"q": "...", "kind": "paper|repo|web|mixed"}, ...],
   "must_have_keywords": ["...", "..."],
   "summary": "1-2 sentence brief summary",
-  "success_criteria": ["...", "..."]
+  "success_criteria": ["...", "..."],
+  "archetype": "<one of the archetypes above>",
+  "time_sensitive": <true|false>,
+  "recency_hint": <"d"|"w"|"m"|"y"|null>,
+  "is_academic_topic": <true|false>,
+  "entities": ["<proper name>", ...]
 }
 """
+
+_MAX_ENTITIES = 6
+# A normalised token that names a period or a number, never a thing (spec §3 WP-I).
+_PERIOD_TOKEN = re.compile(r"q[1-4]|h[12]|fy\d{2,4}|\d+(?:\.\d+)*|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?"
+                           r"|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?"
+                           r"|nov(?:ember)?|dec(?:ember)?")
 
 MIN_SUB_QUESTIONS = 3
 VERBATIM_OVERLAP = 0.9
@@ -88,10 +125,45 @@ def check_brief_quality(brief: ResearchBrief, user_request: str) -> list[str]:
     return failures
 
 
-def _parse_brief(text: str) -> ResearchBrief:
+def _flag(value) -> bool:
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _entities(raw, asked: str) -> list[str]:
+    """The entity phrases, lower-cased and whitespace-collapsed, kept only
+    when ``asked`` (the request, any plan feedback and the previous brief's
+    entities) names them — compared the way the grounding check normalises
+    them — so an invented name or abbreviation never becomes something the
+    documents must contain; a phrase made only of period/number tokens
+    ("Q4", "FY26", "March 2025") is no entity; one per normalised form, at
+    most ``_MAX_ENTITIES``."""
+    hay = f" {normalise(asked)} "
+    out: list[str] = []
+    keys: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, str):
+            continue
+        phrase = " ".join(item.lower().split())
+        key = normalise(phrase)
+        if (key and key not in keys and f" {key} " in hay
+                and not all(_PERIOD_TOKEN.fullmatch(t) for t in key.split())):
+            out.append(phrase)
+            keys.add(key)
+    return out[:_MAX_ENTITIES]
+
+
+def _parse_brief(text: str, asked: str = "") -> ResearchBrief:
+    """The ``brief.draft`` reply as a ResearchBrief — the validate hook: a
+    reply without a ``sub_questions`` list raises (and is retried). The v4
+    fields take their deterministic defaults when missing or malformed: an
+    unknown archetype → ``DEFAULT_ARCHETYPE``; a recency hint is passed on as
+    given (``resolve_recency`` ignores an unusable one with a note)."""
     data = parse_json_obj(text, require_any=("sub_questions",))
+    raw_subs = data.get("sub_questions")
+    if not isinstance(raw_subs, list):
+        raise ValueError(f"'sub_questions' is {type(raw_subs).__name__}, not a list")
     sub_qs = []
-    for sq in data.get("sub_questions") or []:
+    for sq in raw_subs:
         if isinstance(sq, str):
             sq = {"q": sq}
         if not isinstance(sq, dict) or not (sq.get("q") or "").strip():
@@ -100,6 +172,9 @@ def _parse_brief(text: str) -> ResearchBrief:
         if kind not in ("paper", "repo", "web", "mixed"):
             kind = "mixed"
         sub_qs.append(SubQuestion(q=sq["q"].strip(), kind=kind))
+    archetype = str(data.get("archetype") or "").strip().lower()
+    hint = data.get("recency_hint")
+    hint = hint.strip().lower() if isinstance(hint, str) else ""
     return ResearchBrief(
         sub_questions=sub_qs,
         must_have_keywords=[str(k) for k in
@@ -107,24 +182,11 @@ def _parse_brief(text: str) -> ResearchBrief:
         summary=str(data.get("summary") or "")[:600],
         success_criteria=[str(c) for c in
                           (data.get("success_criteria") or []) if c][:4],
-    )
-
-
-def _fallback_brief(user_request: str) -> ResearchBrief:
-    """Single-search fallback when the LLM output is unusable twice."""
-    words = [w for w in re.findall(r"\w{3,}", user_request.lower())][:6]
-    return ResearchBrief(
-        sub_questions=[
-            SubQuestion(q=f"What is known about {user_request}?", kind="web"),
-            SubQuestion(q=f"What academic work covers {user_request}?",
-                        kind="paper"),
-            SubQuestion(q=f"What open-source projects relate to "
-                          f"{user_request}?", kind="repo"),
-        ],
-        must_have_keywords=words,
-        summary=("⚠️ Brief output was unparseable — fell back to a generic "
-                 "3-angle brief. Live search still runs; Edit or Cancel if "
-                 "the topic needs a richer scope."),
+        archetype=archetype if archetype in TEMPLATES else DEFAULT_ARCHETYPE,
+        time_sensitive=_flag(data.get("time_sensitive")),
+        recency_hint=hint if hint not in ("", "null", "none") else None,
+        is_academic_topic=_flag(data.get("is_academic_topic")),
+        entities=_entities(data.get("entities"), asked),
     )
 
 
@@ -161,12 +223,18 @@ def brief_to_plan(brief: ResearchBrief, queries: list[dict] | None = None) -> di
 
 
 def brief_node(state) -> dict:
-    """Draft (or revise, when the user replied at the plan gate) the brief."""
+    """Draft (or revise, when the user replied at the plan gate) the brief.
+    ``brief.draft`` exhausted → ``llm.EngineError`` propagates (the role must
+    raise); every attempt that returned is in ``model_calls``."""
+    rc = run_config.require(state)
     user_request = state.get("user_request") or ""
     feedback = (state.get("plan_feedback") or "").strip()
     prev = state.get("brief") if feedback else None
+    # what the entity phrases must come from: an entity of an earlier plan edit survives the next one
+    asked = "\n".join([user_request, feedback, *((prev or {}).get("entities") or [])])
+    calls: list[dict] = []
 
-    def _invoke(extra: str = "") -> tuple[ResearchBrief, dict]:
+    def _draft(extra: str = "") -> ResearchBrief:
         if feedback:
             human = (
                 f"Topic / question: {user_request}\n\n"
@@ -177,41 +245,26 @@ def brief_node(state) -> dict:
         else:
             human = (f"Topic / question: {user_request}\n{extra}\n"
                      "Draft the research brief as JSON.")
-        chat = llm.chat_for_tier("strong", temperature=0.2, max_tokens=900)
-        resp = llm.invoke_with_retry(chat, [
-            SystemMessage(content=BRIEF_SYSTEM),
-            HumanMessage(content=human[:8000]),
-        ])
-        rec = llm.record_from_response(
-            "strong", llm.resolve_tier("strong"), resp)
-        return _parse_brief(resp.content), rec.model_dump()
+        res = llm.complete("brief.draft", [SystemMessage(content=BRIEF_SYSTEM),
+                                           HumanMessage(content=human[:8000])],
+                           engines=rc.engines, temperature=0.2, max_tokens=1200,
+                           validate=lambda text: _parse_brief(text, asked))
+        calls.extend(r.model_dump() for r in res.records)
+        return res.parsed
 
-    calls: list[dict] = []
     errors: list[str] = []
-    try:
-        brief, rec = _invoke()
-        calls.append(rec)
-    except Exception as e:
-        logger.warning("brief draft failed (%s); using fallback", e)
-        brief = _fallback_brief(user_request)
-        errors.append(f"brief: unparseable output ({e})")
-
+    brief = _draft()
     failures = check_brief_quality(brief, user_request)
     if failures:
         # ONE bounded re-draft with the failure diagnoses in hand.
-        try:
-            brief2, rec2 = _invoke(
-                extra=("\nYour previous brief was rejected: "
-                       + "; ".join(failures)
-                       + ". Fix these gaps."))
-            calls.append(rec2)
-            if not check_brief_quality(brief2, user_request):
-                brief = brief2
-                failures = []
-            elif len(brief2.sub_questions) > len(brief.sub_questions):
-                brief = brief2  # still weak but strictly better
-        except Exception as e:
-            logger.warning("brief re-draft failed (%s); keeping first", e)
+        brief2 = _draft(extra=("\nYour previous brief was rejected: "
+                               + "; ".join(failures)
+                               + ". Fix these gaps."))
+        if not check_brief_quality(brief2, user_request):
+            brief = brief2
+            failures = []
+        elif len(brief2.sub_questions) > len(brief.sub_questions):
+            brief = brief2  # still weak but strictly better
     if failures:
         errors.append(f"brief: weak after re-draft: {failures}")
 

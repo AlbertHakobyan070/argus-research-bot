@@ -12,7 +12,7 @@ so the fix is structural (strip in code), not another prompt tweak.
 """
 from __future__ import annotations
 
-from argus.graph.compose import _normalize_heading_text, _strip_duplicate_heading
+from argus.graph.assemble import _normalize_heading_text, strip_duplicate_heading as _strip_duplicate_heading
 
 
 def test_strips_markdown_heading_duplicate():

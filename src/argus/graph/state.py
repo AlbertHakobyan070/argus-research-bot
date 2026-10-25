@@ -9,6 +9,10 @@ a bot restart and can be re-attached with /continue.
 key a node returns that is not declared here (verified on langgraph
 1.2.8). The ``messages`` note below is one casualty of that rule;
 compose's ``synthesis_outcome`` is another.
+
+Frozen after v4 WP-D (spec §2.4, §5): every v4 key and model field is
+declared here; a missing key is a one-line change by the orchestrator.
+New model fields carry defaults, so pre-v4 checkpoints still load.
 """
 from __future__ import annotations
 
@@ -30,22 +34,6 @@ VALID_LENGTHS: tuple[Length, ...] = (
     "tldr", "short", "medium", "long", "lecture")
 
 
-class PlannedSource(BaseModel):
-    """One source the planner intends to consult."""
-    kind: Literal["paper", "repo", "news", "blog", "official_doc",
-                  "search_result"] = "search_result"
-    query: str = ""
-    target_url: str | None = None
-    rationale: str = ""
-
-
-class ResearchPlan(BaseModel):
-    sub_questions: list[str] = Field(default_factory=list)
-    planned_sources: list[PlannedSource] = Field(default_factory=list)
-    must_have_keywords: list[str] = Field(default_factory=list)
-    summary: str = ""
-
-
 class FetchedItem(BaseModel):
     """A piece of evidence already fetched + normalized."""
     url: str
@@ -60,6 +48,16 @@ class FetchedItem(BaseModel):
     # gathered for, and the provider that surfaced it.
     sub_qs: list[int] = Field(default_factory=list)
     provider: str = ""
+    # v4 (spec §2.4, §2.8)
+    canonical_url: str = ""
+    domain: str = ""
+    published: str = ""
+    fetcher: str = ""          # the fetch rung that produced the text
+    fetch_ms: int = 0
+    chars: int = 0
+    authority_prior: int = 1
+    pinned: bool = False       # a user-appended source (/append): bypasses every cap
+    rungs_tried: list[dict] = Field(default_factory=list)   # [{"rung", "error"}] of the fetch (spec §2.8, WP-B review)
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +74,18 @@ class SubQuestion(BaseModel):
 
 
 class ResearchBrief(BaseModel):
-    """v3 scoping artifact (replaces the v2 ResearchPlan as the driver;
-    a v2-compatible ``plan`` dict is still emitted for the Telegram
-    plan-gate renderer)."""
+    """The scoping artifact that drives research. ``brief_to_plan`` also
+    emits a plain ``plan`` dict for the plan card (Telegram and console)."""
     sub_questions: list[SubQuestion] = Field(default_factory=list)
     must_have_keywords: list[str] = Field(default_factory=list)
     summary: str = ""
     success_criteria: list[str] = Field(default_factory=list)
+    # v4 (spec §2.4)
+    archetype: str = "explainer"
+    time_sensitive: bool = False
+    recency_hint: str | None = None
+    is_academic_topic: bool = False
+    entities: list[str] = Field(default_factory=list)
 
 
 class EvidenceClaim(BaseModel):
@@ -90,6 +93,7 @@ class EvidenceClaim(BaseModel):
     text: str
     quote: str = ""          # short supporting quote from the document
     confidence: Literal["high", "medium", "low"] = "medium"
+    quote_verified: bool | None = None   # v4: quote found in the document; None = not checked
 
 
 class EvidenceNote(BaseModel):
@@ -107,6 +111,10 @@ class EvidenceNote(BaseModel):
     relevance: int = 0       # 0-5, judged by the digest LLM from full text
     stance: Literal["supports", "mixed", "contradicts", "background"] = "background"
     claims: list[EvidenceClaim] = Field(default_factory=list)
+    # v4 (spec §2.4)
+    source_type: str = "other"
+    authority: int = 1
+    cached: bool = False
 
 
 class OutlineSection(BaseModel):
@@ -114,6 +122,7 @@ class OutlineSection(BaseModel):
     title: str
     focus: str = ""
     sub_qs: list[int] = Field(default_factory=list)
+    note_ids: list[int] = Field(default_factory=list)   # v4: the evidence notes allocated to it
 
 
 class PanelVerdict(BaseModel):
@@ -125,6 +134,15 @@ class PanelVerdict(BaseModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     fabrication_flags: list[str] = Field(default_factory=list)
     revise_sections: list[str] = Field(default_factory=list)  # section titles
+    # v4 (spec §2.4, §2.8)
+    next: Literal["research", "compose", "report_builder"] = "report_builder"  # route_after_panel returns it
+    coverage_gaps: list[int] = Field(default_factory=list)
+    wants_rewrite: bool = False
+    judge_not_diverse: bool = False
+    uncited_specifics: list[str] = Field(default_factory=list)
+    skipped_judges: list[str] = Field(default_factory=list)
+    judged: int = 0          # findings the grounding judge judged …
+    total: int = 0           # … of this many (judged < total → "Not fact-checked" banner)
 
 
 class Finding(BaseModel):
@@ -147,6 +165,10 @@ class Finding(BaseModel):
     # it to turn flagged finding ids into the list of sections to
     # rewrite; build_assessment counts claims per section with it.
     section: str = ""
+    # v4 (spec §2.4, §2.8)
+    source_ids: list[int] = Field(default_factory=list)
+    sentence: str = ""       # the verbatim sentence(s) behind the claim, from the extractor
+    status: Literal["kept", "cut", "unlocated"] = "kept"
 
 
 class ReviewVerdict(BaseModel):
@@ -204,7 +226,7 @@ class ArgusState(TypedDict, total=False):
     draft_md: str                   # current draft markdown
     review_verdict: dict | None     # ReviewVerdict-compatible dict
     revision_notes: list[str]       # panel notes (grow each revise round) + user revise
-                                    # requests, which bot.py appends LAST
+                                    # requests, which the run driver (bot/runs.py) appends LAST
     revision_rounds: int            # counter
 
     # v3 research engine
@@ -212,13 +234,28 @@ class ArgusState(TypedDict, total=False):
     queries: list[dict]             # planned search queries (scout + waves)
     evidence: list[dict]            # EvidenceNote.model_dump() list
     coverage: dict                  # {sub_q_idx(str): strength int}
-    outline: dict | None            # {"sections": [OutlineSection...]}
-    sections: list[dict]            # [{"title", "md"}] composed sections
+    outline: dict | None            # {"sections": [OutlineSection...], "changed_sections": [str]}
+    sections: list[dict]            # [{"title", "md", "note_ids"}] composed sections
     panel_verdict: dict | None      # PanelVerdict.model_dump()
     research_rounds: int            # waves executed inside research_node
 
+    # v4 (spec §2.4). run_config is set by every new-run entry point and by
+    # run_config.ensure_in_checkpoint on resume; nodes read it through
+    # run_config.require(state), never state.get.
+    run_config: dict                # RunConfig.model_dump()
+    search_spend: dict              # SpendLedger.snapshot(): {exa_searches, exa_text_pages,
+                                    #   exa_contents_pages, exa_usd, arxiv_queries, ddgs_queries,
+                                    #   github_queries, extend_allowances, recency, dropped_undated}
+    analysis: dict | None           # analyst output (takeaways with confidence labels, …)
+    tldr_md: str | None             # deterministic TL;DR, built by report_builder after the cuts
+    coverage_gaps: list[int]        # sub-questions the next gap wave targets (it clears them)
+    gap_history: list[dict]         # [{round, wave, sub_qs, new_strong, source: "coverage"|"judge"}]
+    gap_waves: int                  # gap waves run, cumulative over the run
+    compose_runs: int               # compose executions in the current user round
+    cancel_note: str                # why a drained run stopped
+
     # Delivery
-    report_paths: dict              # {"md": str, "pdf": str, "folder": str}
+    report_paths: dict              # {"md": str, "pdf": str, "folder": str, "evidence": str}
     quick_answer: str               # for /ask path
     validated_assessment: dict      # T7: ValidatedAssessment.model_dump()
     lecture_appendix: dict          # T7: methodology + tool calls log + density metrics

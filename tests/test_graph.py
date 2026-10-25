@@ -8,6 +8,7 @@ cited report through the v3 engine.
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -15,14 +16,27 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 from argus.config import get_settings
+from argus.engines import registry
 from argus.graph import build_graph, quick_answer_graph
 
 
+@pytest.fixture(autouse=True)
+def _live_engines(monkeypatch):
+    """Resolve the shipped engines config against the live proxy, as every
+    bot drive entry does first; the run's RunConfig carries the snapshot."""
+    monkeypatch.setattr(registry, "_state", registry._State())
+    asyncio.run(registry.load_config([str(registry._ROOT / "argus_engines.json")]))
+    asyncio.run(registry.active_snapshot())
+
+
 def _make_state_in(thread_id: str, user_id: int, text: str) -> dict:
+    from argus.graph.run_config import RunConfig
     return {
         "thread_id": thread_id,
         "user_id": user_id,
         "user_request": text,
+        "run_config": RunConfig.from_preset(       # v4: every node reads it (WP-C: intake, quick_answer)
+            length="short", engines=registry.cached_snapshot(), origin="telegram").model_dump(),
         "messages": [], "plan": None,
         "sources": [], "fetched": [], "findings": [],
         "draft_md": "", "revision_notes": [], "revision_rounds": 0,
@@ -90,10 +104,10 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
         }]
         return hits, []
 
-    monkeypatch.setattr(scout_mod, "run_query_wave", fake_wave)
-    monkeypatch.setattr(research_mod, "run_query_wave", fake_wave)
+    monkeypatch.setattr(scout_mod, "run_wave", fake_wave)
+    monkeypatch.setattr(research_mod, "run_wave", fake_wave)
 
-    def fake_fetch(src):
+    def fake_fetch(src, **kw):
         from argus.graph.state import FetchedItem
         return FetchedItem(
             url=src.get("url", ""), title=src.get("title", ""),
@@ -106,8 +120,8 @@ def test_deep_graph_pauses_for_plan_approval(monkeypatch, tmp_path):
 
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "test:deep"}}
-    g.invoke(_make_state_in("test:deep", 1, "LLM agent benchmarks"),
-             config=cfg)
+    state_in = _make_state_in("test:deep", 1, "LLM agent benchmarks")
+    g.invoke(state_in, config=cfg)
     # Grounded plan gate: paused AFTER scout, before research.
     snap = g.get_state(cfg)
     assert snap.next == ("research",), (

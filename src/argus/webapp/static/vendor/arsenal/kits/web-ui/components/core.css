@@ -1,0 +1,179 @@
+/* core.css — type adjustments, buttons, fields, switch, segmented control, tags and
+   status badges, breadcrumbs, kbd hints, progress, skeletons.
+   Every colour is a token. Load after tokens/base.css (and after a pair-*.css if any). */
+
+/* ---- type: pairing hooks (pair-*.css sets the --kit-* values) ------------ */
+:root{font-synthesis-weight:none} /* single-weight faces (Instrument Serif) render true, never faux-bold */
+h1{font-weight:var(--kit-hw1,700);letter-spacing:var(--kit-track-h1,var(--track-h1))}
+h2,h3{font-weight:var(--kit-hw2,600)}
+.kicker{font-family:var(--kit-label,var(--disp));margin-bottom:11px}
+.lede{font-size:16.5px;line-height:1.58;color:var(--ink-dim);max-width:64ch;margin:0}
+.meta{font:500 11.5px/1.4 var(--mono);color:var(--ink-faint)}
+.dim{color:var(--ink-dim)} .faint{color:var(--ink-faint)}
+.label{font:600 9.5px/1.3 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;color:var(--ink-faint)}
+.mark-word{display:inline-flex;align-items:baseline;gap:8px}
+.mark-word b{font:600 21px/1 var(--serif);letter-spacing:-.01em;color:var(--ink)}
+.mark-word span{font:600 10px/1 var(--kit-label,var(--disp));letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
+.icon{width:1.1em;height:1.1em;flex:none;vertical-align:-.16em}
+.stack{display:flex;flex-direction:column;gap:var(--s3)}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2) var(--s3)}
+
+/* ---- buttons -------------------------------------------------------------- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  font:500 12.5px/1 var(--body);color:var(--ink-dim);background:var(--panel-2);
+  border:1px solid var(--line);border-radius:var(--r);padding:8px 12px;cursor:pointer;text-decoration:none;
+  transition:color var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease),background var(--t-fast) var(--ease)}
+.btn:hover{color:var(--ink);border-color:var(--accent-line)}
+.btn[aria-pressed="true"]{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+.btn:disabled,.btn[aria-disabled="true"]{opacity:.45;cursor:default}
+.btn-a{color:var(--on-fill);background:var(--accent);border-color:var(--accent)}
+.btn-a:hover{color:var(--on-fill);filter:brightness(1.06)}
+.btn-a kbd{background:none;color:inherit;border-color:color-mix(in srgb,var(--on-fill) 45%,transparent)}
+.btn-ghost{background:none;border-color:transparent}
+.btn-ghost:hover{background:var(--panel-2);border-color:var(--line)}
+.btn-danger{color:var(--trap);border-color:color-mix(in srgb,var(--trap) 45%,transparent);background:none}
+.btn-danger:hover{color:var(--on-fill);background:var(--trap);border-color:var(--trap)}
+.btn-s{padding:5px 9px;font-size:11.5px}
+.btn-l{padding:11px 16px;font-size:14px}
+.ib{width:34px;height:32px;display:inline-grid;place-items:center;padding:0;color:var(--ink-dim);
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r);cursor:pointer;
+  transition:color var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease)}
+.ib:hover:not(:disabled){color:var(--accent);border-color:var(--accent-line)}
+.ib:disabled{opacity:.4;cursor:default}
+.ib svg{width:15px;height:15px}
+.ib-a{color:var(--on-fill);background:var(--accent);border-color:var(--accent)}
+.ib-a:hover:not(:disabled){color:var(--on-fill);filter:brightness(1.07)}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+
+/* ---- fields --------------------------------------------------------------- */
+.field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.field > label,.field > .field-l{font:500 13px/1.3 var(--body);color:var(--ink)}
+.field .hint{font-size:12.4px;line-height:1.5;color:var(--ink-faint);margin:0}
+.field .err{font-size:12.4px;line-height:1.5;color:var(--trap);margin:0}
+.input{width:100%;font:400 13.5px/1.3 var(--body);color:var(--ink);background:var(--ground);
+  border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;min-height:36px;
+  transition:border-color var(--t-fast) var(--ease)}
+.input::placeholder{color:var(--ink-faint)}
+.input:hover{border-color:color-mix(in srgb,var(--ink-faint) 55%,var(--line))}
+.input:focus-visible{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}
+.input[aria-invalid="true"]{border-color:var(--trap)}
+textarea.input{min-height:88px;resize:vertical;line-height:1.5}
+select.input{appearance:none;padding-right:30px;cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--ink-faint) 50%),linear-gradient(135deg,var(--ink-faint) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 50%,calc(100% - 10px) 50%;background-size:5px 5px;background-repeat:no-repeat}
+.input.mono,.mono{font-family:var(--mono)}
+.input-group{display:flex}
+.input-group .input{border-radius:var(--r) 0 0 var(--r)}
+.input-group .btn{border-radius:0 var(--r) var(--r) 0;margin-left:-1px}
+input[type="checkbox"]:not(.switch),input[type="radio"]{accent-color:var(--accent);width:15px;height:15px;margin:0}
+input[type="range"]{accent-color:var(--accent)}
+.check{display:inline-flex;align-items:center;gap:8px;font-size:13.5px;cursor:pointer}
+
+/* ---- switch: <input type="checkbox" role="switch" class="switch"> ---------- */
+.switch{appearance:none;flex:none;position:relative;width:32px;height:19px;margin:0;cursor:pointer;
+  border-radius:var(--r-pill);background:var(--sunk);border:1px solid var(--line);
+  transition:background var(--t-med) var(--ease),border-color var(--t-med) var(--ease)}
+.switch::before{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;
+  background:var(--panel);box-shadow:0 0 0 1px var(--line),var(--shadow);
+  transition:transform var(--t-med) var(--ease),background var(--t-med) var(--ease)}
+.switch:checked{background:var(--accent);border-color:var(--accent)}
+.switch:checked::before{transform:translateX(13px);background:var(--on-fill);box-shadow:none}
+.switch:disabled{opacity:.45;cursor:default}
+.switch:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.switch-row{display:flex;align-items:flex-start;gap:12px;cursor:pointer}
+.switch-row .switch{margin-top:2px}
+.switch-row b{display:block;font:500 13.5px/1.35 var(--body);color:var(--ink)}
+.switch-row small{display:block;font-size:12.4px;line-height:1.5;color:var(--ink-faint);margin-top:2px}
+
+/* ---- segmented control ----------------------------------------------------
+   radios: <div class="seg" role="radiogroup"><label><input type="radio" name="g" checked><span>Day</span></label>…
+   buttons: <div class="seg" data-ui="seg"><button aria-pressed="true">Day</button>…            */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--panel);max-width:100%}
+.seg > button,.seg > label > span{display:block;font:500 12.5px/1 var(--body);color:var(--ink-dim);background:none;border:0;
+  padding:9px 14px;cursor:pointer;white-space:nowrap;transition:color var(--t-fast) var(--ease),background var(--t-fast) var(--ease)}
+.seg > label{display:block;position:relative}
+.seg > label > input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+.seg > * + *{border-left:1px solid var(--line)}
+.seg > button:hover,.seg > label:hover > span{color:var(--ink);background:var(--panel-2)}
+.seg > button[aria-pressed="true"],.seg > label > input:checked + span{color:var(--on-fill);background:var(--accent)}
+.seg > label > input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-3px}
+.seg-s > button,.seg-s > label > span{padding:6px 10px;font-size:11.5px}
+
+/* ---- tags, chips, status --------------------------------------------------- */
+.tag{display:inline-block;font:600 8.5px/1 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;
+  color:var(--kc,var(--accent));border:1px solid currentColor;border-radius:2px;padding:3px 5px 2px;flex:none;vertical-align:.12em}
+[data-kind="why"]{--kc:var(--why)} [data-kind="trap"]{--kc:var(--trap)}
+[data-kind="mech"]{--kc:var(--mech)} [data-kind="cost"]{--kc:var(--cost)}
+.chip{display:inline-flex;align-items:center;gap:6px;font:500 12px/1 var(--body);color:var(--ink-dim);
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 10px}
+.chip[aria-pressed="true"]{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+button.chip{cursor:pointer} button.chip:hover{border-color:var(--accent-line);color:var(--ink)}
+/* status: always shape + label, never colour alone */
+.status{display:inline-flex;align-items:center;gap:6px;font:500 12px/1.2 var(--body);color:var(--ink)}
+.status::before{content:"";width:8px;height:8px;flex:none;background:var(--sc)}
+.status[data-s="good"]{--sc:var(--status-good)}       .status[data-s="good"]::before{border-radius:50%}
+.status[data-s="warning"]{--sc:var(--status-warning)} .status[data-s="warning"]::before{clip-path:polygon(50% 0,100% 100%,0 100%);width:9px;height:9px}
+.status[data-s="serious"]{--sc:var(--status-serious)} .status[data-s="serious"]::before{transform:rotate(45deg);width:7px;height:7px}
+.status[data-s="critical"]{--sc:var(--status-critical)} .status[data-s="critical"]::before{border-radius:1px}
+.status[data-s="idle"]{--sc:var(--ink-faint)}          .status[data-s="idle"]::before{border-radius:50%;background:none;box-shadow:inset 0 0 0 1.5px var(--sc)}
+.delta{font:500 12px/1 var(--mono)}
+/* delta colour = direction x whether that direction is good: mark it .good / .bad / .flat, never by sign */
+.delta.good{color:var(--cost)} .delta.bad{color:var(--trap)} .delta.flat{color:var(--ink-faint)}
+
+/* ---- breadcrumbs ----------------------------------------------------------- */
+.crumbs ol{list-style:none;display:flex;flex-wrap:wrap;align-items:center;gap:4px 0;margin:0;padding:0;font:500 12.5px/1.4 var(--body)}
+.crumbs li{display:inline-flex;align-items:center;min-width:0}
+.crumbs li + li::before{content:"/";color:var(--line);margin:0 9px;font-weight:400}
+.crumbs a{color:var(--ink-dim);text-decoration:none;border-radius:var(--r-sm)}
+.crumbs a:hover{color:var(--accent)}
+.crumbs [aria-current]{color:var(--ink);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---- kbd hints ------------------------------------------------------------- */
+.kbd-hint{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--ink-faint)}
+.kbd-hint kbd + kbd{margin-left:-1px}
+.kbd-list{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;align-items:center;font-size:13px;color:var(--ink-dim);margin:0}
+.kbd-list dt{display:flex;gap:3px;justify-content:flex-end}
+.kbd-list dd{margin:0}
+
+/* ---- progress -------------------------------------------------------------- */
+.meter{display:flex;flex-direction:column;gap:7px}
+.meter-top{display:flex;justify-content:space-between;gap:12px;font-size:12.5px;color:var(--ink-dim)}
+.meter-top b{font:600 12px var(--mono);color:var(--ink)}
+.bar{height:5px;border-radius:3px;background:var(--line-soft);overflow:hidden}
+.bar > i{display:block;height:100%;width:var(--p,0%);background:var(--bc,var(--cost));border-radius:inherit;
+  transition:width var(--t-slow) var(--ease)}
+.bar[data-tone="accent"]{--bc:var(--accent)} .bar[data-tone="trap"]{--bc:var(--trap)} .bar[data-tone="mech"]{--bc:var(--mech)}
+.bar.indeterminate > i{width:34%;animation:bar-slide 1.4s var(--ease-io) infinite}
+@keyframes bar-slide{from{transform:translateX(-100%)}to{transform:translateX(300%)}}
+progress.bar{appearance:none;width:100%;border:0;display:block}
+progress.bar::-webkit-progress-bar{background:var(--line-soft);border-radius:3px}
+progress.bar::-webkit-progress-value{background:var(--bc,var(--cost));border-radius:3px;transition:width var(--t-slow) var(--ease)}
+progress.bar::-moz-progress-bar{background:var(--bc,var(--cost));border-radius:3px}
+.ring{--p:0;--size:44px;width:var(--size);height:var(--size);border-radius:50%;display:inline-grid;place-items:center;flex:none;
+  background:conic-gradient(var(--bc,var(--accent)) calc(var(--p) * 1%),var(--line-soft) 0);
+  font:600 11px/1 var(--mono);color:var(--ink)}
+.ring::before{content:"";grid-area:1/1;width:calc(100% - 8px);height:calc(100% - 8px);border-radius:50%;background:var(--panel)}
+.ring > *{grid-area:1/1;position:relative}
+/* stations: the lane-track idiom as a horizontal stepper */
+.stations{list-style:none;margin:0;padding:0;display:flex;counter-reset:st}
+.stations li{flex:1;min-width:0;position:relative;padding-top:20px;counter-increment:st;font:500 12px/1.35 var(--body);color:var(--ink-faint)}
+.stations li::before{content:"";position:absolute;top:5px;left:0;right:0;height:1px;background:var(--line)}
+.stations li::after{content:"";position:absolute;top:0;left:0;width:11px;height:11px;border-radius:50%;
+  border:1px solid var(--line);background:var(--panel);box-sizing:border-box}
+.stations li[data-state="done"]{color:var(--ink-dim)}
+.stations li[data-state="done"]::after{background:var(--cost);border-color:var(--cost)}
+.stations li[data-state="done"]::before{background:var(--cost)}
+.stations li[aria-current="step"]{color:var(--ink);font-weight:600}
+.stations li[aria-current="step"]::after{background:var(--accent);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.stations li span{display:block;padding-right:10px}
+.stations li small{display:block;font:500 10.5px/1.4 var(--mono);color:var(--ink-faint);margin-top:2px}
+
+/* ---- skeletons --------------------------------------------------------------- */
+.skel{display:block;background:var(--panel-2);border-radius:var(--r-sm);height:12px;margin:0 0 9px;
+  animation:skel 1.6s var(--ease-io) infinite alternate}
+.skel.h{height:22px;width:55%;margin-bottom:14px}
+.skel.w80{width:80%} .skel.w60{width:60%} .skel.w40{width:40%}
+.skel.box{height:120px;border-radius:var(--r)}
+.skel.dot{width:32px;height:32px;border-radius:50%}
+@keyframes skel{from{opacity:1}to{opacity:.45}}
+[aria-busy="true"] .skel{cursor:progress}

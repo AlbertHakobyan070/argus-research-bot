@@ -2,13 +2,12 @@
 
 These tests pin the two behavior changes Argus T2 introduced:
 
-* Fix #2 — every intel-stack tool wrapper (``harvest_sources``,
-  ``snatch_url``, ``crawl_url``, ``normalize_to_markdown``) MUST
-  invoke the intel-stack interpreter (INTEL_PYTHON_BIN). Previously
-  only ``harvest_sources`` did so; the other three silently fell
-  back to the argus venv's python and immediately raised
-  ``ModuleNotFoundError`` for feedparser / crawl4ai / markitdown /
-  yt_dlp.
+* Fix #2 — every intel-stack tool wrapper (``snatch_url``,
+  ``crawl_url``, ``normalize_to_markdown``) MUST invoke the
+  intel-stack interpreter (INTEL_PYTHON_BIN). Previously they
+  silently fell back to the argus venv's python and immediately
+  raised ``ModuleNotFoundError`` for feedparser / crawl4ai /
+  markitdown / yt_dlp.
 
 * Fix #3 — the research fetch path MUST propagate
   tool failures into ``state["errors"]`` instead of swallowing them
@@ -27,42 +26,23 @@ from typing import Any
 
 import pytest
 
+import httpx
+
 from argus import tools
+from argus.engines import fetchers
+from argus.engines.ledger import SpendLedger
 from argus.graph import research as research_mod
 from argus.graph.research import _parallel_fetch
-from argus.graph.state import ArgusState, PlannedSource, ResearchPlan
+from argus.graph.run_config import FetchConfig
 from argus.tools import (
     INTEL_PYTHON_BIN, PYTHON_BIN,
-    _run_script, crawl_url, harvest_sources, normalize_to_markdown,
-    snatch_url,
+    _run_script, crawl_url, normalize_to_markdown, snatch_url,
 )
 
 
 # ---------------------------------------------------------------------------
 # Fix #2 — every tool wrapper routes through INTEL_PYTHON_BIN
 # ---------------------------------------------------------------------------
-
-
-def _plan_with_paper() -> ResearchPlan:
-    """A minimal plan that triggers researcher_node's arXiv branch."""
-    return ResearchPlan(
-        sub_questions=["x"],
-        planned_sources=[
-            PlannedSource(kind="paper", query="attention is all you need",
-                          target_url=None, rationale="primary"),
-        ],
-        must_have_keywords=["attention"],
-        summary="probe",
-    )
-
-
-def _make_state(plan: ResearchPlan) -> ArgusState:
-    return {
-        "plan": plan.model_dump(),
-        "sources": [],
-        "fetched": [],
-        "errors": [],
-    }
 
 
 class _FakeProc:
@@ -166,122 +146,82 @@ def test_all_tools_route_through_intel_python(monkeypatch, tool_name,
     assert captured["cmd"][1].endswith(script)
 
 
-def test_harvest_sources_routes_through_intel_python(monkeypatch):
-    """harvest_sources used to pass python_bin explicitly; it now relies
-    on the default. Pin that the spawned interpreter is still INTEL."""
-    captured: dict[str, Any] = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return _FakeProc(rc=0,
-                          stdout='{"dir": "A:\\\\fake\\\\radar"}\n',
-                          stderr="")
-
-    monkeypatch.setattr(tools.subprocess, "run", fake_run)
-
-    class _FakeFolder:
-        def __init__(self, p): self.p = p
-        def __truediv__(self, name): return self
-        def exists(self): return False
-    monkeypatch.setattr(tools, "Path", _FakeFolder)
-    harvest_sources(hours=24, top=3, sections="papers", timeout=10)
-
-    assert captured["cmd"][0] == str(INTEL_PYTHON_BIN)
-
-
 # ---------------------------------------------------------------------------
 # Fix #3 — error propagation through state["errors"]
 # ---------------------------------------------------------------------------
 
 
-def test_parallel_fetch_propagates_exceptions_to_errors(monkeypatch):
-    """A raising snatch/crawl/normalize MUST surface as error strings.
+@pytest.fixture
+def offline(monkeypatch, tmp_path):
+    """The v4 fetch chain on a fake network: ``routes[url]`` → Response."""
+    routes: dict = {}
+    from helpers import as_stream, request_url
+    monkeypatch.setattr(fetchers, "_http_client", lambda cfg, **_: httpx.Client(
+        transport=httpx.MockTransport(lambda r: as_stream(routes.get(request_url(r), httpx.Response(404))))))
+    monkeypatch.setattr(fetchers, "_resolve", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
+    monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    return routes
 
-    Pre-fix behavior (v2): the ``except Exception: logger.warning(...)``
-    branch silently returned ``fetched=[]`` — the writers then produced
-    a vacuous "no evidence" report.
+
+def _fetch_all(sources):
+    return _parallel_fetch(sources, cfg=FetchConfig(), ledger=SpendLedger({}), exa_on=False)
+
+
+def test_parallel_fetch_lets_an_unexpected_rung_exception_propagate(offline, monkeypatch):
+    """A fetch rung's expected failures (HTTP status, network, size, a parser's
+    exception) are error lines (next test); anything else is a bug and MUST
+    propagate (v4 spec §2.8, WP-B review), never become a string.
+
+    v2 swallowed it (``fetched=[]``, then a vacuous "no evidence" report);
+    v4's first cut turned it into an error line.
     """
-    def boom_normalize(url, *a, **kw):
-        raise RuntimeError("normalize exploded")
-    def boom_snatch(url, *a, **kw):
-        raise RuntimeError("snatch exploded")
-    def boom_crawl(url, *a, **kw):
-        raise RuntimeError("crawl exploded")
+    def boom(*a, **kw):
+        raise RuntimeError("native exploded")
 
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom_normalize)
-    monkeypatch.setattr(research_mod, "snatch_url", boom_snatch)
-    monkeypatch.setattr(research_mod, "crawl_url", boom_crawl)
-
-    sources = [
-        {"url": "https://a.example", "kind": "official_doc",
-         "title": "A", "summary": ""},
-        {"url": "https://b.example", "kind": "blog",
-         "title": "B", "summary": ""},
-    ]
-    fetched, errs = _parallel_fetch(sources)
-    assert fetched == []
-    assert any("https://a.example" in e for e in errs), errs
-    assert any("https://b.example" in e for e in errs), errs
+    monkeypatch.setattr(fetchers, "_native", boom)
+    sources = [{"url": "https://a.example", "kind": "official_doc", "title": "A", "summary": ""}]
+    with pytest.raises(RuntimeError, match="native exploded"):
+        _fetch_all(sources)
 
 
-def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(monkeypatch):
-    """Successful URLs should land in fetched; failed URLs in errors —
-    no silent swallowing."""
-    from argus.tools import CrawlResult, NormalizeResult
-
-    def ok_normalize(url, *a, **kw):
-        return NormalizeResult(
-            ok=True,
-            markdown_path="A:\fake\ok.md",
-            markdown_text="x" * 700,
-            title="OK Title",
-        )
-    def bad_snatch(url, *a, **kw):
-        raise RuntimeError("snatch down")
-    def bad_crawl(url, *a, **kw):
-        return CrawlResult(ok=False, error="down",
-                           duration_s=0.0)
-
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", ok_normalize)
-    monkeypatch.setattr(research_mod, "snatch_url", bad_snatch)
-    monkeypatch.setattr(research_mod, "crawl_url", bad_crawl)
-
-    sources = [
-        {"url": "https://ok.example", "kind": "official_doc",
-         "title": "OK", "summary": ""},
-        {"url": "https://bad.example", "kind": "blog",
-         "title": "BAD", "summary": ""},
-    ]
-    fetched, errs = _parallel_fetch(sources)
+def test_parallel_fetch_partial_failure_mixes_fetched_and_errors(offline):
+    """Successful URLs land in fetched; failed URLs in errors — no silent
+    swallowing."""
+    offline["https://ok.example/a"] = httpx.Response(200, html=(
+        "<html><body><article><h1>OK Title</h1>"
+        + "<p>A long enough paragraph about the topic at hand. </p>" * 20
+        + "</article></body></html>"))
+    offline["https://bad.example/b"] = httpx.Response(500)
+    fetched, errs = _fetch_all([
+        {"url": "https://ok.example/a", "kind": "official_doc", "title": "OK", "summary": ""},
+        {"url": "https://bad.example/b", "kind": "blog", "title": "BAD", "summary": ""},
+    ])
     assert len(fetched) == 1
-    assert fetched[0]["url"] == "https://ok.example"
-    assert any("https://bad.example" in e for e in errs), errs
+    assert fetched[0]["url"] == "https://ok.example/a"
+    assert any("https://bad.example/b" in e for e in errs), errs
 
 
-def test_research_node_emits_all_failed_summary(monkeypatch):
+def test_research_node_emits_all_failed_summary(offline, monkeypatch):
     """When every source fails to fetch, research_node must append the
     'all sources failed' summary error (the v2 T2 contract, kept).
 
     Hermetic: with 0 fetched items the wave loop's coverage check finds
-    a gap and would otherwise launch a REAL follow-up search wave
-    (network) — mock it away so this test only exercises the
-    fetch-failure path it's named for.
+    a gap and would otherwise launch a follow-up search wave — mocked away
+    so this test only exercises the fetch-failure path it's named for.
     """
-    def boom(url, *a, **kw):
-        raise RuntimeError("down")
-    monkeypatch.setattr(research_mod, "normalize_to_markdown", boom)
-    monkeypatch.setattr(research_mod, "snatch_url", boom)
-    monkeypatch.setattr(research_mod, "crawl_url", boom)
-    monkeypatch.setattr(research_mod, "followup_queries",
-                        lambda brief, gaps, prior: ([], []))
+    from helpers import make_run_config
 
+    offline["https://a.example/x"] = httpx.Response(503)
+    monkeypatch.setattr(research_mod, "followup_queries", lambda *a, **kw: ([], [], []))
     state = {
         "user_request": "attention transformers",
-        "brief": {"sub_questions": [{"q": "What is attention?",
-                                     "kind": "web"}],
+        "run_config": make_run_config("short", **{"research.rerank": False}),
+        "brief": {"sub_questions": [{"q": "What is attention?", "kind": "web"}],
                   "must_have_keywords": ["attention"]},
         "sources": [
-            {"url": "https://a.example", "kind": "blog", "title": "A",
+            {"url": "https://a.example/x", "kind": "blog", "title": "A",
              "snippet": "attention", "sub_qs": [0]},
         ],
         "fetched": [], "evidence": [], "errors": [],
@@ -290,6 +230,7 @@ def test_research_node_emits_all_failed_summary(monkeypatch):
     assert out["fetched"] == []
     errs = out["errors"]
     assert any("all" in e and "failed to fetch" in e for e in errs), errs
+    assert "fetch https://a.example/x failed: native: HTTP 503 (rungs tried: native)" in errs
 
 
 def test_errors_reducer_in_state_accepts_str_list():

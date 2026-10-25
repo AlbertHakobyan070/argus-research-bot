@@ -1,0 +1,87 @@
+/* overlay.css — native <dialog>, command palette, toasts, tooltip, popover, glossary popover.
+   Entry motion uses @starting-style (no JS timers); reduced motion is honoured by base.css. */
+
+/* ---- dialog: <dialog class="dlg"> + [data-dialog-open="id"] ------------------- */
+.dlg{width:min(520px,calc(100vw - 32px));max-height:min(86vh,720px);padding:0;color:var(--ink);background:var(--panel);
+  border:1px solid var(--line);border-top:2px solid var(--accent);border-radius:var(--r);box-shadow:var(--pop-shadow);
+  opacity:1;transform:none;transition:opacity var(--t-med) var(--ease),transform var(--t-med) var(--ease),overlay var(--t-med) allow-discrete,display var(--t-med) allow-discrete}
+.dlg[open]{display:flex;flex-direction:column}
+.dlg::backdrop{background:color-mix(in srgb,var(--ground) 30%,rgb(0 0 0 / .42));transition:opacity var(--t-med) var(--ease),overlay var(--t-med) allow-discrete,display var(--t-med) allow-discrete}
+@starting-style{.dlg[open]{opacity:0;transform:translateY(8px)} .dlg[open]::backdrop{opacity:0}}
+.dlg.danger{border-top-color:var(--trap)}
+.dlg-h{padding:18px 22px 4px}
+.dlg-h .kicker{margin-bottom:8px}
+.dlg-h h2{font-size:20px;line-height:1.25;margin:0}
+.dlg-b{padding:10px 22px 18px;overflow:auto;font-size:14px;color:var(--ink-dim)}
+.dlg-b p{margin:0 0 12px}
+.dlg-f{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;padding:12px 22px;border-top:1px solid var(--line);background:var(--panel-2)}
+.dlg-x{position:absolute;top:12px;right:12px}
+
+/* ---- command palette (built by ui.js; open with Ctrl/Cmd+K) ----------------------- */
+.cmdk{width:min(620px,calc(100vw - 24px));margin:12vh auto auto;padding:0;color:var(--ink);background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--pop-shadow);overflow:hidden;
+  transition:opacity var(--t-fast) var(--ease),transform var(--t-fast) var(--ease),overlay var(--t-fast) allow-discrete,display var(--t-fast) allow-discrete}
+.cmdk::backdrop{background:color-mix(in srgb,var(--ground) 30%,rgb(0 0 0 / .36))}
+@starting-style{.cmdk[open]{opacity:0;transform:scale(.985)}}
+.cmdk-in{display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid var(--line)}
+.cmdk-in svg{width:16px;height:16px;color:var(--ink-faint);flex:none}
+.cmdk-in input{flex:1;min-width:0;font:400 15px/1 var(--body);color:var(--ink);background:none;border:0;padding:16px 0;outline:none}
+.cmdk-in input::placeholder{color:var(--ink-faint)}
+.cmdk-list{list-style:none;margin:0;padding:6px;max-height:min(56vh,420px);overflow:auto;scroll-padding:6px}
+.cmdk-g{font:600 9px/1 var(--kit-label,var(--disp));letter-spacing:.13em;text-transform:uppercase;color:var(--ink-faint);padding:12px 10px 6px}
+.cmdk-o{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:var(--r-sm);cursor:pointer;font-size:13.5px;color:var(--ink-dim)}
+.cmdk-o svg{width:15px;height:15px;flex:none;color:var(--ink-faint)}
+.cmdk-o .cmdk-t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmdk-o .cmdk-h{font:500 11px/1 var(--mono);color:var(--ink-faint)}
+.cmdk-o[aria-selected="true"]{background:var(--accent-soft);color:var(--ink)}
+.cmdk-o[aria-selected="true"] svg{color:var(--accent)}
+.cmdk-o mark{background:none;color:var(--accent);font-weight:600;padding:0}
+.cmdk-empty{padding:26px 12px;text-align:center;color:var(--ink-faint);font-size:13px}
+.cmdk-f{display:flex;gap:16px;flex-wrap:wrap;padding:9px 14px;border-top:1px solid var(--line);background:var(--panel-2);font-size:11.5px;color:var(--ink-faint)}
+.cmdk-f span{display:inline-flex;align-items:center;gap:5px}
+
+/* ---- toasts ------------------------------------------------------------------------- */
+.toasts{position:fixed;z-index:90;right:16px;bottom:16px;display:flex;flex-direction:column-reverse;gap:8px;
+  width:min(380px,calc(100vw - 32px));pointer-events:none}
+.toast{pointer-events:auto;display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start;
+  background:var(--panel);color:var(--ink);border:1px solid var(--line);border-left:3px solid var(--kc,var(--accent));border-radius:var(--r);
+  box-shadow:var(--pop-shadow);padding:11px 10px 12px 14px;font-size:13.4px;line-height:1.45;
+  transition:opacity var(--t-med) var(--ease),transform var(--t-med) var(--ease)}
+@starting-style{.toast{opacity:0;transform:translateY(10px)}}
+.toast.out{opacity:0;transform:translateX(16px)}
+.toast b{display:block;font:600 13.5px/1.3 var(--disp);margin-bottom:2px}
+.toast p{margin:0;color:var(--ink-dim)}
+.toast .toast-a{grid-column:1;justify-self:start;margin-top:6px}
+.toast .toast-x{grid-row:1;grid-column:2;width:24px;height:24px;display:grid;place-items:center;padding:0;color:var(--ink-faint);
+  background:none;border:0;border-radius:var(--r-sm);cursor:pointer;font:400 16px/1 var(--body)}
+.toast .toast-x:hover{color:var(--ink);background:var(--panel-2)}
+.toast[data-kind="info"]{--kc:var(--ink-faint)}
+
+/* ---- tooltip ([data-tip]) and popover ([popover].pop) ---------------------------------- */
+.tip{position:fixed;z-index:95;max-width:260px;pointer-events:none;background:var(--ink);color:var(--ground);
+  font:500 12px/1.4 var(--body);padding:6px 9px;border-radius:var(--r-sm);box-shadow:var(--pop-shadow);
+  opacity:0;transform:translateY(2px);transition:opacity var(--t-fast) var(--ease),transform var(--t-fast) var(--ease)}
+.tip.on{opacity:1;transform:none}
+.tip kbd{color:var(--ground);border-color:color-mix(in srgb,var(--ground) 40%,transparent);background:none;margin-left:4px}
+.pop{position:fixed;inset:auto;margin:0;width:max-content;max-width:min(340px,calc(100vw - 24px));color:var(--ink);background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--pop-shadow);padding:12px 14px;font-size:13px;line-height:1.55;
+  transition:opacity var(--t-fast) var(--ease),overlay var(--t-fast) allow-discrete,display var(--t-fast) allow-discrete}
+@starting-style{.pop:popover-open{opacity:0}}
+.pop h4{font:600 14px/1.3 var(--disp);margin:0 0 5px}
+.pop p{margin:0 0 8px} .pop p:last-child{margin:0}
+.pop.menu{padding:5px;min-width:180px}
+.menu button,.menu a{display:flex;align-items:center;gap:9px;width:100%;text-align:left;font:400 13px/1.2 var(--body);color:var(--ink-dim);
+  background:none;border:0;border-radius:var(--r-sm);padding:8px 10px;cursor:pointer;text-decoration:none}
+.menu button:hover,.menu a:hover,.menu button:focus-visible{background:var(--accent-soft);color:var(--ink)}
+.menu hr{margin:4px 0;border-top-color:var(--line-soft)}
+
+/* ---- glossary term + popover (Atlas) ------------------------------------------------------- */
+.gl{font:inherit;color:inherit;background:none;border:0;padding:0;margin:0;cursor:help;letter-spacing:inherit;text-transform:inherit;
+  line-height:inherit;text-align:inherit;border-bottom:1px dotted var(--accent-line);border-radius:0}
+.gl:hover,.gl[aria-expanded="true"]{border-bottom:1px solid var(--accent);color:var(--ink)}
+.gl-pop{position:absolute;z-index:60;width:min(340px,calc(100vw - 24px));background:var(--panel);color:var(--ink);
+  border:1px solid var(--line);border-top:2px solid var(--accent);border-radius:var(--r);box-shadow:var(--pop-shadow);
+  padding:11px 14px 12px;font-size:13px;line-height:1.55}
+.gl-pop .gp-t{display:block;font:600 14px/1.3 var(--disp);margin-bottom:5px}
+.gl-pop p{margin:0}
+.gl-pop .gp-w{margin-top:8px;font-size:12px}

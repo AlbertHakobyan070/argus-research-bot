@@ -25,6 +25,17 @@ def _path_env(name: str, default: str | Path) -> Path:
     return Path(raw).expanduser()
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={os.environ[name]!r} is not a boolean (use true or false)")
+
+
 @dataclass(frozen=True)
 class Settings:
     """Resolved runtime configuration. Frozen so it can be hashed/cached."""
@@ -43,8 +54,15 @@ class Settings:
     transcripts_root: Path
     history_root: Path
     ffmpeg_path: str | None         # unread: media.resolve_ffmpeg reads ARGUS_FFMPEG itself
-    request_timeout_seconds: float
-    max_revision_rounds: int        # unread: panel.route_after_panel reads ARGUS_MAX_REVISIONS itself
+
+    # v4 (spec §7). These defaults are the only ones: load() falls back to
+    # them. Read by the run driver (WP-E1: drain on cancel and on shutdown)
+    # and the console (WP-E2). ARGUS_ENGINES_FILE / ARGUS_ENGINES_LOCAL_FILE
+    # are read by the engines registry only (registry.default_paths).
+    webapp_enabled: bool = True
+    webapp_port: int = 8787
+    cancel_drain_timeout_s: float = 300.0   # cancel: wait this long for the drain, then task.cancel()
+    shutdown_drain_s: float = 120.0         # shutdown: bound on draining every live run
 
     @classmethod
     def load(cls) -> "Settings":
@@ -55,11 +73,9 @@ class Settings:
         # bot._allowed() then rejects every user.
         allowed = int(os.environ.get("TELEGRAM_ALLOWED_USER_ID", "0") or "0")
 
-        if not key or not key.startswith("freellmapi-"):
-            raise RuntimeError(
-                "FREELLMAPI_API_KEY missing or malformed in .env "
-                "(expected 'freellmapi-<key>')."
-            )
+        # FREELLMAPI_API_KEY is not checked here: the bot must start without
+        # it (media, /find). The engines registry reports a missing key at
+        # startup and refuses a run that needs it (v4 spec §2.2).
         if not token or ":" not in token:
             raise RuntimeError(
                 "TELEGRAM_BOT_TOKEN missing or malformed in .env "
@@ -99,8 +115,11 @@ class Settings:
             transcripts_root=transcripts_root,
             history_root=history_root,
             ffmpeg_path=os.environ.get("ARGUS_FFMPEG") or None,
-            request_timeout_seconds=float(os.environ.get("ARGUS_TIMEOUT", "60")),
-            max_revision_rounds=int(os.environ.get("ARGUS_MAX_REVISIONS", "3")),
+            webapp_enabled=_bool_env("ARGUS_WEBAPP_ENABLED", cls.webapp_enabled),
+            webapp_port=int(os.environ.get("ARGUS_WEBAPP_PORT") or cls.webapp_port),
+            cancel_drain_timeout_s=float(os.environ.get("ARGUS_CANCEL_DRAIN_TIMEOUT_S")
+                                         or cls.cancel_drain_timeout_s),
+            shutdown_drain_s=float(os.environ.get("ARGUS_SHUTDOWN_DRAIN_S") or cls.shutdown_drain_s),
         )
 
 

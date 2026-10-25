@@ -9,24 +9,27 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from telegram import InlineKeyboardMarkup
 
-from argus import bot as bot_mod
-from argus.bot import (
-    _media_keyboard, _pool_get, _pool_put, _video_pool,
-    fetch_cmd, find_cmd, on_callback, on_text, quality_cmd,
+from argus.bot import app as bot_app
+from argus.bot import media as bot_media
+from argus.bot.app import on_callback, on_text
+from argus.bot.media import (
+    _media_keyboard, _pool_get, _pool_put,
+    fetch_cmd, find_cmd, quality_cmd,
 )
 from argus.config import Settings
 
 
 @pytest.fixture(autouse=True)
 def _clean_pools():
-    _video_pool.clear()
+    bot_media._video_pool.clear()
     yield
-    _video_pool.clear()
+    bot_media._video_pool.clear()
 
 
 @pytest.fixture(autouse=True)
 def _bypass_acl(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(bot_mod, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_app, "_allowed", lambda _s, _uid: True)
+    monkeypatch.setattr(bot_media, "_allowed", lambda _s, _uid: True)
 
 
 @pytest.fixture(autouse=True)
@@ -44,10 +47,9 @@ def _dummy_settings(monkeypatch: pytest.MonkeyPatch):
         transcripts_root=Path("vault/transcripts"),
         history_root=Path("vault/history"),
         ffmpeg_path=None,
-        request_timeout_seconds=60.0,
-        max_revision_rounds=3,
     )
-    monkeypatch.setattr(bot_mod, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_app, "get_settings", lambda: dummy)
+    monkeypatch.setattr(bot_media, "get_settings", lambda: dummy)
 
 
 def _make_update(chat_id: int = 42, text: str = "") -> MagicMock:
@@ -165,7 +167,7 @@ async def test_find_reddit_pools_results_with_media_keyboard(monkeypatch):
     async def fake_search(query, *, limit=8, **kw):
         return list(results)
 
-    monkeypatch.setattr(bot_mod, "reddit_search", fake_search)
+    monkeypatch.setattr(bot_media, "reddit_search", fake_search)
     update = _make_update(chat_id=77)
     ctx = _make_ctx(args=["reddit", "funny", "cats"])
     await find_cmd(update, ctx)
@@ -260,7 +262,7 @@ def test_application_configures_upload_timeouts():
     40 MB video off a home uplink, so send_video raised TimedOut, the
     document fallback timed out too, and the user got "✅ Saved <path>"
     with no file. Regression guard: the action client must be patient."""
-    from argus.bot import build_application
+    from argus.bot.app import build_application
 
     app = build_application()
     req = app.bot.request
@@ -287,7 +289,7 @@ async def test_user_is_told_when_telegram_delivery_fails(monkeypatch,
             ok=True, url=url, platform="x", path=str(vid),
             title="Clip", size_bytes=1024, duration_s=3.0)
 
-    monkeypatch.setattr(bot_mod, "download_media", _fake_download)
+    monkeypatch.setattr(bot_media, "download_media", _fake_download)
 
     app = MagicMock()
     app.bot.send_message = AsyncMock(
@@ -297,7 +299,7 @@ async def test_user_is_told_when_telegram_delivery_fails(monkeypatch,
     app.bot.send_document = AsyncMock(side_effect=TimeoutError("also timed out"))
     app.bot_data = {}
 
-    await bot_mod._fetch_one_media(app, 42, "https://x.com/u/status/1")
+    await bot_media._fetch_one_media(app, 42, "https://x.com/u/status/1")
 
     said = " ".join(str(c) for c in app.bot.send_message.await_args_list)
     assert "delivery" in said.lower(), (

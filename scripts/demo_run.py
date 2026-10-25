@@ -1,23 +1,26 @@
-"""Self-contained v3 end-to-end demo — drive the full research engine.
+"""Self-contained v4 end-to-end demo — drive the full research engine.
 
 Strategy
 --------
 The two live-network pieces (the search wave and the page fetches) are
 stubbed to a small controlled corpus so the run is deterministic and
-doesn't depend on live search. Everything else is the REAL v3 engine
-hitting the live FreeLLMAPI proxy: brief scoping, the per-source digest
-that reads each document into evidence notes, the section writers, and
-the review panel. The point is to show the engine producing a grounded,
-cited report from evidence the LLM actually read.
+doesn't depend on live search. Everything else is the REAL v4 engine on
+the active engines profile (``argus_engines.json``; the default profile
+uses the FreeLLMAPI proxy): brief scoping, the per-source digest that
+reads each document into evidence notes, the outline, the section
+writers, the analyst and the review panel. The point is to show the
+engine producing a grounded, cited report from evidence the LLM actually
+read. ``scripts/live_check.py`` is the acceptance check; this is a demo.
 
 What you should see
 -------------------
-1. Routing: cheap=<X> strong=<Y> judge=<Z>
+1. Engines: the active profile and the engine each tier resolved to.
 2. Plan gate: pause after `scout` with the corpus sources shown.
-3. Resume -> research (fetch + digest) -> outline -> compose -> panel
-   (revise loop if the panel flags a section) -> report_builder.
-4. Report gate: report.md + report.pdf on disk, every finding cited to a
-   corpus URL; then a final resume runs to deliver.
+3. Resume -> research (fetch + digest) -> outline -> compose -> analyst
+   -> panel (a gap wave or a targeted rewrite if the panel asks) ->
+   report_builder.
+4. Report gate: report.md, report.pdf and evidence.json on disk, every
+   kept finding cited to a corpus URL; then a final resume runs to deliver.
 """
 from __future__ import annotations
 
@@ -110,7 +113,7 @@ def main() -> int:
         return hits, []
 
     # Stub the fetch: point each source at its pre-written corpus markdown.
-    def fake_fetch(src):
+    def fake_fetch(src, **kw):
         from argus.graph.state import FetchedItem
         url = src.get("url", "")
         path = corpus_paths.get(url)
@@ -123,8 +126,8 @@ def main() -> int:
             sub_qs=src.get("sub_qs") or [], provider="demo",
         ).model_dump(), []
 
-    scout_mod.run_query_wave = fake_wave
-    research_mod.run_query_wave = fake_wave
+    scout_mod.run_wave = fake_wave
+    research_mod.run_wave = fake_wave
     research_mod.fetch_one_source = fake_fetch
 
     # Reports into demo_output (not the vault).
@@ -132,26 +135,35 @@ def main() -> int:
     from argus import config as cfg_mod
     cfg_mod._cached = None
 
+    import asyncio
+
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
     from argus.config import get_settings
+    from argus.engines import registry
     from argus.graph import build_graph
-    from argus.llm import resolve_tier
+    from argus.graph.run_config import RunConfig
 
     s = get_settings()
-    print("=== Argus v3 end-to-end demo ===")
+    # Resolve the engines as every bot drive entry does (an unusable profile
+    # stops here with its EngineConfigError), and start the run with its
+    # run_config, which carries the snapshot.
+    engines = asyncio.run(registry.active_snapshot())
+    run_config = RunConfig.from_preset(length="medium", engines=engines, origin="demo")
+    print("=== Argus v4 end-to-end demo ===")
     print(f"Topic: {DEMO_TOPIC}")
     print(f"Reports root: {s.reports_root}")
-    print(f"FreeLLMAPI base: {s.freellmapi_base_url}")
-    print(f"Routing -> cheap={resolve_tier('cheap')} "
-          f"strong={resolve_tier('strong')} judge={resolve_tier('judge')}")
+    print(f"Engines -> profile {engines.profile}: " + ", ".join(sorted(
+        {f"{b.tier}={b.primary.provider}/{b.primary.model}" for b in engines.roles.values()})))
+    for w in engines.warnings:
+        print(f"  warning: {w}")
     print()
 
     g = build_graph(checkpointer=MemorySaver())
     cfg = {"configurable": {"thread_id": "demo"}}
     state_in = {
         "thread_id": "demo", "user_id": 0, "user_request": DEMO_TOPIC,
-        "length": "medium",
+        "length": "medium", "run_config": run_config.model_dump(),
         "messages": [], "plan": None, "sources": [], "fetched": [],
         "findings": [], "draft_md": "", "revision_notes": [],
         "revision_rounds": 0, "model_calls": [], "hitl": {"pending": False},
@@ -190,13 +202,16 @@ def main() -> int:
     print(f"evidence notes: {len(final.get('evidence') or [])}")
     print(f"findings:       {len(final.get('findings') or [])}")
     print(f"fetched:        {len(final.get('fetched') or [])}")
+    panel = final.get("panel_verdict") or {}
     print(f"verdict:        {(final.get('review_verdict') or {}).get('verdict')}")
+    print(f"judged:         {panel.get('judged')}/{panel.get('total')}")
     print(f"md:             {paths.get('md')}")
     print(f"pdf:            {paths.get('pdf')}")
+    print(f"evidence:       {paths.get('evidence')}")
     print(f"calls:          {len(final.get('model_calls') or [])}")
     for c in (final.get("model_calls") or [])[:10]:
-        print(f"  - {str(c.get('tier')):6s} req={c.get('requested_model')} "
-              f"served={c.get('served_model')}")
+        print(f"  - {str(c.get('role')):26s} req={c.get('requested_model')} "
+              f"served={c.get('served_model')} ok={c.get('ok')}")
 
     transcript = DEMO_OUT / "demo_transcript.json"
     transcript.write_text(json.dumps({
