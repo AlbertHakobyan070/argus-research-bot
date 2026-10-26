@@ -24,6 +24,7 @@ const view = $("#view");
 let cleanup = null;
 let authFailed = false;
 let shownPath = null;                      // a new view opens at the top; a refresh keeps the place
+let routeSeq = 0;                          // the latest route; an older view still loading is stale
 
 // ---- theme: the saved appearance (#/settings) — Telegram's light/dark or a pinned one, then which kit
 // theme; Telegram's own header and background take the theme's ground colour
@@ -71,6 +72,8 @@ const goBack = () => { if (history.length > 1) history.back(); else location.has
 
 async function route() {
   if (authFailed) return;
+  const seq = ++routeSeq;
+  const current = () => seq === routeSeq;
   if (cleanup) { cleanup(); cleanup = null; }
   clearMainButton();
   const path = location.hash.replace(/^#/, "") || "/runs";
@@ -84,15 +87,22 @@ async function route() {
     if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   });
   backButton(path !== "/runs", goBack);
+  // Each view paints its own box: one that answers after a newer route paints a detached box nobody sees,
+  // and its cleanup (polling, buttons) runs at once.
+  const box = document.createElement("div");
+  view.replaceChildren(box);
   view.setAttribute("aria-busy", "true");
   try {
-    cleanup = (await mod.render(view, m.slice(1), { crumbs })) || null;
+    const done = (await mod.render(box, m.slice(1), { crumbs: (items) => { if (current()) crumbs(items); } })) || null;
+    if (!current()) { done?.(); return; }
+    cleanup = done;
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
+    if (!current()) return;                // the newer view shows; this one's load failure is moot
     if (e.status === 401 || e.status === 403) { showAuth(e); return; }
     showLoadProblem(e);
   } finally {
-    view.removeAttribute("aria-busy");
+    if (current()) view.removeAttribute("aria-busy");
   }
   window.UI.init(view);
 }
