@@ -98,6 +98,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await media.handle_callback(update, ctx, ns, action, run_id)
         return
 
+    # Library item buttons (mx:mp3/tr/tag/ok:<asset_id>).
+    if ns == "mx":
+        await media.handle_item_callback(update, ctx, action, run_id)
+        return
+
     # Delete-browser buttons (del:cat/tgl/pg/ok/yes/no/cancel).
     if ns == "del":
         await delete.handle_callback(update, ctx, ns, action, run_id)

@@ -54,6 +54,7 @@ VALID_RUN_STATUSES: tuple[str, ...] = (
 )
 
 ASSET_KINDS: tuple[str, ...] = ("media", "transcript", "report")
+AUDIO_EXTS: tuple[str, ...] = (".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac")
 
 _SOURCE_STATUSES: tuple[str, ...] = ("pending", "ingested", "failed")
 
@@ -390,7 +391,8 @@ class Library:
                 "  platform=excluded.platform, source_url=excluded.source_url,"
                 "  media_id=excluded.media_id, title=excluded.title,"
                 "  bytes=excluded.bytes, duration_s=excluded.duration_s,"
-                "  meta_json=excluded.meta_json"
+                # merged, not replaced: a re-download keeps the item's tags and group
+                "  meta_json=json_patch(assets.meta_json, excluded.meta_json)"
                 " RETURNING asset_id",
                 (kind, platform, source_url, media_id, title, str(path),
                  int(size_bytes), duration_s,
@@ -437,6 +439,122 @@ class Library:
                  " DESC, asset_id DESC LIMIT ? OFFSET ?")
             args = (kind, limit, offset)
         async with db.execute(q, args) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_asset(r) for r in rows]
+
+    async def get_asset(self, asset_id: int) -> dict[str, Any] | None:
+        rows = await self.get_assets([asset_id])
+        return rows[0] if rows else None
+
+    async def update_asset_meta(self, asset_id: int, patch: dict) -> dict[str, Any] | None:
+        """Merge ``patch`` into the asset's meta in one statement (SQLite's
+        RFC 7396 ``json_patch``: a None value removes the key, objects merge,
+        lists are replaced). The updated row, or None for an unknown id."""
+        db = self._conn()
+        cur = await db.execute(
+            "UPDATE assets SET meta_json = json_patch(meta_json, ?) WHERE asset_id = ?",
+            (json.dumps(patch, ensure_ascii=False), int(asset_id)))
+        await db.commit()
+        return await self.get_asset(asset_id) if cur.rowcount else None
+
+    async def rename_asset(self, asset_id: int, title: str) -> dict[str, Any] | None:
+        """Set the asset's title; the updated row, or None for an unknown id."""
+        db = self._conn()
+        cur = await db.execute("UPDATE assets SET title = ? WHERE asset_id = ?", (title, int(asset_id)))
+        await db.commit()
+        return await self.get_asset(asset_id) if cur.rowcount else None
+
+    async def search_assets(self, *, q: str | None = None, kind: str | None = None,
+                            media_type: str | None = None, tag: str | None = None,
+                            group: str | None = None, review: str | None = None, primary: bool = True,
+                            limit: int = 30, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+        """The media library's browse query over media and transcript assets,
+        newest first: ``q`` matches title, source URL and meta (tags, gist);
+        ``media_type`` audio|video splits media by file extension; ``tag`` a
+        confirmed tag; ``group`` the confirmed group; ``review`` pending (a
+        suggestion waits) | untagged (no confirmed tags, nothing pending).
+        ``primary`` lists items, not parts: an mp3 made from a file and a
+        transcript of a media asset show on that asset's page instead.
+        Returns (rows, total matching)."""
+        where, args = ["kind IN ('media','transcript')"], []
+        if primary:
+            where.append(
+                "json_extract(meta_json, '$.derived_from') IS NULL AND NOT (kind = 'transcript' AND ("
+                "json_extract(meta_json, '$.media_asset_id') IS NOT NULL OR EXISTS (SELECT 1 FROM assets m"
+                " WHERE m.kind = 'media' AND m.source_url IS NOT NULL AND m.source_url = assets.source_url)))")
+        if kind is not None:
+            if kind not in ("media", "transcript"):
+                raise ValueError(f"kind must be media or transcript, got {kind!r}")
+            where.append("kind = ?")
+            args.append(kind)
+        if media_type is not None:
+            if media_type not in ("audio", "video"):
+                raise ValueError(f"media_type must be audio or video, got {media_type!r}")
+            audio = " OR ".join(f"lower(path) LIKE '%{ext}'" for ext in AUDIO_EXTS)
+            where.append(f"kind = 'media' AND {'' if media_type == 'audio' else 'NOT '}({audio})")
+        if q:
+            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(title LIKE ? ESCAPE '\\' OR source_url LIKE ? ESCAPE '\\'"
+                         " OR meta_json LIKE ? ESCAPE '\\')")
+            args += [like, like, like]
+        if tag:
+            where.append("EXISTS (SELECT 1 FROM json_each(assets.meta_json, '$.tags') WHERE value = ?)")
+            args.append(tag)
+        if group:
+            where.append("json_extract(meta_json, '$.group') = ?")
+            args.append(group)
+        if review == "pending":
+            where.append("json_extract(meta_json, '$.review') = 'pending'")
+        elif review == "untagged":
+            where.append("coalesce(json_array_length(meta_json, '$.tags'), 0) = 0"
+                         " AND coalesce(json_extract(meta_json, '$.review'), '') != 'pending'")
+        elif review is not None:
+            raise ValueError(f"review must be pending or untagged, got {review!r}")
+        sql_where = " AND ".join(where)
+        db = self._conn()
+        async with db.execute(f"SELECT count(*) FROM assets WHERE {sql_where}", args) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+                f"SELECT * FROM assets WHERE {sql_where} ORDER BY created_at DESC, asset_id DESC"
+                " LIMIT ? OFFSET ?", [*args, int(limit), int(offset)]) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_asset(r) for r in rows], int(total)
+
+    async def asset_facets(self) -> dict[str, Any]:
+        """Confirmed tags and groups with their counts (most used first), and
+        how many suggestions wait for review."""
+        db = self._conn()
+        async with db.execute(
+                "SELECT j.value, count(*) AS n FROM assets, json_each(assets.meta_json, '$.tags') AS j"
+                " WHERE kind IN ('media','transcript') GROUP BY j.value ORDER BY n DESC, j.value") as cur:
+            tags = [[r[0], r[1]] for r in await cur.fetchall()]
+        async with db.execute(
+                "SELECT json_extract(meta_json, '$.group') AS g, count(*) AS n FROM assets"
+                " WHERE kind IN ('media','transcript') AND g IS NOT NULL AND g != ''"
+                " GROUP BY g ORDER BY n DESC, g") as cur:
+            groups = [[r[0], r[1]] for r in await cur.fetchall()]
+        async with db.execute(
+                "SELECT count(*) FROM assets WHERE json_extract(meta_json, '$.review') = 'pending'") as cur:
+            pending = (await cur.fetchone())[0]
+        return {"tags": tags, "groups": groups, "pending": int(pending)}
+
+    async def related_assets(self, asset: dict[str, Any]) -> list[dict[str, Any]]:
+        """Other assets made from or for ``asset``: derived from it (an mp3),
+        transcribing it (``meta.media_asset_id``), the one it was made from,
+        or a transcript sharing its source URL (captions). Two media files of
+        one link (its video and its mp3) are separate items, not parts."""
+        db = self._conn()
+        aid = int(asset["asset_id"])
+        async with db.execute(
+                "SELECT * FROM assets WHERE asset_id != ? AND kind IN ('media','transcript') AND ("
+                " json_extract(meta_json, '$.derived_from') = ?"
+                " OR json_extract(meta_json, '$.media_asset_id') = ?"
+                " OR (? IS NOT NULL AND source_url = ? AND (kind = 'transcript' OR ? = 'transcript'))"
+                " OR asset_id = json_extract(?, '$.derived_from')"
+                " OR asset_id = json_extract(?, '$.media_asset_id'))"
+                " ORDER BY asset_id",
+                (aid, aid, aid, asset.get("source_url"), asset.get("source_url"), asset["kind"],
+                 json.dumps(asset.get("meta") or {}), json.dumps(asset.get("meta") or {}))) as cur:
             rows = await cur.fetchall()
         return [_row_to_asset(r) for r in rows]
 

@@ -90,9 +90,11 @@ class FasterWhisper:
         self.key = tuple(block[k] for k in _FW_KEYS)
         self.backend = f"faster_whisper:{block['model']}"
 
-    async def transcribe(self, media_path: Path) -> tuple[str, str]:
+    async def transcribe(self, media_path: Path, *, language: str | None = None,
+                         timestamps: bool = False) -> tuple[str, str]:
         try:
-            text, language = await asyncio.to_thread(_whisper_file, Path(media_path), self.key)
+            text, language = await asyncio.to_thread(_whisper_file, Path(media_path), self.key,
+                                                     language or None, timestamps)
         except Exception as e:                  # model load / decode failures: reported, with the cause chained
             logger.exception("faster-whisper failed on %s", media_path)
             raise TranscribeError(f"{type(e).__name__}: {e}") from e
@@ -114,12 +116,25 @@ def _whisper_model(key: tuple):
         return _ASR_MODEL[1]
 
 
-def _whisper_file(media_path: Path, key: tuple) -> tuple[str, str]:
+def stamp(seconds: float) -> str:
+    """``[m:ss]`` (``[h:mm:ss]`` past an hour) for a timestamped transcript line."""
+    s = int(seconds)
+    h, m = divmod(s // 60, 60)
+    return f"[{h}:{m:02d}:{s % 60:02d}]" if h else f"[{m}:{s % 60:02d}]"
+
+
+def _whisper_file(media_path: Path, key: tuple, language: str | None = None,
+                  timestamps: bool = False) -> tuple[str, str]:
     """Blocking ASR over one media file → (text, language). Whisper segments
-    can overlap-repeat like rolling captions, so the same dedup applies."""
+    can overlap-repeat like rolling captions, so the same dedup applies (to
+    plain text only: a timestamped line is kept with its time)."""
     from ..tools import _dedup_rolling_captions
-    segments, info = _whisper_model(key).transcribe(str(media_path), vad_filter=True)
-    lines = _dedup_rolling_captions([s.text.strip() for s in segments if s.text.strip()])
+    segments, info = _whisper_model(key).transcribe(str(media_path), vad_filter=True,
+                                                    **({"language": language} if language else {}))
+    if timestamps:
+        lines = [f"{stamp(s.start)} {s.text.strip()}" for s in segments if s.text.strip()]
+    else:
+        lines = _dedup_rolling_captions([s.text.strip() for s in segments if s.text.strip()])
     return "\n".join(lines), (getattr(info, "language", "") or "")
 
 
@@ -145,7 +160,9 @@ class OpenAIAudio:
     def _redact(self, text: str) -> str:
         return text.replace(self._key, "***") if self._key != "none" else text
 
-    async def transcribe(self, media_path: Path) -> tuple[str, str]:
+    async def transcribe(self, media_path: Path, *, language: str | None = None,
+                         timestamps: bool = False) -> tuple[str, str]:
+        language = language or self.language
         with tempfile.TemporaryDirectory(prefix="argus_audio_") as tmp:
             try:
                 chunks = await extract_audio_chunks(Path(media_path), Path(tmp),
@@ -162,16 +179,22 @@ class OpenAIAudio:
             texts = []
             async with _client(self.prov.timeout_s) as client:
                 for i, c in enumerate(chunks, 1):
-                    texts.append(await self._one(client, c, f"chunk {i}/{n}"))
+                    texts.append(await self._one(client, c, f"chunk {i}/{n}", language=language,
+                                                 offset_s=(i - 1) * self.chunk_seconds if timestamps else None))
         text = "\n".join(t for t in texts if t)
         if not text:
             raise _no_speech(self.backend)
-        return text, self.language or ""
+        return text, language or ""
 
-    async def _one(self, client: httpx.AsyncClient, chunk: Path, where: str) -> str:
-        data = {"model": self.model, "response_format": "json"}
-        if self.language:
-            data["language"] = self.language
+    async def _one(self, client: httpx.AsyncClient, chunk: Path, where: str, *, language: str | None = None,
+                   offset_s: float | None = None) -> str:
+        """One chunk's text; with ``offset_s`` (timestamps asked) the provider's
+        ``verbose_json`` segments as ``[m:ss] text`` lines, shifted by the
+        chunk's start. A provider without verbose_json answers with an HTTP
+        error, raised as such."""
+        data = {"model": self.model, "response_format": "json" if offset_s is None else "verbose_json"}
+        if language:
+            data["language"] = language
         headers = {**self.prov.headers, "Authorization": f"Bearer {self._key}"}
         try:
             r = await client.post(self.url, headers=headers, data=data,
@@ -190,6 +213,9 @@ class OpenAIAudio:
             body = r.json()
         except ValueError:
             body = None
+        if offset_s is not None and isinstance(body, dict) and isinstance(body.get("segments"), list):
+            return "\n".join(f"{stamp(offset_s + float(s.get('start') or 0))} {str(s.get('text') or '').strip()}"
+                             for s in body["segments"] if isinstance(s, dict) and str(s.get("text") or "").strip())
         text = body.get("text") if isinstance(body, dict) else None
         if not isinstance(text, str):
             raise TranscribeError(self._redact(f"{self.backend}: {where}: unusable answer {r.text.strip()[:300]!r}"))

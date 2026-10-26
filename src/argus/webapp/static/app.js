@@ -4,6 +4,8 @@ import { ApiError, get } from "./api.js";
 import { takeLaunchParams } from "./auth.js";
 import { $, $$, backButton, clearMainButton, esc, problemHtml, tg } from "./views/common.js";
 import * as engines from "./views/engines.js";
+import * as media from "./views/media.js";
+import * as mediaItem from "./views/media_item.js";
 import * as newRun from "./views/new.js";
 import * as run from "./views/run.js";
 import * as runs from "./views/runs.js";
@@ -13,6 +15,8 @@ const ROUTES = [
   [/^\/run\/([A-Za-z0-9_-]+)$/, run, "runs"],
   [/^\/new$/, newRun, "new"],
   [/^\/engines$/, engines, "engines"],
+  [/^\/media(?:\/(library|get|review|jobs|settings))?$/, media, "media"],
+  [/^\/media\/item\/(\d+)$/, mediaItem, "media"],
 ];
 const view = $("#view");
 let cleanup = null;

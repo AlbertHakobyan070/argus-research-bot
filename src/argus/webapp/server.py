@@ -25,7 +25,7 @@ from telegram import MenuButtonWebApp, WebAppInfo
 from telegram.error import TelegramError
 
 from ..config import get_settings
-from . import api, tunnel
+from . import api, media_api, tunnel
 
 logger = logging.getLogger("argus.webapp")
 
@@ -41,6 +41,9 @@ _KEY = "webapp_console"                  # bot_data: the running _Console
 
 async def _security_headers(request: web.Request, response: web.StreamResponse) -> None:
     response.headers.update(HEADERS)
+    # Revalidate (a cheap 304) so a webview never runs a stale app.js after an update; a
+    # handler's own Cache-Control (the signed media files) stands.
+    response.headers.setdefault("Cache-Control", "no-cache")
 
 
 def build_app(deps: api.Deps, *, static_dir: Path = STATIC_DIR) -> web.Application:
@@ -60,6 +63,7 @@ def build_app(deps: api.Deps, *, static_dir: Path = STATIC_DIR) -> web.Applicati
     if static_dir.is_dir():
         app.router.add_static("/static", static_dir, show_index=False, follow_symlinks=False)
     api.setup(app)
+    media_api.setup(app)
     return app
 
 
@@ -93,7 +97,7 @@ class _Console:
                         bot_token=self.settings.telegram_bot_token,
                         allowed_user_id=self.settings.telegram_allowed_user_id,
                         max_age_s=float(os.environ.get("ARGUS_WEBAPP_INITDATA_MAX_AGE_S") or DEFAULT_MAX_AGE_S),
-                        reports_root=Path(self.settings.reports_root))
+                        reports_root=Path(self.settings.reports_root), settings=self.settings)
         self.runner = web.AppRunner(build_app(deps), access_log=None)   # no request lines in the log
         await self.runner.setup()
         await web.TCPSite(self.runner, HOST, port).start()

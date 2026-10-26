@@ -11,11 +11,12 @@ from typing import Any
 
 from telegram import (
     InputFile,
-    InlineKeyboardButton, InlineKeyboardMarkup, Update,
+    InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from .. import media_service as ms
 from ..config import get_settings
 from ..media import (
     detect_platform, download_media, extract_urls, quality_format,
@@ -156,10 +157,254 @@ def _media_keyboard(n: int) -> InlineKeyboardMarkup:
     for i in range(1, n + 1):
         rows.append([
             InlineKeyboardButton(f"⬇ {i}", callback_data=f"m:dl:{i}"),
+            InlineKeyboardButton(f"🎵 {i}", callback_data=f"m:mp3:{i}"),
             InlineKeyboardButton(f"📝 {i}", callback_data=f"m:tr:{i}"),
             InlineKeyboardButton(f"⬇+📝 {i}", callback_data=f"m:both:{i}"),
         ])
     return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# Library items in the chat (spec 2026-10-26): item buttons (mx:*), the tag
+# suggestion with Accept, file imports, /media
+# ---------------------------------------------------------------------------
+
+# Bots may download files only up to 20 MB through the cloud Bot API.
+_TG_DOWNLOAD_CAP_BYTES = 20 * 1024 * 1024
+
+
+def _public(app) -> str | None:
+    return (app.bot_data.get("webapp_public_url") if isinstance(app.bot_data, dict) else None) or None
+
+
+def _item_keyboard(app, a: dict) -> InlineKeyboardMarkup:
+    """MP3 (videos) · Transcribe (video, audio) · Tags · Open in the console."""
+    aid, kind = a["asset_id"], ms.media_type(a)
+    first = []
+    if kind == "video":
+        first.append(InlineKeyboardButton("🎵 MP3", callback_data=f"mx:mp3:{aid}"))
+    if kind in ("video", "audio"):
+        first.append(InlineKeyboardButton("📝 Transcribe", callback_data=f"mx:tr:{aid}"))
+    second = [InlineKeyboardButton("🏷 Tags", callback_data=f"mx:tag:{aid}")]
+    url = _public(app)
+    if url:
+        second.append(InlineKeyboardButton("📱 Open", web_app=WebAppInfo(ms.item_url(url, aid))))
+    return InlineKeyboardMarkup([row for row in (first, second) if row])
+
+
+async def _post_suggestion(app, chat_id: int, asset_id: int, job: ms.Job) -> None:
+    """The tag job's result in the chat: the suggestion with ✅ Accept and
+    ✏️ Edit (the console), or why there is none."""
+    if job.state != "done":
+        await app.bot.send_message(chat_id=chat_id, text=f"🏷 No tag suggestion: {job.error}")
+        return
+    a = await app.bot_data["library"].get_asset(asset_id)
+    sug = (a or {}).get("meta", {}).get("suggest") or {}
+    if not sug.get("tags"):
+        return
+    lines = [f"🏷 Suggested tags for {(a.get('title') or '')[:80]}:", " ".join(f"#{t}" for t in sug["tags"])]
+    if sug.get("group"):
+        lines.append(f"Group: {sug['group']}")
+    if sug.get("summary"):
+        lines += ["", sug["summary"]]
+    repos = [link["url"] for link in sug.get("links") or [] if link.get("kind") == "repo"][:5]
+    if repos:
+        lines += ["", "Repos:", *repos]
+    rows = [[InlineKeyboardButton("✅ Accept", callback_data=f"mx:ok:{asset_id}")]]
+    url = _public(app)
+    if url:
+        rows[0].append(InlineKeyboardButton("✏️ Edit", web_app=WebAppInfo(ms.item_url(url, asset_id))))
+    await app.bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=InlineKeyboardMarkup(rows),
+                               disable_web_page_preview=True)
+
+
+async def _autotag(app, chat_id: int, asset_id: int | None, title: str) -> None:
+    async def then(job: ms.Job) -> None:
+        await _post_suggestion(app, chat_id, asset_id, job)
+    await ms.maybe_autotag(app.bot_data["library"], asset_id, title, then=then)
+
+
+async def _deliver(app, chat_id: int, job: ms.Job, what: str) -> None:
+    """A finished chat job's file in the chat (a link when too big), or why it failed."""
+    if job.state != "done":
+        await app.bot.send_message(chat_id=chat_id, text=f"⚠️ {what} failed: {job.error}")
+        return
+    a = await app.bot_data["library"].get_asset(job.asset_id)
+    s = get_settings()
+    try:
+        await ms.send_to_chat(app.bot, chat_id, a, bot_token=s.telegram_bot_token, public_url=_public(app),
+                              hours=(await ms.load_settings(app.bot_data["library"]))["link_hours"])
+    except ms.MediaError as e:
+        await app.bot.send_message(chat_id=chat_id, text=f"📁 {what} saved to the vault, but: {e}\n{a['path']}")
+    except Exception as e:
+        logger.exception("%s delivery failed", what)
+        await app.bot.send_message(chat_id=chat_id, text=(f"📁 {what} saved to the vault, but Telegram delivery "
+                                                          f"failed ({type(e).__name__}: {str(e)[:200]}).\n{a['path']}"))
+
+
+def _start_item_job(app, chat_id: int, kind: str, a: dict) -> None:
+    """mp3 / transcribe for one library item, its result sent to the chat."""
+    lib, s, aid = app.bot_data["library"], get_settings(), a["asset_id"]
+    title = a.get("title") or Path(a["path"]).name
+    if kind == "mp3":
+        ms.start_job("convert", f"MP3 · {title}", lambda job: ms.convert(lib, aid, job),
+                     then=lambda job: _deliver(app, chat_id, job, "MP3"))
+        return
+
+    async def then(job: ms.Job) -> None:
+        await _deliver(app, chat_id, job, "Transcript")
+        if job.state == "done" and not a["meta"].get("tags"):
+            await _autotag(app, chat_id, aid, title)        # a transcript makes better tags
+    ms.start_job("transcribe", f"Transcript · {title}", lambda job: ms.transcribe(lib, s, aid, job), then=then)
+
+
+async def handle_item_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, raw_id: str) -> None:
+    """``mx:<action>:<asset_id>``: mp3 · tr (transcribe) · tag (suggest) · ok (accept the suggestion)."""
+    q = update.callback_query
+    app = ctx.application
+    chat_id = q.message.chat.id if q.message else update.effective_chat.id
+    lib = _get_library(ctx)
+    a = await lib.get_asset(int(raw_id)) if lib is not None and raw_id.isdigit() else None
+    if a is None:
+        await app.bot.send_message(chat_id=chat_id, text="(that library item no longer exists)")
+        return
+    title = a.get("title") or Path(a["path"]).name
+    if action in ("mp3", "tr"):
+        if not Path(a["path"]).is_file():
+            await app.bot.send_message(chat_id=chat_id, text=f"⚠️ The file of {title} is missing on disk.")
+            return
+        _start_item_job(app, chat_id, action, a)
+        await app.bot.send_message(chat_id=chat_id, text=(
+            f"🎵 Converting to mp3: {title[:80]}…" if action == "mp3" else
+            f"📝 Transcribing: {title[:80]}… (speech-to-text can take a few minutes)"))
+    elif action == "tag":
+        ms.tag_job(lib, a["asset_id"], title, then=lambda job: _post_suggestion(app, chat_id, a["asset_id"], job))
+        await app.bot.send_message(chat_id=chat_id, text=f"🏷 Asking for tags: {title[:80]}…")
+    elif action == "ok":
+        sug = a["meta"].get("suggest") or {}
+        if not sug.get("tags"):
+            await app.bot.send_message(chat_id=chat_id, text="(no suggestion to accept — tap 🏷 Tags first)")
+            return
+        row = await ms.accept(lib, a["asset_id"], tags=sug["tags"], group=sug.get("group"))
+        done = " ".join(f"#{t}" for t in row["meta"]["tags"]) + (f" · {row['meta']['group']}" if row["meta"].get("group") else "")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.info("could not clear the suggestion's buttons (an old message?)")
+        await app.bot.send_message(chat_id=chat_id, text=f"✅ Tagged {title[:60]}: {done}")
+
+
+_KIND_NAMES = {"video": ("video", ".mp4"), "audio": ("audio", ".mp3"), "voice": ("voice", ".ogg"),
+               "video_note": ("video_note", ".mp4")}
+
+
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """A video, audio, voice or video note, or a document (video, audio or a
+    .txt/.md/.srt/.vtt transcript) sent to the bot: saved to the library
+    with its item buttons. Over the Bot API's 20 MB download cap the bot
+    says so and points to the console upload."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        return
+    msg = update.message
+    app = ctx.application
+    lib = _get_library(ctx)
+    kind = next((k for k in ("video", "audio", "voice", "video_note", "document") if getattr(msg, k, None)), None)
+    if kind is None or lib is None:
+        return
+    att = getattr(msg, kind)
+    stem, ext = _KIND_NAMES.get(kind, ("file", ""))
+    name = getattr(att, "file_name", None) or f"{stem}_{msg.message_id}{ext}"
+    try:
+        ms.import_kind(name)
+    except ms.MediaError as e:
+        await msg.reply_text(f"⚠️ Not saved: {e}")
+        return
+    size = att.file_size or 0
+    if size > _TG_DOWNLOAD_CAP_BYTES:
+        url = _public(app)
+        kb = (InlineKeyboardMarkup([[InlineKeyboardButton("⬆️ Upload in Argus",
+                                                          web_app=WebAppInfo(f"{url.rstrip('/')}/#/media/get"))]])
+              if url else None)
+        await msg.reply_text(
+            f"📦 {name} is {size / 1048576:.0f} MB. Telegram lets bots download files only up to 20 MB, so "
+            "upload it from the Argus console instead (Media → Get → From this device)"
+            + ("." if url else " — open the console from the Argus menu button."), reply_markup=kb)
+        return
+    note = await msg.reply_text(f"⬇️ Saving {name}…")
+    part = Path(s.media_root) / ".uploads" / f"tg_{msg.chat_id}_{msg.message_id}.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tg_file = await att.get_file()
+        await tg_file.download_to_drive(custom_path=part)
+        caption = (msg.caption or "").strip()
+        asset_id = await ms.import_file(lib, s, part, filename=name, platform="telegram",
+                                        title=caption.splitlines()[0][:200] if caption else None)
+    except Exception as e:
+        part.unlink(missing_ok=True)
+        logger.exception("chat import failed for %s", name)
+        await note.edit_text(f"⚠️ Could not save {name}: {type(e).__name__}: {str(e)[:300]}")
+        return
+    a = await lib.get_asset(asset_id)
+    extra = (f"\n↪ feed it into research: /append <run-id> asset:{asset_id}" if a["kind"] == "transcript" else "")
+    await note.edit_text(f"✅ Saved to the library as asset:{asset_id} — {a.get('title')}"
+                         f" ({a.get('bytes', 0) / 1048576:.1f} MB){extra}", reply_markup=_item_keyboard(app, a))
+    await _autotag(app, msg.chat_id, asset_id, a.get("title") or name)
+
+
+async def rename_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/rename <asset:N|N> <new title> — retitle a library item (and its parts)."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    args = list(ctx.args or [])
+    ref = args[0].removeprefix("asset:") if args else ""
+    if not ref.isdigit() or len(args) < 2:
+        await update.message.reply_text("Usage: /rename <asset:N> <new title>\n"
+                                        "Ids show on saved items, in /transcripts and on the console's item page.")
+        return
+    try:
+        row = await ms.rename(lib, int(ref), " ".join(args[1:]))
+    except (ValueError, ms.MediaError) as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    await update.message.reply_text(f"✏️ asset:{row['asset_id']} is now “{row['title']}”.",
+                                    reply_markup=_item_keyboard(ctx.application, row))
+
+
+async def media_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/media — what the library holds, with buttons into the console."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    _, total = await lib.search_assets(limit=1)
+    _, untagged = await lib.search_assets(review="untagged", limit=1)
+    facets = await lib.asset_facets()
+    top = " ".join(f"#{t}" for t, _ in facets["tags"][:12])
+    text = (f"🗃 Media library: {total} item(s) · {facets['pending']} tag suggestion(s) to review · {untagged} untagged"
+            + (f"\nTop tags: {top}" if top else "")
+            + "\n\nSend me a video, audio or transcript file to save it; paste a link to download it."
+            + "\nRename one: /rename asset:<N> <new title>")
+    url = _public(ctx.application)
+    kb = None
+    if url:
+        base = url.rstrip("/")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Library", web_app=WebAppInfo(f"{base}/#/media")),
+                                    InlineKeyboardButton("🏷 Review", web_app=WebAppInfo(f"{base}/#/media/review"))],
+                                   [InlineKeyboardButton("⬆️ Get / upload", web_app=WebAppInfo(f"{base}/#/media/get"))]])
+    else:
+        text += "\n(The console is not reachable right now — see /status.)"
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def _get_media_quality(app) -> str:
@@ -206,22 +451,37 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
         return
 
     lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
+    asset = None
     if lib is not None:
         try:
-            await lib.add_asset(
+            asset = await lib.get_asset(await lib.add_asset(
                 kind="media", platform=r.platform, source_url=url,
                 media_id=r.media_id, title=r.title or url, path=r.path,
                 size_bytes=r.size_bytes, duration_s=r.duration_s,
-                meta={"quality": quality,
-                      "info_json": r.info_json_path})
+                meta={"quality": quality, "info_json": r.info_json_path,
+                      **({"thumb": r.thumb_path} if r.thumb_path else {})}))
         except Exception:
             logger.exception("asset registration failed for %s", r.path)
 
     size_mb = r.size_bytes / (1024 * 1024)
     dur = _fmt_duration(r.duration_s)
     summary = (f"✅ Saved ({r.platform}, {size_mb:.1f} MB"
-               + (f", {dur}" if dur else "") + f")\n{r.path}")
+               + (f", {dur}" if dur else "") + f")\n{r.path}"
+               + (f"\nasset:{asset['asset_id']}" if asset else ""))
     await _stream_progress(bot, chat_id, summary, prog)
+    if asset is not None:
+        await bot.send_message(chat_id=chat_id, text=f"🎬 {(r.title or url)[:200]}",
+                               reply_markup=_item_keyboard(app, asset))
+        await _autotag(app, chat_id, asset["asset_id"], r.title or url)
+
+    if r.size_bytes > _TG_UPLOAD_CAP_BYTES and asset is not None and _public(app):
+        # Too big for a bot upload: a private link from this PC instead of a dead end.
+        try:
+            await ms.send_to_chat(bot, chat_id, asset, bot_token=s.telegram_bot_token, public_url=_public(app),
+                                  hours=(await ms.load_settings(lib))["link_hours"])
+            return
+        except Exception:
+            logger.exception("download link for %s failed; saying where the file is", r.path)
 
     if r.size_bytes <= _TG_UPLOAD_CAP_BYTES:
         try:
@@ -715,6 +975,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return
         item = pool[idx - 1]
         queued: list[str] = []
+        if action == "mp3":
+            app, lib, s = ctx.application, _get_library(ctx), get_settings()
+            if lib is None:
+                await app.bot.send_message(chat_id=chat_id, text="⚠️ Library unavailable.")
+                return
+
+            async def then(job: ms.Job) -> None:
+                await _deliver(app, chat_id, job, "MP3")
+                if job.state == "done":
+                    await _autotag(app, chat_id, job.asset_id, item.get("title") or item["url"])
+            ms.start_job("fetch", f"MP3 · {item.get('title') or item['url']}",
+                         lambda job: ms.fetch(lib, s, item["url"], job, mode="mp3", via="telegram"), then=then)
+            queued.append("mp3")
         if action in ("dl", "both"):
             ctx.application.create_task(
                 _fetch_one_media(ctx.application, chat_id, item["url"]))
@@ -763,3 +1036,7 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("quality", quality_cmd))
     app.add_handler(CommandHandler("transcript", transcript_cmd))
     app.add_handler(CommandHandler("transcripts", transcripts_cmd))
+    app.add_handler(CommandHandler("media", media_cmd))
+    app.add_handler(CommandHandler("rename", rename_cmd))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
+                                   | filters.Document.ALL, handle_file))

@@ -52,6 +52,7 @@ class TranscriptResult(BaseModel):
     backend: str = ""
     error: str | None = None
     elapsed_s: float = 0.0
+    asset_id: int | None = None                 # the transcript asset (transcribe_file, with a library)
 
 
 async def engines_config(library) -> EnginesConfig:
@@ -184,6 +185,54 @@ async def _asr(url: str, platform: str, out_dir: Path, cfg: EnginesConfig,
         ok=True, source_url=url, platform=platform, path=str(out_path),
         text=text, language=language, title=title, backend=backend,
         elapsed_s=time.monotonic() - t0)
+
+
+async def transcribe_file(
+    media_path: Path, *, transcripts_root: Path, platform: str, title: str = "", source_url: str = "",
+    language: str | None = None, timestamps: bool = False, library=None, media_asset_id: int | None = None,
+    engines: EnginesConfig | None = None,
+) -> TranscriptResult:
+    """ASR over a file already on disk (an upload, a chat import, an mp3, a
+    downloaded video) into ``transcripts_root/<platform>/<stem>.txt``
+    (``<stem>.timestamps.txt`` with timestamps), registered as a transcript
+    asset linked to ``media_asset_id``. ``language`` overrides the engine's
+    (None: detect). Fail-soft like ``transcribe_url``."""
+    t0 = time.monotonic()
+    media_path = Path(media_path)
+
+    def fail(error: str, backend: str = "") -> TranscriptResult:
+        return TranscriptResult(ok=False, source_url=source_url, platform=platform, backend=backend,
+                                error=error, elapsed_s=time.monotonic() - t0)
+
+    if not media_path.is_file():
+        return fail(f"the media file is missing on disk ({media_path.name})")
+    try:
+        cfg = engines if engines is not None else await engines_config(library)
+        engine = asr_engine(cfg.transcriber, cfg)
+    except EngineConfigError as e:
+        return fail(f"transcriber configuration: {e}")
+    try:
+        text, lang = await engine.transcribe(media_path, language=language, timestamps=timestamps)
+    except TranscribeError as e:
+        logger.warning("ASR failed for %s: %s", media_path, e)
+        return fail(f"ASR failed ({engine.backend}): {e}", engine.backend)
+    if not text.strip():
+        return fail(f"ASR failed ({engine.backend}): no speech in the result", engine.backend)
+    out_dir = Path(transcripts_root) / platform
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{media_path.stem}{'.timestamps' if timestamps else ''}.txt"
+    header = (f"# {title or media_path.name}\n" + (f"# source: {source_url}\n" if source_url else "")
+              + f"# backend: {engine.backend} ({lang or '?'})\n\n")
+    out_path.write_text(header + text + "\n", encoding="utf-8")
+    result = TranscriptResult(ok=True, source_url=source_url, platform=platform, path=str(out_path), text=text,
+                              language=lang, title=title, backend=engine.backend, elapsed_s=time.monotonic() - t0)
+    if library is not None:
+        result.asset_id = await library.add_asset(
+            kind="transcript", platform=platform, source_url=source_url or None, title=title or None,
+            path=str(out_path), size_bytes=out_path.stat().st_size,
+            meta={"backend": engine.backend, "language": lang, "timestamps": timestamps,
+                  **({"media_asset_id": media_asset_id} if media_asset_id is not None else {})})
+    return result
 
 
 async def _register(library, result: TranscriptResult) -> None:

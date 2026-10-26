@@ -11,7 +11,7 @@ full guide.
   runs.py        the run driver: one live drive per run, cancel by drain,
                  attach on action, /continue, the plan card's data
   progress.py    the run event bus and the live Telegram progress card
-  media.py       /find, /video, /fetch, /quality, /transcript(s), pasted links
+  media.py       /find, /video, /fetch, /quality, /transcript(s), /media, pasted links, sent files
   history.py     /runs, /status, /append, /continue, /cancel, /help
   delete.py      /delete
   engines_cmd.py /engines (profiles, roles, tiers, the transcriber)

@@ -35,7 +35,7 @@ HELP_TEXT = """\
   /fetch <url…> — download links (or just paste them)
   /quality [auto|min|max|<h>] — download quality
   /transcript <indices> — captions for /find picks
-  /transcripts — browse saved transcripts
+  /transcripts · /media — transcripts · library
 
 *Runs*
   /runs — list · /status — in flight + console link
@@ -48,7 +48,7 @@ HELP_TEXT = """\
   /engines — models per role · /engines use <profile>
   /engines transcriber — speech-to-text
 
-_Tip: paste a YouTube/X/Reddit/Instagram link for a download menu._
+_Tip: paste a media link or send me a file to save it._
 """
 
 # Loaded lazily from docs/help.md (repo) for `/help full`.

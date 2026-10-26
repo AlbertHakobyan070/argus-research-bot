@@ -109,6 +109,10 @@ class FakeRuns:
         call = self.calls[-1][1]
         return out or Outcome("delivered" if call["action"] == "send" else "started", "", call["run_id"])
 
+    async def continue_run(self, *args, **kw) -> Outcome:
+        out = self._act("continue_run", args, kw, None)
+        return out or Outcome("started", "", self.calls[-1][1]["row"]["run_id"])
+
     async def cancel_run(self, *args, **kw) -> Outcome:
         out = self._act("cancel_run", args, kw, None)
         run_id = self.calls[-1][1]["run_id"]
@@ -123,6 +127,7 @@ class FakeLibrary:
         self.rows: dict[str, dict] = {}
         self.settings: dict[str, str] = {}
         self.exa_usd = 0.0
+        self.pending: dict[str, list[dict]] = {}       # run_id → run_sources rows still pending
 
     async def list_runs(self, *, chat_id: int | None = None, limit: int = 10) -> list[dict]:
         rows = sorted(self.rows.values(), key=lambda r: r["created_at"], reverse=True)
@@ -133,6 +138,9 @@ class FakeLibrary:
 
     async def exa_usd_month_to_date(self) -> float:
         return self.exa_usd
+
+    async def pending_sources(self, run_id: str) -> list[dict]:
+        return list(self.pending.get(run_id, []))
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         return self.settings.get(key, default)
@@ -167,13 +175,21 @@ class FakeBot:
 
 def make_app(fake: FakeRuns, *, reports_root: Path, library: FakeLibrary | None = None,
              bot: FakeBot | None = None, bot_data: dict | None = None, max_age_s: float = 3600,
-             static_dir: Path = server.STATIC_DIR) -> web.Application:
-    """The real console app on the fakes; ``app[api.DEPS]`` holds them."""
+             static_dir: Path = server.STATIC_DIR, settings=None) -> web.Application:
+    """The real console app on the fakes; ``app[api.DEPS]`` holds them.
+    ``settings``: the vault roots for the media routes (``media_settings``)."""
     deps = api.Deps(runs=fake, library=library or FakeLibrary(), bot=bot or FakeBot(),
                     bot_data=bot_data if bot_data is not None else {"webapp_ok": True},
                     bot_token=TOKEN, allowed_user_id=USER_ID, max_age_s=max_age_s,
-                    reports_root=Path(reports_root))
+                    reports_root=Path(reports_root), settings=settings)
     return server.build_app(deps, static_dir=static_dir)
+
+
+def media_settings(root: Path):
+    """The ``Settings`` fields the media routes read, every root under ``root``."""
+    from types import SimpleNamespace
+    return SimpleNamespace(media_root=root / "media", transcripts_root=root / "transcripts",
+                           history_root=root / "history", reports_root=root / "reports")
 
 
 def seed_run(fake: FakeRuns, app: web.Application, run_id: str, *, status: str = "running",

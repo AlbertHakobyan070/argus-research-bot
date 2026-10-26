@@ -15,12 +15,14 @@ const UNREACHABLE = "the tunnel may have restarted — reopen the console from t
 /** No answer, or one that cannot be read (a dropped tunnel, a proxy's error page): ApiError(0, "network"). */
 const network = (what) => new ApiError(0, "network", `${what}; ${UNREACHABLE}`);
 
-export async function api(path, { method = "GET", body } = {}) {
+/** `raw`: a Blob sent as is (an upload chunk), instead of a JSON `body`. */
+export async function api(path, { method = "GET", body, raw } = {}) {
   const headers = { Authorization: `tma ${authData()}` };
   if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (raw !== undefined) headers["Content-Type"] = "application/octet-stream";
   let r;
   try {
-    r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    r = await fetch(path, { method, headers, body: raw !== undefined ? raw : body === undefined ? undefined : JSON.stringify(body) });
   } catch (e) {
     throw network(`the console could not reach the bot (${e.message})`);
   }
@@ -59,3 +61,28 @@ export const post = {
   send: (id, what) => api(`/api/runs/${enc(id)}/send`, { method: "POST", body: { what } }),
 };
 export const putEngines = (body) => api("/api/engines", { method: "PUT", body });
+export const continueRun = (id) => api(`/api/runs/${enc(id)}/continue`, { method: "POST" });
+
+/** The media library (webapp/media_api.py). */
+export const media = {
+  list: (params) => api(`/api/media?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null))}`),
+  item: (id) => api(`/api/media/${enc(id)}`),
+  jobs: () => api("/api/media/jobs"),
+  settings: () => api("/api/media/settings"),
+  saveSettings: (body) => api("/api/media/settings", { method: "PUT", body }),
+  probe: (url) => api("/api/media/probe", { method: "POST", body: { url } }),
+  fetch: (body) => api("/api/media/fetch", { method: "POST", body }),
+  convert: (id, quality) => api(`/api/media/${enc(id)}/convert`, { method: "POST", body: { quality } }),
+  transcribe: (id, body) => api(`/api/media/${enc(id)}/transcribe`, { method: "POST", body }),
+  suggest: (id) => api(`/api/media/${enc(id)}/tag`, { method: "POST" }),
+  tagUntagged: () => api("/api/media/tag-untagged", { method: "POST" }),
+  saveTags: (id, tags, group) => api(`/api/media/${enc(id)}/tags`, { method: "PUT", body: { tags, group } }),
+  rename: (id, title) => api(`/api/media/${enc(id)}/title`, { method: "PUT", body: { title } }),
+  send: (id) => api(`/api/media/${enc(id)}/send`, { method: "POST" }),
+  attach: (id, runId) => api(`/api/media/${enc(id)}/attach`, { method: "POST", body: { run_id: runId } }),
+  remove: (id) => api(`/api/media/${enc(id)}`, { method: "DELETE" }),
+  uploadOpen: (name, size) => api("/api/media/uploads", { method: "POST", body: { name, size } }),
+  uploadChunk: (uid, offset, blob) => api(`/api/media/uploads/${enc(uid)}?offset=${offset}`, { method: "PUT", raw: blob }),
+  uploadFinish: (uid, body) => api(`/api/media/uploads/${enc(uid)}/finish`, { method: "POST", body }),
+  uploadCancel: (uid) => api(`/api/media/uploads/${enc(uid)}`, { method: "DELETE" }),
+};
