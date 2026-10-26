@@ -6,6 +6,13 @@
 .problem{max-width:78ch}
 .sec-head + .kpis{margin-top:0}
 
+/* shell: the wordmark sits at the top bar's right; who is signed in sits in the footer */
+.topbar .mark-word{text-decoration:none}
+.app-foot{margin-top:56px;padding-top:14px;border-top:1px solid var(--line-soft)}
+.rail-head{justify-content:flex-end}
+@media (max-width:1140px){.rail-head{display:none}}
+.chip-more{border-style:dashed}
+
 /* timeline */
 .timeline td:first-child{white-space:nowrap}
 .timeline tr[data-kind="trap"] td:last-child{color:var(--trap)}

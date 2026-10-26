@@ -9,6 +9,7 @@ import * as mediaItem from "./views/media_item.js";
 import * as newRun from "./views/new.js";
 import * as run from "./views/run.js";
 import * as runs from "./views/runs.js";
+import * as settings from "./views/settings.js";
 
 const ROUTES = [
   [/^\/runs$/, runs, "runs"],
@@ -17,15 +18,27 @@ const ROUTES = [
   [/^\/engines$/, engines, "engines"],
   [/^\/media(?:\/(library|get|review|jobs|settings))?$/, media, "media"],
   [/^\/media\/item\/(\d+)$/, mediaItem, "media"],
+  [/^\/settings$/, settings, "settings"],
 ];
 const view = $("#view");
 let cleanup = null;
 let authFailed = false;
+let shownPath = null;                      // a new view opens at the top; a refresh keeps the place
 
-// ---- theme: the kit's dark when Telegram says dark, else the default ledger (no picker, no OS fallback)
+// ---- theme: the saved appearance (#/settings) — Telegram's light/dark or a pinned one, then which kit
+// theme; Telegram's own header and background take the theme's ground colour
+let appearance = { mode: "telegram", light: "ledger", dark: "dark" };
 function applyTheme() {
-  document.documentElement.setAttribute("data-theme", tg()?.colorScheme === "dark" ? "dark" : "ledger");
+  const webApp = tg();
+  const dark = appearance.mode === "dark" || (appearance.mode === "telegram" && webApp?.colorScheme === "dark");
+  document.documentElement.setAttribute("data-theme", dark ? appearance.dark : appearance.light);
+  const ground = getComputedStyle(document.documentElement).getPropertyValue("--ground").trim();
+  if (/^#[0-9a-f]{6}$/i.test(ground) && webApp?.isVersionAtLeast?.("6.9")) {
+    webApp.setHeaderColor(ground);
+    webApp.setBackgroundColor(ground);
+  }
 }
+window.addEventListener("argus:appearance", (e) => { appearance = e.detail; applyTheme(); });
 
 function crumbs(items) {
   $("#crumbs").innerHTML = [["#/runs", "Argus"], ...items].map(([href, label], i, all) => (i === all.length - 1
@@ -64,6 +77,7 @@ async function route() {
   const hit = ROUTES.map(([re, mod, nav]) => [path.match(re), mod, nav]).find(([m]) => m);
   if (!hit) { location.replace("#/runs"); return; }
   const [m, mod, nav] = hit;
+  if (path !== shownPath) { window.scrollTo(0, 0); shownPath = path; }
   $$("#nav a").forEach((a) => {
     const on = a.dataset.route === nav;
     a.classList.toggle("on", on);
@@ -96,7 +110,9 @@ async function start() {
   window.addEventListener("hashchange", () => route());
   try {
     const me = await get.me();
-    $("#who").textContent = `${me.user.first_name || me.user.id} · Argus ${me.bot.version}`;
+    appearance = me.appearance;
+    applyTheme();
+    $("#who").textContent = `Signed in as ${me.user.first_name || me.user.id} · Argus ${me.bot.version}`;
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
     if (e.status === 401 || e.status === 403) { showAuth(e); return; }

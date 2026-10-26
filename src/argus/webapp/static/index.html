@@ -20,19 +20,15 @@
 <div class="shell">
   <aside class="rail" data-ui="rail">
     <div class="rail-head">
-      <span class="mark-word"><b>Argus</b><span>Console</span></span>
       <button class="rail-toggle" data-rail-toggle></button>
     </div>
-    <p class="mark-sub">Research runs, plans and reports from your Telegram bot.</p>
     <nav class="rail-nav" aria-label="Console"><ol class="track" id="nav">
       <li><a href="#/runs" data-route="runs"><span><span class="kick">Library</span>Runs</span></a></li>
       <li><a href="#/new" data-route="new"><span><span class="kick">Start</span>New research</span></a></li>
       <li><a href="#/media" data-route="media"><span><span class="kick">Vault</span>Media</span></a></li>
       <li><a href="#/engines" data-route="engines"><span><span class="kick">Settings</span>Engines</span></a></li>
+      <li><a href="#/settings" data-route="settings"><span><span class="kick">Settings</span>Appearance</span></a></li>
     </ol></nav>
-    <div class="rail-tools">
-      <div><span class="rail-k">Signed in</span><p class="meta" id="who">checking…</p></div>
-    </div>
   </aside>
 
   <main class="main wide" id="main">
@@ -40,9 +36,11 @@
       <nav class="crumbs" aria-label="Breadcrumb"><ol id="crumbs"><li><span aria-current="page">Argus</span></li></ol></nav>
       <div class="topbar-actions">
         <button class="ib" type="button" id="refresh" aria-label="Refresh this view" data-tip="Refresh this view"><i data-icon="refresh-cw"></i></button>
+        <a class="mark-word" href="#/runs" aria-label="Argus console, home"><b>Argus</b><span>Console</span></a>
       </div>
     </header>
     <div id="view" aria-live="polite"><div class="page-head"><div><span class="skel h"></span><span class="skel w60"></span></div></div></div>
+    <footer class="app-foot meta" id="who">checking…</footer>
   </main>
 </div>
 <div popover id="cite-pop" class="pop cite-pop"></div>
