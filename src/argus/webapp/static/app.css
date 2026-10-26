@@ -97,5 +97,8 @@ section.sec[hidden] + section.sec{border-top:0}
 .job-top b{font-weight:500;overflow-wrap:anywhere;min-width:0}
 .job .meta{margin:0;overflow-wrap:anywhere}
 .job .btn{align-self:flex-start}
+.rename:not([hidden]){display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 8px;max-width:var(--measure)}
+.rename .input{flex:1 1 18em;min-width:0;font-size:16px}
+.rename .hint{flex-basis:100%;margin:0;font-size:12.4px;color:var(--ink-faint);overflow-wrap:anywhere}
 .pending-sources{margin:0 0 var(--s3);padding-left:20px;font-size:14px}
 .pending-sources li{overflow-wrap:anywhere}

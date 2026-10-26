@@ -77,6 +77,7 @@ export const media = {
   suggest: (id) => api(`/api/media/${enc(id)}/tag`, { method: "POST" }),
   tagUntagged: () => api("/api/media/tag-untagged", { method: "POST" }),
   saveTags: (id, tags, group) => api(`/api/media/${enc(id)}/tags`, { method: "PUT", body: { tags, group } }),
+  rename: (id, title) => api(`/api/media/${enc(id)}/title`, { method: "PUT", body: { title } }),
   send: (id) => api(`/api/media/${enc(id)}/send`, { method: "POST" }),
   attach: (id, runId) => api(`/api/media/${enc(id)}/attach`, { method: "POST", body: { run_id: runId } }),
   remove: (id) => api(`/api/media/${enc(id)}`, { method: "DELETE" }),

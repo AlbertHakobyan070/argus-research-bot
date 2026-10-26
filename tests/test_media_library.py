@@ -184,6 +184,31 @@ async def test_a_links_video_and_its_mp3_are_separate_items(lib, roots):
     assert (await lib.get_asset(m)) is not None and Path(roots.media_root, "youtube/clip_audio.mp3").exists()
 
 
+async def test_rename_retitles_the_item_and_its_parts_but_a_part_alone(lib, roots):
+    v = await _add(lib, _file(roots.media_root, "x/talk.mp4"), title="old")
+    m = await _add(lib, _file(roots.media_root, "x/talk.320.mp3"), title="old", meta={"derived_from": v})
+    t = await _add(lib, _file(roots.transcripts_root, "x/talk.txt"), kind="transcript", title="old",
+                   meta={"media_asset_id": v})
+    row = await ms.rename(lib, v, "  Agents   at scale \n ")
+    assert row["title"] == "Agents at scale"
+    assert [a["title"] for a in await lib.get_assets([m, t])] == ["Agents at scale", "Agents at scale"]
+    await ms.rename(lib, m, "Just the audio")
+    assert [a["title"] for a in await lib.get_assets([v, m, t])] == ["Agents at scale", "Just the audio", "Agents at scale"]
+    assert Path(roots.media_root, "x/talk.mp4").exists()                       # the vault file keeps its name
+    for bad in ("", "   ", None):
+        with pytest.raises(ValueError):
+            await ms.rename(lib, v, bad)
+    with pytest.raises(ms.MediaError):
+        await ms.rename(lib, 999, "x")
+
+
+def test_download_name_is_the_title_made_safe():
+    a = {"path": r"C:\v\20261020_abc_x.MP4", "title": 'RAG: "what" / why?  <part 2>. '}
+    assert ms.download_name(a) == "RAG what why part 2.mp4"
+    assert ms.download_name({"path": "/v/stem.mp3", "title": "///"}) == "stem.mp3"
+    assert ms.download_name({"path": "/v/stem.txt", "title": None}) == "stem.txt"
+
+
 def test_import_kind():
     assert ms.import_kind("Talk.MP4") == "media" and ms.import_kind("a.opus") == "media"
     assert ms.import_kind("notes.srt") == "transcript"
@@ -423,6 +448,36 @@ async def test_accept_in_chat_confirms_the_suggestion(lib, roots, monkeypatch):
     meta = (await lib.get_asset(a))["meta"]
     assert meta["tags"] == ["rag", "evals"] and meta["group"] == "LLM engineering" and meta["review"] == "done"
     assert "✅ Tagged" in ctx.application.bot.send_message.await_args.kwargs["text"]
+
+
+async def test_rename_route_names_downloads_and_sends_after_the_title(client, lib, roots):
+    t = await _add(lib, _file(roots.transcripts_root, "x/20261020_notes.txt", b"hello"), kind="transcript")
+    r = await client.put(f"/api/media/{t}/title", json={"title": "Claude Code: workflow notes"}, headers=auth())
+    item = (await r.json())["item"]
+    assert r.status == 200 and item["title"] == "Claude Code: workflow notes"
+    assert item["file_name"] == "Claude Code workflow notes.txt" and item["vault_name"] == "20261020_notes.txt"
+    r = await client.get(item["links"]["download"])
+    assert "Claude%20Code%20workflow%20notes.txt" in r.headers["Content-Disposition"]
+    await client.post(f"/api/media/{t}/send", headers=auth())
+    assert client.bot.documents[-1]["filename"] == "Claude Code workflow notes.txt"
+    r = await client.put(f"/api/media/{t}/title", json={"title": "  "}, headers=auth())
+    assert r.status == 400
+    assert (await client.put("/api/media/999/title", json={"title": "x"}, headers=auth())).status == 404
+
+
+async def test_rename_in_chat(lib, roots, monkeypatch):
+    from unittest.mock import AsyncMock
+    bot_media, update, ctx, msg, _ = _chat(monkeypatch, lib, roots)
+    monkeypatch.setattr(bot_media, "_get_library", lambda _ctx: lib)
+    update.message.reply_text = AsyncMock()
+    a = await _add(lib, _file(roots.media_root, "x/clip.mp4"), title="clip")
+    ctx.args = [f"asset:{a}", "Prompt", "caching", "explained"]
+    await bot_media.rename_cmd(update, ctx)
+    assert (await lib.get_asset(a))["title"] == "Prompt caching explained"
+    assert "is now “Prompt caching explained”" in update.message.reply_text.await_args.args[0]
+    ctx.args = ["asset:x", "y"]
+    await bot_media.rename_cmd(update, ctx)
+    assert update.message.reply_text.await_args.args[0].startswith("Usage: /rename")
 
 
 async def test_settings_route_refuses_bad_values(client):

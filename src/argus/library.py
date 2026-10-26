@@ -457,6 +457,13 @@ class Library:
         await db.commit()
         return await self.get_asset(asset_id) if cur.rowcount else None
 
+    async def rename_asset(self, asset_id: int, title: str) -> dict[str, Any] | None:
+        """Set the asset's title; the updated row, or None for an unknown id."""
+        db = self._conn()
+        cur = await db.execute("UPDATE assets SET title = ? WHERE asset_id = ?", (title, int(asset_id)))
+        await db.commit()
+        return await self.get_asset(asset_id) if cur.rowcount else None
+
     async def search_assets(self, *, q: str | None = None, kind: str | None = None,
                             media_type: str | None = None, tag: str | None = None,
                             group: str | None = None, review: str | None = None, primary: bool = True,

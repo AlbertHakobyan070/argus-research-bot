@@ -30,10 +30,16 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
     : it.type === "audio" ? `<audio class="media-audio" controls preload="metadata" src="${esc(it.links.file)}"></audio>`
     : `<pre class="transcript">${esc(text || "")}</pre>${(text || "").length >= 12000 ? '<p class="meta">The first part is shown; Download has the whole file.</p>' : ""}`;
   st.el.innerHTML = `<div class="page-head">
-      <div><span class="kicker">${esc(typeLabel(it))}${it.platform ? ` · ${esc(it.platform)}` : ""}${it.imported ? " · imported" : ""}</span><h1>${esc(it.title)}</h1>
+      <div><span class="kicker">${esc(typeLabel(it))}${it.platform ? ` · ${esc(it.platform)}` : ""}${it.imported ? " · imported" : ""}</span><h1 id="title">${esc(it.title)}</h1>
+        <form class="rename" id="rename-form" hidden novalidate>
+          <input class="input" id="rename-input" type="text" maxlength="200" value="${esc(it.title)}" aria-label="New title" required>
+          <button class="btn btn-a btn-s" type="submit"><i data-icon="check"></i>Save</button>
+          <button class="btn btn-s" type="button" id="rename-cancel">Cancel</button>
+          <p class="hint">Downloads and files sent to the chat take this name${it.derived_from || it.media_asset_id ? "" : "; so do the item's parts"}. The vault file keeps <code>${esc(it.vault_name)}</code>.</p></form>
         <p class="meta">${esc([facts(it), it.quality && `quality ${it.quality}`, it.backend, it.language, `saved ${when(it.created_at)}`].filter(Boolean).join(" · "))}</p>
         ${it.tags.length || it.group ? `<p class="chips">${it.group ? `<span class="tag">${esc(it.group)}</span>` : ""}${tagChips(it.tags)}</p>` : ""}</div>
-      ${it.source_url ? `<div class="btn-row"><button class="btn btn-s" type="button" id="source"><i data-icon="external-link"></i>Source</button></div>` : ""}
+      <div class="btn-row"><button class="btn btn-s" type="button" id="rename"><i data-icon="file-text"></i>Rename</button>
+        ${it.source_url ? '<button class="btn btn-s" type="button" id="source"><i data-icon="external-link"></i>Source</button>' : ""}</div>
     </div>
     <div id="notice" hidden></div>
     <section class="sec media-view">${player}</section>
@@ -59,14 +65,14 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
       <p>What you will search for later. Suggestions come from the title, description and transcript.</p></div><div id="review"></div></section>
     ${parts.length ? `<section class="sec"><div class="sec-head"><span class="kicker">Parts</span><h2>Made from this item</h2></div>
       <div class="tw"><table><thead><tr><th>Part</th><th>Size</th><th></th></tr></thead><tbody>${parts.map((p) => `<tr>
-        <td><a href="#/media/item/${p.id}">${esc(typeLabel(p))}${p.quality ? ` · ${esc(p.quality)}` : ""}${p.backend ? ` · ${esc(p.backend)}` : ""}</a><span class="meta row-id">${esc(p.file_name)}</span></td>
+        <td><a href="#/media/item/${p.id}">${esc(typeLabel(p))}${p.quality ? ` · ${esc(p.quality)}` : ""}${p.backend ? ` · ${esc(p.backend)}` : ""}</a><span class="meta row-id">${esc(p.vault_name)}</span></td>
         <td>${esc(bytes(p.bytes))}${p.duration_s ? ` · ${esc(duration(p.duration_s))}` : ""}</td>
         <td class="btn-row"><button class="btn btn-s" type="button" data-dl="${p.id}"><i data-icon="download"></i>Download</button>
           <button class="btn btn-s" type="button" data-send="${p.id}">Send</button></td></tr>`).join("")}</tbody></table></div></section>` : ""}
     ${transcripts.length ? `<section class="sec set-sec"><div class="set-intro"><h2>Use it in research</h2>
         <p>Queue ${transcripts.length > 1 ? "a" : "the"} transcript on a research run; Continue ingests it (an append-only pass on a finished run, no new searches).</p></div>
       <form class="set-panel" id="attach-form" novalidate>
-        ${transcripts.length > 1 ? `<div class="set-row"><label class="set-l" for="att-t"><b>Transcript</b></label><select class="input" id="att-t" name="transcript">${transcripts.map((p) => `<option value="${p.id}">${esc(p.file_name)}</option>`).join("")}</select></div>` : `<input type="hidden" name="transcript" value="${transcripts[0].id}">`}
+        ${transcripts.length > 1 ? `<div class="set-row"><label class="set-l" for="att-t"><b>Transcript</b></label><select class="input" id="att-t" name="transcript">${transcripts.map((p) => `<option value="${p.id}">${esc(p.vault_name)}</option>`).join("")}</select></div>` : `<input type="hidden" name="transcript" value="${transcripts[0].id}">`}
         <div class="set-row"><label class="set-l" for="att-run"><b>Run</b><small>Newest first.</small></label><select class="input" id="att-run" name="run"><option value="">Loading runs…</option></select></div>
         <div class="set-panel-f"><span class="hint" id="att-hint"></span><button class="btn btn-a" type="submit"><i data-icon="plus"></i>Add to run</button></div>
       </form></section>` : ""}`;
@@ -74,6 +80,26 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
   const byId = Object.fromEntries([it, ...parts].map((p) => [p.id, p]));
   const src = $("#source", st.el);
   if (src) src.addEventListener("click", () => openLink(it.source_url));
+  const renameForm = $("#rename-form", st.el);
+  const renameInput = $("#rename-input", st.el);
+  const renameBtn = $("#rename", st.el);
+  const showRename = (on) => {
+    renameForm.hidden = !on;
+    $("#title", st.el).hidden = on;
+    renameBtn.hidden = on;
+    if (on) { renameInput.focus(); renameInput.select(); }
+  };
+  renameBtn.addEventListener("click", () => showRename(true));
+  $("#rename-cancel", st.el).addEventListener("click", () => { renameInput.value = it.title; showRename(false); });
+  renameForm.addEventListener("keydown", (e) => { if (e.key === "Escape") { renameInput.value = it.title; showRename(false); } });
+  renameForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const title = renameInput.value.trim();
+    if (!title) { renameInput.focus(); return; }
+    if (title === it.title) { showRename(false); return; }
+    const r = await act($('button[type="submit"]', renameForm), notice, () => media.rename(it.id, title));
+    if (r) { toast(`Renamed to “${r.item.title}”.`, "cost", "Rename"); repaint(); }
+  });
   $("#dl", st.el).addEventListener("click", () => downloadToDevice(it));
   const sendTo = async (button, p) => {
     const r = await act(button, notice, () => media.send(p.id));

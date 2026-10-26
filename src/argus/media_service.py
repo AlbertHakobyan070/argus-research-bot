@@ -357,6 +357,34 @@ async def accept(lib, asset_id: int, *, tags: list, group: str | None) -> dict:
     return row
 
 
+MAX_TITLE = 200
+_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+async def rename(lib, asset_id: int, title: str) -> dict:
+    """Retitle an item and its parts (its mp3s and transcripts carry the
+    title too); a part alone is retitled alone. Whitespace is collapsed; an
+    empty title is refused. Files on disk keep their names. The updated asset."""
+    t = " ".join(str(title or "").split())[:MAX_TITLE]
+    if not t:
+        raise ValueError("the title cannot be empty")
+    a = await lib.get_asset(int(asset_id))
+    if a is None or a["kind"] not in ("media", "transcript"):
+        raise MediaError(f"no library item {asset_id}")
+    is_part = a["meta"].get("derived_from") is not None or a["meta"].get("media_asset_id") is not None
+    for r in [] if is_part else await lib.related_assets(a):
+        await lib.rename_asset(r["asset_id"], t)
+    return await lib.rename_asset(a["asset_id"], t)
+
+
+def download_name(asset: dict) -> str:
+    """The item's title as a file name (downloads, files sent to the chat):
+    characters a file system refuses taken out, the file's extension kept."""
+    p = Path(asset["path"])
+    stem = " ".join(_UNSAFE_NAME.sub(" ", asset.get("title") or "").split()).strip(" .")[:120].strip() or p.stem
+    return stem + p.suffix.lower()
+
+
 def tag_job(lib, asset_id: int, title: str, *, then: Callable[[Job], Awaitable[None]] | None = None) -> Job:
     async def work(job: Job) -> int:
         job.message = "asking the model for tags"
@@ -453,28 +481,30 @@ async def send_to_chat(bot, chat_id: int, asset: dict, *, bot_token: str, public
     p = Path(asset["path"])
     size = p.stat().st_size
     title = (asset.get("title") or p.name)[:1024]
+    name = download_name(asset)
     kind = media_type(asset)
     if size <= _TG_UPLOAD_CAP_BYTES:
         with p.open("rb") as f:
             if kind == "transcript":
-                await bot.send_document(chat_id=chat_id, document=f, filename=p.name, caption=title)
+                await bot.send_document(chat_id=chat_id, document=f, filename=name, caption=title)
             elif kind == "audio":
-                await bot.send_audio(chat_id=chat_id, audio=f, filename=p.name, title=title[:64], caption=title,
+                await bot.send_audio(chat_id=chat_id, audio=f, filename=name, title=title[:64], caption=title,
                                      duration=int(asset["duration_s"]) if asset.get("duration_s") else None)
             else:
                 try:
-                    await bot.send_video(chat_id=chat_id, video=f, caption=title, supports_streaming=True)
+                    await bot.send_video(chat_id=chat_id, video=f, filename=name, caption=title,
+                                         supports_streaming=True)
                 except Exception as e:                   # Telegram refused it as a video: the file as a document
                     logger.warning("send_video failed (%s); sending as a document", e)
                     f.seek(0)
-                    await bot.send_document(chat_id=chat_id, document=f, filename=p.name, caption=title)
+                    await bot.send_document(chat_id=chat_id, document=f, filename=name, caption=title)
         return "sent"
     if not public_url:
         raise MediaError(f"the file is {size / 1048576:.0f} MB, over Telegram's bot upload cap, and the console "
                          "has no public URL for a download link (is the tunnel up? see /status)")
     token = sign_link(bot_token, asset["asset_id"], "d", hours)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Download", url=link_url(public_url, token, p.name))],
+        [InlineKeyboardButton("⬇️ Download", url=link_url(public_url, token, name))],
         [InlineKeyboardButton("📱 Open in Argus", web_app=WebAppInfo(item_url(public_url, asset["asset_id"])))]])
     await bot.send_message(chat_id=chat_id, reply_markup=kb, text=(
         f"📁 {title}\n{size / 1048576:.0f} MB — over Telegram's 50 MB bot upload cap, so here is a private "

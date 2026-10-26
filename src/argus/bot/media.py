@@ -352,6 +352,31 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _autotag(app, msg.chat_id, asset_id, a.get("title") or name)
 
 
+async def rename_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/rename <asset:N|N> <new title> — retitle a library item (and its parts)."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    args = list(ctx.args or [])
+    ref = args[0].removeprefix("asset:") if args else ""
+    if not ref.isdigit() or len(args) < 2:
+        await update.message.reply_text("Usage: /rename <asset:N> <new title>\n"
+                                        "Ids show on saved items, in /transcripts and on the console's item page.")
+        return
+    try:
+        row = await ms.rename(lib, int(ref), " ".join(args[1:]))
+    except (ValueError, ms.MediaError) as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    await update.message.reply_text(f"✏️ asset:{row['asset_id']} is now “{row['title']}”.",
+                                    reply_markup=_item_keyboard(ctx.application, row))
+
+
 async def media_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/media — what the library holds, with buttons into the console."""
     s = get_settings()
@@ -368,7 +393,8 @@ async def media_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     top = " ".join(f"#{t}" for t, _ in facets["tags"][:12])
     text = (f"🗃 Media library: {total} item(s) · {facets['pending']} tag suggestion(s) to review · {untagged} untagged"
             + (f"\nTop tags: {top}" if top else "")
-            + "\n\nSend me a video, audio or transcript file to save it; paste a link to download it.")
+            + "\n\nSend me a video, audio or transcript file to save it; paste a link to download it."
+            + "\nRename one: /rename asset:<N> <new title>")
     url = _public(ctx.application)
     kb = None
     if url:
@@ -1011,5 +1037,6 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("transcript", transcript_cmd))
     app.add_handler(CommandHandler("transcripts", transcripts_cmd))
     app.add_handler(CommandHandler("media", media_cmd))
+    app.add_handler(CommandHandler("rename", rename_cmd))
     app.add_handler(MessageHandler(filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
                                    | filters.Document.ALL, handle_file))

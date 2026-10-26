@@ -71,7 +71,7 @@ async def _require(lib, asset_id: int, kind: str | None = None) -> dict:
 
 def _links(d, a: dict, hours: int) -> dict:
     """Relative signed links (same origin; the page prefixes its origin when it needs an absolute one)."""
-    name = Path(a["path"]).name
+    name = ms.download_name(a)
     out = {"file": ms.link_url("", ms.sign_link(d.bot_token, a["asset_id"], "f", hours), name),
            "download": ms.link_url("", ms.sign_link(d.bot_token, a["asset_id"], "d", hours), name)}
     if a["meta"].get("thumb"):
@@ -83,7 +83,8 @@ def _item(d, a: dict, hours: int) -> dict:
     meta = a.get("meta") or {}
     return {"id": a["asset_id"], "kind": a["kind"], "type": ms.media_type(a), "title": a.get("title") or Path(a["path"]).name,
             "platform": a.get("platform"), "source_url": a.get("source_url"), "bytes": a.get("bytes") or 0,
-            "duration_s": a.get("duration_s"), "created_at": a.get("created_at"), "file_name": Path(a["path"]).name,
+            "duration_s": a.get("duration_s"), "created_at": a.get("created_at"), "file_name": ms.download_name(a),
+            "vault_name": Path(a["path"]).name,
             "format": meta.get("format"), "quality": meta.get("quality") or meta.get("mp3_quality"),
             "tags": meta.get("tags") or [], "group": meta.get("group") or "", "review": meta.get("review"),
             "suggest": meta.get("suggest"), "derived_from": meta.get("derived_from"),
@@ -246,6 +247,18 @@ async def put_tags(request: web.Request) -> web.Response:
     body = await _body(request)
     try:
         row = await ms.accept(lib, _id(request), tags=body.get("tags"), group=_opt(body, "group"))
+    except ValueError as e:
+        raise _bad(str(e)) from None
+    except ms.MediaError as e:
+        raise _media_error(e) from None
+    return _ok({"item": _item(d, row, await _hours(lib))})
+
+
+async def put_title(request: web.Request) -> web.Response:
+    d, lib, _ = _ctx(request)
+    title = _opt(await _body(request), "title")
+    try:
+        row = await ms.rename(lib, _id(request), title)
     except ValueError as e:
         raise _bad(str(e)) from None
     except ms.MediaError as e:
@@ -452,7 +465,8 @@ async def serve_file(request: web.Request) -> web.StreamResponse:
     if not await asyncio.to_thread(lambda: path.is_file() and _inside_roots(path, d.settings)):
         logger.warning("webapp: media %s: its file is missing or outside the Argus roots; refused", asset_id)
         raise web.HTTPNotFound(text="the file is missing on disk")
-    headers = {"Content-Disposition": f"{'attachment' if kind == 'd' else 'inline'}; filename*=UTF-8''{quote(path.name)}",
+    name = "thumb.jpg" if kind == "t" else ms.download_name(a)
+    headers = {"Content-Disposition": f"{'attachment' if kind == 'd' else 'inline'}; filename*=UTF-8''{quote(name)}",
                "Cache-Control": "private, max-age=3600"}
     if kind == "d":
         headers["Access-Control-Allow-Origin"] = "https://web.telegram.org"   # WebApp.downloadFile on Telegram Web
@@ -480,6 +494,7 @@ def setup(app: web.Application) -> None:
     r.add_post("/api/media/{id}/transcribe", transcribe)
     r.add_post("/api/media/{id}/tag", suggest_tags)
     r.add_put("/api/media/{id}/tags", put_tags)
+    r.add_put("/api/media/{id}/title", put_title)
     r.add_post("/api/media/{id}/send", send)
     r.add_post("/api/media/{id}/attach", attach)
     r.add_get("/files/{token}/{name}", serve_file)

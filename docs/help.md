@@ -177,6 +177,11 @@ section, which has five tabs:
 - **Settings** — default video quality (shared with `/quality`), mp3
   quality, transcript language and timestamps, auto-tagging, link lifetime.
 
+### `/rename <asset:N> <new title>`
+Retitle a library item — or **Rename** on its console page. An item's parts
+(its mp3s and transcripts) take the new title too. Downloads and files sent
+to the chat are named after the title; the file in the vault keeps its name.
+
 An item's page plays the file (seeking works), downloads it to the device,
 sends it to the chat, makes an mp3, transcribes it (language, timestamps),
 lists its parts (mp3s, transcripts) and can **add a transcript to a research
