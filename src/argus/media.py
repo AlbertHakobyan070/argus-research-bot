@@ -299,7 +299,9 @@ def _build_argv(url: str, platform: str, dest_root: Path, fmt: str,
     argv = [
         url,
         "-P", str(dest_root / platform),
-        "-o", "%(upload_date>%Y%m%d|na)s_%(id)s_%(title).60B.%(ext)s",
+        # an audio download gets its own stem, so it never shares (or overwrites) the
+        # video's .info.json and thumbnail
+        "-o", f"%(upload_date>%Y%m%d|na)s_%(id)s_%(title).60B{'_audio' if audio else ''}.%(ext)s",
         "--restrict-filenames",
         "--no-playlist",
         "--write-info-json",

@@ -172,6 +172,18 @@ async def test_delete_removes_item_parts_and_sidecars_but_never_outside_the_root
     assert await ms.delete(lib, roots, o) == [] and outside.exists()           # the row goes, the file stays
 
 
+async def test_a_links_video_and_its_mp3_are_separate_items(lib, roots):
+    """Found live: the mp3 fetched from a link shared the video's source URL, so it showed as the video's
+    part and deleting the video deleted it too."""
+    url = "https://www.youtube.com/watch?v=x"
+    v = await _add(lib, _file(roots.media_root, "youtube/clip.mp4"), source_url=url)
+    m = await _add(lib, _file(roots.media_root, "youtube/clip_audio.mp3"), source_url=url, meta={"format": "mp3"})
+    assert {r["asset_id"] for r in (await lib.search_assets())[0]} == {v, m}
+    assert await lib.related_assets(await lib.get_asset(v)) == []
+    assert await ms.delete(lib, roots, v) == ["clip.mp4"]
+    assert (await lib.get_asset(m)) is not None and Path(roots.media_root, "youtube/clip_audio.mp3").exists()
+
+
 def test_import_kind():
     assert ms.import_kind("Talk.MP4") == "media" and ms.import_kind("a.opus") == "media"
     assert ms.import_kind("notes.srt") == "transcript"

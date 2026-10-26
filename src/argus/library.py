@@ -533,18 +533,20 @@ class Library:
 
     async def related_assets(self, asset: dict[str, Any]) -> list[dict[str, Any]]:
         """Other assets made from or for ``asset``: derived from it (an mp3),
-        transcribing it (``meta.media_asset_id``), or sharing its source URL."""
+        transcribing it (``meta.media_asset_id``), the one it was made from,
+        or a transcript sharing its source URL (captions). Two media files of
+        one link (its video and its mp3) are separate items, not parts."""
         db = self._conn()
         aid = int(asset["asset_id"])
         async with db.execute(
                 "SELECT * FROM assets WHERE asset_id != ? AND kind IN ('media','transcript') AND ("
                 " json_extract(meta_json, '$.derived_from') = ?"
                 " OR json_extract(meta_json, '$.media_asset_id') = ?"
-                " OR (? IS NOT NULL AND source_url = ?)"
+                " OR (? IS NOT NULL AND source_url = ? AND (kind = 'transcript' OR ? = 'transcript'))"
                 " OR asset_id = json_extract(?, '$.derived_from')"
                 " OR asset_id = json_extract(?, '$.media_asset_id'))"
                 " ORDER BY asset_id",
-                (aid, aid, aid, asset.get("source_url"), asset.get("source_url"),
+                (aid, aid, aid, asset.get("source_url"), asset.get("source_url"), asset["kind"],
                  json.dumps(asset.get("meta") or {}), json.dumps(asset.get("meta") or {}))) as cur:
             rows = await cur.fetchall()
         return [_row_to_asset(r) for r in rows]

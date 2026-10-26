@@ -255,7 +255,7 @@ async def convert(lib, asset_id: int, job: Job, *, quality: str | None = None) -
     a = await require(lib, asset_id, "media")
     q = quality or (await load_settings(lib))["mp3_quality"]
     src = Path(a["path"])
-    dest = src.with_name(f"{src.stem}.{q}.mp3") if src.suffix.lower() == ".mp3" else src.with_suffix(".mp3")
+    dest = src.with_name(f"{src.stem}.{q}.mp3")      # never the name of a link's own mp3 (<stem>_audio.mp3)
     job.pct, job.message = 0.0, f"converting to mp3 ({q})"
 
     def on_progress(pct: float, _eta: str) -> None:
