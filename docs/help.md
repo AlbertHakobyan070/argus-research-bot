@@ -129,8 +129,14 @@ status links, Reddit posts / `v.redd.it`, Instagram reels/posts.
 
 > Instagram (and some X) downloads need login cookies. Public content works out
 > of the box; for the rest, set `ARGUS_YTDLP_COOKIES` (a cookies.txt) or
-> `ARGUS_YTDLP_COOKIES_BROWSER` (e.g. `firefox`). Files over Telegram's bot
-> upload cap stay in the vault and Argus sends you the path.
+> `ARGUS_YTDLP_COOKIES_BROWSER` (e.g. `firefox`). A file over Telegram's bot
+> upload cap (about 50 MB) comes as a private **download link** from your PC
+> instead (it expires; see the media settings), with an **Open** button for
+> the console.
+
+Each saved item gets buttons: **🎵 MP3**, **📝 Transcribe**, **🏷 Tags** and
+**📱 Open** (its page in the console). The pasted-link menu has **🎵** too:
+the link's audio straight to mp3.
 
 ### `/quality [auto|min|max|<height>]`
 Global download quality. `auto` picks a sensible cap, `max`/`min` are the
@@ -147,6 +153,47 @@ collapsed automatically.
 ### `/transcripts`
 Browse the latest transcripts saved in the vault, with **📤** buttons to
 re-send any of them. Each line shows its `asset:<N>` id for `/append`.
+
+### Sending files to the bot
+Send a video, audio file, voice message, video note, or a transcript
+(`.txt` `.md` `.srt` `.vtt`) and Argus saves it to the library with the item
+buttons above. Telegram lets bots download files only up to 20 MB; for a
+bigger one Argus answers with an **Upload in Argus** button (the console's
+upload takes files up to `ARGUS_MEDIA_UPLOAD_MAX_MB`, 4096 by default).
+
+### `/media` and the console's Media section
+`/media` shows what the library holds and opens the console's **Media**
+section, which has five tabs:
+- **Library** — every saved video, audio file and transcript, newest first:
+  search titles, tags and gists; filter by type, group or tag.
+- **Get** — paste a link, **Read link** to see what it offers (the real
+  resolutions, the source audio bitrate), then save it as video at a chosen
+  quality or as **mp3** (320 kbps is mp3's maximum; V0 is high-quality VBR).
+  Or upload a file from the device (sent in pieces; keep the console open),
+  optionally transcribing it or making an mp3.
+- **Review** — tag suggestions waiting for you (below).
+- **Jobs** — downloads, conversions, transcripts and tagging in progress.
+  The list is lost on a bot restart; the files are not.
+- **Settings** — default video quality (shared with `/quality`), mp3
+  quality, transcript language and timestamps, auto-tagging, link lifetime.
+
+An item's page plays the file (seeking works), downloads it to the device,
+sends it to the chat, makes an mp3, transcribes it (language, timestamps),
+lists its parts (mp3s, transcripts) and can **add a transcript to a research
+run** — then **Continue** ingests it (as `/append` + `/continue`).
+
+### Tags and groups (you confirm them)
+After each download, upload or transcript, Argus asks the cheap model tier
+(role `media.tag`) for a few tags, one group, a two-line gist and the links it
+saw; GitHub repos in the description or transcript are always picked up. A
+suggestion is only a suggestion: it waits in **Review** (and in the chat, with
+**✅ Accept**) until you keep, drop or add tags and pick a group. Turn the
+automatic suggestion off in the media settings; **Suggest tags** on any item
+(or for up to 20 untagged items at once on the Review tab) asks again.
+
+Links to files are signed, expire, and only work through the console's
+current address — the quick tunnel changes it on every restart, so make a
+new link after one.
 
 ### Transcription engines
 - **YouTube** → caption extraction first (fast, no media download), then

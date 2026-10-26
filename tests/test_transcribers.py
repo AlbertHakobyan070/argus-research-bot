@@ -304,7 +304,7 @@ async def test_faster_whisper_maps_the_block_onto_whisper_model(tmp_path, monkey
 
 async def test_faster_whisper_all_silent_is_no_silent_empty_transcript(tmp_path, monkeypatch):
     monkeypatch.setattr(transcribers, "asr_available", lambda: True)
-    monkeypatch.setattr(transcribers, "_whisper_file", lambda path, key: ("", ""))
+    monkeypatch.setattr(transcribers, "_whisper_file", lambda path, key, language, timestamps: ("", ""))
     cfg = _cfg(faster_whisper=FW)
     with pytest.raises(TranscribeError, match="no speech"):
         await transcribers.asr_engine(cfg.transcriber, cfg).transcribe(tmp_path / "a.mp4")

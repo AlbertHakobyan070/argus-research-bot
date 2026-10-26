@@ -1,6 +1,6 @@
 // #/run/<id> — one run: progress (events polled every 2 s while a drive runs, the snapshot re-fetched
 // on stage end), the plan gate, the report gate, the report reader with tap-to-verify, Send to chat.
-import { get, post } from "../api.js";
+import { continueRun, get, post } from "../api.js";
 import {
   $, $$, act, clearMainButton, confirmDialog, esc, exaEstimate, LENGTHS, mainButton, openLink, RECENCY,
   showProblem, statusHtml, toast, usd, when,
@@ -19,7 +19,7 @@ export async function render(el, [id], ctx) {
   await moreEvents(s);
   el.innerHTML = `<div id="run-head"></div><div id="notice" hidden></div>
     <section class="sec" id="gate" hidden></section><section class="sec" id="report" hidden></section>
-    <section class="sec" id="progress"></section>`;
+    <section class="sec" id="appends" hidden></section><section class="sec" id="progress"></section>`;
   s.el = el;
   s.notice = $("#notice", el);
   paint(s);
@@ -102,7 +102,33 @@ function paint(s) {
   paintProgress(s);
   paintGate(s);
   paintReport(s);
+  paintAppends(s);
   window.UI.init(s.el);
+}
+
+/** Sources queued for the run (/append, or Add to run in the media library) and how they get in. */
+function paintAppends(s) {
+  const sec = $("#appends", s.el);
+  const pending = s.data.pending_sources || [];
+  const { run } = s.data;
+  sec.hidden = !pending.length;
+  if (!pending.length) { sec.innerHTML = ""; return; }
+  const canContinue = !run.in_flight && !run.awaiting;
+  const how = run.in_flight ? "They go in on the next Continue after this pass."
+    : run.awaiting === "report" ? "Extend at the report preview ingests them."
+    : run.awaiting === "plan" ? "Approve the plan first; a Continue after the run ingests them."
+    : "Continue ingests them: an append-only pass on a finished run, no new searches.";
+  sec.innerHTML = `<div class="sec-head"><span class="kicker">Queued sources</span><h2>${pending.length} source${pending.length === 1 ? "" : "s"} waiting</h2><p>${esc(how)}</p></div>
+    <ul class="pending-sources">${pending.map((p) => {
+      const m = /^asset:(\d+)$/.exec(p.ref);
+      return `<li>${m ? `<a href="#/media/item/${m[1]}">Library item ${m[1]}</a>` : esc(p.ref)}</li>`;
+    }).join("")}</ul>
+    ${canContinue ? '<div class="btn-row"><button class="btn btn-a" type="button" id="continue-run"><i data-icon="play"></i>Continue run</button></div>' : ""}`;
+  const go = $("#continue-run", sec);
+  if (go) go.addEventListener("click", async () => {
+    const r = await act(go, s.notice, () => continueRun(s.id));
+    if (r) { toast(r.message || `Run ${s.id}: ${r.outcome}.`, "cost", "Continue"); await refresh(s); }
+  });
 }
 
 function paintHead(s) {

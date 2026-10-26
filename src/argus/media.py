@@ -267,6 +267,7 @@ class MediaResult(BaseModel):
     platform: str = ""
     path: str = ""
     info_json_path: str = ""
+    thumb_path: str = ""
     title: str = ""
     media_id: str = ""
     size_bytes: int = 0
@@ -275,9 +276,26 @@ class MediaResult(BaseModel):
     elapsed_s: float = 0.0
 
 
+# mp3 quality: "320" is mp3's ceiling (CBR), "v0" the best VBR (~245 kbit/s).
+MP3_QUALITIES = ("320", "v0", "192", "128")
+
+
+def _mp3_ytdlp(q: str) -> str:
+    """``--audio-quality`` for an MP3_QUALITIES value."""
+    if q not in MP3_QUALITIES:
+        raise ValueError(f"mp3 quality must be one of {', '.join(MP3_QUALITIES)}, got {q!r}")
+    return "0" if q == "v0" else f"{q}K"
+
+
+def _mp3_ffmpeg(q: str) -> list[str]:
+    if q not in MP3_QUALITIES:
+        raise ValueError(f"mp3 quality must be one of {', '.join(MP3_QUALITIES)}, got {q!r}")
+    return ["-q:a", "0"] if q == "v0" else ["-b:a", f"{q}k"]
+
+
 def _build_argv(url: str, platform: str, dest_root: Path, fmt: str,
                 marker: Path, ffmpeg: str | None,
-                sort: str | None = None) -> list[str]:
+                sort: str | None = None, audio: str | None = None) -> list[str]:
     argv = [
         url,
         "-P", str(dest_root / platform),
@@ -304,8 +322,11 @@ def _build_argv(url: str, platform: str, dest_root: Path, fmt: str,
     ]
     if sort:
         argv += ["-S", sort]
+    if audio:
+        argv += ["-x", "--audio-format", "mp3", "--audio-quality", _mp3_ytdlp(audio)]
     if ffmpeg:
-        argv += ["--ffmpeg-location", ffmpeg]
+        # A jpg thumbnail beside the file, for the console's library cards.
+        argv += ["--ffmpeg-location", ffmpeg, "--write-thumbnail", "--convert-thumbnails", "jpg"]
     cookies_file = os.environ.get("ARGUS_YTDLP_COOKIES")
     cookies_browser = os.environ.get("ARGUS_YTDLP_COOKIES_BROWSER")
     if cookies_file:
@@ -430,15 +451,20 @@ async def download_media(
     on_progress: Callable[[float, str], None] | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     stall_s: int = STALL_TIMEOUT_S,
+    audio: str | None = None, any_url: bool = False,
 ) -> MediaResult:
     """Download one media URL into ``dest_root/<platform>/``.
+
+    ``audio`` (an MP3_QUALITIES value) fetches the best audio stream as
+    mp3 instead of the video. ``any_url`` lets yt-dlp try a link outside
+    the four platforms (into ``other/``).
 
     Returns a fail-soft :class:`MediaResult` — ``ok=False`` carries the
     downloader's stderr tail so the bot can surface WHY it failed
     (age-gate, login wall, dead link) instead of a generic error.
     """
     t0 = time.monotonic()
-    platform = detect_platform(url)
+    platform = detect_platform(url) or ("other" if any_url and _URL_RE.fullmatch(url or "") else None)
     if platform is None:
         return MediaResult(
             ok=False, url=url,
@@ -451,9 +477,12 @@ async def download_media(
     marker = plat_dir / f".argus_marker_{os.getpid()}_{time.monotonic_ns()}"
 
     ffmpeg = resolve_ffmpeg()
-    fmt = quality_format(quality, ffmpeg_available=bool(ffmpeg))
+    if audio and not ffmpeg:
+        return MediaResult(ok=False, url=url, platform=platform,
+                           error="mp3 needs ffmpeg (set ARGUS_FFMPEG or install imageio-ffmpeg)")
+    fmt = "ba/b" if audio else quality_format(quality, ffmpeg_available=bool(ffmpeg))
     argv = _build_argv(url, platform, dest_root, fmt, marker, ffmpeg,
-                       quality_sort(quality))
+                       None if audio else quality_sort(quality), audio=audio)
     cmd = [*_YTDLP_PREFIX, *argv]
 
     def _on_line(line: str) -> None:
@@ -515,9 +544,11 @@ async def download_media(
         except Exception:
             logger.warning("could not parse info.json %s", info_path)
 
+    thumb = final_path.with_suffix(".jpg")
     return MediaResult(
         ok=True, url=url, platform=platform, path=str(final_path),
         info_json_path=str(info_path) if info_path.exists() else "",
+        thumb_path=str(thumb) if thumb.exists() else "",
         title=title, media_id=media_id,
         size_bytes=final_path.stat().st_size,
         duration_s=float(duration) if duration is not None else None,
@@ -598,6 +629,106 @@ async def _run_ffmpeg(cmd: list[str], *, stdin: bytes | None = None, timeout_s: 
     if proc.returncode != 0:
         tail = (err or b"").decode("utf-8", "replace").strip()[-500:]
         raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {tail}")
+
+
+# ---------------------------------------------------------------------------
+# The console's media actions: probe a link, mp3 from a file, duration, thumbnail
+# ---------------------------------------------------------------------------
+
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+_OUT_TIME_RE = re.compile(r"^out_time_(?:us|ms)=(\d+)$")
+
+
+async def probe_url(url: str, *, timeout_s: int = 90) -> dict[str, Any]:
+    """What a link offers, without downloading: title, duration, uploader,
+    the video heights on offer (short side, i.e. orientation-free) and the
+    best audio bitrate. Raises ``RuntimeError`` with the downloader's
+    explained error."""
+    # One JSON line of often several hundred KB: communicate(), not the
+    # line-streaming runner (its readline limit is 64 KB).
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = await asyncio.create_subprocess_exec(
+        *_YTDLP_PREFIX, "-J", "--no-playlist", "--no-warnings", url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
+    except BaseException as e:                  # timeout or cancel: never leave yt-dlp running
+        _kill_tree(proc.pid)
+        await proc.wait()
+        if isinstance(e, TimeoutError):
+            raise RuntimeError(f"reading the link timed out after {timeout_s}s") from e
+        raise
+    try:
+        info = json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        stderr = err.decode("utf-8", "replace").strip()
+        raise RuntimeError(explain_error(stderr or f"yt-dlp exited {proc.returncode} without metadata")[-800:]) from None
+    fmts = info.get("formats") or []
+    heights = sorted({min(f["width"], f["height"]) for f in fmts
+                      if f.get("vcodec") not in (None, "none") and f.get("width") and f.get("height")})
+    abr = max((f.get("abr") or 0 for f in fmts if f.get("acodec") not in (None, "none")), default=0)
+    return {"url": url, "platform": detect_platform(url) or "other", "title": info.get("title") or "",
+            "uploader": info.get("uploader") or info.get("channel") or "", "duration_s": info.get("duration"),
+            "heights": heights, "audio_kbps": round(abr) or None,
+            "description": (info.get("description") or "")[:600]}
+
+
+async def media_duration(path: Path | str, *, ffmpeg: str | None = None) -> float | None:
+    """The duration ffmpeg reads from a file's header, or None (no ffmpeg,
+    or no duration in the header)."""
+    ffmpeg = ffmpeg or resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    proc = await asyncio.create_subprocess_exec(ffmpeg, "-hide_banner", "-nostdin", "-i", str(path),
+                                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()        # exits 1 (no output named): the header is all we want
+    m = _DURATION_RE.search((err or b"").decode("utf-8", "replace"))
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
+
+
+async def make_thumbnail(src: Path | str, dest: Path | str, *, ffmpeg: str | None = None) -> bool:
+    """One frame of ``src`` (3 s in, 480 px wide) as a jpg; False when there
+    is no ffmpeg or no video frame (an audio file) — a card shows its glyph."""
+    ffmpeg = ffmpeg or resolve_ffmpeg()
+    if not ffmpeg:
+        return False
+    try:
+        await _run_ffmpeg([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", "3", "-i",
+                           str(src), "-frames:v", "1", "-vf", "scale=480:-2", str(dest)], timeout_s=60)
+    except RuntimeError as e:
+        logger.info("no thumbnail for %s: %s", src, e)
+        return False
+    return Path(dest).is_file()
+
+
+async def convert_to_mp3(src: Path | str, dest: Path | str, *, quality: str = "320",
+                         duration_s: float | None = None,
+                         on_progress: Callable[[float, str], None] | None = None,
+                         timeout_s: int = DEFAULT_TIMEOUT_S) -> Path:
+    """The audio of ``src`` as an mp3 at ``quality`` (MP3_QUALITIES), with
+    ffmpeg's progress as a percentage when the duration is known. Written to
+    ``dest`` via a ``.part`` file, so a failure never leaves a half mp3.
+    Raises ``RuntimeError`` (no ffmpeg, ffmpeg's error, the stall/timeout)."""
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("mp3 needs ffmpeg (set ARGUS_FFMPEG or install imageio-ffmpeg)")
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".part")
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-vn",
+           "-map_metadata", "0", "-c:a", "libmp3lame", *_mp3_ffmpeg(quality), "-f", "mp3",
+           "-progress", "pipe:1", str(part)]
+
+    def on_line(line: str) -> None:
+        m = _OUT_TIME_RE.match(line.strip())
+        if m and duration_s and on_progress is not None:
+            on_progress(min(99.0, int(m.group(1)) / 1e6 / duration_s * 100), "")
+
+    rc, stderr = await _run_streaming(cmd, timeout_s=timeout_s, on_line=on_line)
+    if rc != 0 or not part.is_file():
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg failed ({rc}): {stderr.strip()[-500:]}")
+    part.replace(dest)
+    return dest
 
 
 # ---------------------------------------------------------------------------

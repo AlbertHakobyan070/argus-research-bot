@@ -52,6 +52,7 @@ class Deps:
     allowed_user_id: int
     max_age_s: float
     reports_root: Path
+    settings: Any = None             # config.Settings: the vault roots the media routes write to and serve from
 
 
 DEPS = web.AppKey("deps", Deps)
@@ -287,6 +288,7 @@ async def get_run(request: web.Request) -> web.Response:
             "compose_runs": v.get("compose_runs") or 0,
             "gap_waves": v.get("gap_waves") or 0,
         },
+        "pending_sources": await d.library.pending_sources(run_id),   # queued by /append or the media library
         "last_seq": snap["last_seq"],
     })
 
@@ -385,6 +387,28 @@ async def cancel(request: web.Request) -> web.Response:
     return _outcome(await d.runs.cancel_run(run_id, actor="webapp"))
 
 
+async def continue_run(request: web.Request) -> web.Response:
+    """Continue, as ``/continue``: a finished run is extended with its
+    pending appended sources (append-only, no new searches) or a fresh
+    search pass; a stopped one resumes; one at a gate is re-attached. The
+    next report gate marks each append, naming failures in the chat."""
+    from ..bot.common import _safe_send                     # lazy: bot.app imports the webapp
+    from ..bot.history import appends_marker, pending_appends
+    d, run_id = _deps(request), request.match_info["id"]
+    row = await _row(d, run_id)
+    graph = d.bot_data.get("graph")
+    if graph is None:
+        raise ApiError(409, "refused", "the bot is not fully initialized (no graph) — restart it")
+    pending, appended = await pending_appends(d.library, run_id)
+
+    async def reply(text: str) -> None:
+        await _safe_send(d.bot, row["chat_id"], text, parse_mode=None)
+
+    on_report = appends_marker(d.library, graph, {"configurable": {"thread_id": row["thread_id"]}}, run_id,
+                               pending, appended, reply)
+    return _outcome(await d.runs.continue_run(row, chat_id=row["chat_id"], appended=appended, on_report=on_report))
+
+
 async def _engines_body(d: Deps) -> dict:
     cfg = registry.current_config()
     config = cfg.model_dump(mode="json")
@@ -466,6 +490,7 @@ def setup(app: web.Application) -> None:
     r.add_post("/api/runs/{id}/plan", plan_action)
     r.add_post("/api/runs/{id}/report", report_action)
     r.add_post("/api/runs/{id}/cancel", cancel)
+    r.add_post("/api/runs/{id}/continue", continue_run)
     r.add_get("/api/engines", get_engines)
     r.add_put("/api/engines", put_engines)
     r.add_get("/api/engines/providers/{name}/models", provider_models)
