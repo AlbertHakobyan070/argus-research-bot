@@ -74,6 +74,7 @@ class ComposeConfig(BaseModel):
     dedupe_pass: bool = True
     section_min_notes: int = 2
     analyst: bool = True
+    calculations: Literal["auto", "off"] = "auto"   # graph/calc.py: worked numbers when the request asks for them
 
 
 class PanelConfig(BaseModel):

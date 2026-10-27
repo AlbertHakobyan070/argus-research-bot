@@ -34,6 +34,7 @@ from . import run_config
 from .archetypes import AGREEMENT, IMPLICATIONS, OPEN_QUESTIONS, SCENARIOS, TAKEAWAYS, TEMPLATES
 from .assemble import (ANALYSIS_SECTION, CITE_RE, assemble_draft, normalize_cite_markers, strip_fences,
                        strip_footnote_definitions)
+from .calc import worked_numbers
 from .compose import _footnote_lines, extract_findings
 from .research import _round
 from .state import ResearchBrief
@@ -329,6 +330,20 @@ def _emit(runtime: Runtime | None, kind: str, data: dict) -> None:
 
 
 def analyst_node(state, runtime: Runtime | None = None) -> dict:
+    """The analysis (``_analyse``), then the worked numbers over the findings it
+    leaves (``calc.worked_numbers``: ``calculations``, [] when none are due)."""
+    out = _analyse(state, runtime)
+    findings = out["findings"] if "findings" in out else list(state.get("findings") or [])
+    calc = worked_numbers(state, findings, rc=run_config.require(state), rnd=_round(state))
+    if "calculations" in calc or state.get("calculations"):       # new ones, or clear a past round's
+        out["calculations"] = calc.get("calculations") or []
+    for key in ("model_calls", "errors"):
+        if calc.get(key):
+            out[key] = [*(out.get(key) or []), *calc[key]]
+    return out
+
+
+def _analyse(state, runtime: Runtime | None = None) -> dict:
     """The analysis of the composed report (``analysis``, the findings with
     the analysis findings, an interim ``draft_md``); ``analysis`` None for
     ``tldr``, with ``compose.analyst`` off, without findings, or degraded.
