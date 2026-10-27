@@ -30,13 +30,13 @@ the run.
 | Stage | Job |
 |---|---|
 | `intake` | classify quick vs deep, refine the request |
-| `brief` | sub-questions, success criteria, archetype, time sensitivity, entities — no URLs, so hallucinated links are structurally impossible |
+| `brief` | sub-questions, success criteria, archetype, time sensitivity, entities — no URLs, so hallucinated links are structurally impossible; the links *you* typed are read first (GitHub metadata, README or page text, and at a repo or site root up to three parts that fit the question: docs, releases, changelog, pricing…), excerpted into the brief and pinned as sources |
 | `scout` | one live discovery wave per sub-question across the search providers; decides the recency window |
 | **PLAN GATE** | Approve / Edit / Cancel over the real found sources, with length, depth, engines-profile and recency knobs |
 | `research` | waves of rerank → fetch (an SSRF-guarded native fetcher, Exa text, optional intel-stack rungs) → digest (an LLM reads each document into claims with verbatim-checked quotes) under one spend ledger; gap waves and Extend passes are targeted and budgeted |
 | `outline` | sections with allocated evidence notes, shaped by the archetype; an Extend keeps the titles |
 | `compose` | parallel section writers over their own notes (plain markdown), then finding extraction per section |
-| `analyst` | takeaways with confidence labels, disagreements and scenarios, from the findings |
+| `analyst` | takeaways with confidence labels, disagreements and scenarios, from the findings; for a question that asks for numbers, worked calculations — the model proposes formulas, the code checks each input against the finding it cites (or takes it as a labelled assumption) and evaluates them |
 | `panel` | batched grounding judge (every finding judged against its cited quotes), coverage review, deterministic precision scan; routes to a gap wave, a targeted rewrite or the report |
 | `report_builder` | cuts rejected claims, compiles the TL;DR from kept findings, banners and degradation notes, Sources, PDF, `metadata.json`, `evidence.json` |
 | **REPORT GATE** | Send / Extend / Revise / Cancel |

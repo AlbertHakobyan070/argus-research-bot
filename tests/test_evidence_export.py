@@ -74,8 +74,8 @@ def test_the_document_follows_section_2_6_and_validates(tmp_path):
     Evidence.model_validate(doc)
     assert list(doc) == ["schema", "run", "run_config", "engines", "brief", "coverage", "gap_history",
                          "compose_runs", "revision_rounds", "gap_waves", "revise_rounds", "extend_rounds",
-                         "degraded", "sources", "notes", "findings", "analysis", "tldr", "panel", "search",
-                         "degradations", "errors"]
+                         "degraded", "sources", "notes", "findings", "analysis", "calculations", "tldr", "panel",
+                         "search", "degradations", "errors"]          # calculations: graph/calc.py (after §2.6)
     assert doc["schema"] == 1
     assert doc["run"] == {"run_id": "abcd1234", "thread_id": "tg:42:abcd1234", "topic": "How does it pause?",
                           "generated_at": "2026-10-20T10:00:00+04:00", "length": "medium", "depth": "standard",

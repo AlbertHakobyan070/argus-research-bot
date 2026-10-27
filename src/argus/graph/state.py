@@ -221,6 +221,7 @@ class ArgusState(TypedDict, total=False):
 
     # Research pipeline
     sources: list[dict]             # candidate sources from scout/research
+    anchors: list[dict]             # the user's own links, read before the brief (graph/anchors.py)
     fetched: list[dict]             # FetchedItem.model_dump() list
     findings: list[dict]            # Finding.model_dump() list
     draft_md: str                   # current draft markdown
@@ -247,6 +248,7 @@ class ArgusState(TypedDict, total=False):
                                     #   exa_contents_pages, exa_usd, arxiv_queries, ddgs_queries,
                                     #   github_queries, extend_allowances, recency, dropped_undated}
     analysis: dict | None           # analyst output (takeaways with confidence labels, …)
+    calculations: list[dict]        # graph/calc.py: checked, code-computed worked numbers
     tldr_md: str | None             # deterministic TL;DR, built by report_builder after the cuts
     coverage_gaps: list[int]        # sub-questions the next gap wave targets (it clears them)
     gap_history: list[dict]         # [{round, wave, sub_qs, new_strong, source: "coverage"|"judge"}]

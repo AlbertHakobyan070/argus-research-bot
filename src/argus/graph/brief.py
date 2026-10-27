@@ -5,7 +5,9 @@ source-kind hints, keywords, success criteria, and (v4, spec §3 WP-I) the
 report archetype, time sensitivity with a recency hint, the academic flag
 and the entity phrases the grounding check looks for. NO URLs — the scout
 searches live, so the LLM never gets a chance to invent links (the v2
-hallucinated-URL bug class is structurally impossible here).
+hallucinated-URL bug class is structurally impossible here). The links the
+USER typed are read first (``anchors``): the brief drafts from an excerpt of
+each, and each one read becomes a pinned source.
 
 A v2-compatible ``plan`` dict is emitted alongside the brief so the
 Telegram plan-gate renderer (``_format_plan``) works unchanged.
@@ -26,7 +28,9 @@ import re
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .. import llm
+from ..engines.ledger import SpendLedger
 from . import run_config
+from .anchors import brief_context, plan_view, read_anchors
 from .archetypes import DEFAULT_ARCHETYPE, TEMPLATES
 from .grounding import normalise
 from .jsonx import parse_json_obj
@@ -68,6 +72,11 @@ Rules:
   "Bitcoin price outlook for Q4" → ["Bitcoin"];
   "LangGraph vs CrewAI" → ["LangGraph", "CrewAI"];
   a general topic that names nothing specific ("causes of inflation") → [].
+- When the request comes with CONTEXT FROM THE USER'S LINKS, those pages
+  are what the request is about or refers to: write sub-questions about
+  that specific project, product or page (what it is and does, who it is
+  for, how it is built, how it compares), name it in entities, and use
+  its own terms in the keywords — never only the generic market around it.
 - Do NOT include URLs anywhere. Live search finds the sources.
 
 Return ONLY JSON:
@@ -190,11 +199,13 @@ def _parse_brief(text: str, asked: str = "") -> ResearchBrief:
     )
 
 
-def brief_to_plan(brief: ResearchBrief, queries: list[dict] | None = None) -> dict:
+def brief_to_plan(brief: ResearchBrief, queries: list[dict] | None = None,
+                  anchors: list[dict] | None = None) -> dict:
     """v2-compatible plan dict for the Telegram plan-gate renderer.
 
     ``_format_plan`` reads sub_questions (strings), planned_sources
-    (kind + query), must_have_keywords, summary.
+    (kind + query), must_have_keywords, summary, and ``anchors`` (the user's
+    links: what was read, or why not).
     """
     planned_sources = []
     for q in (queries or []):
@@ -219,6 +230,7 @@ def brief_to_plan(brief: ResearchBrief, queries: list[dict] | None = None) -> di
         "planned_sources": planned_sources,
         "must_have_keywords": list(brief.must_have_keywords),
         "summary": brief.summary,
+        "anchors": plan_view(anchors or []),
     }
 
 
@@ -233,26 +245,33 @@ def brief_node(state) -> dict:
     # what the entity phrases must come from: an entity of an earlier plan edit survives the next one
     asked = "\n".join([user_request, feedback, *((prev or {}).get("entities") or [])])
     calls: list[dict] = []
+    # the user's own links, read before drafting (a re-draft keeps those already read) — from the user's
+    # own words too: intake's refined request may drop a link ("…from the provided GitHub URL", run e02ea8b8)
+    raw = next((m.get("content") or "" for m in state.get("messages") or [] if m.get("role") == "user"), "")
+    ledger = SpendLedger.for_run(rc, state.get("search_spend"))
+    anchors, anchor_sources, errors = read_anchors(f"{raw}\n{user_request}\n{feedback}", rc=rc, ledger=ledger,
+                                                   known=state.get("anchors"))
+    context = brief_context(anchors)
+    context = f"\n{context}\n" if context else ""
 
     def _draft(extra: str = "") -> ResearchBrief:
         if feedback:
             human = (
-                f"Topic / question: {user_request}\n\n"
+                f"Topic / question: {user_request}\n{context}\n"
                 f"PREVIOUS BRIEF (JSON):\n{json.dumps(prev or {}, indent=2)}\n\n"
                 f"USER FEEDBACK — revise the brief accordingly:\n{feedback}\n"
                 f"{extra}\n\nReturn the revised brief as JSON."
             )
         else:
-            human = (f"Topic / question: {user_request}\n{extra}\n"
+            human = (f"Topic / question: {user_request}\n{context}{extra}\n"
                      "Draft the research brief as JSON.")
         res = llm.complete("brief.draft", [SystemMessage(content=BRIEF_SYSTEM),
-                                           HumanMessage(content=human[:8000])],
+                                           HumanMessage(content=human[:14000])],
                            engines=rc.engines, temperature=0.2, max_tokens=1200,
                            validate=lambda text: _parse_brief(text, asked))
         calls.extend(r.model_dump() for r in res.records)
         return res.parsed
 
-    errors: list[str] = []
     brief = _draft()
     failures = check_brief_quality(brief, user_request)
     if failures:
@@ -268,10 +287,16 @@ def brief_node(state) -> dict:
     if failures:
         errors.append(f"brief: weak after re-draft: {failures}")
 
-    plan = brief_to_plan(brief)
-    msg = (f"📋 Brief drafted: {len(brief.sub_questions)} sub-questions. "
-           "Scouting live sources…")
+    plan = brief_to_plan(brief, anchors=anchors)
+    read = sum(1 for a in anchors if a["ok"])
+    msg = (f"📋 Brief drafted: {len(brief.sub_questions)} sub-questions"
+           + (f", {read} of your {len(anchors)} link(s) read" if anchors else "")
+           + ". Scouting live sources…")
+    out_sources = {"sources": [*anchor_sources, *(state.get("sources") or [])]} if anchor_sources else {}
     return {
+        **out_sources,
+        "anchors": anchors,
+        "search_spend": ledger.snapshot(),
         "brief": brief.model_dump(),
         "plan": plan,
         "plan_feedback": "",   # consumed
