@@ -74,6 +74,19 @@ async def test_me(client, app, monkeypatch):
     assert (bot["allowed_user_id"], bot["public_url"], bot["console_ok"]) == (
         USER_ID, "https://a-b.trycloudflare.com", True)
     assert bot["active_profile"] is None and bot["version"]          # no engines config loaded here
+    assert body["appearance"] == {"mode": "telegram", "light": "ledger", "dark": "dark"}
+
+
+async def test_appearance_saves_and_refuses_unknown_themes(client):
+    r = await client.put("/api/appearance", headers=auth(), json={"mode": "dark", "dark": "slate"})
+    assert (await _json(r))["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate"}
+    body = await _json(await client.get("/api/me", headers=auth()))
+    assert body["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate"}
+    for bad in ({"mode": "neon"}, {"light": "dark"}, {"dark": "paper"}):
+        r = await client.put("/api/appearance", headers=auth(), json=bad)
+        assert r.status == 400, bad
+    body = await _json(await client.get("/api/me", headers=auth()))
+    assert body["appearance"]["dark"] == "slate"                   # a refused change saves nothing
 
 
 # --- runs list and run view -------------------------------------------------

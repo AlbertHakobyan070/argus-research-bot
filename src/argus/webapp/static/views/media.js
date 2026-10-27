@@ -7,6 +7,7 @@ import { bytes, card, duration, jobToast, reviewPanel, TYPES } from "./media_com
 
 const TABS = [["library", "Library"], ["get", "Get"], ["review", "Review"], ["jobs", "Jobs"], ["settings", "Settings"]];
 const PAGE = 30;
+const TAG_PEEK = 8;                                // tags shown before "Show all"
 const JOB_POLL_MS = 2000;
 const MP3_LABEL = { 320: "320 kbps (mp3's maximum)", v0: "V0 VBR (~245 kbps, transparent)", 192: "192 kbps", 128: "128 kbps" };
 
@@ -31,7 +32,7 @@ async function library(t) {
         <div class="seg seg-s" role="radiogroup" aria-label="Type">${Object.entries(TYPES).map(([v, label]) => `<label><input type="radio" name="type" value="${v}"${v === "" ? " checked" : ""}><span>${esc(label)}</span></label>`).join("")}</div>
         <select class="input" name="group" aria-label="Group"><option value="">Every group</option>${t.facets.groups.map(([g, n]) => `<option value="${esc(g)}">${esc(g)} (${n})</option>`).join("")}</select>
       </form>
-      ${t.facets.tags.length ? `<div class="chips media-tagbar" role="group" aria-label="Filter by tag">${t.facets.tags.slice(0, 24).map(([tag, n]) => `<button class="chip" type="button" aria-pressed="false" data-tag="${esc(tag)}">#${esc(tag)} <span class="faint">${n}</span></button>`).join("")}</div>` : ""}
+      ${t.facets.tags.length ? `<div class="chips media-tagbar" role="group" aria-label="Filter by tag">${t.facets.tags.map(([tag, n]) => `<button class="chip" type="button" aria-pressed="false" data-tag="${esc(tag)}">#${esc(tag)} <span class="faint">${n}</span></button>`).join("")}${t.facets.tags.length > TAG_PEEK ? `<button class="chip chip-more" type="button" id="tag-more" aria-expanded="false"></button>` : ""}</div>` : ""}
       <p class="meta" id="lib-count"></p>
       <div class="media-grid" id="lib-grid"></div>
       <div class="btn-row"><button class="btn" type="button" id="lib-more" hidden>Show more</button></div>
@@ -65,13 +66,27 @@ async function library(t) {
     typing = setTimeout(() => load(false), e.target.name === "q" ? 300 : 0);
   });
   form.addEventListener("submit", (e) => e.preventDefault());
-  $$(".media-tagbar [data-tag]", t.root).forEach((b) => b.addEventListener("click", () => {
+  // The most used tags show; the rest wait behind "Show all" (a chosen tag stays visible either way).
+  const tagBtns = $$(".media-tagbar [data-tag]", t.root);
+  const tagMore = $("#tag-more", t.root);
+  const peekTags = () => {
+    const all = tagMore?.getAttribute("aria-expanded") === "true";
+    tagBtns.forEach((b, i) => { b.hidden = !all && i >= TAG_PEEK && b.dataset.tag !== f.tag; });
+    if (tagMore) tagMore.textContent = all ? "Show fewer" : `Show all ${tagBtns.length} tags…`;
+  };
+  tagMore?.addEventListener("click", () => {
+    tagMore.setAttribute("aria-expanded", String(tagMore.getAttribute("aria-expanded") !== "true"));
+    peekTags();
+  });
+  tagBtns.forEach((b) => b.addEventListener("click", () => {
     const on = f.tag !== b.dataset.tag;
-    $$(".media-tagbar [data-tag]", t.root).forEach((x) => x.setAttribute("aria-pressed", "false"));
+    tagBtns.forEach((x) => x.setAttribute("aria-pressed", "false"));
     b.setAttribute("aria-pressed", String(on));
     f.tag = on ? b.dataset.tag : "";
+    peekTags();
     load(false);
   }));
+  peekTags();
   more.addEventListener("click", () => load(true));
   t.cleanups.push(() => clearTimeout(typing));
   await load(false);

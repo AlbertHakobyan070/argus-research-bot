@@ -15,9 +15,10 @@ quotes it cites, and **cuts** what fails. You get Markdown, a PDF and an
 ## What it does
 
 - **Two checkpoints with you.** A plan gate over the real sources before
-  anything is fetched (approve, edit, set length, depth, engines and recency),
-  and a report gate before delivery (send, extend, revise, cancel).
-- **Trust first.** Links come only from live search, quotes are checked word
+  anything is fetched — only the links you put in the question are read
+  first, so the plan is about them (approve, edit, set length, depth, engines
+  and recency), and a report gate before delivery (send, extend, revise, cancel).
+- **Trust first.** Links come only from live search or from you, quotes are checked word
   for word, unsupported claims leave the body for an appendix, and anything
   unchecked is announced at the top of the report.
 - **Swappable engines.** `argus_engines.json` binds every pipeline role to a

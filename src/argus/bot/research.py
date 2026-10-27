@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..config import get_settings
+from ..graph.anchors import SOURCE as ANCHOR_SOURCE
 from ..graph.report_builder_helpers import render_degradation_notes
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS
 from . import common, runs
@@ -222,12 +223,30 @@ def _format_plan(p: dict) -> str:
     summary = plan.get("summary", "")
     sub_qs = plan.get("sub_questions") or []
     intents = plan.get("planned_sources") or []
+    anchors = plan.get("anchors") or []
     sources = p.get("sources")
+    if sources is not None:                       # the user's links have their own block
+        sources = [s for s in sources if s.get("source") != ANCHOR_SOURCE]
 
     def render(lim: dict) -> str:
         out = list(lines)
         if summary:
             out += [_md_escape(_clip(summary, lim["summary"])), ""]
+        if anchors:
+            out.append("*Read from your links:*")
+            for a in anchors:
+                url = (a.get("url") or "").replace("(", "%28").replace(")", "%29")
+                title = _md_inside(_clip(a.get("title") or url, 70), "]")
+                note = (f"{a.get('chars', 0):,} chars" + (f" — {_md_escape(_clip(a['about'], 90))}"
+                                                           if a.get("about") else "")
+                        if a.get("ok") else f"⚠️ not read: {_md_escape(_clip(a.get('error') or '', 90))}")
+                out.append(f"- [{title}]({url}) — {note}")
+                read = [p for p in a.get("pages") or [] if p.get("ok")]
+                if read:
+                    out.append("  ↳ also read: " + ", ".join(
+                        f"[{_md_inside(_clip(p.get('title') or '', 40), ']')}]"
+                        f"({(p.get('url') or '').replace('(', '%28').replace(')', '%29')})" for p in read))
+            out.append("")
         if sub_qs:
             out.append("*Sub-questions:*")
             out += [f"- {_md_escape(_clip(q, lim['sq_chars']))}" for q in sub_qs[:lim["sq"]]]

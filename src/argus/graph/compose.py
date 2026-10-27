@@ -230,7 +230,8 @@ def extract_findings(title: str, md: str, fetched: list[dict], *, engines, rnd: 
         res = llm.complete("compose.findings_extract", [
             SystemMessage(content=EXTRACT_SYSTEM),
             HumanMessage(content=f"Section: {title}\n\n{md}\n\nReturn the findings JSON.")],
-            engines=engines, temperature=0.1, max_tokens=2000, validate=_parse_findings, item=title)
+            # 4000: the proxy's reasoning models spend part of the budget thinking; at 2000 the JSON was cut off
+            engines=engines, temperature=0.1, max_tokens=4000, validate=_parse_findings, item=title)
     except llm.EngineSkipped as e:
         logger.warning("compose.findings_extract skipped for %r (%s)", title, e)
         return [], [a.model_dump() for a in e.attempts], [f"[r{rnd}] skip: compose.findings_extract {title} ({e})"]

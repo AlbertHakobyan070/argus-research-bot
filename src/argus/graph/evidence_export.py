@@ -137,6 +137,7 @@ class Evidence(_Strict):
     notes: list[Note]
     findings: list[Finding]
     analysis: Analysis | None
+    calculations: list[dict] = []    # graph/calc.py: inputs (figure + source ids, or assumption), formula, result
     tldr: Tldr
     panel: PanelVerdict
     search: Search
@@ -211,6 +212,7 @@ def write_evidence(path: Path, state, *, findings: list[dict], errors: list[str]
             "stance_map": analysis.get("stance_map") or {},
             "has_disagreement_section": bool(analysis.get("has_disagreement_section")),
             "has_scenarios": bool(analysis.get("has_scenarios"))},
+        "calculations": list(state.get("calculations") or []),
         "tldr": tldr,
         "panel": PanelVerdict.model_validate(state.get("panel_verdict") or {}).model_dump(),
         "search": {"queries": list(state.get("queries") or []), "spend": dict(spend)},

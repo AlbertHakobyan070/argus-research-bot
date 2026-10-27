@@ -9,6 +9,7 @@ import * as mediaItem from "./views/media_item.js";
 import * as newRun from "./views/new.js";
 import * as run from "./views/run.js";
 import * as runs from "./views/runs.js";
+import * as settings from "./views/settings.js";
 
 const ROUTES = [
   [/^\/runs$/, runs, "runs"],
@@ -17,15 +18,28 @@ const ROUTES = [
   [/^\/engines$/, engines, "engines"],
   [/^\/media(?:\/(library|get|review|jobs|settings))?$/, media, "media"],
   [/^\/media\/item\/(\d+)$/, mediaItem, "media"],
+  [/^\/settings$/, settings, "settings"],
 ];
 const view = $("#view");
 let cleanup = null;
 let authFailed = false;
+let shownPath = null;                      // a new view opens at the top; a refresh keeps the place
+let routeSeq = 0;                          // the latest route; an older view still loading is stale
 
-// ---- theme: the kit's dark when Telegram says dark, else the default ledger (no picker, no OS fallback)
+// ---- theme: the saved appearance (#/settings) — Telegram's light/dark or a pinned one, then which kit
+// theme; Telegram's own header and background take the theme's ground colour
+let appearance = { mode: "telegram", light: "ledger", dark: "dark" };
 function applyTheme() {
-  document.documentElement.setAttribute("data-theme", tg()?.colorScheme === "dark" ? "dark" : "ledger");
+  const webApp = tg();
+  const dark = appearance.mode === "dark" || (appearance.mode === "telegram" && webApp?.colorScheme === "dark");
+  document.documentElement.setAttribute("data-theme", dark ? appearance.dark : appearance.light);
+  const ground = getComputedStyle(document.documentElement).getPropertyValue("--ground").trim();
+  if (/^#[0-9a-f]{6}$/i.test(ground) && webApp?.isVersionAtLeast?.("6.9")) {
+    webApp.setHeaderColor(ground);
+    webApp.setBackgroundColor(ground);
+  }
 }
+window.addEventListener("argus:appearance", (e) => { appearance = e.detail; applyTheme(); });
 
 function crumbs(items) {
   $("#crumbs").innerHTML = [["#/runs", "Argus"], ...items].map(([href, label], i, all) => (i === all.length - 1
@@ -58,27 +72,37 @@ const goBack = () => { if (history.length > 1) history.back(); else location.has
 
 async function route() {
   if (authFailed) return;
+  const seq = ++routeSeq;
+  const current = () => seq === routeSeq;
   if (cleanup) { cleanup(); cleanup = null; }
   clearMainButton();
   const path = location.hash.replace(/^#/, "") || "/runs";
   const hit = ROUTES.map(([re, mod, nav]) => [path.match(re), mod, nav]).find(([m]) => m);
   if (!hit) { location.replace("#/runs"); return; }
   const [m, mod, nav] = hit;
+  if (path !== shownPath) { window.scrollTo(0, 0); shownPath = path; }
   $$("#nav a").forEach((a) => {
     const on = a.dataset.route === nav;
     a.classList.toggle("on", on);
     if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   });
   backButton(path !== "/runs", goBack);
+  // Each view paints its own box: one that answers after a newer route paints a detached box nobody sees,
+  // and its cleanup (polling, buttons) runs at once.
+  const box = document.createElement("div");
+  view.replaceChildren(box);
   view.setAttribute("aria-busy", "true");
   try {
-    cleanup = (await mod.render(view, m.slice(1), { crumbs })) || null;
+    const done = (await mod.render(box, m.slice(1), { crumbs: (items) => { if (current()) crumbs(items); } })) || null;
+    if (!current()) { done?.(); return; }
+    cleanup = done;
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
+    if (!current()) return;                // the newer view shows; this one's load failure is moot
     if (e.status === 401 || e.status === 403) { showAuth(e); return; }
     showLoadProblem(e);
   } finally {
-    view.removeAttribute("aria-busy");
+    if (current()) view.removeAttribute("aria-busy");
   }
   window.UI.init(view);
 }
@@ -96,7 +120,9 @@ async function start() {
   window.addEventListener("hashchange", () => route());
   try {
     const me = await get.me();
-    $("#who").textContent = `${me.user.first_name || me.user.id} · Argus ${me.bot.version}`;
+    appearance = me.appearance;
+    applyTheme();
+    $("#who").textContent = `Signed in as ${me.user.first_name || me.user.id} · Argus ${me.bot.version}`;
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
     if (e.status === 401 || e.status === 403) { showAuth(e); return; }

@@ -21,7 +21,7 @@ from ..citations import SourceRegistry, sanitize_report, verify_citations
 from ..engines.registry import summarize_calls
 from ..sources_block import sanitize_sources_block
 from ..tools import markdown_to_pdf
-from . import precision, run_config
+from . import calc, precision, run_config
 from .assemble import ANALYSIS_SECTION, assemble_draft
 from .evidence_export import DEGRADATION_LINE, run_config_dump, write_evidence
 from .grounding import check_grounding, grounding_banner
@@ -185,6 +185,10 @@ def report_builder_node(state: ArgusState) -> dict:
             tldr_md = TLDR_LABEL + "\n\n" + "\n".join(f"- {i}" for i in items)
         else:
             new_errors.append(f"[r{rnd}] tldr: omitted — no kept takeaway or finding")
+        worked, gone = calc.render_appendix(state.get("calculations") or [],
+                                            {f["id"] for f in findings if f.get("status") == "kept" and f.get("id")})
+        appendices.insert(0, worked)
+        new_errors += [f"[r{rnd}] calc: dropped {label!r} — a figure it uses was cut" for label in gone]
         if rc.panel.precision_mode == "deterministic":
             appendices.append(precision.render_appendix(precision.scan(
                 "\n\n".join([*(s["md"] for s in kept_sections), analysis_md]))))

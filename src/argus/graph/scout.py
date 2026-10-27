@@ -4,7 +4,8 @@ For every brief sub-question, plan 1-2 targeted queries (one cheap
 batched LLM call, ``scout.querygen``; degrade → the sub-question text
 queries) and run them as one search wave (``engines/search.run_wave``,
 first-pass budget) across Exa / DDGS / arXiv / GitHub. Search-API only —
-no page fetching happens before the user approves the plan.
+no page fetching happens before the user approves the plan, except the
+links the user typed into the question (``anchors``, read by the brief).
 
 Output feeds the plan gate: ``sources`` (real, live URLs tagged with the
 sub-questions they serve, deduped by canonical URL) + an updated ``plan``
@@ -24,6 +25,7 @@ from ..engines.ledger import SpendLedger
 from ..engines.search import resolve_recency, run_wave
 from ..engines.urls import canonical_url
 from . import run_config
+from .anchors import SOURCE as ANCHOR_SOURCE
 from .brief import brief_to_plan
 from .jsonx import parse_json_obj
 from .search_providers import exa_enabled
@@ -193,8 +195,12 @@ def scout_node(state, runtime: Runtime | None = None) -> dict:
             final.append(dict(s))
             seen.add(key)
     final = final[:SCOUT_SOURCE_CAP]
+    # the user's own links serve every sub-question: their notes count for each one's coverage
+    for s in final:
+        if s.get("source") == ANCHOR_SOURCE:
+            s["sub_qs"] = list(range(len(brief.sub_questions)))
 
-    plan = brief_to_plan(brief, queries)
+    plan = brief_to_plan(brief, queries, anchors=state.get("anchors"))
     message = (f"🔎 Scout: {len(final)} candidate source(s) from {len(queries)} live "
                "queries — awaiting your approval.")
     _emit(runtime, "stage", {"status": "end", "summary": message})

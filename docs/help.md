@@ -22,8 +22,17 @@ live progress card (stage, counts, last event) follows the run while it works.
    wave first* (Exa/DDGS/arXiv/GitHub), then shows you the sub-questions plus
    the **real sources it found** (title + URL). The brief carries no URLs at
    all, so hallucinated links are structurally impossible — you approve
-   actual evidence. The card also names the report's archetype, the recency
-   window, the engines profile and an Exa cost estimate (when Exa is on).
+   actual evidence. Links you put in the question itself (a GitHub repo, a
+   product page, docs) are read before the brief, so the plan is about that
+   project; the card lists them under **Read from your links** (or says why
+   one could not be read), and research always reads them. A repo or a
+   site's front page also brings up to three of its most fitting parts —
+   for a repo its docs, releases, changelog or homepage; for a site the
+   docs, pricing or feature pages it links to — picked by your question's
+   words. A deep link, or "only the README" / "just this page" in the
+   question, reads that page alone. The card also names the report's
+   archetype, the recency window, the engines profile and an Exa cost
+   estimate (when Exa is on).
    Buttons:
    - **Length** (TL;DR / Short / Medium / Long / Lecture) — the report's shape.
    - **Depth** (Quick / Standard / Deep / Exhaustive, or **Auto**, which
@@ -40,7 +49,11 @@ live progress card (stage, counts, last event) follows the run while it works.
    digested into evidence notes), the outline, the section writers, the
    analyst and the review panel, you see the report head. It opens with a
    quality line (how many findings were judged and how many claims were
-   cut), any warning banner, and the run's degradation notes.
+   cut), any warning banner, and the run's degradation notes. When the
+   question asks for numbers (costs, revenue, growth, "with calculations"),
+   the report ends with **Worked numbers**: each calculation's formula, its
+   inputs — a figure with the source that states it, or a labelled
+   assumption — and the result, computed by code rather than the model.
    Buttons:
    - **📤 Send** — deliver the `.md` + `.pdf` (and finish the run).
    - **🔎 Extend** — another research pass to deepen it (capped rounds).
@@ -93,7 +106,8 @@ The **Argus** menu button next to the chat's text field opens the console:
 the runs list, a run's live progress, its plan gate (with the same knobs as
 the chat card), the report with **tap-to-verify** citations (tap `[n]` to see
 the source and its quotes) and **Send to chat**, a new-research form, and
-the engines settings. It follows Telegram's light/dark theme. A session that
+the engines settings. **Appearance** picks a light and a dark theme and
+whether to follow Telegram's light/dark or always use one. A session that
 is too old shows "Session expired — reopen from the menu button".
 
 The console is optional: if it is down, research and media in chat keep

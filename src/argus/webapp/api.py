@@ -239,6 +239,19 @@ async def _report_file(d: Deps, run_id: str, key: str) -> Path:
 # routes
 # ---------------------------------------------------------------------------
 
+# The console's look: follow Telegram's light/dark, or pin one; a light and a dark theme from the kit.
+APPEARANCE_KEY = "console.appearance"
+APPEARANCE_MODES = ("telegram", "light", "dark")
+LIGHT_THEMES = ("ledger", "steel", "solar", "paper")
+DARK_THEMES = ("dark", "graphite", "slate", "contrast")
+APPEARANCE_DEFAULT = {"mode": "telegram", "light": "ledger", "dark": "dark"}
+
+
+async def _appearance(library) -> dict:
+    raw = await library.get_setting(APPEARANCE_KEY)
+    return {**APPEARANCE_DEFAULT, **(json.loads(raw) if raw else {})}
+
+
 async def me(request: web.Request) -> web.Response:
     d, user = _deps(request), request[USER]
     try:
@@ -248,7 +261,20 @@ async def me(request: web.Request) -> web.Response:
     return _ok({"user": {"id": user.id, "first_name": user.first_name},
                 "bot": {"allowed_user_id": d.allowed_user_id, "active_profile": profile,
                         "public_url": d.bot_data.get("webapp_public_url") or None,
-                        "console_ok": d.bot_data.get("webapp_ok") is True, "version": __version__}})
+                        "console_ok": d.bot_data.get("webapp_ok") is True, "version": __version__},
+                "appearance": await _appearance(d.library)})
+
+
+async def put_appearance(request: web.Request) -> web.Response:
+    d, body = _deps(request), await _body(request)
+    cur = await _appearance(d.library)
+    for key, allowed in (("mode", APPEARANCE_MODES), ("light", LIGHT_THEMES), ("dark", DARK_THEMES)):
+        if key in body:
+            if body[key] not in allowed:
+                raise _bad(f"{key} must be one of {', '.join(allowed)}")
+            cur[key] = body[key]
+    await d.library.set_setting(APPEARANCE_KEY, json.dumps(cur))
+    return _ok({"appearance": cur})
 
 
 async def list_runs(request: web.Request) -> web.Response:
@@ -480,6 +506,7 @@ async def presets(request: web.Request) -> web.Response:
 def setup(app: web.Application) -> None:
     r = app.router
     r.add_get("/api/me", me)
+    r.add_put("/api/appearance", put_appearance)
     r.add_get("/api/runs", list_runs)
     r.add_post("/api/runs", start_run)
     r.add_get("/api/runs/{id}", get_run)

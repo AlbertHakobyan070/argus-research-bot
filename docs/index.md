@@ -8,10 +8,11 @@ separate judge check each claim against the quotes it cites, and cuts what
 fails. You get Markdown, a PDF and an `evidence.json`, and every claim in the
 report can be traced back to the page it came from.
 
-- **Two checkpoints with you.** A plan gate before anything is fetched
-  (approve, edit, set length, depth, engines and recency) and a report gate
-  before delivery (send, extend, revise, cancel).
-- **Trust first.** Links come only from live search, quotes are checked word
+- **Two checkpoints with you.** A plan gate before anything is fetched — only
+  the links you put in the question are read first — (approve, edit, set
+  length, depth, engines and recency) and a report gate before delivery (send,
+  extend, revise, cancel).
+- **Trust first.** Links come only from live search or from you, quotes are checked word
   for word, unsupported claims leave the body, and anything unchecked is
   announced at the top of the report.
 - **Swappable engines.** Every model role can run on the free proxy, a paid

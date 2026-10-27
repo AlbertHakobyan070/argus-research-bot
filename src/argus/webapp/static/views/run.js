@@ -229,10 +229,17 @@ function planBody(p) {
   const plan = p.plan || {};
   const subs = plan.sub_questions || [];
   const intents = plan.planned_sources || [];
-  const sources = p.sources || [];
+  const anchors = plan.anchors || [];
+  const sources = (p.sources || []).filter((x) => x.source !== "anchor");   // the user's links have their own block
   const shown = sources.slice(0, 12);
   return `${p.error ? `<aside class="callout" data-kind="trap"><h4>trap<i>The plan's settings do not fit</i></h4><p>${esc(p.error)}</p></aside>` : ""}
     ${plan.summary ? `<p class="lede plan-summary">${esc(plan.summary)}</p>` : ""}
+    ${anchors.length ? `<div class="plan-anchors"><h3>Read from your links</h3><ul>${anchors.map((a) => `<li>${link(a.url, a.title || host(a.url))} ${a.ok
+      ? `<span class="meta">${esc(Number(a.chars || 0).toLocaleString())} chars${a.about ? ` — ${esc(a.about)}` : ""}</span>`
+      : `<span class="tag" data-kind="trap">not read</span> <span class="meta">${esc(a.error || "")}</span>`}${(a.pages || []).length
+      ? `<ul class="plan-anchor-pages">${a.pages.map((g) => `<li>${link(g.url, g.title || host(g.url))} <span class="meta">${esc(g.why || "")}${g.ok
+        ? ` · ${esc(Number(g.chars || 0).toLocaleString())} chars` : ` · not read: ${esc(g.error || "")}`}</span></li>`).join("")}</ul>` : ""}</li>`).join("")}</ul>
+      <p class="meta">Pinned: research always reads them, outside the fetch budget.</p></div>` : ""}
     <div class="plan-grid">
       ${subs.length ? `<div><h3>Sub-questions</h3><ol>${subs.map((q) => `<li>${esc(q)}</li>`).join("")}</ol></div>` : ""}
       ${intents.length ? `<div><h3>Search intents</h3><ul>${intents.map((i) => `<li><code>${esc(i.kind || "search")}</code> ${esc(i.query || "live search")}</li>`).join("")}</ul></div>` : ""}
