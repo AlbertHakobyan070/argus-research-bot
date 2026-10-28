@@ -242,8 +242,10 @@ async def _report_file(d: Deps, run_id: str, key: str) -> Path:
 # The console's look: follow Telegram's light/dark, or pin one; a light and a dark theme from the kit.
 APPEARANCE_KEY = "console.appearance"
 APPEARANCE_MODES = ("telegram", "light", "dark")
-LIGHT_THEMES = ("ledger", "steel", "solar", "paper")
-DARK_THEMES = ("dark", "graphite", "slate", "contrast")
+# plus the imported Noetrix themes (scripts/import_noetrix_themes.py writes the listing)
+_NOETRIX = json.loads((Path(__file__).resolve().parent / "static" / "themes-noetrix.json").read_text(encoding="utf-8"))
+LIGHT_THEMES = ("ledger", "steel", "solar", "paper", *(t["id"] for t in _NOETRIX if t["mode"] == "light"))
+DARK_THEMES = ("dark", "graphite", "slate", "contrast", *(t["id"] for t in _NOETRIX if t["mode"] == "dark"))
 APPEARANCE_DEFAULT = {"mode": "telegram", "light": "ledger", "dark": "dark"}
 
 

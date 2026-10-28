@@ -10,8 +10,17 @@ const LIGHT = [["ledger", "Ledger", "warm parchment, amber"], ["steel", "Steel",
 const DARK = [["dark", "Ledger dark", "espresso, amber"], ["graphite", "Graphite", "blue-black, steel"],
   ["slate", "Slate", "deep slate, teal"], ["contrast", "Contrast", "black, signal yellow"]];
 
+// The imported Noetrix themes (scripts/import_noetrix_themes.py), appended once per page load.
+const noetrix = fetch("/static/themes-noetrix.json").then((r) => {
+  if (!r.ok) throw new Error(`themes-noetrix.json: HTTP ${r.status}`);
+  return r.json();
+}).then((list) => {
+  for (const t of list) (t.mode === "light" ? LIGHT : DARK).push([t.id, t.name, "Noetrix"]);
+});
+
 export async function render(el, _params, ctx) {
   ctx.crumbs([["", "Settings"]]);
+  await noetrix;
   let { appearance: a } = await get.me();
   const swatches = (key, label, themes) => `<div class="set-row stack"><span class="set-l"><b>${esc(label)}</b>
       <small id="${key}-name"></small></span>
