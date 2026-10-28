@@ -1,0 +1,52 @@
+[
+ {
+  "id": "tokyo-night",
+  "name": "Tokyo Night",
+  "mode": "dark"
+ },
+ {
+  "id": "nordic-slate-frosted-glass",
+  "name": "Nordic Slate & Frosted Glass",
+  "mode": "light"
+ },
+ {
+  "id": "atelier-cream-indigo",
+  "name": "Atelier Cream & Indigo",
+  "mode": "light"
+ },
+ {
+  "id": "matcha-dragon-fruit",
+  "name": "Matcha & Dragon Fruit",
+  "mode": "light"
+ },
+ {
+  "id": "retro-futuristic",
+  "name": "Retro-Futuristic",
+  "mode": "light"
+ },
+ {
+  "id": "matcha-dragon-fruit-dark",
+  "name": "Matcha & Dragon Fruit dark",
+  "mode": "dark"
+ },
+ {
+  "id": "obsidian-electric-iris",
+  "name": "Obsidian & Electric Iris",
+  "mode": "dark"
+ },
+ {
+  "id": "warm-espresso-smoked-coppe",
+  "name": "Warm Espresso & Smoked Copper",
+  "mode": "dark"
+ },
+ {
+  "id": "high-voltage",
+  "name": "High Voltage",
+  "mode": "dark"
+ },
+ {
+  "id": "midnight-sorbet",
+  "name": "Midnight Sorbet",
+  "mode": "dark"
+ }
+]
