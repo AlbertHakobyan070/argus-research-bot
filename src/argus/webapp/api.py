@@ -27,7 +27,7 @@ from aiohttp import web
 from pydantic import ValidationError
 from telegram.error import TelegramError
 
-from .. import __version__
+from .. import __version__, updates
 from ..engines import registry
 from ..engines.registry import EngineConfigError
 from ..engines.schema import ProfileOverrides, TranscriberConfig
@@ -497,6 +497,26 @@ async def provider_models(request: web.Request) -> web.Response:
     return _ok({"provider": name, "models": await asyncio.to_thread(registry.live_models, name)})
 
 
+async def get_updates(request: web.Request) -> web.Response:
+    return _ok({"components": await updates.status()})
+
+
+async def post_update(request: web.Request) -> web.Response:
+    """Upgrade one component of ``updates.COMPONENTS`` (the path names it; no
+    body is read): 409 ``busy`` / ``refused`` (it would change other
+    packages), 502 ``failed`` (uv's own error)."""
+    name = request.match_info["name"]
+    if name not in updates.COMPONENTS:
+        raise ApiError(404, "not_found", f"no updatable component {name!r}")
+    try:
+        result = await updates.upgrade(name)
+    except updates.UpdateError as e:
+        logger.warning("webapp: update %s %s: %s", name, e.code, e)
+        raise ApiError(502 if e.code == "failed" else 409, e.code, str(e)) from None
+    logger.info("webapp: update %s: %s", name, result["changes"] or "already up to date")
+    return _ok({**result, "components": await updates.status()})
+
+
 async def presets(request: web.Request) -> web.Response:
     exa = registry.current_config().pricing.exa
     return _ok({"presets": PRESETS, "default_depth": {n: RunConfig.default_depth(n) for n in VALID_LENGTHS},
@@ -522,3 +542,5 @@ def setup(app: web.Application) -> None:
     r.add_put("/api/engines", put_engines)
     r.add_get("/api/engines/providers/{name}/models", provider_models)
     r.add_get("/api/config/presets", presets)
+    r.add_get("/api/updates", get_updates)
+    r.add_post("/api/updates/{name}", post_update)

@@ -63,6 +63,10 @@ export const post = {
 export const putEngines = (body) => api("/api/engines", { method: "PUT", body });
 export const continueRun = (id) => api(`/api/runs/${enc(id)}/continue`, { method: "POST" });
 export const saveAppearance = (body) => api("/api/appearance", { method: "PUT", body });
+export const updates = {
+  list: () => api("/api/updates"),
+  run: (name) => api(`/api/updates/${enc(name)}`, { method: "POST" }),
+};
 
 /** The media library (webapp/media_api.py). */
 export const media = {

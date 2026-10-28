@@ -126,6 +126,32 @@ def strip_reasoning(text: str) -> str:
     return _REASONING_BLOCK.sub("", text or "").strip()
 
 
+# Untagged reasoning some models put in ``content`` (seen: "Okay, let's tackle this section. The
+# user wants…", and a prompt echo followed by "We need… / We must… / Let's extract facts:").
+_PLANNING_LINE = re.compile(
+    r"(?:okay|ok|alright|hmm|so)\b[,.!]?\s+(?:let(?:'|’)?s|let me|i\b|we\b|the user|first|now)"
+    r"|let(?:'|’)?s (?:tackle|extract|start by|begin by|see|check|think|look closer|re-?evaluate)"
+    r"|let me\b|i need to\b|i should\b|i must\b|we need\b|we must\b"
+    r"|the user (?:wants|asks|is asking|has asked|provided|requested)\b", re.IGNORECASE)
+_REASONING_OPEN = re.compile(r"\s*<(?:think|thinking|reasoning|analysis)>", re.IGNORECASE)
+# Markdown roles whose caller drops (and records) the text before its fixed headings itself (insight.py).
+_OWN_PREAMBLE_ROLES = frozenset({"compose.analyst"})
+
+
+def reject_reasoning(text: str) -> None:
+    """Raise ValueError when a markdown reply is a reasoning trace: its first
+    line opens like one, or three of its lines do. Prompt-agnostic heuristic;
+    report prose (third person, cited) does not open lines this way. An
+    opening reasoning tag left by ``strip_reasoning`` (cut off, never closed)
+    is one too."""
+    if _REASONING_OPEN.match(text):
+        raise ValueError(f"unclosed reasoning block in the reply: {text.strip()[:120]!r}")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if _PLANNING_LINE.match(ln)]
+    if hits and (hits[0] is lines[0] or len(hits) >= 3):
+        raise ValueError(f"untagged reasoning trace in the reply: {hits[0][:120]!r}")
+
+
 _TRANSIENT_TRIES = 3
 _QUOTA_STEP_S = 30.0                # one wait while a provider's quota_wait_s lasts
 _QUOTA_LATCH_S = 60.0               # a provider found out of quota fails at once this long
@@ -296,10 +322,10 @@ def _on_engine(role: str, binding: ResolvedBinding, engine: EngineSpec, rank: in
             truncated, reason = True, "truncated"
             budget = _TRUNCATION_CAP if budget is None else min(budget * 2, _TRUNCATION_CAP)
             continue
-        if validate is None:
-            return LLMResult(text=text, parsed=NOT_VALIDATED, record=rec, records=list(records))
         try:
-            parsed = validate(text)
+            if not expect_json and role not in _OWN_PREAMBLE_ROLES:   # a reasoning trace is never the answer
+                reject_reasoning(text)
+            parsed = NOT_VALIDATED if validate is None else validate(text)
         except Exception as e:   # the hook rejecting a reply is an outcome: recorded, retried, then on_exhausted
             rec.ok, rec.error = False, f"unparseable: {type(e).__name__}: {e}"[:300]
             if nudged:
