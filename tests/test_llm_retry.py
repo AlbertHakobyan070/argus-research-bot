@@ -206,3 +206,58 @@ def test_rpm_limit_waits_for_the_sliding_window(env, monkeypatch):
     for _ in range(3):
         llm.complete("brief.draft", MSGS, engines=_snap())
     assert env.sleeps == [60.0], "the third request in one minute waits for the window"
+
+
+# Untagged reasoning on a markdown role, as shipped in run 8a0b122d's "Competitive
+# Landscape" section (meta/muse-glimmer-30b, finish_reason=length) — verbatim excerpt.
+_LEAK_ECHO = """Report topic: Analyze viability and monetization strategies for worldwide knowledge archive platform featuring interactive maps, timeline sliders, cultural data, future university integration. Provide recommendations for business model, revenue streams, growth strategy.
+Section: The Competitive Landscape: Existing Platforms and Models
+Target ~3200 chars.
+
+We need use ONLY evidence notes provided. Cite with [n] immediately after each factual claim, where n is source id. Multiple ids allowed.
+
+Every number, date, name must come from claim/quote in evidence.
+
+We need to use evidence notes: [1] Memory Mapper, [4] Peripleo, [10] HistoAtlas, [17] Historica, [20] OldMapsOnline.
+
+We must cite each factual claim.
+
+Let's extract facts:
+
+Memory Mapper: open-source web application for mapping cultural heritage developed at UCL [1]."""
+# The other shape (run 20260715 DSpark lecture): reasoning opens the reply.
+_LEAK_OPENER = ("Okay, let's tackle this section on DSpark's speculative decoding. The user wants a focus on core "
+                "principles and mechanisms, specifically answering the sub-question about the core principles.\n\n"
+                "Speculative decoding drafts tokens with a small model and verifies them with the large one [1].")
+_CLEAN_SECTION = ("A worldwide knowledge archive with interactive maps, timeline sliders, and cultural data is technically "
+                  "feasible: multiple production systems demonstrate the core stack. Annalium delivers a free, no-login "
+                  "world-history map with multi-track timeline using PostGIS for spatial-temporal queries [26].")
+
+
+def _section_snap() -> EnginesSnapshot:
+    b = ResolvedBinding(role="compose.section", tier="strong", primary=EngineSpec(provider="p", model="m"),
+                        fallbacks=[EngineSpec(provider="f", model="m")], on_exhausted="skip_item",
+                        retry_on_truncation=True)
+    return EnginesSnapshot(profile="t", resolved_at="2026-10-19T00:00:00+00:00", roles={"compose.section": b})
+
+
+@pytest.mark.parametrize("leak", [_LEAK_ECHO, _LEAK_OPENER, "<think>\n" + _LEAK_OPENER],
+                         ids=["prompt-echo", "opener", "unclosed-think"])
+def test_an_untagged_reasoning_trace_on_a_markdown_role_is_rejected_and_retried(env, leak):
+    d = env.drive(_ok(leak), _ok(_CLEAN_SECTION))
+    out = llm.complete("compose.section", MSGS, engines=_section_snap())
+    assert d.calls == 2 and out.text == _CLEAN_SECTION
+    first, second = out.records
+    assert not first.ok and first.error.startswith("unparseable: ") and "reasoning" in first.error
+    assert second.ok and second.retry_reason == "unparseable"
+
+
+def test_a_reasoning_trace_from_every_engine_exhausts_the_role(env):
+    env.drive(*[_ok(_LEAK_ECHO)] * 4)
+    with pytest.raises(llm.EngineSkipped):
+        llm.complete("compose.section", MSGS, engines=_section_snap())
+
+
+def test_report_prose_is_not_mistaken_for_reasoning(env):
+    env.drive(_ok(_CLEAN_SECTION))
+    assert llm.complete("compose.section", MSGS, engines=_section_snap()).text == _CLEAN_SECTION
