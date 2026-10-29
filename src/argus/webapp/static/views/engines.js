@@ -202,8 +202,8 @@ function providersSec(s) {
     const key = p.api_key || {};
     const st = key.env === null ? '<span class="status" data-s="idle">keyless</span>'
       : key.present ? `<span class="status" data-s="good">${esc(key.env)} set</span>` : `<span class="status" data-s="critical">${esc(key.env)} missing</span>`;
-    return `<tr><td><b>${esc(p.name)}</b>${p.notes ? `<span class="meta row-id">${esc(p.notes)}</span>` : ""}</td><td class="mono url">${esc(p.base_url)}</td>
-      <td>${st}</td><td>${p.models_endpoint ? "live list" : `${(p.known_models || []).length} known`}</td></tr>`;
+    return `<tr class="prov"><td><b>${esc(p.name)}</b></td><td class="mono url">${esc(p.base_url)}</td>
+      <td>${st}</td><td>${p.models_endpoint ? "live list" : `${(p.known_models || []).length} known`}</td></tr>${p.notes ? `<tr class="prov-note"><td colspan="4">${esc(p.notes)}</td></tr>` : ""}`;
   }).join("");
   return `<section class="sec set-sec" id="providers" data-kicker="Providers">
       ${intro("Providers", "Where each engine runs. Read-only here: edit <code>argus_engines.json</code> to change one. Key values are never shown.")}

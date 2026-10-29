@@ -30,18 +30,21 @@ export const typeLabel = (it) => (it.format === "mp3" ? "MP3" : TYPE_LABEL[it.ty
 export const facts = (it) => [it.platform, duration(it.duration_s), bytes(it.bytes)].filter(Boolean).join(" · ");
 export const tagChips = (tags) => tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("");
 
-/** One library card: thumbnail (or the type as a word), title, facts, confirmed tags, the review state. */
+/** One library card: thumbnail when there is one, kicker, title, facts, a few tags, the review state.
+ *  No thumbnail means no placeholder block: the card is text only, so unthumbed items stay dense. */
+const TAGS_ON_CARD = 3;
 export function card(it) {
   const thumb = it.links.thumb
-    ? `<img src="${esc(it.links.thumb)}" alt="" loading="lazy">`
-    : `<span class="media-glyph">${esc(typeLabel(it))}</span>`;
+    ? `<span class="media-thumb" data-type="${esc(it.type)}"><img src="${esc(it.links.thumb)}" alt="" loading="lazy">${it.duration_s ? `<span class="media-dur">${esc(duration(it.duration_s))}</span>` : ""}</span>`
+    : "";
   const review = it.review === "pending" ? '<span class="status" data-s="serious">Tags to review</span>' : "";
-  return `<a class="card media-card" href="#/media/item/${it.id}">
-      <span class="media-thumb" data-type="${esc(it.type)}" data-thumb="${it.links.thumb ? 1 : 0}">${thumb}${it.duration_s ? `<span class="media-dur">${esc(duration(it.duration_s))}</span>` : ""}</span>
-      <span class="tag">${esc(typeLabel(it))}${it.group ? ` · ${esc(it.group)}` : ""}</span>
+  const rest = it.tags.length - TAGS_ON_CARD;
+  return `<a class="card media-card${thumb ? "" : " no-thumb"}" href="#/media/item/${it.id}">
+      ${thumb}<span class="media-body">
+      <span class="media-kick">${esc(typeLabel(it))}${it.group ? `<span class="media-group"> · ${esc(it.group)}</span>` : ""}</span>
       <h4>${esc(it.title)}</h4>
-      <p class="meta">${esc(facts(it))}</p>
-      ${it.tags.length ? `<span class="chips">${tagChips(it.tags.slice(0, 6))}</span>` : ""}${review}
+      <span class="meta media-facts">${esc(facts(it))}</span>
+      ${it.tags.length ? `<span class="media-tags">${it.tags.slice(0, TAGS_ON_CARD).map((t) => `#${esc(t)}`).join(" ")}${rest > 0 ? ` <span class="faint">+${rest}</span>` : ""}</span>` : ""}${review}</span>
     </a>`;
 }
 

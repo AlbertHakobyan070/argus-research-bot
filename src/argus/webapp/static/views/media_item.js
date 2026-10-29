@@ -37,7 +37,7 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
           <button class="btn btn-s" type="button" id="rename-cancel">Cancel</button>
           <p class="hint">Downloads and files sent to the chat take this name${it.derived_from || it.media_asset_id ? "" : "; so do the item's parts"}. The vault file keeps <code>${esc(it.vault_name)}</code>.</p></form>
         <p class="meta">${esc([facts(it), it.quality && `quality ${it.quality}`, it.backend, it.language, `saved ${when(it.created_at)}`].filter(Boolean).join(" · "))}</p>
-        ${it.tags.length || it.group ? `<p class="chips">${it.group ? `<span class="tag">${esc(it.group)}</span>` : ""}${tagChips(it.tags)}</p>` : ""}</div>
+        ${it.tags.length || it.group ? `<p class="chips media-item-tags">${it.group ? `<span class="tag">${esc(it.group)}</span>` : ""}${tagChips(it.tags)}</p>` : ""}</div>
       <div class="btn-row"><button class="btn btn-s" type="button" id="rename"><i data-icon="file-text"></i>Rename</button>
         ${it.source_url ? '<button class="btn btn-s" type="button" id="source"><i data-icon="external-link"></i>Source</button>' : ""}</div>
     </div>
@@ -50,7 +50,7 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
         <button class="btn" type="button" id="send"${present ? "" : " disabled"}><i data-icon="message-square"></i>Send to chat</button>
         <button class="btn btn-danger" type="button" id="del"><i data-icon="trash-2"></i>Delete…</button>
       </div>
-      <p class="hint">Over ${esc(bytes(49 * 1048576))}, Send to chat sends a private download link instead (valid ${settings.settings.link_hours} h, or until the bot restarts).</p>
+      <p class="hint media-hint">Over ${esc(bytes(49 * 1048576))}, Send to chat sends a private download link instead (valid ${settings.settings.link_hours} h, or until the bot restarts).</p>
       ${isMedia && present ? `<div class="media-actions">
         <form class="action-row" id="mp3-form"><b>MP3</b>
           <select class="input" name="quality" aria-label="MP3 quality">${settings.mp3_qualities.map((q) => `<option value="${q}"${q === settings.settings.mp3_quality ? " selected" : ""}>${esc(MP3_LABEL[q] || q)}</option>`).join("")}</select>
