@@ -24,7 +24,7 @@ export async function render(el, _params, ctx) {
   let { appearance: a } = await get.me();
   const swatches = (key, label, themes) => `<div class="set-row stack"><span class="set-l"><b>${esc(label)}</b>
       <small id="${key}-name"></small></span>
-      <div class="themes" role="radiogroup" aria-label="${esc(label)}">${themes.map(([id, name]) => `<button class="tsw" type="button" role="radio" data-key="${key}" data-theme-id="${id}" aria-label="${esc(name)}" data-tip="${esc(name)}"><i></i></button>`).join("")}</div></div>`;
+      <div class="themes" role="radiogroup" aria-label="${esc(label)}">${themes.map(([id, name]) => `<button class="tsw" type="button" role="radio" data-key="${key}" data-theme-id="${id}" aria-label="${esc(name)}" data-tip="${esc(name)}"><i></i><span>${esc(name)}</span></button>`).join("")}</div></div>`;
   el.innerHTML = `<div class="page-head"><div><span class="kicker">Settings</span><h1>Look and backend</h1>
       <p>The theme is saved on the bot, so every device you open the console from looks the same.</p></div></div>
     <section class="sec set-sec" data-kicker="Theme">

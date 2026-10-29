@@ -137,7 +137,7 @@ function paintHead(s) {
   const facts = [LENGTHS[run.length] || run.length, run.depth, run.archetype, `origin ${run.origin || "—"}`,
                  `started ${when(run.created_at)}`].filter(Boolean);
   $("#run-head", s.el).innerHTML = `<div class="page-head">
-      <div><span class="kicker">Run ${esc(run.run_id)}</span><h1>${esc(run.topic || run.run_id)}</h1>
+      <div><span class="kicker">Run ${esc(run.run_id)}</span><h1 class="run-title">${esc(run.topic || run.run_id)}</h1>
         <p>${statusHtml(run)} <span class="meta head-facts">${esc(facts.join(" · "))}</span></p></div>
       ${canCancel ? '<div class="btn-row"><button class="btn btn-danger" type="button" id="cancel-run">Cancel run…</button></div>' : ""}
     </div>`;
@@ -182,6 +182,11 @@ function describe(e) {
   }
 }
 
+/** The event log: open while the run works, a closed disclosure once the drive is over. */
+const logHtml = (inner, collapse, n) => (collapse
+  ? `<details class="acc"><summary><span class="acc-t">Event log <span class="meta">${n} events</span></span></summary><div class="acc-b">${inner}</div></details>`
+  : inner);
+
 function paintProgress(s) {
   const { run, snapshot } = s.data;
   const sec = $("#progress", s.el);
@@ -200,8 +205,9 @@ function paintProgress(s) {
   const lede = run.in_flight ? "Updates every two seconds while the run works."
     : s.events.length ? "Events of this bot session (the log is kept for an hour after a drive)." : "No events in this bot session.";
   sec.innerHTML = `<div class="sec-head"><span class="kicker">Progress</span><h2>${esc(head)}</h2><p>${esc(lede)}</p></div>${kpis}`
-    + (rows ? `<div class="tw timeline"><table><thead><tr><th>Time</th><th>Node</th><th>Event</th></tr></thead><tbody>${rows}</tbody></table></div>`
-      + (s.events.length > SHOWN_EVENTS ? `<p class="meta">The newest ${SHOWN_EVENTS} of ${s.events.length} events.</p>` : "") : "");
+    + (rows ? logHtml(`<div class="tw timeline"><table><thead><tr><th>Time</th><th>Node</th><th>Event</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      + (s.events.length > SHOWN_EVENTS ? `<p class="meta">The newest ${SHOWN_EVENTS} of ${s.events.length} events.</p>` : ""),
+      !run.in_flight, Math.min(s.events.length, SHOWN_EVENTS)) : "");
 }
 
 // ---- the plan gate -------------------------------------------------------------------------------
@@ -430,12 +436,15 @@ async function loadReport(s, body, check) {
   } else s.evidence = evidence.value || { missing: true };
   // the header says what the report's own banners say; nothing is claimed before both have loaded
   check.innerHTML = trustHeader($$(":scope > blockquote > p", body).map((p) => p.textContent.trim()), s.evidence);
+  tidyReport(body);
   $$(".cite[data-n]", body).forEach((c) => {
     c.tabIndex = 0;
     c.setAttribute("role", "button");
     c.setAttribute("aria-label", `Source ${c.dataset.n}`);
   });
   body.addEventListener("click", (e) => {
+    const jump = e.target.closest("a[data-h]");
+    if (jump) { e.preventDefault(); jumpTo(body, jump.dataset.h); return; }
     const cite = e.target.closest(".cite[data-n]");
     if (cite) { showCite(s, cite); return; }
     const a = e.target.closest("a[href]");
@@ -445,6 +454,38 @@ async function loadReport(s, body, check) {
     const cite = e.target.closest(".cite[data-n]");
     if (cite && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); showCite(s, cite); }
   });
+}
+
+/** Reading aids, after the trust header has read the report's banners: the run's own metadata block (the
+ *  paragraphs and quote before the first rule) folds into a disclosure, and a contents list jumps to each
+ *  section. The report text itself is untouched. */
+function tidyReport(body) {
+  const lead = [];
+  for (const n of Array.from(body.children)) {
+    if (n.tagName === "HR") break;
+    if (n.tagName !== "H1") lead.push(n);
+  }
+  const hr = body.querySelector(":scope > hr");
+  if (hr && lead.length) {
+    const d = document.createElement("details");
+    d.className = "acc report-meta";
+    d.innerHTML = '<summary><span class="acc-t">Run details and quality summary</span></summary><div class="acc-b"></div>';
+    $(".acc-b", d).append(...lead);
+    hr.before(d);
+  }
+  const heads = $$(":scope > h2", body);
+  if (heads.length < 4) return;
+  const nav = document.createElement("nav");
+  nav.className = "report-toc";
+  nav.setAttribute("aria-label", "Report contents");
+  nav.innerHTML = `<details class="acc"><summary><span class="acc-t">Contents <span class="meta">${heads.length} sections</span></span></summary>`
+    + `<div class="acc-b"><ol>${heads.map((h, i) => `<li><a href="${esc(location.hash)}" data-h="${i}">${esc(h.textContent)}</a></li>`).join("")}</ol></div></details>`;
+  (body.querySelector(":scope > h1") || body.firstElementChild)?.after(nav);
+}
+
+function jumpTo(body, i) {
+  const target = $$(":scope > h2", body)[Number(i)];
+  if (target) target.scrollIntoView({ block: "start" });
 }
 
 // ---- tap-to-verify -------------------------------------------------------------------------------
