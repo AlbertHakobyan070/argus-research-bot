@@ -25,6 +25,9 @@ let cleanup = null;
 let authFailed = false;
 let shownPath = null;                      // a new view opens at the top; a refresh keeps the place
 let routeSeq = 0;                          // the latest route; an older view still loading is stale
+// painted while a view fetches; the view's own markup replaces it
+const SKELETON = `<div class="page-head"><div class="skel-head"><span class="skel w40"></span><span class="skel h"></span><span class="skel w60"></span></div></div>
+  <section class="sec skel-sec">${'<div class="skel-row"><span class="skel w80"></span><span class="skel w40"></span></div>'.repeat(5)}</section>`;
 
 // ---- theme: the saved appearance (#/settings) — Telegram's light/dark or a pinned one, then which kit
 // theme; Telegram's own header and background take the theme's ground colour
@@ -90,6 +93,7 @@ async function route() {
   // Each view paints its own box: one that answers after a newer route paints a detached box nobody sees,
   // and its cleanup (polling, buttons) runs at once.
   const box = document.createElement("div");
+  box.innerHTML = SKELETON;
   view.replaceChildren(box);
   view.setAttribute("aria-busy", "true");
   try {
@@ -117,6 +121,10 @@ async function start() {
     webApp.onEvent?.("themeChanged", applyTheme);
   }
   $("#refresh").addEventListener("click", () => route());
+  const toTop = $("#to-top");                // shown once the page is scrolled past one screen
+  window.addEventListener("scroll", () => { toTop.hidden = window.scrollY < innerHeight; }, { passive: true });
+  toTop.addEventListener("click", () => window.scrollTo({ top: 0,
+    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }));
   window.addEventListener("hashchange", () => route());
   try {
     const me = await get.me();

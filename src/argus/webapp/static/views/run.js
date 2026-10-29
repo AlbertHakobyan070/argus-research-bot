@@ -522,7 +522,11 @@ function showCite(s, cite) {
   const ext = $("a[data-ext]", p);
   if (ext) ext.addEventListener("click", (e) => { e.preventDefault(); openLink(ext.href); });
   if (!p.matches(":popover-open")) p.showPopover();
+  p.scrollTop = 0;
   window.UI.place(p, cite, "bottom", "start");
+  // place() keeps a too-tall pop below the citation; lift it so its end (the source link) stays on screen
+  const r = p.getBoundingClientRect();
+  if (r.bottom > innerHeight - 8) p.style.top = `${Math.max(8, innerHeight - 8 - r.height)}px`;
 }
 
 document.addEventListener("click", (e) => {        // plan-source links open through Telegram
