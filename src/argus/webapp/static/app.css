@@ -44,7 +44,7 @@
   border-bottom:1px dotted var(--accent-line);border-radius:var(--r-sm);padding:0 1px}
 .cite:hover,.cite:focus-visible{border-bottom-style:solid;background:var(--accent-soft)}
 .cite-demo{cursor:default}
-.cite-pop{max-width:min(380px,calc(100vw - 24px))}
+.cite-pop{max-width:min(380px,calc(100vw - 24px));max-height:min(70vh,calc(100vh - 16px));overflow-y:auto;overscroll-behavior:contain}
 .cite-pop .kicker{margin-bottom:6px}
 .cite-quote{margin:8px 0;padding:2px 0 2px 12px;border-left:2px solid var(--accent-line)}
 .cite-quote p{margin:0 0 5px;font-style:italic;color:var(--ink-dim)}
@@ -247,3 +247,13 @@ section.sec[hidden] + section.sec{border-top:0}
 .media-hint{margin:10px 0 0}
 .media-player{background:var(--sunk)}
 @media (prefers-reduced-motion:no-preference){.media-card h4{transition:color var(--t-fast) var(--ease)}}
+
+/* ==== loading skeleton + back to top ==== */
+.skel-head{flex:1;max-width:520px}
+.skel-row{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line-soft)}
+.skel-row .skel{margin:0}
+.skel-row .skel:first-child{flex:1;width:auto}
+.skel-row .skel:last-child{width:72px;flex:none}
+.to-top{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:15;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);opacity:.88}
+.to-top:hover,.to-top:focus-visible{opacity:1;color:var(--ink)}
