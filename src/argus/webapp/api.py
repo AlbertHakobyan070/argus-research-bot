@@ -1,6 +1,7 @@
 """The console's JSON API (v4 spec §2.7): a thin layer over the run driver.
 
-Every action calls ``bot/runs.py`` with ``actor="webapp"`` (the driver
+Every action calls ``bot/runs.py`` with ``actor="webapp"`` (``"service"``
+for the service token; the driver
 takes the run's lock, claims it, attaches an untracked run resting at a
 gate, and edits the Telegram gate message); its ``Outcome`` maps to HTTP:
 ``busy`` / ``already_running`` / ``refused`` → 409, ``not_found`` → 404,
@@ -9,6 +10,12 @@ Views read the library and the driver (``tracked``, ``snapshot``,
 ``plan_payload``, the bus), never the graph per row. Report files are
 served only through the run's ``report_paths``, contained in
 ``reports_root``. Every error is ``{"error": {"code", "message"}}``.
+
+A service token (``Authorization: Bearer``, ``Deps.service_token``) lets
+another program start runs and read and act on them: only on
+``_SERVICE_ROUTES``, only with a Host in ``service_hosts``, and only on the
+runs it started (``origin`` = ``service_origin``; any other run is 404). A
+known ``external_ref`` answers 200 ``existing`` with its run.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ from ..engines.schema import ProfileOverrides, TranscriberConfig
 from ..graph.run_config import PRESETS, RunConfig
 from ..graph.state import VALID_LENGTHS
 from . import render
-from .auth import AuthError, AuthUser, validate_init_data
+from .auth import AuthError, AuthUser, validate_init_data, validate_service_token
 
 logger = logging.getLogger("argus.webapp")
 
@@ -53,13 +60,16 @@ class Deps:
     max_age_s: float
     reports_root: Path
     settings: Any = None             # config.Settings: the vault roots the media routes write to and serve from
+    service_token: str = ""          # "": no Bearer is accepted
+    service_hosts: frozenset[str] = frozenset()   # the Host headers a Bearer is accepted with
+    service_origin: str = "api"      # the origin of the service's runs, the only runs it sees
 
 
 DEPS = web.AppKey("deps", Deps)
 USER = web.RequestKey("user", AuthUser)
 
 _HTTP = {"busy": 409, "already_running": 409, "refused": 409, "not_found": 404}
-_SUCCESS = frozenset({"started", "updated", "attached", "delivered", "draining", "cancelled"})
+_SUCCESS = frozenset({"started", "existing", "updated", "attached", "delivered", "draining", "cancelled"})
 _AWAITING = {"awaiting_plan": "plan", "awaiting_report": "report"}
 _ROW_KEYS = ("run_id", "thread_id", "topic", "length", "depth", "archetype", "status", "origin", "created_at",
              "updated_at", "report_dir", "exa_usd")
@@ -71,7 +81,17 @@ _AUTH_MESSAGES = {
     "hash_mismatch": "initData signature mismatch — reopen the console from the Argus menu button",
     "expired": "session expired — reopen from the menu button",
     "wrong_user": "this console belongs to another Telegram user",
+    "wrong_host": "a service token is not accepted on this host",
+    "bad_token": "invalid service token",
+    "not_allowed": "this route does not accept a service token",
 }
+# What a service token may call: start, read, approve / edit / cancel at the plan gate, cancel.
+# Never Send (POST .../report delivers to the owner's chat) nor anything else.
+_SERVICE_ROUTES = frozenset({("POST", "/api/runs"), ("GET", "/api/runs/{id}"), ("GET", "/api/runs/{id}/events"),
+                             ("GET", "/api/runs/{id}/evidence"), ("GET", "/api/runs/{id}/report"),
+                             ("POST", "/api/runs/{id}/plan"), ("POST", "/api/runs/{id}/cancel")})
+_START_OPTIONS = {"notify_chat": bool, "external_ref": str, "auto_approve_plan": bool, "auto_send_report": bool}
+_EXTERNAL_REF = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _FIELD_NAME = re.compile(r"[A-Za-z0-9_]{1,32}")
 _MAX_LOGGED_FIELDS = 10
 _dumps = functools.partial(json.dumps, default=str, ensure_ascii=False)
@@ -132,24 +152,45 @@ async def errors(request: web.Request, handler) -> web.StreamResponse:
 
 @web.middleware
 async def auth(request: web.Request, handler) -> web.StreamResponse:
-    """``/api/*`` needs ``Authorization: tma <initData>``. A refusal logs the
+    """``/api/*`` needs ``Authorization: tma <initData>``, or, with a service
+    token set, ``Bearer <token>`` (module docstring). A refusal logs the
     reason code and the names of the fields present — never a value, the
     header or the token. The source IP is never trusted (tunnel traffic
     arrives from loopback)."""
     if not request.path.startswith("/api"):
         return await handler(request)
     d = request.app[DEPS]
-    scheme, _, init_data = request.headers.get("Authorization", "").partition(" ")
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
     try:
-        if scheme != "tma" or not init_data:
+        if scheme == "Bearer" and d.service_token:
+            user = _service_user(request, d, credential)
+        elif scheme != "tma" or not credential:
             raise AuthError("missing_field")
-        user = validate_init_data(init_data, d.bot_token, d.allowed_user_id, d.max_age_s)
+        else:
+            user = validate_init_data(credential, d.bot_token, d.allowed_user_id, d.max_age_s)
     except AuthError as e:
         logger.warning("webapp: %s %r refused: %s (fields present: %s)", request.method, request.path, e.code,
                        _field_names(e.fields))
-        return _error(e.status, e.code, _AUTH_MESSAGES[e.code])
+        code = "missing_field" if e.code == "wrong_host" else e.code    # the public side cannot tell it is on
+        return _error(e.status, code, _AUTH_MESSAGES[code])
     request[USER] = user
+    run_id = request.match_info.get("id")
+    if user.service and run_id is not None:
+        row = await d.library.get_run(run_id)
+        if row is None or row.get("origin") != d.service_origin:
+            return _error(404, "not_found", f"no run {run_id}")
     return await handler(request)
+
+
+def _service_user(request: web.Request, d: Deps, token: str) -> AuthUser:
+    """The service principal: the Host first (the tunnel's own never matches), then the token, then the route."""
+    if request.host.lower() not in d.service_hosts:
+        raise AuthError("wrong_host")
+    user = validate_service_token(token, d.service_token)
+    resource = request.match_info.route.resource
+    if (request.method, resource.canonical if resource is not None else None) not in _SERVICE_ROUTES:
+        raise AuthError("not_allowed")
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +218,18 @@ def _opt(body: dict, key: str, kind: type = str):
     if value is not None and not isinstance(value, kind):
         raise _bad(f"{key} must be a {kind.__name__}")
     return value
+
+
+def _service_refuses(request: web.Request, body: dict, keys: tuple[str, ...], what: str) -> None:
+    """The service principal may not set ``keys`` (present at all) at ``what``."""
+    got = [k for k in keys if k in body]
+    if request[USER].service and got:
+        raise _bad(f"not accepted from a service token at {what}: {', '.join(got)}")
+
+
+def _actor(request: web.Request) -> str:
+    """Who acts, for the driver's events and gate edits: the console, or the service token."""
+    return "service" if request[USER].service else "webapp"
 
 
 def _int_query(request: web.Request, key: str, default: int, lo: int, hi: int) -> int:
@@ -284,9 +337,12 @@ async def list_runs(request: web.Request) -> web.Response:
     drive, ``awaiting`` the library's gate status while none runs."""
     d = _deps(request)
     limit = _int_query(request, "limit", 20, 1, 200)
+    origin = request.query.get("origin")
+    if origin not in (None, "all"):
+        raise _bad("origin must be all (absent: the service token's runs are hidden)")
     tracked = d.runs.tracked()
     out = []
-    for row in await d.library.list_runs(limit=limit):
+    for row in await d.library.list_runs(limit=limit, exclude_origin=None if origin == "all" else d.service_origin):
         h = tracked.get(row["run_id"])
         live = bool(h is not None and h.live)
         out.append(_run_json(row, in_flight=live, stage=h.stage if h is not None else None,
@@ -374,14 +430,20 @@ async def start_run(request: web.Request) -> web.Response:
     topic = body.get("topic")
     if not isinstance(topic, str) or not topic.strip():
         raise _bad("topic must be a non-empty string")
+    _service_refuses(request, body, ("overrides", "engines_profile"), "start")
     knobs = {k: _opt(body, k) for k in ("length", "depth", "engines_profile")}
     overrides = dict(_opt(body, "overrides", dict) or {})
     recency = _opt(body, "recency")
     if recency is not None:
         overrides["recency"] = recency                   # an overridable root of RunConfig
-    out = await d.runs.start_run(chat_id=d.allowed_user_id, user_id=request[USER].id, topic=topic.strip(),
+    options = {k: _opt(body, k, kind) for k, kind in _START_OPTIONS.items()}
+    if options["external_ref"] is not None and not _EXTERNAL_REF.fullmatch(options["external_ref"]):
+        raise _bad("external_ref must be 1-128 characters of A-Z, a-z, 0-9, '.', '_', ':' or '-'")
+    user = request[USER]
+    out = await d.runs.start_run(chat_id=d.allowed_user_id, user_id=user.id, topic=topic.strip(),
                                  **{k: v for k, v in knobs.items() if v is not None}, overrides=overrides,
-                                 origin="webapp")
+                                 origin=d.service_origin if user.service else "webapp",
+                                 **{k: v for k, v in options.items() if v is not None})
     return _outcome(out)
 
 
@@ -389,15 +451,16 @@ async def plan_action(request: web.Request) -> web.Response:
     d, run_id, body = _deps(request), request.match_info["id"], await _body(request)
     action = body.get("action")
     if action == "approve":
+        _service_refuses(request, body, ("length", "depth", "engines_profile"), "approve")
         knobs = {k: _opt(body, k) for k in ("length", "depth", "engines_profile")}
-        return _outcome(await d.runs.approve_plan(run_id, actor="webapp", **knobs))
+        return _outcome(await d.runs.approve_plan(run_id, actor=_actor(request), **knobs))
     if action == "edit":
         feedback = _opt(body, "feedback")
         if feedback is None:
             raise _bad("edit needs feedback")
-        return _outcome(await d.runs.edit_plan(run_id, feedback, actor="webapp"))
+        return _outcome(await d.runs.edit_plan(run_id, feedback, actor=_actor(request)))
     if action == "cancel":
-        return _outcome(await d.runs.cancel_run(run_id, actor="webapp"))
+        return _outcome(await d.runs.cancel_run(run_id, actor=_actor(request)))
     raise _bad("action must be approve, edit or cancel")
 
 
@@ -412,7 +475,7 @@ async def report_action(request: web.Request) -> web.Response:
 
 async def cancel(request: web.Request) -> web.Response:
     d, run_id = _deps(request), request.match_info["id"]
-    return _outcome(await d.runs.cancel_run(run_id, actor="webapp"))
+    return _outcome(await d.runs.cancel_run(run_id, actor=_actor(request)))
 
 
 async def continue_run(request: web.Request) -> web.Response:

@@ -355,6 +355,7 @@ CREATE TABLE run_sources (
 );
 """
 _V4_COLUMNS = {"config_json", "depth", "archetype", "origin", "exa_usd"}
+_API_COLUMNS = {"external_ref", "options_json"}          # the service token's start options
 _TABLES = ("runs", "assets", "settings", "run_sources")
 
 
@@ -398,7 +399,7 @@ async def test_migration_adds_v4_columns_to_a_pre_v4_db_and_keeps_rows(tmp_path)
 
     counts_after, cols_after = _shape(db)
     assert counts_after == counts_before                       # additive only
-    assert cols_after == cols_before | _V4_COLUMNS
+    assert cols_after == cols_before | _V4_COLUMNS | _API_COLUMNS
     assert (old["topic"], old["length"], old["status"], old["report_dir"]) == (
         "old topic", "long", "done", "A:/r")
     assert (old["config_json"], old["depth"], old["archetype"], old["exa_usd"]) == (
@@ -515,3 +516,18 @@ async def test_a_failed_open_closes_its_connection(tmp_path, monkeypatch):      
     assert conn._connection is None, "the connection was closed"
     with pytest.raises(RuntimeError, match="not opened"):
         lib._conn()
+
+
+async def test_a_migrated_db_keeps_its_runs_beside_the_service_columns(tmp_path):
+    db = tmp_path / "pre_v4.sqlite"
+    _pre_v4_db(db)
+    lib = Library(db)
+    await lib.open()
+    [old] = await lib.list_runs(limit=10, exclude_origin="api")
+    assert (old["run_id"], old["external_ref"], old["options_json"]) == ("old00001", None, None)
+    await lib.create_run(run_id="s1", thread_id="t:s1", chat_id=1, topic="y", config_json="{}", depth="quick",
+                         origin="api", external_ref="k", options={"notify_chat": False})
+    assert (await lib.get_run_by_ref("api", "k"))["options_json"] == '{"notify_chat": false}'
+    assert await lib.get_run_by_ref("webapp", "k") is None
+    assert [r["run_id"] for r in await lib.list_runs(limit=10, exclude_origin="api")] == ["old00001"]
+    await lib.close()

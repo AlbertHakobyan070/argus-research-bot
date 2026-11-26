@@ -29,6 +29,8 @@ from argus.webapp.auth import sign_init_data
 
 TOKEN = "123456:TEST-not-a-real-token"
 USER_ID = 42
+SERVICE_TOKEN = "svc-TEST-not-a-real-token"
+SERVICE_HOST = "host.docker.internal:8787"
 _GATES = {("research",): "plan", ("deliver",): "report"}
 
 
@@ -43,6 +45,11 @@ def init_data(user_id: int = USER_ID, *, auth_date: int | None = None, first_nam
 def auth(user_id: int = USER_ID, **kw) -> dict:
     """The ``Authorization`` header of a console request."""
     return {"Authorization": f"tma {init_data(user_id, **kw)}"}
+
+
+def bearer(token: str = SERVICE_TOKEN, host: str | None = SERVICE_HOST) -> dict:
+    """The headers of a service-token request (``host`` None: the test client's own Host)."""
+    return {"Authorization": f"Bearer {token}", **({"Host": host} if host is not None else {})}
 
 
 def dev_fragment(**kw) -> str:
@@ -129,9 +136,11 @@ class FakeLibrary:
         self.exa_usd = 0.0
         self.pending: dict[str, list[dict]] = {}       # run_id → run_sources rows still pending
 
-    async def list_runs(self, *, chat_id: int | None = None, limit: int = 10) -> list[dict]:
+    async def list_runs(self, *, chat_id: int | None = None, limit: int = 10,
+                        exclude_origin: str | None = None) -> list[dict]:
         rows = sorted(self.rows.values(), key=lambda r: r["created_at"], reverse=True)
-        return [r for r in rows if chat_id is None or r["chat_id"] == chat_id][:limit]
+        return [r for r in rows if (chat_id is None or r["chat_id"] == chat_id)
+                and (exclude_origin is None or r.get("origin") != exclude_origin)][:limit]
 
     async def get_run(self, run_id: str) -> dict | None:
         return self.rows.get(run_id)
@@ -175,13 +184,16 @@ class FakeBot:
 
 def make_app(fake: FakeRuns, *, reports_root: Path, library: FakeLibrary | None = None,
              bot: FakeBot | None = None, bot_data: dict | None = None, max_age_s: float = 3600,
-             static_dir: Path = server.STATIC_DIR, settings=None) -> web.Application:
+             static_dir: Path = server.STATIC_DIR, settings=None, service_token: str = "",
+             service_hosts: tuple[str, ...] = (SERVICE_HOST,), service_origin: str = "api") -> web.Application:
     """The real console app on the fakes; ``app[api.DEPS]`` holds them.
-    ``settings``: the vault roots for the media routes (``media_settings``)."""
+    ``settings``: the vault roots for the media routes (``media_settings``);
+    ``service_token`` "" leaves the service token off."""
     deps = api.Deps(runs=fake, library=library or FakeLibrary(), bot=bot or FakeBot(),
                     bot_data=bot_data if bot_data is not None else {"webapp_ok": True},
                     bot_token=TOKEN, allowed_user_id=USER_ID, max_age_s=max_age_s,
-                    reports_root=Path(reports_root), settings=settings)
+                    reports_root=Path(reports_root), settings=settings, service_token=service_token,
+                    service_hosts=frozenset(service_hosts), service_origin=service_origin)
     return server.build_app(deps, static_dir=static_dir)
 
 

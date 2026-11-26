@@ -19,7 +19,8 @@ from argus.graph.run_config import PRESETS
 from argus.webapp import api, server
 
 from test_runs_driver import CHAT, _at_plan_gate, _snap, env  # noqa: F401  (env: the real driver on a stubbed graph)
-from webapp_fakes import TOKEN, USER_ID, FakeHandle, FakeLibrary, FakeRuns, auth, make_app, seed_run
+from webapp_fakes import (SERVICE_TOKEN, TOKEN, USER_ID, FakeHandle, FakeLibrary, FakeRuns, auth, bearer, make_app,
+                          seed_run)
 
 ENGINES: dict = {
     "active_profile": "main",
@@ -539,3 +540,112 @@ async def test_index_until_the_frontend_exists(client, app, tmp_path):
 async def test_a_tracked_handle_without_a_row_is_not_listed(client, app, fake):
     fake.handles["ghost001"] = FakeHandle(live=True, stage="research")
     assert (await _json(await client.get("/api/runs", headers=auth())))["runs"] == []
+
+
+# --- the service token: the service's own runs, its start options ------------
+
+@pytest.fixture
+async def svc(fake, lib, tmp_path):
+    app = make_app(fake, library=lib, reports_root=tmp_path / "reports", service_token=SERVICE_TOKEN)
+    async with TestClient(TestServer(app)) as c:
+        c.app_ = app
+        yield c
+
+
+async def test_the_service_gets_404_for_an_owner_run(svc, fake):
+    seed_run(fake, svc.app_, "own00001", status="awaiting_plan", next_=("research",), origin="webapp")
+    seed_run(fake, svc.app_, "tel00001", status="awaiting_report", next_=("deliver",))      # origin telegram
+    for run_id in ("own00001", "tel00001", "nope0001"):
+        for method, path, payload in (("GET", "", None), ("GET", "/events", None), ("GET", "/report", None),
+                                      ("GET", "/evidence", None), ("POST", "/plan", {"action": "approve"}),
+                                      ("POST", "/plan", {"action": "cancel"}), ("POST", "/cancel", None)):
+            r = await svc.request(method, f"/api/runs/{run_id}{path}", headers=bearer(), json=payload)
+            body = await _json(r, 404)
+            assert body["error"] == {"code": "not_found", "message": f"no run {run_id}"}, (run_id, path)
+    assert fake.calls == []
+
+
+async def test_the_service_acts_on_its_own_runs(svc, fake):
+    seed_run(fake, svc.app_, "svc00001", status="awaiting_plan", next_=("research",), origin="api")
+    body = await _json(await svc.get("/api/runs/svc00001", headers=bearer()))
+    assert (body["run"]["origin"], body["run"]["awaiting"]) == ("api", "plan")
+    await _json(await svc.post("/api/runs/svc00001/plan", headers=bearer(), json={"action": "approve"}))
+    await _json(await svc.post("/api/runs/svc00001/plan", headers=bearer(),
+                               json={"action": "edit", "feedback": "narrower"}))
+    await _json(await svc.post("/api/runs/svc00001/plan", headers=bearer(), json={"action": "cancel"}))
+    await _json(await svc.post("/api/runs/svc00001/cancel", headers=bearer()))
+    assert [name for name, _ in fake.calls] == ["approve_plan", "edit_plan", "cancel_run", "cancel_run"]
+    assert fake.calls[0][1] == {"run_id": "svc00001", "actor": "service", "length": None, "depth": None,
+                                "engines_profile": None}
+    assert {call["actor"] for _, call in fake.calls} == {"service"}         # never credited to the console
+
+
+async def test_a_service_start_carries_the_service_origin(svc, fake):
+    body = await _json(await svc.post("/api/runs", headers=bearer(), json={
+        "topic": " gold ", "length": "medium", "depth": "deep", "recency": "m", "origin": "telegram"}))
+    assert body["run_id"] == "new00001"
+    assert fake.calls == [("start_run", {"chat_id": USER_ID, "user_id": 0, "topic": "gold", "length": "medium",
+                                         "depth": "deep", "overrides": {"recency": "m"}, "origin": "api"})]
+
+
+@pytest.mark.parametrize("extra", [{"overrides": {"research.waves": 2}}, {"overrides": {}},
+                                   {"engines_profile": "other"}, {"engines_profile": None}])
+async def test_a_service_start_refuses_overrides_and_the_engines_profile(svc, fake, extra):
+    body = await _json(await svc.post("/api/runs", headers=bearer(), json={"topic": "x", **extra}), 400)
+    assert body["error"]["code"] == "bad_request" and next(iter(extra)) in body["error"]["message"]
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("knob", [{"length": "long"}, {"depth": "deep"}, {"engines_profile": "other"},
+                                  {"depth": None}])
+async def test_a_service_approve_refuses_the_knobs(svc, fake, knob):
+    seed_run(fake, svc.app_, "svc00001", status="awaiting_plan", next_=("research",), origin="api")
+    body = await _json(await svc.post("/api/runs/svc00001/plan", headers=bearer(),
+                                      json={"action": "approve", **knob}), 400)
+    assert body["error"]["code"] == "bad_request" and next(iter(knob)) in body["error"]["message"]
+    assert fake.calls == []
+
+
+async def test_start_options_reach_the_driver(client, svc, fake):
+    opts = {"notify_chat": False, "external_ref": "job-42:A.b_c", "auto_approve_plan": True,
+            "auto_send_report": True}
+    await _json(await svc.post("/api/runs", headers=bearer(), json={"topic": "x", **opts}))
+    await _json(await client.post("/api/runs", headers=auth(), json={"topic": "y", "notify_chat": True}))
+    assert fake.calls == [
+        ("start_run", {"chat_id": USER_ID, "user_id": 0, "topic": "x", "overrides": {}, "origin": "api", **opts}),
+        ("start_run", {"chat_id": USER_ID, "user_id": USER_ID, "topic": "y", "overrides": {}, "origin": "webapp",
+                       "notify_chat": True})]
+
+
+@pytest.mark.parametrize("bad", [{"external_ref": ""}, {"external_ref": "x" * 129}, {"external_ref": "a b"},
+                                 {"external_ref": "a/b"}, {"external_ref": 7}, {"notify_chat": "no"},
+                                 {"auto_approve_plan": 1}, {"auto_send_report": "true"}])
+async def test_bad_start_options_are_400(client, svc, fake, bad):
+    for c, headers in ((svc, bearer()), (client, auth())):
+        body = await _json(await c.post("/api/runs", headers=headers, json={"topic": "x", **bad}), 400)
+        assert body["error"]["code"] == "bad_request" and next(iter(bad)) in body["error"]["message"]
+    assert fake.calls == []
+
+
+async def test_a_known_external_ref_answers_200_with_its_run(svc, fake):
+    fake.outcomes["start_run"] = Outcome("existing", "", "svc00001")
+    body = await _json(await svc.post("/api/runs", headers=bearer(), json={"topic": "x", "external_ref": "j1"}))
+    assert (body["outcome"], body["run_id"]) == ("existing", "svc00001")
+
+
+async def test_lists_hide_service_runs_unless_asked(client, app, fake):
+    seed_run(fake, app, "own00001", origin="webapp", created_at="2026-10-21T10:03")
+    seed_run(fake, app, "svc00001", origin="api", created_at="2026-10-21T10:02")
+    seed_run(fake, app, "tel00001", created_at="2026-10-21T10:01")
+    body = await _json(await client.get("/api/runs", headers=auth()))
+    assert [r["run_id"] for r in body["runs"]] == ["own00001", "tel00001"]
+    body = await _json(await client.get("/api/runs?origin=all", headers=auth()))
+    assert [r["run_id"] for r in body["runs"]] == ["own00001", "svc00001", "tel00001"]
+    body = await _json(await client.get("/api/runs?origin=nope", headers=auth()), 400)
+    assert body["error"]["code"] == "bad_request"
+
+
+async def test_a_service_start_may_set_recency(svc, fake):
+    """Recency is a search filter, not a cost knob: the service may set it (README)."""
+    await _json(await svc.post("/api/runs", headers=bearer(), json={"topic": "x", "recency": "w"}))
+    assert fake.calls[0][1]["overrides"] == {"recency": "w"}

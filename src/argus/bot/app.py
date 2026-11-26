@@ -51,6 +51,7 @@ POST_INIT_HOOKS: list = []
 POST_STOP_HOOKS: list = []
 POST_SHUTDOWN_HOOKS: list = []
 POST_INIT_HOOKS.append(runs.init)
+POST_INIT_HOOKS.append(runs.rearm_auto_gates)        # after the reconcile and init: the unattended gate steps
 POST_STOP_HOOKS.append(runs.drain_all)
 POST_INIT_HOOKS.append(webapp_server.start)
 POST_SHUTDOWN_HOOKS.append(webapp_server.stop)
@@ -223,7 +224,8 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
     resumable from its last saved step; no checkpoint → error. A quick /ask
     (which /continue refuses) is cancelled and told to ask again — its own
     graph's deliver step reads as ("deliver",) through the deep graph. Each
-    user is DM'd how to go on. Bounded + best-effort."""
+    user is DM'd how to go on, except about a run started with notify_chat
+    off (its status is still set). Bounded + best-effort."""
     lib: Library | None = app.bot_data.get("library")
     graph = app.bot_data.get("graph")
     if lib is None or graph is None:
@@ -268,6 +270,8 @@ async def _reconcile_orphaned_runs(app: Application) -> None:
             msg = (f"⚠️ Run `{run_id}` ({topic}) was interrupted by a bot "
                    "restart and can't be resumed from where it stopped.\n"
                    "Please /research it again.")
+        if not runs._options(run).get("notify_chat", True):
+            continue
         try:
             await app.bot.send_message(chat_id=run["chat_id"], text=msg,
                                        parse_mode=ParseMode.MARKDOWN)

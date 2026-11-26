@@ -1,7 +1,9 @@
 """Telegram Mini App ``initData`` (v4 spec §2.7): validated on every
 ``/api/*`` request (``Authorization: tma <initData>``); signed only by the
-dev URL script. An ``AuthError`` carries its reason code and the *names* of
-the fields present, the only things the server logs — never a value."""
+dev URL script. A service token (``Authorization: Bearer <token>``, for
+other programs) is checked by ``validate_service_token``. An ``AuthError``
+carries its reason code and the *names* of the fields present, the only
+things the server logs — never a value."""
 from __future__ import annotations
 
 import hashlib
@@ -11,7 +13,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode
 
-CODES = ("missing_field", "hash_mismatch", "expired", "wrong_user")
+CODES = ("missing_field", "hash_mismatch", "expired", "wrong_user", "wrong_host", "bad_token", "not_allowed")
 
 
 class AuthError(Exception):
@@ -29,6 +31,10 @@ class AuthError(Exception):
 class AuthUser:
     id: int
     first_name: str
+    service: bool = False       # the service-token principal (SERVICE), never a Telegram user
+
+
+SERVICE = AuthUser(id=0, first_name="service", service=True)
 
 
 def _hash(pairs: list[tuple[str, str]], bot_token: str) -> str:
@@ -60,6 +66,14 @@ def validate_init_data(init_data: str, bot_token: str, allowed_user_id: int, max
     if user_id != allowed_user_id:
         raise AuthError("wrong_user", fields)
     return AuthUser(id=user_id, first_name=str(user.get("first_name") or ""))
+
+
+def validate_service_token(presented: str, expected: str) -> AuthUser:
+    """``SERVICE`` when ``presented`` is ``expected`` (compared in constant
+    time), else ``AuthError("bad_token")``. Never called with ``expected`` ""."""
+    if not hmac.compare_digest(presented.encode(), expected.encode()):
+        raise AuthError("bad_token")
+    return SERVICE
 
 
 def sign_init_data(fields: dict, bot_token: str) -> str:

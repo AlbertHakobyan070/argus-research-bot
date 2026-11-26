@@ -136,7 +136,8 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def runs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/runs — the run registry for this chat (newest first)."""
+    """/runs — the run registry for this chat (newest first); ``/runs all``
+    also lists the runs the service token started."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -145,7 +146,9 @@ async def runs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lib is None:
         await update.message.reply_text("⚠️ Library unavailable.")
         return
-    runs = await lib.list_runs(chat_id=update.effective_chat.id, limit=10)
+    every = list(ctx.args or []) == ["all"]
+    runs = await lib.list_runs(chat_id=update.effective_chat.id, limit=10,
+                               exclude_origin=None if every else s.service_origin)
     if not runs:
         await update.message.reply_text("No runs recorded yet — /research!")
         return

@@ -12,7 +12,7 @@ from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ..engines.schema import EnginesSnapshot, ExaPrices
 from .state import Length
@@ -182,7 +182,8 @@ class RunConfig(BaseModel):
     engines: EnginesSnapshot
     overrides_applied: dict[str, Any] = {}                     # the dotted overrides from_preset applied (console / bench)
     created_at: str
-    origin: Literal["telegram", "webapp", "bench", "live_check", "demo", "legacy"] = "telegram"
+    # telegram, webapp, bench, live_check, demo, legacy, or the service token's ARGUS_SERVICE_ORIGIN
+    origin: str = Field("telegram", pattern=r"^[a-z0-9_-]{1,32}$")
     legacy: bool = False
 
     @model_validator(mode="after")

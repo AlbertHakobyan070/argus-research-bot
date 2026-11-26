@@ -2143,3 +2143,178 @@ async def test_a_plan_card_that_cannot_be_sent_gets_a_short_card_with_its_button
     data = [b.callback_data for row in last["reply_markup"].inline_keyboard for b in row]
     assert f"plan:approve:{run_id}" in data
     assert common._inflight[run_id].gate_msg is not None, "the short card is the gate message"
+
+
+# --- start options for other programs: external_ref, notify_chat, the auto gates
+
+async def _settled(env, run_id: str, status: str, timeout: float = 10.0) -> None:
+    """The run's row reads ``status`` with no drive and no auto step pending."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end:
+        h = common._inflight.get(run_id)
+        if (await env.lib.get_run(run_id))["status"] == status and not runs._auto_tasks and not (h and h.live):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"run {run_id} never settled at {status}: {(await env.lib.get_run(run_id))['status']}")
+
+
+def _service_start(**kw):
+    return runs.start_run(chat_id=CHAT, user_id=0, topic=kw.pop("topic", "t"), origin="api", **kw)
+
+
+async def test_a_quiet_unattended_run_goes_end_to_end_without_a_chat_message(env):
+    out = await _service_start(notify_chat=False, auto_approve_plan=True, auto_send_report=True,
+                               external_ref="job-1")
+    assert out.code == "started", out
+    await _settled(env, out.run_id, "done")
+    assert (env.bot.send_message.await_count, env.bot.send_document.await_count,
+            env.bot.edit_message_text.await_count) == (0, 0, 0)
+    row = await env.lib.get_run(out.run_id)
+    assert (row["origin"], row["external_ref"]) == ("api", "job-1")
+    assert [e.data["actor"] for e in _events(out.run_id, "gate")] == ["auto", "auto"]
+    assert tuple((await _snap(env, out.run_id)).next) == ()                # past the report gate: finished
+    assert out.run_id not in common._inflight
+    again = await _service_start(external_ref="job-1")                     # finished: the same run, no new one
+    assert (again.code, again.run_id) == ("existing", out.run_id) and out.run_id not in common._inflight
+
+
+async def test_auto_gates_with_the_chat_on_post_and_send_as_usual(env):
+    out = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="t", auto_approve_plan=True, auto_send_report=True)
+    await _settled(env, out.run_id, "done")
+    sent = _sent(env)
+    assert any(t.startswith("📋 *Research plan*") for t in sent) and "✅ Delivered." in sent
+    assert env.bot.send_document.await_count == 1                          # report.md (the stub has no pdf)
+
+
+async def test_a_repeated_external_ref_returns_the_live_run_before_the_busy_check(env):
+    research = _blocking(env)
+    first = await _service_start(notify_chat=False, auto_approve_plan=True, external_ref="job-7")
+    assert await asyncio.to_thread(research.started.wait, 5)
+    assert common._inflight[first.run_id].live
+    again = await _service_start(topic="other", external_ref="job-7")
+    assert (again.code, again.run_id) == ("existing", first.run_id)
+    assert (await _service_start(external_ref="job-8")).code == "busy"     # a new ref still waits its turn
+    research.release.set()
+    await _settled(env, first.run_id, "awaiting_report")
+    common._inflight.clear()                                               # a restart: the library answers
+    again = await _service_start(external_ref="job-7")
+    assert (again.code, again.run_id) == ("existing", first.run_id)
+    other = await runs.start_run(chat_id=CHAT, user_id=CHAT, topic="t", origin="webapp", external_ref="job-7")
+    assert other.code == "started" and other.run_id != first.run_id       # a ref is scoped to its origin
+    await common._inflight[other.run_id].task
+
+
+async def test_two_concurrent_starts_with_one_ref_make_one_run(env):
+    a, b = await asyncio.gather(_service_start(notify_chat=False, external_ref="job-9"),
+                                _service_start(notify_chat=False, external_ref="job-9"))
+    assert sorted((a.code, b.code)) == ["existing", "started"] and a.run_id == b.run_id
+    await common._inflight[a.run_id].task
+    async with env.lib._conn().execute("SELECT COUNT(*) FROM runs WHERE external_ref = 'job-9'") as cur:
+        assert (await cur.fetchone())[0] == 1
+
+
+async def test_notify_chat_off_survives_a_restart(env):
+    out = await _service_start(notify_chat=False)
+    await common._inflight[out.run_id].task
+    assert (await env.lib.get_run(out.run_id))["status"] == "awaiting_plan"
+    common._inflight.clear()                                               # the restart
+    assert (await runs.approve_plan(out.run_id, actor="webapp")).code == "started"
+    await common._inflight[out.run_id].task
+    assert (await env.lib.get_run(out.run_id))["status"] == "awaiting_report"
+    assert (env.bot.send_message.await_count, env.bot.edit_message_text.await_count) == (0, 0)
+
+
+async def test_runs_command_hides_service_runs_unless_asked(env):
+    owner = await _at_plan_gate(env, "owner topic")
+    svc = await _service_start(topic="service topic", notify_chat=False)
+    await common._inflight[svc.run_id].task
+    for args, shown in (((), {owner}), (("all",), {owner, svc.run_id})):
+        u = _update()
+        await history.runs_cmd(u, _ctx(env, args))
+        text = u.message.reply_text.await_args.args[0]
+        assert {r for r in (owner, svc.run_id) if r in text} == shown, args
+
+
+# --- review round 1: quiet runs across a restart, the auto step's handle, a refused start's ref
+
+async def test_the_restart_notice_skips_a_quiet_run(env):
+    quiet = await _service_start(notify_chat=False)
+    await common._inflight[quiet.run_id].task
+    owner = await _at_plan_gate(env, "owner topic")
+    common._inflight.clear()                                               # the restart
+    sends = env.bot.send_message.await_count
+    await bot_app._reconcile_orphaned_runs(env.app)
+    notices = _sent(env)[sends:]
+    assert [t for t in notices if owner in t] and not [t for t in notices if quiet.run_id in t]
+    assert (await env.lib.get_run(quiet.run_id))["status"] == "awaiting_plan"      # the status is still set
+
+
+async def test_an_auto_step_refused_at_shutdown_is_rearmed_after_the_restart(env):
+    out = await _service_start(notify_chat=False, auto_approve_plan=True)
+    env.monkeypatch.setattr(runs, "_shutting_down", True)                 # the approve is refused
+    await common._inflight[out.run_id].task
+    await _settled(env, out.run_id, "awaiting_plan")
+    runs._shutting_down = False
+    common._inflight.clear()                                               # the restart, in its hook order
+    await bot_app._reconcile_orphaned_runs(env.app)
+    assert bot_app.POST_INIT_HOOKS.index(runs.rearm_auto_gates) == bot_app.POST_INIT_HOOKS.index(runs.init) + 1
+    await runs.rearm_auto_gates(env.app)
+    await _settled(env, out.run_id, "awaiting_report")
+    assert env.bot.send_message.await_count == 0
+
+
+async def test_the_owners_continue_shows_a_quiet_runs_card(env):
+    out = await _service_start(notify_chat=False)
+    await common._inflight[out.run_id].task
+    common._inflight.clear()
+    res = await runs.continue_run(await env.lib.get_run(out.run_id), chat_id=CHAT)
+    assert res.code == "attached"
+    assert [t for t in _sent(env) if t.startswith("📋 *Research plan*")], "an explicit owner action shows the card"
+    assert common._inflight[out.run_id].gate_msg is not None
+
+
+async def test_a_cancel_at_the_gate_wins_over_a_pending_auto_step(env):
+    out = await _service_start(notify_chat=False, auto_approve_plan=True)
+    await common._inflight[out.run_id].task                                # the auto step is pending
+    assert (await runs.cancel_run(out.run_id, actor="service")).code == "cancelled"
+    await _settled(env, out.run_id, "cancelled")
+    assert out.run_id not in common._inflight
+    assert tuple((await _snap(env, out.run_id)).next) == ("research",), "nothing was approved after the cancel"
+
+
+async def test_a_start_refused_at_launch_frees_its_ref(env, monkeypatch):
+    real = env.lib.create_run
+
+    async def then_shutdown(**kw):
+        row = await real(**kw)
+        runs._shutting_down = True                                         # the shutdown began while it prepared
+        return row
+
+    monkeypatch.setattr(env.lib, "create_run", then_shutdown)
+    first = await _service_start(notify_chat=False, external_ref="job-r")
+    assert first.code == "refused"
+    monkeypatch.setattr(env.lib, "create_run", real)
+    runs._shutting_down = False
+    again = await _service_start(notify_chat=False, external_ref="job-r")
+    assert again.code == "started" and again.run_id != first.run_id
+    assert (await env.lib.get_run_by_ref("api", "job-r"))["run_id"] == again.run_id
+    await common._inflight[again.run_id].task
+
+
+async def test_a_waiter_on_a_failed_start_gets_a_new_run_not_a_dead_id(env, monkeypatch):
+    real, calls = env.lib.create_run, []
+
+    async def fails_first(**kw):
+        calls.append(kw["run_id"])
+        if len(calls) == 1:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("disk full")
+        return await real(**kw)
+
+    monkeypatch.setattr(env.lib, "create_run", fails_first)
+    a, b = await asyncio.gather(_service_start(notify_chat=False, external_ref="job-w"),
+                                _service_start(notify_chat=False, external_ref="job-w"))
+    assert a.code == "refused" and b.code == "started" and b.run_id not in (None, calls[0])
+    assert (await env.lib.get_run_by_ref("api", "job-w"))["run_id"] == b.run_id
+    await common._inflight[b.run_id].task

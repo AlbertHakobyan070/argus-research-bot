@@ -22,6 +22,9 @@ its ``length``/``depth`` columns mirror it), ``depth``, ``archetype``,
 ``origin`` and ``exa_usd`` (per-run Exa spend). ``_migrate`` adds them to
 an existing DB: guarded, additive only, idempotent; pre-v4 rows keep NULL
 there (``origin`` defaults to ``'telegram'``, the only pre-v4 writer).
+The service token's start options add ``external_ref`` (the caller's
+idempotency key, unique per origin) and ``options_json`` (the start options
+that differ from their defaults); NULL for every other run.
 
 The DB itself lives in the project directory (NOT the synced Obsidian
 vault — SQLite WAL + sync tooling is a corruption hazard). The vault
@@ -109,8 +112,10 @@ CREATE TABLE IF NOT EXISTS run_sources (
 _V4_RUN_COLUMNS: tuple[tuple[str, str], ...] = (
     ("config_json", "TEXT"), ("depth", "TEXT"), ("archetype", "TEXT"),
     ("origin", "TEXT DEFAULT 'telegram'"), ("exa_usd", "REAL"))
+# Columns the service token's start options add, in the order _migrate adds them.
+_API_RUN_COLUMNS: tuple[tuple[str, str], ...] = (("external_ref", "TEXT"), ("options_json", "TEXT"))
 # What update_run may set (the identity columns and created_at never change).
-_UPDATABLE_RUN_COLUMNS = frozenset({"topic", "length", "mode", "status", "report_dir",
+_UPDATABLE_RUN_COLUMNS = frozenset({"topic", "length", "mode", "status", "report_dir", "external_ref",
                                     *(name for name, _ in _V4_RUN_COLUMNS)})
 
 
@@ -119,9 +124,10 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     on any pre-v4 DB and a no-op on a migrated one."""
     async with db.execute("PRAGMA table_info(runs)") as cur:
         have = {row[1] for row in await cur.fetchall()}
-    for name, decl in _V4_RUN_COLUMNS:
+    for name, decl in (*_V4_RUN_COLUMNS, *_API_RUN_COLUMNS):
         if name not in have:
             await db.execute(f"ALTER TABLE runs ADD COLUMN {name} {decl}")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_external_ref ON runs(origin, external_ref)")
     await db.commit()
 
 
@@ -204,10 +210,12 @@ class Library:
                          status: str = "planning",
                          config_json: str, depth: str,
                          archetype: str | None = None,
-                         origin: str) -> dict[str, Any]:
+                         origin: str, external_ref: str | None = None,
+                         options: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """``config_json`` is the run's RunConfig as JSON text
         (``rc.model_dump_json()``); ``length``/``depth``/``origin`` are its
-        own values."""
+        own values. ``external_ref`` / ``options``: the service token's start
+        options (``options``: those that differ from their defaults)."""
         if status not in VALID_RUN_STATUSES:
             raise ValueError(f"unknown run status {status!r}")
         _require_json_object(config_json)
@@ -216,10 +224,11 @@ class Library:
         await db.execute(
             "INSERT INTO runs (run_id, thread_id, chat_id, topic, length,"
             " mode, status, created_at, updated_at, config_json, depth,"
-            " archetype, origin)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " archetype, origin, external_ref, options_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, thread_id, chat_id, topic, length, mode, status, ts, ts,
-             config_json, depth, archetype, origin),
+             config_json, depth, archetype, origin, external_ref,
+             json.dumps(dict(options)) if options else None),
         )
         await db.commit()
         run = await self.get_run(run_id)
@@ -289,6 +298,14 @@ class Library:
             row = await cur.fetchone()
         return _row_to_run(row) if row else None
 
+    async def get_run_by_ref(self, origin: str, external_ref: str) -> dict[str, Any] | None:
+        """The run ``origin`` started with ``external_ref``, or None."""
+        db = self._conn()
+        async with db.execute("SELECT * FROM runs WHERE origin = ? AND external_ref = ?",
+                              (origin, external_ref)) as cur:
+            row = await cur.fetchone()
+        return _row_to_run(row) if row else None
+
     async def resolve_run(self, chat_id: int, ref: str) -> dict[str, Any] | None:
         """Resolve a (possibly partial) run id typed by the user.
 
@@ -308,18 +325,18 @@ class Library:
             return None
         return _row_to_run(rows[0])
 
-    async def list_runs(self, *, chat_id: int | None = None,
-                        limit: int = 10) -> list[dict[str, Any]]:
+    async def list_runs(self, *, chat_id: int | None = None, limit: int = 10,
+                        exclude_origin: str | None = None) -> list[dict[str, Any]]:
+        """Newest first: all runs or one chat's, without those of ``exclude_origin``."""
         db = self._conn()
-        if chat_id is None:
-            q = ("SELECT * FROM runs ORDER BY created_at DESC, rowid DESC"
-                 " LIMIT ?")
-            args: tuple = (limit,)
-        else:
-            q = ("SELECT * FROM runs WHERE chat_id = ?"
-                 " ORDER BY created_at DESC, rowid DESC LIMIT ?")
-            args = (chat_id, limit)
-        async with db.execute(q, args) as cur:
+        where, args = [], []
+        for clause, value in (("chat_id = ?", chat_id), ("origin IS NOT ?", exclude_origin)):
+            if value is not None:
+                where.append(clause)
+                args.append(value)
+        q = ("SELECT * FROM runs" + (f" WHERE {' AND '.join(where)}" if where else "")
+             + " ORDER BY created_at DESC, rowid DESC LIMIT ?")
+        async with db.execute(q, (*args, limit)) as cur:
             rows = await cur.fetchall()
         return [_row_to_run(r) for r in rows]
 
