@@ -97,7 +97,10 @@ class _Console:
                         bot_token=self.settings.telegram_bot_token,
                         allowed_user_id=self.settings.telegram_allowed_user_id,
                         max_age_s=float(os.environ.get("ARGUS_WEBAPP_INITDATA_MAX_AGE_S") or DEFAULT_MAX_AGE_S),
-                        reports_root=Path(self.settings.reports_root), settings=self.settings)
+                        reports_root=Path(self.settings.reports_root), settings=self.settings,
+                        service_token=self.settings.service_token,
+                        service_hosts=frozenset(self.settings.service_hosts),
+                        service_origin=self.settings.service_origin)
         self.runner = web.AppRunner(build_app(deps), access_log=None)   # no request lines in the log
         await self.runner.setup()
         await web.TCPSite(self.runner, HOST, port).start()

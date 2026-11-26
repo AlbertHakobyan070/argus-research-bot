@@ -61,6 +61,46 @@ reports "cloudflared not found".
 > venv's `site-packages` breaks `pydantic_core`). The `scripts/run*.sh`
 > scripts clear it; if you bypass them, `unset PYTHONPATH` first.
 
+## API access for other programs
+
+A script, a cron job or another bot can start and follow runs through the
+console's API with a service token instead of Telegram's `initData`:
+`Authorization: Bearer <token>`. It is off until you set the token.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ARGUS_SERVICE_TOKEN` | unset (off) | The token; unset or empty refuses every `Bearer`. |
+| `ARGUS_SERVICE_HOSTS` | `host.docker.internal:8787` | Comma list of `Host` headers a `Bearer` is accepted with, so it never works through the public tunnel. |
+| `ARGUS_SERVICE_ORIGIN` | `api` | The `origin` label of the runs the token starts (`[a-z0-9_-]{1,32}`, not one of Argus's own origins). |
+
+The token may call only `POST /api/runs`, `GET /api/runs/{id}` (and its
+`/events`, `/evidence`, `/report`), `POST /api/runs/{id}/plan` and
+`POST /api/runs/{id}/cancel`, and only on the runs it started: any other run
+answers 404, any other route 401 (a `Bearer` on a Host outside
+`ARGUS_SERVICE_HOSTS` is answered as if the token were off). It cannot Send a
+report to the chat. At start it may set `length`, `depth` and `recency` (a
+search filter, not a cost knob), but not `overrides` or an engines profile; on
+approve it may set none of `length`, `depth` or an engines profile. Its actions
+are recorded with the actor `service`, never as the console's.
+
+`POST /api/runs` takes these start options beside `topic` (from the console
+too):
+
+- `notify_chat` (default `true`): `false` posts nothing to your chat for the
+  run (no progress card, plan card, report preview or restart notice); your
+  own `/continue` of it still shows its card.
+- `external_ref`: an idempotency key, 1-128 characters of `A-Z a-z 0-9 . _ : -`.
+  A key already used by a run of the same origin answers `200` with
+  `"outcome": "existing"` and that run's id, live or finished.
+- `auto_approve_plan`, `auto_send_report` (default `false`): pass that gate
+  unattended, so a run can go end to end on its own (Send posts the report
+  files to your chat only when `notify_chat` is on; the files are under the
+  run's report folder either way). A run resting at such a gate after a
+  restart gets that step again at startup.
+
+`/runs` and the console's run list hide the token's runs; `/runs all` and
+`GET /api/runs?origin=all` show them.
+
 ## More
 
 - Running, the console and tunnel, migration and troubleshooting: `handoff.md`.

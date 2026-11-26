@@ -2,6 +2,7 @@
 sign round-trip, field-name-only logging on 401/403, and the dev URL script."""
 from __future__ import annotations
 
+import hmac
 import importlib.util
 import logging
 import time
@@ -14,9 +15,11 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from yarl import URL
 
+from argus.config import Settings
+from argus.webapp import api
 from argus.webapp.auth import AuthError, AuthUser, sign_init_data, validate_init_data
 
-from webapp_fakes import TOKEN, USER_ID, FakeRuns, init_data, make_app
+from webapp_fakes import SERVICE_TOKEN, TOKEN, USER_ID, FakeRuns, bearer, init_data, make_app, seed_run
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -198,3 +201,150 @@ def test_dev_url_exits_non_zero_when_the_server_is_down(monkeypatch, capsys):
     assert mod.main([]) != 0
     out = capsys.readouterr()
     assert out.out == "" and "8787" in out.err
+
+
+# --- the service token: Authorization: Bearer, for other programs -------------
+
+ALLOWED = [("POST", "/api/runs", {"topic": "x"}), ("GET", "/api/runs/svc00001", None),
+           ("GET", "/api/runs/svc00001/events", None), ("GET", "/api/runs/svc00001/evidence", None),
+           ("GET", "/api/runs/svc00001/report", None), ("POST", "/api/runs/svc00001/plan", {"action": "approve"}),
+           ("POST", "/api/runs/svc00001/cancel", None)]
+
+
+def _service_app(tmp_path, **kw):
+    fake = FakeRuns()
+    app = make_app(fake, reports_root=tmp_path, **kw)
+    folder = tmp_path / "svc00001"
+    folder.mkdir()
+    (folder / "report.md").write_text("# R", encoding="utf-8")
+    (folder / "evidence.json").write_text("{}", encoding="utf-8")
+    seed_run(fake, app, "svc00001", status="awaiting_report", next_=("deliver",), origin="api",
+             values={"report_paths": {"md": str(folder / "report.md"), "evidence": str(folder / "evidence.json")}})
+    return fake, app
+
+
+@pytest.fixture
+async def service(tmp_path):
+    fake, app = _service_app(tmp_path, service_token=SERVICE_TOKEN)
+    async with TestClient(TestServer(app)) as c:
+        yield SimpleNamespace(client=c, app=app, fake=fake)
+
+
+async def _code_of(r) -> str:
+    return (await r.json())["error"]["code"]
+
+
+async def test_a_bearer_passes_on_every_allowlisted_route(service):
+    for method, path, body in ALLOWED:
+        r = await service.client.request(method, path, headers=bearer(), json=body)
+        assert r.status == 200, (method, path, await r.text())
+    assert [name for name, _ in service.fake.calls] == ["start_run", "approve_plan", "cancel_run"]
+    assert service.fake.calls[0][1]["user_id"] == 0                    # the service principal
+
+
+async def test_a_bearer_is_refused_on_every_other_route(service):
+    allowed = {(m, p.replace("svc00001", "{id}")) for m, p, _ in ALLOWED}
+    refused = set()
+    for route in service.app.router.routes():
+        path = route.resource.canonical
+        if not path.startswith("/api") or (route.method, path) in allowed:
+            continue
+        url = path.replace("{id}", "svc00001").replace("{name}", "fixed")
+        body = {"action": "send", "what": ["md"]} if route.method in ("POST", "PUT") else None
+        r = await service.client.request(route.method, url, headers=bearer(), json=body)
+        assert r.status == 401, (route.method, url)
+        if route.method != "HEAD":
+            assert await _code_of(r) == "not_allowed", (route.method, url)
+        refused.add((route.method, path))
+    assert {("POST", "/api/runs/{id}/report"), ("POST", "/api/runs/{id}/send"), ("GET", "/api/runs"),
+            ("POST", "/api/runs/{id}/continue"), ("GET", "/api/me"), ("PUT", "/api/engines")} <= refused
+    r = await service.client.get("/api/no-such-route", headers=bearer())
+    assert r.status == 401 and await _code_of(r) == "not_allowed"
+    assert service.fake.calls == [] and service.app[api.DEPS].bot.documents == []
+
+
+@pytest.mark.parametrize("host", [None, "plain-river-quiet-hill.trycloudflare.com", "host.docker.internal:9999",
+                                  "127.0.0.1:8787"])
+async def test_a_bearer_on_another_host_is_401_as_if_the_feature_were_off(service, caplog, host):
+    caplog.set_level(logging.DEBUG)
+    headers = {**bearer(host=host), "X-Forwarded-Host": "host.docker.internal:8787"}   # never trusted
+    r = await service.client.post("/api/runs", headers=headers, json={"topic": "x"})
+    assert r.status == 401 and await _code_of(r) == "missing_field"      # the public side cannot tell
+    assert "wrong_host" in caplog.text                                   # the server log can
+    assert service.fake.calls == []
+
+
+@pytest.mark.parametrize("configured", ["", None])
+async def test_without_a_configured_token_every_bearer_is_401(tmp_path, configured):
+    kw = {} if configured is None else {"service_token": configured}
+    fake, app = _service_app(tmp_path, **kw)
+    async with TestClient(TestServer(app)) as c:
+        for method, path, body in ALLOWED:
+            for token in (SERVICE_TOKEN, ""):
+                r = await c.request(method, path, headers=bearer(token), json=body)
+                assert r.status == 401, (method, path, token)
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("token", ["svc-wrong", SERVICE_TOKEN + "x", SERVICE_TOKEN[:-1], "", "tma"])
+async def test_a_wrong_token_is_401_and_never_logged(service, caplog, token):
+    caplog.set_level(logging.DEBUG)
+    r = await service.client.post("/api/runs", headers=bearer(token), json={"topic": "x"})
+    assert r.status == 401 and await _code_of(r) == "bad_token"
+    assert service.fake.calls == []
+    assert "bad_token" in caplog.text
+    assert SERVICE_TOKEN not in caplog.text and (len(token) < 4 or token not in caplog.text)
+
+
+async def test_the_token_is_compared_with_compare_digest(service, monkeypatch):
+    seen = []
+    real = hmac.compare_digest
+    monkeypatch.setattr(hmac, "compare_digest", lambda a, b: seen.append((a, b)) or real(a, b))
+    r = await service.client.post("/api/runs", headers=bearer(), json={"topic": "x"})
+    assert r.status == 200
+    assert (SERVICE_TOKEN.encode(), SERVICE_TOKEN.encode()) in seen
+    seen.clear()
+    r = await service.client.post("/api/runs", headers=bearer("svc-wrong"), json={"topic": "x"})
+    assert r.status == 401 and (b"svc-wrong", SERVICE_TOKEN.encode()) in seen
+
+
+async def test_a_tma_user_is_unchanged_beside_a_service_token(service):
+    tma = {"Authorization": f"tma {init_data()}"}
+    r = await service.client.get("/api/me", headers=tma)
+    assert r.status == 200 and (await r.json())["user"] == {"id": USER_ID, "first_name": "Albert"}
+    r = await service.client.post("/api/runs", headers=tma, json={"topic": "x"})
+    assert r.status == 200
+    assert (service.fake.calls[-1][1]["origin"], service.fake.calls[-1][1]["user_id"]) == ("webapp", USER_ID)
+
+
+_SERVICE_ENV = ("ARGUS_SERVICE_TOKEN", "ARGUS_SERVICE_HOSTS", "ARGUS_SERVICE_ORIGIN")
+
+
+@pytest.fixture
+def service_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    for name in _SERVICE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_service_settings_default_to_off(service_env):
+    s = Settings.load()
+    assert (s.service_token, s.service_hosts, s.service_origin) == ("", ("host.docker.internal:8787",), "api")
+
+
+def test_service_settings_from_the_environment(service_env):
+    service_env.setenv("ARGUS_SERVICE_TOKEN", f" {SERVICE_TOKEN} ")
+    service_env.setenv("ARGUS_SERVICE_HOSTS", " Host.Docker.Internal:8787, 127.0.0.1:8787 ,, ")
+    service_env.setenv("ARGUS_SERVICE_ORIGIN", "jobs_v2")
+    s = Settings.load()
+    assert (s.service_token, s.service_hosts, s.service_origin) == (
+        SERVICE_TOKEN, ("host.docker.internal:8787", "127.0.0.1:8787"), "jobs_v2")
+    assert SERVICE_TOKEN not in repr(s)
+
+
+@pytest.mark.parametrize("origin", ["API", "a b", "x" * 33, "telegram", "webapp", "legacy"])
+def test_a_bad_service_origin_is_refused(service_env, origin):
+    service_env.setenv("ARGUS_SERVICE_ORIGIN", origin)
+    with pytest.raises(ValueError, match="ARGUS_SERVICE_ORIGIN"):
+        Settings.load()

@@ -234,7 +234,8 @@ sent before a restart keep working.
 
 ### `/runs`
 List this chat's runs (newest first) with their short ids and status glyphs.
-Use the ids with `/continue` and `/append`.
+Use the ids with `/continue` and `/append`. Runs other programs started with
+the service token are hidden; `/runs all` lists them too.
 
 ### `/status`
 Each tracked run's stage, elapsed time and last event (or the gate it waits

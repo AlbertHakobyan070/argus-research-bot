@@ -14,6 +14,14 @@
   ``application.create_task``, whose tasks PTB awaits in ``stop()`` before
   ``post_stop``) with a fresh ``RunControl``; the driver reports its own
   failures (status ``error``, a chat message, a ``stage error`` event).
+- **Start options** (``POST /api/runs``): a known ``external_ref`` answers
+  ``existing`` with its run, live or finished, before the busy check; the
+  ref is claimed with the run (in the registry, then the library row).
+  ``notify_chat`` False posts nothing to the chat for that run (no progress
+  card, gate message, line or file); ``auto_approve_plan`` /
+  ``auto_send_report`` act on that gate as soon as the drive reaching it
+  ends (actor ``auto``). The options live on the library row, so they
+  outlast a restart.
 - **Cancel = drain**: ``request_drain``; LangGraph raises ``GraphDrained``
   at the next superstep boundary with the checkpoint saved. ``task.cancel()``
   only after ``ARGUS_CANCEL_DRAIN_TIMEOUT_S`` (it cannot stop a node's
@@ -32,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -68,6 +77,7 @@ _app: Any = None                  # the Application (bot, graphs, library), set 
 _sleep = asyncio.sleep            # the cancel deadline's clock (tests patch it)
 _shutting_down = False            # drain_all began: no new claim (a claim made before may still launch)
 _launch_closed = False            # drain_all stopped waiting for the claims made before it: nothing launches
+_auto_tasks: set[asyncio.Task] = set()   # the auto gate steps in flight (a task needs a reference)
 
 PLAN, REPORT = "plan", "report"
 _GATES = {("research",): PLAN, ("deliver",): REPORT}
@@ -88,8 +98,9 @@ _REPLY_PROMPTS = {
 
 @dataclass(frozen=True)
 class Outcome:
-    """``code``: started · attached · updated · draining · cancelled ·
-    delivered · busy · already_running · refused · not_found. ``text`` is
+    """``code``: started · existing (a known ``external_ref``) · attached ·
+    updated · draining · cancelled · delivered · busy · already_running ·
+    refused · not_found. ``text`` is
     the chat line ("" when the driver's own messages already say it)."""
     code: str
     text: str
@@ -131,11 +142,16 @@ class RunHandle:
     cancelled_by: str | None = None  # the actor of a cancel accepted while this drive was live
     attaching: bool = False          # registered by an action on an untracked run; attached under the lock
     route: str | None = None         # the node its launching action wrote as (re-plan, fork); a resume's: _ROUTES
+    notify: bool = True              # notify_chat: False posts nothing to the chat for this run
+    auto: frozenset[str] = frozenset()   # the gates passed unattended (auto_approve_plan, auto_send_report)
+    ref: tuple[str, str] | None = None   # (origin, external_ref) its start claimed
 
     @classmethod
     def of(cls, row: dict, chat_id: int) -> RunHandle:
+        opts = _options(row)
         return cls(run_id=row["run_id"], chat_id=chat_id, thread_id=row["thread_id"],
-                   topic=row.get("topic") or "", quick=row.get("mode") == "quick")
+                   topic=row.get("topic") or "", quick=row.get("mode") == "quick",
+                   notify=opts.get("notify_chat", True), auto=_auto_gates(opts))
 
     @property
     def cfg(self) -> dict:
@@ -150,10 +166,51 @@ class RunHandle:
         return self.starting or (self.task is not None and not self.task.done())
 
 
+def _options(row: dict) -> dict:
+    """A library row's stored start options (those that differ from their defaults)."""
+    return json.loads(row.get("options_json") or "{}")
+
+
+def _auto_gates(opts: dict) -> frozenset[str]:
+    """The gates a run's start options pass unattended."""
+    return frozenset(g for g, k in ((PLAN, "auto_approve_plan"), (REPORT, "auto_send_report")) if opts.get(k))
+
+
+class _NoCard:
+    """The progress card of a run started with ``notify_chat`` off: nothing is posted."""
+
+    def start(self) -> None:
+        pass
+
+    async def stop(self, final: str) -> None:
+        pass
+
+
 async def init(app) -> None:
     """POST_INIT hook: the application the drives use."""
     global _app
     _app = app
+
+
+async def rearm_auto_gates(app) -> None:
+    """POST_INIT hook, after ``init`` (and the orphan reconcile before it,
+    which set each gate status from its checkpoint): a run resting at a gate
+    its start options pass unattended is attached and gets that gate's auto
+    step again — one refused before the restart, or never run."""
+    lib = _library()
+    if lib is None:
+        return
+    for row in await lib.list_runs_by_status(("awaiting_plan", "awaiting_report")):
+        gate = PLAN if row["status"] == "awaiting_plan" else REPORT
+        if gate not in _auto_gates(_options(row)):
+            continue
+        async with _hold(row["run_id"], "re-arm") as h:
+            if isinstance(h, Outcome):
+                logger.warning("run %s: its unattended %s gate step was not re-armed: %s", row["run_id"], gate,
+                               h.text)
+            elif not h.live and h.gate_kind == gate:
+                _arm_auto(h, None)
+                logger.info("run %s: its unattended %s gate step re-armed", h.run_id, gate)
 
 
 def tracked(chat_id: int | None = None) -> dict[str, RunHandle]:
@@ -195,8 +252,11 @@ async def _status(run_id: str, status: str, *, report_dir: str | None = None) ->
     await _set_run_status(SimpleNamespace(application=_app), run_id, status, report_dir=report_dir)
 
 
-async def _say(chat_id: int, text: str, *, mode: str | None = None, markup=None):
-    return await _safe_send(_app.bot, chat_id, text, reply_markup=markup, parse_mode=mode)
+async def _say(h: RunHandle, text: str, *, mode: str | None = None, markup=None):
+    """A chat line about ``h``; nothing for a run started with ``notify_chat`` off."""
+    if not h.notify:
+        return None
+    return await _safe_send(_app.bot, h.chat_id, text, reply_markup=markup, parse_mode=mode)
 
 
 def _not_found(run_id: str, *, quick: bool = False) -> Outcome:
@@ -247,7 +307,7 @@ def _claim(h: RunHandle) -> Outcome | None:
 
 @contextlib.asynccontextmanager
 async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: str | None = None,
-                row: dict | None = None, chat_id: int | None = None):
+                row: dict | None = None, chat_id: int | None = None, only: RunHandle | None = None):
     """The run's handle with its lock held. An untracked run resting at a
     gate is attached first (§2.5: buttons minted before a restart keep
     working); the tapped message (``message_id``) becomes its gate message
@@ -258,9 +318,14 @@ async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: 
     failed attach, say) looks the run up again, once. Yields an ``Outcome``
     instead when there is nothing to act on: ``not_found`` (no library row,
     not resting at a gate, or forgotten again while this actor waited), or
-    the attach's refusal (``what`` names the action)."""
+    the attach's refusal (``what`` names the action). With ``only`` (an auto
+    step) the action is on that handle while it is tracked, else
+    ``not_found``: never a look-up, never an attach."""
     for again in (False, True):
         h = common._inflight.get(run_id)
+        if only is not None and h is not only:
+            yield _not_found(run_id)
+            return
         if h is None and row is not None:
             h = common._inflight[run_id] = RunHandle.of(row, chat_id)
         elif h is None:
@@ -279,7 +344,7 @@ async def _hold(run_id: str, what: str, *, message_id: int | None = None, card: 
             return
         async with h.lock:
             if common._inflight.get(run_id) is not h:
-                if not again:
+                if not again and only is None:
                     continue                      # forgotten while this actor waited: look it up again
                 yield _not_found(run_id, quick=h.quick)
                 return
@@ -403,7 +468,7 @@ def _appends_marker(h: RunHandle, pending: list[dict], appended: list[dict]):
     /continue fork's bookkeeping), its failure lines to the chat."""
     from . import history                           # lazy: history imports this module
     return history.appends_marker(_library(), h.graph, h.cfg, h.run_id, pending, appended,
-                                  lambda text: _say(h.chat_id, text))
+                                  lambda text: _say(h, text))
 
 
 def _merged_sources(sources: list[dict] | None, appended: list[dict]) -> list[dict]:
@@ -459,8 +524,8 @@ def _launch(h: RunHandle, resume_input: Any, *, stage: str, route: str | None = 
     pending = common._pending_reply.get(h.chat_id)
     if pending is not None and pending[1] == h.run_id:
         del common._pending_reply[h.chat_id]        # an Edit / Revise prompt this drive made moot
-    h.card = TelegramCard(_app.bot, h.chat_id, h.run_id, bus,
-                          title=f"🔄 Run {h.run_id} — {_cut(h.topic, 60)}")
+    h.card = (TelegramCard(_app.bot, h.chat_id, h.run_id, bus, title=f"🔄 Run {h.run_id} — {_cut(h.topic, 60)}")
+              if h.notify else _NoCard())
     h.task = asyncio.create_task(_drive(h, resume_input), name=f"run {h.run_id}")
     logger.info("run %s: task started (%s)", h.run_id, stage)
     if _shutting_down:                              # claimed before drain_all began, which drains it
@@ -497,6 +562,30 @@ async def _drive(h: RunHandle, resume_input: Any) -> None:
         bus.finish(h.run_id)
         if h.gate_kind is None:
             _forget(h)
+        elif h.gate_kind in h.auto and common._inflight.get(h.run_id) is h:
+            _arm_auto(h, h.task)
+
+
+def _arm_auto(h: RunHandle, drive: asyncio.Task | None) -> None:
+    task = asyncio.create_task(_auto_gate(h, drive, h.gate_kind), name=f"run {h.run_id} auto {h.gate_kind}")
+    _auto_tasks.add(task)
+    task.add_done_callback(_auto_tasks.discard)
+
+
+async def _auto_gate(h: RunHandle, drive: asyncio.Task | None, kind: str) -> None:
+    """A gate the run's start options pass unattended, acted on once the
+    drive that reached it (if any) has ended, as a tap would (actor
+    ``auto``), on this handle only: a run cancelled or otherwise forgotten
+    meanwhile is left alone. A refusal (another run drives, the shutdown)
+    leaves the run at its gate: logged, and said in the chat; the next
+    start re-arms it (``rearm_auto_gates``)."""
+    if drive is not None:
+        await asyncio.wait([drive])
+    out = await (approve_plan(h.run_id, actor="auto", handle=h) if kind == PLAN
+                 else report_action(h.run_id, "send", actor="auto", handle=h))
+    if out.code not in ("started", "delivered"):
+        logger.warning("run %s: the unattended %s gate step was refused: %s", h.run_id, kind, out.text)
+        await _say(h, f"⚠️ Run {h.run_id} rests at its {kind} gate: {out.text}")
 
 
 async def _stream(h: RunHandle, resume_input: Any) -> None:
@@ -582,16 +671,16 @@ async def _at_rest(h: RunHandle) -> None:
                 await callback()
             except Exception as e:
                 logger.exception("run %s: the report-gate callback failed", h.run_id)
-                await _say(h.chat_id, f"⚠️ Could not record run {h.run_id}'s appended sources: {e}")
+                await _say(h, f"⚠️ Could not record run {h.run_id}'s appended sources: {e}")
     elif not nxt:
         if h.quick:
             await h.card.stop("✅ Answered below.")
-            await _say(h.chat_id, values.get("quick_answer") or "(no answer)", mode=ParseMode.MARKDOWN)
+            await _say(h, values.get("quick_answer") or "(no answer)", mode=ParseMode.MARKDOWN)
             await _status(h.run_id, "done")
         else:
             await h.card.stop("✅ Finished.")
             await _status(h.run_id, "done", report_dir=(values.get("report_paths") or {}).get("folder"))
-            await _say(h.chat_id, f"✅ Run {h.run_id} finished — /continue {h.run_id} extends it.")
+            await _say(h, f"✅ Run {h.run_id} finished — /continue {h.run_id} extends it.")
     else:
         raise RuntimeError(f"the drive stopped before {', '.join(nxt)}, which is not a gate")
 
@@ -654,7 +743,7 @@ async def _abandoned(h: RunHandle) -> None:
         kind = _gate(nxt, snap.values or {})
     except Exception as e:
         logger.error("run %s: could not record the cancel note", h.run_id, exc_info=e)
-        await _say(h.chat_id, f"⚠️ Run {h.run_id}: could not record the cancel note: {e}")
+        await _say(h, f"⚠️ Run {h.run_id}: could not record the cancel note: {e}")
     logger.info("run %s: %s", h.run_id, note)
     await _status(h.run_id, "cancelled")
     bus.publish(h.run_id, "stage", node, {"status": "cancelled", "summary": note})
@@ -680,7 +769,7 @@ async def _failed(h: RunHandle, e: Exception) -> None:
     bus.publish(h.run_id, "stage", h.stage, {"status": "error", "summary": f"{type(e).__name__}: {e}"})
     await h.card.stop(f"⚠️ Failed at {h.stage or 'start'}.")
     await _status(h.run_id, "error")
-    await _say(h.chat_id, f"⚠️ Research failed: {e}")
+    await _say(h, f"⚠️ Research failed: {e}")
 
 
 async def _paused(h: RunHandle, e: llm.QuotaExhausted) -> None:
@@ -698,7 +787,7 @@ async def _paused(h: RunHandle, e: llm.QuotaExhausted) -> None:
         snap = await h.graph.aget_state(h.cfg)
         nxt = tuple(snap.next or ())
         again = _continue_hint(h.run_id, nxt, _gate(nxt, snap.values or {}))
-    await _say(h.chat_id, f"⏸ Run {h.run_id} paused: every model engine is out of quota ({e.role}). "
+    await _say(h, f"⏸ Run {h.run_id} paused: every model engine is out of quota ({e.role}). "
                           f"Once the quota resets, {again}.")
 
 
@@ -719,7 +808,7 @@ async def _record_spend(h: RunHandle) -> None:
             logger.warning("run %s has no library row; its exa_usd is in the checkpoint only", h.run_id)
     except Exception as e:
         logger.exception("run %s: recording the Exa spend failed", h.run_id)
-        await _say(h.chat_id, f"⚠️ Could not record run {h.run_id}'s Exa spend: {e}")
+        await _say(h, f"⚠️ Could not record run {h.run_id}'s Exa spend: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -812,23 +901,35 @@ async def drain_all(app) -> None:
 
 async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEFAULT_LENGTH,
                     depth: str | None = None, overrides: dict | None = None, quick: bool = False,
-                    engines_profile: str | None = None, origin: str = "telegram") -> Outcome:
+                    engines_profile: str | None = None, origin: str = "telegram",
+                    external_ref: str | None = None, notify_chat: bool = True, auto_approve_plan: bool = False,
+                    auto_send_report: bool = False) -> Outcome:
     """/research (``quick``: /ask) and ``POST /api/runs``: a new run and its
     first drive — to the plan gate, or (quick) to the answer. An
     ``engines_profile`` other than the active one is validated like the plan
     card's profile; it is the run's from the plan drive on and the card's
-    profile choice."""
+    profile choice. The start options: module docstring."""
     if _app is None or ("quick_graph" if quick else "graph") not in _app.bot_data:
         return Outcome("refused", "⚠️ Bot not fully initialized (no graph) — restart the bot.")
+    key = (origin, external_ref) if external_ref is not None else None
+    if key is not None:
+        known = await _ref_run(key)               # None: nothing awaits between here and the claim below
+        if known is not None:
+            return Outcome("existing", f"Run `{known}` already has external_ref {external_ref!r}.", known)
     if _shutting_down:
         return _shutdown()
     busy = _busy()
     if busy is not None:
         return busy
     run_id = new_run_id()
-    h = RunHandle(run_id=run_id, chat_id=chat_id, thread_id=f"tg:{chat_id}:{run_id}", topic=topic, quick=quick)
+    opts = {k: v for k, v, default in (("notify_chat", notify_chat, True),
+                                       ("auto_approve_plan", auto_approve_plan, False),
+                                       ("auto_send_report", auto_send_report, False)) if v != default}   # stored
+    h = RunHandle(run_id=run_id, chat_id=chat_id, thread_id=f"tg:{chat_id}:{run_id}", topic=topic, quick=quick,
+                  notify=notify_chat, auto=_auto_gates(opts), ref=key)
     h.starting = True                                  # claimed before the first await: a second start is busy
     common._inflight[run_id] = h
+    created = False                                    # the library row exists (it holds the ref)
     async with h.lock:
         try:
             engines = active = await registry.active_snapshot()
@@ -846,7 +947,9 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
                 await lib.create_run(run_id=run_id, thread_id=h.thread_id, chat_id=chat_id, topic=topic,
                                      length=rc.length, mode="quick" if quick else "deep",
                                      status="running" if quick else "planning", config_json=rc.model_dump_json(),
-                                     depth=rc.depth, origin=rc.origin)
+                                     depth=rc.depth, origin=rc.origin, external_ref=external_ref,
+                                     options=opts or None)
+                created = True
             state_in = {
                 "thread_id": h.thread_id, "user_id": user_id, "user_request": topic, "length": rc.length,
                 "run_config": rc.model_dump(), "messages": [], "plan": None, "sources": [], "fetched": [],
@@ -860,14 +963,39 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
             _forget(h)
             if not isinstance(e, (EngineConfigError, ValueError)):
                 logger.error("run %s: start failed", run_id, exc_info=e)
+            if created and key is not None:
+                await _library().update_run(run_id, external_ref=None)     # a failed start frees its ref
             return Outcome("refused", f"⚠️ Could not start the research: {e}")
         finally:
             h.starting = False
         if refused is not None:                        # the shutdown began while it prepared: never driven
             await _status(run_id, "cancelled")
+            if created and key is not None:
+                await _library().update_run(run_id, external_ref=None)     # a refused start frees its ref
             _forget(h)
             return refused
     return Outcome("started", "", run_id)
+
+
+async def _ref_run(key: tuple[str, str]) -> str | None:
+    """The run a start claimed ``key`` (origin, external_ref) with: a tracked
+    one, else the library's. A start still preparing is waited for (it holds
+    its lock), so a refused or failed one is never answered. Returns None
+    only after a synchronous check of the registry."""
+    lib = _library()
+    while True:
+        h = next((x for x in common._inflight.values() if x.ref == key), None)
+        if h is not None and h.starting:
+            async with h.lock:                         # its start (or a later action) finishes preparing
+                pass
+            continue
+        if h is not None:
+            return h.run_id
+        row = await lib.get_run_by_ref(*key) if lib is not None else None
+        if row is not None:
+            return row["run_id"]
+        if not any(x.ref == key for x in common._inflight.values()):   # none claimed it meanwhile
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -986,7 +1114,8 @@ async def plan_payload(run_id: str) -> dict | None:
     return await _payload(h, values)
 
 
-async def _present_plan(h: RunHandle, values: dict) -> None:
+async def _present_plan(h: RunHandle, values: dict, *, shown: bool = False) -> None:
+    """The plan card; ``shown``: posted even for a quiet run (an owner's /continue)."""
     from . import research                          # lazy: research imports this module
     payload = await _payload(h, values)
     text = research._format_plan(payload)
@@ -994,7 +1123,7 @@ async def _present_plan(h: RunHandle, values: dict) -> None:
     fallback = (f"📋 Research plan for run {h.run_id} is ready, but Telegram refused the full card. "
                 "Approve, Edit or Cancel below; a knob tap re-renders it.")
     msg = await _safe_send(_app.bot, h.chat_id, text, reply_markup=research._plan_keyboard(payload),
-                           parse_mode=ParseMode.MARKDOWN, fallback=fallback)
+                           parse_mode=ParseMode.MARKDOWN, fallback=fallback) if h.notify or shown else None
     h.gate_msg = (msg.message_id, text, ParseMode.MARKDOWN) if msg is not None else None
     await _status(h.run_id, "awaiting_plan")
     h.gate_kind = PLAN
@@ -1064,12 +1193,12 @@ async def set_plan_choice(run_id: str, knob: str, value: str, *, message_id: int
 
 async def approve_plan(run_id: str, *, actor: str = "telegram", length: str | None = None,
                        depth: str | None = None, engines_profile: str | None = None,
-                       message_id: int | None = None) -> Outcome:
+                       message_id: int | None = None, handle: RunHandle | None = None) -> Outcome:
     """Approve: the RunConfig rebuilt for the choices (``rc.rebuild``) into the
     checkpoint and the library row — everything resolved first (the console's
     knobs reach the choices only then), so a refusal leaves the run at its
-    gate as it was — then the research drive."""
-    async with _hold(run_id, "approve", message_id=message_id, card=PLAN) as h:
+    gate as it was — then the research drive. ``handle``: an auto step's (``_hold`` ``only``)."""
+    async with _hold(run_id, "approve", message_id=message_id, card=PLAN, only=handle) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -1169,22 +1298,26 @@ async def await_reply(run_id: str, kind: str, *, message_id: int | None = None) 
 # the report gate
 # ---------------------------------------------------------------------------
 
-async def _present_report(h: RunHandle, values: dict) -> None:
+async def _present_report(h: RunHandle, values: dict, *, shown: bool = False) -> None:
+    """The report preview; ``shown``: posted even for a quiet run (an owner's /continue)."""
     from . import research                          # lazy: research imports this module
     await _status(h.run_id, "awaiting_report", report_dir=(values.get("report_paths") or {}).get("folder"))
-    msg, text, mode = await research._send_report_preview(_app.bot, h.chat_id, h.run_id, values)
+    msg, text, mode = (await research._send_report_preview(_app.bot, h.chat_id, h.run_id, values)
+                       if h.notify or shown else (None, "", None))
     h.gate_msg = (msg.message_id, text, mode) if msg is not None else None
     h.gate_kind = REPORT
 
 
 async def report_action(run_id: str, action: str, *, feedback: str | None = None,
-                        actor: str = "telegram", message_id: int | None = None) -> Outcome:
+                        actor: str = "telegram", message_id: int | None = None,
+                        handle: RunHandle | None = None) -> Outcome:
     """Report gate: send · extend · revise (with ``feedback``) · cancel. An
     Extend runs its normal pass with the run's pending /append sources merged
-    in as pinned sources; the next report gate marks them."""
+    in as pinned sources; the next report gate marks them. ``handle``: an
+    auto step's (``_hold`` ``only``)."""
     if action == "cancel":
         return await cancel_run(run_id, actor=actor, message_id=message_id)
-    async with _hold(run_id, action, message_id=message_id, card=REPORT) as h:
+    async with _hold(run_id, action, message_id=message_id, card=REPORT, only=handle) as h:
         if isinstance(h, Outcome):
             return h
         if h.live:
@@ -1252,12 +1385,12 @@ async def _deliver(h: RunHandle, actor: str) -> Outcome:
     try:
         cap = f"Argus report — folder: `{paths.get('folder', '')}`"
         for key in ("md", "pdf"):
-            if paths.get(key) and Path(paths[key]).exists():
+            if h.notify and paths.get(key) and Path(paths[key]).exists():
                 await _send_md_doc(_app.bot, h.chat_id, Path(paths[key]), caption=cap)
-        await _say(h.chat_id, "✅ Delivered.")
+        await _say(h, "✅ Delivered.")
     except Exception as e:
         logger.exception("run %s: sending the report failed", h.run_id)
-        await _say(h.chat_id, f"⚠️ send failed: {e}")
+        await _say(h, f"⚠️ send failed: {e}")
     try:
         await h.graph.aupdate_state(h.cfg, {"extend_requested": False, "revision_requested": False},
                                     as_node="deliver")              # Send ends the run: next == ()
@@ -1355,9 +1488,9 @@ async def continue_run(row: dict, *, chat_id: int, appended: list[dict] | None =
                 if kind == PLAN:
                     if h.choices is None:
                         _attached_choices(h, rc, active.profile)
-                    await _present_plan(h, values)
+                    await _present_plan(h, values, shown=True)
                 else:
-                    await _present_report(h, values)
+                    await _present_report(h, values, shown=True)
         except Exception as e:
             if h.gate_kind is None:
                 _forget(h)

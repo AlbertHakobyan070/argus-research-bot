@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -36,6 +37,26 @@ def _bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name}={os.environ[name]!r} is not a boolean (use true or false)")
 
 
+# The origins Argus's own writers give a run: a service origin equal to one would let
+# the service token see the owner's runs.
+_BUILTIN_ORIGINS = ("telegram", "webapp", "bench", "live_check", "demo", "legacy")
+_ORIGIN = re.compile(r"[a-z0-9_-]{1,32}")
+
+
+def _hosts_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """A comma-separated list of ``host:port`` values, lower-cased; unset or blank: ``default``."""
+    hosts = tuple(h.strip().lower() for h in (os.environ.get(name) or "").split(",") if h.strip())
+    return hosts or default
+
+
+def _origin_env(name: str, default: str) -> str:
+    raw = (os.environ.get(name) or "").strip() or default
+    if not _ORIGIN.fullmatch(raw) or raw in _BUILTIN_ORIGINS:
+        raise ValueError(f"{name}={raw!r} must be 1-32 characters of a-z, 0-9, _ or - and not one of "
+                         f"Argus's own origins ({', '.join(_BUILTIN_ORIGINS)})")
+    return raw
+
+
 @dataclass(frozen=True)
 class Settings:
     """Resolved runtime configuration. Frozen so it can be hashed/cached."""
@@ -63,6 +84,13 @@ class Settings:
     webapp_port: int = 8787
     cancel_drain_timeout_s: float = 300.0   # cancel: wait this long for the drain, then task.cancel()
     shutdown_drain_s: float = 120.0         # shutdown: bound on draining every live run
+
+    # The service token for other programs (README "API access for other programs"):
+    # ARGUS_SERVICE_TOKEN unset or blank = off; a Bearer is accepted only with a Host
+    # in service_hosts; the runs it starts carry service_origin.
+    service_token: str = field(default="", repr=False)
+    service_hosts: tuple[str, ...] = ("host.docker.internal:8787",)
+    service_origin: str = "api"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -120,6 +148,9 @@ class Settings:
             cancel_drain_timeout_s=float(os.environ.get("ARGUS_CANCEL_DRAIN_TIMEOUT_S")
                                          or cls.cancel_drain_timeout_s),
             shutdown_drain_s=float(os.environ.get("ARGUS_SHUTDOWN_DRAIN_S") or cls.shutdown_drain_s),
+            service_token=(os.environ.get("ARGUS_SERVICE_TOKEN") or "").strip(),
+            service_hosts=_hosts_env("ARGUS_SERVICE_HOSTS", cls.service_hosts),
+            service_origin=_origin_env("ARGUS_SERVICE_ORIGIN", cls.service_origin),
         )
 
 
