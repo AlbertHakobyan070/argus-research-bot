@@ -791,20 +791,33 @@ class _Gate:
         self.received = 0
         self.refused: list[str] = []
         self.failures: list[Exception] = []
+        self._closed = False
         self._server = socket.create_server(("127.0.0.1", 0))
         self.port = self._server.getsockname()[1]
-        threading.Thread(target=self._accept, name="argus-browser-gate", daemon=True).start()
+        self._accepting = threading.Thread(target=self._accept, name="argus-browser-gate", daemon=True)
+        self._accepting.start()
 
     @property
     def too_large(self) -> bool:
         return self.received > self._cap
 
     def close(self) -> None:
-        self._server.close()
+        """Close every relayed connection and stop listening: once a call returns,
+        the port refuses connections. Closing a socket does not wake an
+        ``accept()`` blocked on it everywhere (on Linux it goes on listening), so
+        the first call makes one connection of its own to wake it, and the accept
+        thread closes it; every call waits for that."""
         with self._lock:
+            first, self._closed = not self._closed, True
             sockets, self._open = list(self._open), set()
         for s in sockets:
             s.close()
+        if first:
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=self._timeout).close()
+            except ConnectionRefusedError:        # the accept thread has closed it already
+                pass
+        self._accepting.join()
 
     def _track(self, s: socket.socket) -> socket.socket:
         with self._lock:
@@ -812,12 +825,17 @@ class _Gate:
         return s
 
     def _accept(self) -> None:
-        while True:
-            try:
-                conn, _addr = self._server.accept()
-            except OSError:                       # close() closed the listening socket
-                return
-            threading.Thread(target=self._serve, args=(self._track(conn),), daemon=True).start()
+        with self._server:
+            while True:
+                try:
+                    conn, _addr = self._server.accept()
+                except OSError as e:              # nothing closes the socket but this thread: a real failure
+                    self.failures.append(e)
+                    return
+                if self._closed:                  # close()'s own connection, or one that came after it
+                    conn.close()
+                    return
+                threading.Thread(target=self._serve, args=(self._track(conn),), daemon=True).start()
 
     def _serve(self, conn: socket.socket) -> None:
         upstream = None
