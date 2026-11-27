@@ -61,7 +61,7 @@ def test_help_md_exists_and_covers_commands():
     body = Path(_HELP_MD_PATH).read_text(encoding="utf-8")
     for cmd in ("/research", "/find", "/fetch", "/quality", "/transcripts",
                 "/runs", "/append", "/continue", "/delete", "/status", "/cancel",
-                "/engines", "/engines transcriber", "menu button"):
+                "/engines", "/engines transcriber", "menu button", "/repos"):
         assert cmd in body, f"help.md must document {cmd}"
 
 

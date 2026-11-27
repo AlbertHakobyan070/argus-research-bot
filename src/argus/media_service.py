@@ -12,6 +12,12 @@ a file (``meta.derived_from``) and a transcript of a media asset
 suggestion lives in ``meta.suggest`` with ``meta.review = "pending"`` until
 ``accept`` writes ``meta.tags`` / ``meta.group`` (``review = "done"``).
 
+Investigate (spec 2026-11-27): ``investigate`` keeps what ``investigate.find``
+checked as ``meta.investigate`` (``state = "pending"`` until attached; ``rev``
+bumps on every run, so an old chat list cannot act); ``set_repos`` /
+``attach_chosen`` write ``meta.repos``; bookmarks live in the library's
+``bookmarks`` table (``bookmark_about`` fills ``about`` from the project).
+
 Links: ``sign_link`` makes an HMAC-signed, expiring token for one asset's file
 (``f`` inline, ``d`` download, ``t`` thumbnail); ``/files/{token}/<name>``
 (``webapp/media_api.py``) serves it.
@@ -33,6 +39,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
+from . import investigate as finder
 from . import media, media_tags
 from .engines.registry import EngineConfigError
 from .library import AUDIO_EXTS
@@ -100,7 +107,7 @@ async def save_settings(lib, patch: dict) -> dict[str, Any]:
 @dataclass
 class Job:
     id: str
-    kind: str                       # fetch | convert | transcribe | tag | import
+    kind: str                       # fetch | convert | transcribe | tag | import | investigate
     title: str
     state: str = "running"          # running | done | failed
     pct: float | None = None        # None: no measurable progress (transcription, tagging)
@@ -400,6 +407,198 @@ async def maybe_autotag(lib, asset_id: int | None, title: str, *,
     if asset_id is None or not (await load_settings(lib))["auto_tag"]:
         return None
     return tag_job(lib, asset_id, title, then=then)
+
+
+# ---------------------------------------------------------------------------
+# investigate (spec 2026-11-27): the repos, tools and sites an item mentions
+# ---------------------------------------------------------------------------
+
+_INVESTIGATING: dict[int, Job] = {}         # asset_id → its latest investigate job
+MAX_NOTE = 300
+
+
+async def _transcript_text(lib, a: dict) -> str:
+    """The item's transcript (itself, or its first transcript part), whole."""
+    paths = [a["path"]] if a["kind"] == "transcript" else [r["path"] for r in await lib.related_assets(a)
+                                                           if r["kind"] == "transcript"]
+    for path in paths:
+        text = await asyncio.to_thread(_read_text, path, 400_000)
+        if text.strip():
+            return text
+    return ""
+
+
+async def investigate(lib, s, asset_id: int, job: Job, *, stage: Callable[[str], Awaitable[None]] | None = None) -> int:
+    """Find what the item mentions (``investigate.find``) and keep it as the
+    item's pending result, ``meta.investigate``: ``{rev, at, state, found,
+    skipped, model, read, note}``. A media item without a transcript is
+    transcribed first (YouTube: captions first); when that fails the finder
+    reads the rest and ``note`` says why. The item id."""
+    a = await lib.get_asset(int(asset_id))
+    if a is None or a["kind"] not in ("media", "transcript"):
+        raise MediaError(f"no library item {asset_id}")
+
+    async def say(text: str) -> None:
+        job.message = text
+        if stage is not None:
+            await stage(text)
+
+    note = ""
+    transcript = await _transcript_text(lib, a)
+    if not transcript and a["kind"] == "media":
+        if await asyncio.to_thread(Path(a["path"]).is_file):
+            await say("transcribing first — speech-to-text can take a few minutes")
+            try:
+                await transcribe(lib, s, a["asset_id"], job,
+                                 timestamps=False if a.get("platform") == "youtube" else None)
+            except (MediaError, ValueError, EngineConfigError) as e:      # said in the result, not hidden
+                note = f"No transcript: {e}"
+                logger.warning("investigate %s: the transcript failed: %s", a["asset_id"], e)
+            transcript = await _transcript_text(lib, a)
+        else:
+            note = "No transcript: the file is missing on disk"
+    info = await asyncio.to_thread(lambda: finder.read_info(finder.info_path(a)))
+    m = finder.material(title=a.get("title") or Path(a["path"]).stem, info=info, transcript=transcript)
+    result = await finder.find(m, stage=say)
+    found = result["found"]
+    prev = int((a["meta"].get("investigate") or {}).get("rev") or 0)
+    result.update(rev=prev + 1, at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                  state="pending" if found else "done", note=note)
+    await lib.update_asset_meta(a["asset_id"], {"investigate": None})     # replace, not merge, the old one
+    await lib.update_asset_meta(a["asset_id"], {"investigate": result})
+    repos = sum(1 for f in found if f["kind"] == "repo")
+    job.message = (f"{repos} repo(s), {len(found) - repos} tool(s) or site(s)" if found else "nothing found")
+    return a["asset_id"]
+
+
+def investigate_job(lib, s, asset_id: int, title: str, *, then: Callable[[Job], Awaitable[None]] | None = None,
+                    stage: Callable[[str], Awaitable[None]] | None = None) -> Job:
+    """An investigate job for one item; ``MediaError`` while one already runs for it."""
+    running = _INVESTIGATING.get(int(asset_id))
+    if running is not None and running.state == "running":
+        raise MediaError(f"item {asset_id} is already being investigated — its result comes when it finishes")
+    job = start_job("investigate", f"Investigate · {title}",
+                    lambda job: investigate(lib, s, asset_id, job, stage=stage), then=then)
+    _INVESTIGATING[int(asset_id)] = job
+    return job
+
+
+def _attached(item: dict) -> dict:
+    return {k: item.get(k) for k in ("kind", "key", "name", "url", "about", "stars")}
+
+
+async def _pending(lib, asset_id: int, rev: int | None) -> tuple[dict, dict]:
+    """(asset, its investigation); ``MediaError`` when there is none or ``rev`` is not the latest."""
+    a = await lib.get_asset(int(asset_id))
+    if a is None:
+        raise MediaError(f"no library item {asset_id}")
+    inv = a["meta"].get("investigate") or {}
+    if not inv.get("found"):
+        raise MediaError("nothing to attach — tap 🔎 Investigate first")
+    if rev is not None and int(inv.get("rev") or 0) != int(rev):
+        raise MediaError("this list is out of date — use the newest Investigate result")
+    return a, inv
+
+
+async def toggle_found(lib, asset_id: int, rev: int, index: int) -> dict:
+    """Tick or untick one found entry of the latest investigation; the asset."""
+    a, inv = await _pending(lib, asset_id, rev)
+    found = list(inv["found"])
+    if not 0 <= index < len(found):
+        raise MediaError("that entry is not in this list")
+    found[index] = {**found[index], "on": not found[index].get("on")}
+    return await lib.update_asset_meta(a["asset_id"], {"investigate": {"found": found}})
+
+
+async def set_repos(lib, asset_id: int, keys: list, *, bookmark: list = ()) -> dict:
+    """Attach exactly ``keys`` — entries of the latest investigation or ones
+    already attached — to the item (``meta.repos``; the others come off),
+    close the investigation, and bookmark the ``bookmark`` keys. The asset."""
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+        raise ValueError("repos must be a list of keys")
+    if not all(isinstance(k, str) for k in bookmark) or not set(bookmark) <= set(keys):
+        raise ValueError("bookmark must list keys that are attached")
+    a = await lib.get_asset(int(asset_id))
+    if a is None:
+        raise MediaError(f"no library item {asset_id}")
+    inv = a["meta"].get("investigate") or {}
+    pool = {i["key"]: i for i in a["meta"].get("repos") or []}
+    pool.update({i["key"]: i for i in inv.get("found") or []})
+    unknown = [k for k in keys if k not in pool]
+    if unknown:
+        raise ValueError(f"not found by Investigate for this item: {', '.join(unknown[:5])}")
+    patch: dict[str, Any] = {"repos": [_attached(pool[k]) for k in dict.fromkeys(keys)]}
+    if inv:
+        patch["investigate"] = {"state": "done"}
+    row = await lib.update_asset_meta(a["asset_id"], patch)
+    for k in dict.fromkeys(bookmark):
+        await _bookmark(lib, pool[k], a["asset_id"])
+    return row
+
+
+async def attach_chosen(lib, asset_id: int, rev: int, *, bookmark: bool = False) -> tuple[dict, list[dict]]:
+    """The chat's Attach: the ticked entries join what the item already
+    carries (and are bookmarked when ``bookmark``). (asset, the entries attached)."""
+    a, inv = await _pending(lib, asset_id, rev)
+    chosen = [f for f in inv["found"] if f.get("on")]
+    if not chosen:
+        raise MediaError("nothing is ticked — tick at least one first")
+    keys = [r["key"] for r in a["meta"].get("repos") or []] + [f["key"] for f in chosen]
+    row = await set_repos(lib, a["asset_id"], list(dict.fromkeys(keys)),
+                          bookmark=[f["key"] for f in chosen] if bookmark else [])
+    return row, chosen
+
+
+async def _bookmark(lib, item: dict, asset_id: int | None) -> dict:
+    return await lib.add_bookmark(kind=item["kind"], key=item["key"], name=item["name"], url=item["url"],
+                                  note=(item.get("said") or "")[:MAX_NOTE], stars=item.get("stars"),
+                                  asset_id=asset_id)
+
+
+async def bookmark_from_item(lib, asset_id: int, key: str) -> dict:
+    """Bookmark one repo or tool attached to (or found for) the item; the bookmark."""
+    a = await lib.get_asset(int(asset_id))
+    if a is None:
+        raise MediaError(f"no library item {asset_id}")
+    found = {i["key"]: i for i in (a["meta"].get("investigate") or {}).get("found") or []}
+    attached = {i["key"]: i for i in a["meta"].get("repos") or []}
+    if key not in found and key not in attached:
+        raise ValueError(f"{key} is not attached to or found for this item")
+    return await _bookmark(lib, {**found.get(key, {}), **attached.get(key, {})}, a["asset_id"])
+
+
+async def bookmark_about(lib, bookmark_id: int) -> dict:
+    """Fill a bookmark's ``about`` from the project itself: a repo's GitHub
+    description (its README's first paragraph when it has none), a tool's
+    page title. The bookmark; ``MediaError`` saying why when it cannot."""
+    b = await lib.get_bookmark(int(bookmark_id))
+    if b is None:
+        raise MediaError(f"no bookmark {bookmark_id}")
+    try:
+        if b["kind"] == "repo":
+            about = await asyncio.to_thread(finder.about_from_github, *b["key"].split("/", 1))
+        else:
+            about = (await asyncio.to_thread(finder.open_page, b["url"]))[1]
+            if not about:
+                raise ValueError(f"{b['url']} has no page title")
+    except ValueError as e:
+        raise MediaError(str(e)) from e
+    except finder.GitHubLimit as e:
+        when = f" (it resets at {datetime.fromtimestamp(e.reset).strftime('%H:%M')})" if e.reset else ""
+        raise MediaError(f"GitHub's rate limit{when}; a GITHUB_TOKEN in .env lifts it") from e
+    except finder.GitHubError as e:
+        raise MediaError(str(e)) from e
+    return await lib.update_bookmark(b["bookmark_id"], about=about)
+
+
+async def set_bookmark_note(lib, bookmark_id: int, note: Any) -> dict:
+    """Your note on a bookmark (whitespace collapsed, at most ``MAX_NOTE`` characters); the bookmark."""
+    if not isinstance(note, str):
+        raise ValueError("note must be text")
+    row = await lib.update_bookmark(int(bookmark_id), note=" ".join(note.split())[:MAX_NOTE])
+    if row is None:
+        raise MediaError(f"no bookmark {bookmark_id}")
+    return row
 
 
 async def delete(lib, s, asset_id: int) -> list[str]:

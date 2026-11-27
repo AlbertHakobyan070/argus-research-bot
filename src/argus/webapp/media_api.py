@@ -2,8 +2,13 @@
 
 ``/api/media/*`` sits behind the same initData auth and error JSON as the
 rest of ``/api``; the actions themselves are ``media_service`` (shared with
-the chat). Long actions (fetch, convert, transcribe, tag) answer at once with
-a job the Jobs tab polls.
+the chat). Long actions (fetch, convert, transcribe, tag, investigate) answer
+at once with a job the Jobs tab polls.
+
+Investigate (spec 2026-11-27): ``POST /api/media/{id}/investigate`` starts
+one; ``PUT /api/media/{id}/repos`` attaches what was picked; bookmarks are
+``/api/bookmarks`` (list, ``PUT`` the note, ``DELETE``, ``POST …/about`` to
+fill the project's own description).
 
 ``/files/{token}/{name}`` is outside ``/api``: a ``<video>`` element or a
 phone's download manager cannot send the Authorization header, so the token
@@ -90,6 +95,7 @@ def _item(d, a: dict, hours: int) -> dict:
             "suggest": meta.get("suggest"), "derived_from": meta.get("derived_from"),
             "media_asset_id": meta.get("media_asset_id"), "backend": meta.get("backend"),
             "language": meta.get("language"), "imported": bool(meta.get("imported")),
+            "repos": meta.get("repos") or [], "investigate": meta.get("investigate"),
             "links": _links(d, a, hours)}
 
 
@@ -134,9 +140,11 @@ async def get_item(request: web.Request) -> web.Response:
     if a["kind"] == "transcript":
         text = await asyncio.to_thread(ms._read_text, a["path"], 12000)
     present = await asyncio.to_thread(Path(a["path"]).is_file)
+    keys = [r["key"] for r in a["meta"].get("repos") or []] + \
+           [f["key"] for f in (a["meta"].get("investigate") or {}).get("found") or []]
     return _ok({"item": _item(d, a, hours), "parts": parts, "text": text, "present": present,
                 "public_url": d.bot_data.get("webapp_public_url") or None,
-                "facets": await lib.asset_facets()})
+                "facets": await lib.asset_facets(), "bookmarked": sorted(await lib.bookmarked_keys(keys))})
 
 
 async def delete_item(request: web.Request) -> web.Response:
@@ -252,6 +260,44 @@ async def put_tags(request: web.Request) -> web.Response:
     except ms.MediaError as e:
         raise _media_error(e) from None
     return _ok({"item": _item(d, row, await _hours(lib))})
+
+
+async def investigate(request: web.Request) -> web.Response:
+    _, lib, s = _ctx(request)
+    a = await lib.get_asset(_id(request))
+    if a is None or a["kind"] not in ("media", "transcript"):
+        raise ApiError(404, "not_found", f"no library item {request.match_info['id']}")
+    try:
+        return _job(ms.investigate_job(lib, s, a["asset_id"], a.get("title") or str(a["asset_id"])))
+    except ms.MediaError as e:
+        raise _media_error(e) from None
+
+
+async def put_repos(request: web.Request) -> web.Response:
+    """Attach exactly ``repos`` (keys of found or attached entries); ``bookmark`` saves some of them too."""
+    d, lib, _ = _ctx(request)
+    body = await _body(request)
+    try:
+        row = await ms.set_repos(lib, _id(request), body.get("repos"), bookmark=body.get("bookmark") or [])
+    except ValueError as e:
+        raise _bad(str(e)) from None
+    except ms.MediaError as e:
+        raise _media_error(e) from None
+    return _ok({"item": _item(d, row, await _hours(lib))})
+
+
+async def bookmark_item(request: web.Request) -> web.Response:
+    _, lib, _ = _ctx(request)
+    key = _opt(await _body(request), "key")
+    if not key:
+        raise _bad("key is required")
+    try:
+        b = await ms.bookmark_from_item(lib, _id(request), key)
+    except ValueError as e:
+        raise _bad(str(e)) from None
+    except ms.MediaError as e:
+        raise _media_error(e) from None
+    return _ok({"bookmark": await _bookmark(lib, b)})
 
 
 async def put_title(request: web.Request) -> web.Response:
@@ -473,6 +519,64 @@ async def serve_file(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path, headers=headers)
 
 
+# ---------------------------------------------------------------------------
+# bookmarks (Investigate)
+# ---------------------------------------------------------------------------
+
+async def _bookmark(lib, b: dict) -> dict:
+    """A bookmark as the console shows it: its row, and the items that carry it."""
+    items = await lib.bookmark_items(b["kind"], b["key"])
+    return {**b, "videos": [{"id": a["asset_id"], "title": a.get("title") or Path(a["path"]).name,
+                             "type": ms.media_type(a)} for a in items[:10]]}
+
+
+async def _get_bookmark(lib, request: web.Request) -> dict:
+    b = await lib.get_bookmark(_id(request))
+    if b is None:
+        raise ApiError(404, "not_found", f"no bookmark {request.match_info['id']}")
+    return b
+
+
+async def list_bookmarks(request: web.Request) -> web.Response:
+    _, lib, _ = _ctx(request)
+    kind = request.query.get("kind") or None
+    try:
+        rows, total = await lib.list_bookmarks(q=(request.query.get("q") or "").strip() or None, kind=kind,
+                                               limit=_int_query(request, "limit", 50, 1, 200),
+                                               offset=_int_query(request, "offset", 0, 0, 10**6))
+    except ValueError as e:
+        raise _bad(str(e)) from None
+    return _ok({"bookmarks": [await _bookmark(lib, b) for b in rows], "total": total})
+
+
+async def put_bookmark(request: web.Request) -> web.Response:
+    _, lib, _ = _ctx(request)
+    b = await _get_bookmark(lib, request)
+    try:
+        row = await ms.set_bookmark_note(lib, b["bookmark_id"], (await _body(request)).get("note"))
+    except ValueError as e:
+        raise _bad(str(e)) from None
+    return _ok({"bookmark": await _bookmark(lib, row)})
+
+
+async def delete_bookmark(request: web.Request) -> web.Response:
+    _, lib, _ = _ctx(request)
+    b = await _get_bookmark(lib, request)
+    await lib.delete_bookmark(b["bookmark_id"])
+    return _ok({"outcome": "deleted", "message": f"Removed the bookmark {b['name']}."})
+
+
+async def bookmark_about(request: web.Request) -> web.Response:
+    """Fill ``about`` from the project itself (GitHub, or the site's title) — one call, answered at once."""
+    _, lib, _ = _ctx(request)
+    b = await _get_bookmark(lib, request)
+    try:
+        row = await ms.bookmark_about(lib, b["bookmark_id"])
+    except ms.MediaError as e:
+        raise ApiError(502, "lookup_failed", str(e)) from None
+    return _ok({"bookmark": await _bookmark(lib, row)})
+
+
 def setup(app: web.Application) -> None:
     app[UPLOADS] = {}
     r = app.router
@@ -495,6 +599,13 @@ def setup(app: web.Application) -> None:
     r.add_post("/api/media/{id}/tag", suggest_tags)
     r.add_put("/api/media/{id}/tags", put_tags)
     r.add_put("/api/media/{id}/title", put_title)
+    r.add_post("/api/media/{id}/investigate", investigate)
+    r.add_put("/api/media/{id}/repos", put_repos)
+    r.add_post("/api/media/{id}/bookmark", bookmark_item)
+    r.add_get("/api/bookmarks", list_bookmarks)
+    r.add_put("/api/bookmarks/{id}", put_bookmark)
+    r.add_delete("/api/bookmarks/{id}", delete_bookmark)
+    r.add_post("/api/bookmarks/{id}/about", bookmark_about)
     r.add_post("/api/media/{id}/send", send)
     r.add_post("/api/media/{id}/attach", attach)
     r.add_get("/files/{token}/{name}", serve_file)

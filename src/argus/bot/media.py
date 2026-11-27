@@ -1,7 +1,8 @@
 """Media: /video, /find, /fetch, /quality, /widgets, /transcript and
 /transcripts, pasted media links, the per-chat result pool and its m:*
 buttons, the video card (vc:* buttons and widget queries, see cards.py),
-the qs:* quality buttons and the t:send transcript-library buttons."""
+the qs:* quality buttons and the t:send transcript-library buttons. An item's
+🔎 Investigate button (mx:inv) hands over to repos.py."""
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +28,7 @@ from ..media import (
 from ..engines.registry import EngineConfigError
 from ..engines.transcribers import asr_label
 from ..transcribe import engines_config, transcribe_url
-from . import cards, tgx
+from . import cards, repos, tgx
 from .common import (
     _TG_UPLOAD_CAP_BYTES, _allowed, _fmt_bytes, _fmt_duration, _get_library,
     _html_escape_for_tg, _md_escape, _parse_indices, _safe_send,
@@ -178,14 +179,15 @@ def _public(app) -> str | None:
 
 
 def _item_keyboard(app, a: dict) -> InlineKeyboardMarkup:
-    """MP3 (videos) · Transcribe (video, audio) · Tags · Open in the console."""
+    """MP3 (videos) · Transcribe (video, audio) · Tags · Investigate · Open in the console."""
     aid, kind = a["asset_id"], ms.media_type(a)
     first = []
     if kind == "video":
         first.append(InlineKeyboardButton("🎵 MP3", callback_data=f"mx:mp3:{aid}"))
     if kind in ("video", "audio"):
         first.append(InlineKeyboardButton("📝 Transcribe", callback_data=f"mx:tr:{aid}"))
-    second = [InlineKeyboardButton("🏷 Tags", callback_data=f"mx:tag:{aid}")]
+    second = [InlineKeyboardButton("🏷 Tags", callback_data=f"mx:tag:{aid}"),
+              InlineKeyboardButton("🔎 Investigate", callback_data=f"mx:inv:{aid}")]
     url = _public(app)
     if url:
         second.append(InlineKeyboardButton("📱 Open", web_app=WebAppInfo(ms.item_url(url, aid))))
@@ -259,7 +261,8 @@ def _start_item_job(app, chat_id: int, kind: str, a: dict) -> None:
 
 
 async def handle_item_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, raw_id: str) -> None:
-    """``mx:<action>:<asset_id>``: mp3 · tr (transcribe) · tag (suggest) · ok (accept the suggestion)."""
+    """``mx:<action>:<asset_id>``: mp3 · tr (transcribe) · tag (suggest) · ok (accept the suggestion) ·
+    inv (investigate: the repos, tools and sites it mentions — see repos.py)."""
     q = update.callback_query
     app = ctx.application
     chat_id = q.message.chat.id if q.message else update.effective_chat.id
@@ -277,6 +280,8 @@ async def handle_item_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a
         await app.bot.send_message(chat_id=chat_id, text=(
             f"🎵 Converting to mp3: {title[:80]}…" if action == "mp3" else
             f"📝 Transcribing: {title[:80]}… (speech-to-text can take a few minutes)"))
+    elif action == "inv":
+        await repos.start(app, chat_id, a)
     elif action == "tag":
         ms.tag_job(lib, a["asset_id"], title, then=lambda job: _post_suggestion(app, chat_id, a["asset_id"], job))
         await app.bot.send_message(chat_id=chat_id, text=f"🏷 Asking for tags: {title[:80]}…")

@@ -59,6 +59,9 @@ def net(monkeypatch, tmp_path):
     monkeypatch.setattr(fetchers, "_resolve", lambda host: n.dns.get(host, [PUBLIC_IP]))
     monkeypatch.setattr(fetchers, "_scratch_dir", lambda: tmp_path)
     monkeypatch.setattr(fetchers, "INTEL_AVAILABLE", False)
+    # the fake Scrapling / Playwright modules stand in: these rungs run whether or not the groups are installed (CI has none)
+    monkeypatch.setattr(fetchers, "SCRAPLING_AVAILABLE", True)
+    monkeypatch.setattr(fetchers, "BROWSER_AVAILABLE", True)
     for env in ("EXA_API_KEY", "FREELLMAPI_BASE_URL", "ARGUS_WEBAPP_PUBLIC_URL", "JINA_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(fetchers, "_sleep", lambda s: None)

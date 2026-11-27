@@ -13,18 +13,18 @@ ROLES: tuple[str, ...] = (
     "intake.classify", "brief.draft", "scout.querygen", "research.rerank", "research.digest",
     "research.followup_querygen", "research.extend_querygen", "outline.plan", "compose.section", "compose.flat",
     "compose.findings_extract", "compose.analyst", "panel.grounding", "panel.coverage", "quick.answer",
-    "media.tag", "compose.calc", "read.answer",
+    "media.tag", "compose.calc", "media.investigate", "read.answer",
 )
 ROLE_TIERS: dict[str, Tier] = {
     "intake.classify": "cheap", "brief.draft": "strong", "scout.querygen": "cheap", "research.rerank": "cheap",
     "research.digest": "cheap", "research.followup_querygen": "cheap", "research.extend_querygen": "cheap",
     "outline.plan": "strong", "compose.section": "strong", "compose.flat": "strong", "compose.findings_extract": "cheap",
     "compose.analyst": "strong", "panel.grounding": "judge", "panel.coverage": "strong", "quick.answer": "cheap",
-    "media.tag": "cheap", "compose.calc": "strong", "read.answer": "strong"}
+    "media.tag": "cheap", "compose.calc": "strong", "media.investigate": "cheap", "read.answer": "strong"}
 JSON_ROLES = frozenset({"intake.classify", "brief.draft", "scout.querygen", "research.rerank", "research.digest",
                         "research.followup_querygen", "research.extend_querygen", "outline.plan",
                         "compose.findings_extract", "panel.grounding", "panel.coverage", "media.tag",
-                        "compose.calc"})
+                        "compose.calc", "media.investigate"})
 # Failure policy classes (validated in schema.py):
 SKIPPABLE_ROLES = frozenset({"research.digest", "compose.findings_extract", "compose.section",
                              "panel.grounding", "panel.coverage"})  # on_exhausted="skip_item": drop that item (source / section / judge batch)
@@ -41,4 +41,5 @@ DEGRADABLE_ROLES: dict[str, str] = {                               # on_exhauste
 }
 MUST_RAISE_ROLES = frozenset({"brief.draft", "compose.flat", "quick.answer",   # on_exhausted must be "raise"
                               "media.tag",                                       # no tags rather than invented ones
+                              "media.investigate",                               # no repos rather than invented ones
                               "read.answer"})                                    # /read: no answer rather than an invented one
