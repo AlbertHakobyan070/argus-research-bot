@@ -305,8 +305,8 @@ def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
     length = p.get("length") or DEFAULT_LENGTH
     auto = bool(p.get("depth_auto"))
 
-    def button(label: str, data: str, on: bool = False) -> InlineKeyboardButton:
-        return InlineKeyboardButton(label + (" ✅" if on else ""), callback_data=data + sfx)
+    def button(label: str, data: str, on: bool = False, style: str | None = None) -> InlineKeyboardButton:
+        return InlineKeyboardButton(label + (" ✅" if on else ""), callback_data=data + sfx, style=style)
 
     profile = (p.get("profile") or "engines") + (" ⚠" if p.get("profile_problem") else "")
     return InlineKeyboardMarkup([
@@ -316,7 +316,8 @@ def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
          button("Auto", "dep:auto", auto)],
         [button(f"⚙ {profile}", "prof:next"),
          button(f"🕒 {_RECENCY_LABELS.get(p.get('recency'), p.get('recency'))}", "rec:next")],
-        [button("✅ Approve", "plan:approve"), button("✏️ Edit", "plan:edit"), button("❌ Cancel", "plan:cancel")],
+        [button("✅ Approve", "plan:approve", style="success"), button("✏️ Edit", "plan:edit"),
+         button("❌ Cancel", "plan:cancel", style="danger")],
     ])
 
 
@@ -324,12 +325,12 @@ def _report_keyboard(run_id: str = "") -> InlineKeyboardMarkup:
     sfx = f":{run_id}" if run_id else ""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📤 Send", callback_data=f"report:send{sfx}"),
+            InlineKeyboardButton("📤 Send", callback_data=f"report:send{sfx}", style="success"),
             InlineKeyboardButton("🔎 Extend", callback_data=f"report:extend{sfx}"),
         ],
         [
             InlineKeyboardButton("🔁 Revise", callback_data=f"report:revise{sfx}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"report:cancel{sfx}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"report:cancel{sfx}", style="danger"),
         ],
     ])
 

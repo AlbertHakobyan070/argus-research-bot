@@ -93,7 +93,7 @@ def _render_delete_page(sess: dict) -> tuple[str, InlineKeyboardMarkup]:
     if nav:
         rows.append(nav)
     rows.append([
-        InlineKeyboardButton("🗑 Delete selected", callback_data="del:ok:_"),
+        InlineKeyboardButton("🗑 Delete selected", callback_data="del:ok:_", style="danger"),
         InlineKeyboardButton("✖ Close", callback_data="del:cancel:_"),
     ])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -249,7 +249,7 @@ async def _on_delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return
         total = sum(sess["items"][i]["bytes"] for i in sess["selected"])
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, delete", callback_data="del:yes:_"),
+            InlineKeyboardButton("🗑 Yes, delete", callback_data="del:yes:_", style="danger"),
             InlineKeyboardButton("↩ Back", callback_data="del:no:_"),
         ]])
         await q.edit_message_text(

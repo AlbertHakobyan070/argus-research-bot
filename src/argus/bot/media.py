@@ -1,6 +1,7 @@
-"""Media: /video, /find, /fetch, /quality, /transcript and /transcripts,
-pasted media links, the per-chat result pool and its m:* buttons, and the
-t:send transcript-library buttons."""
+"""Media: /video, /find, /fetch, /quality, /widgets, /transcript and
+/transcripts, pasted media links, the per-chat result pool and its m:*
+buttons, the video card (vc:* buttons and widget queries, see cards.py),
+the qs:* quality buttons and the t:send transcript-library buttons."""
 from __future__ import annotations
 
 import asyncio
@@ -14,22 +15,24 @@ from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo,
 )
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .. import media_service as ms
 from ..config import get_settings
 from ..media import (
-    detect_platform, download_media, extract_urls, quality_format,
+    detect_platform, download_media, extract_urls, probe_url, quality_format,
     reddit_search, resolve_ffmpeg,
 )
 from ..engines.registry import EngineConfigError
 from ..engines.transcribers import asr_label
 from ..transcribe import engines_config, transcribe_url
+from . import cards, tgx
 from .common import (
-    _TG_UPLOAD_CAP_BYTES, _allowed, _fmt_duration, _get_library,
+    _TG_UPLOAD_CAP_BYTES, _allowed, _fmt_bytes, _fmt_duration, _get_library,
     _html_escape_for_tg, _md_escape, _parse_indices, _safe_send,
-    _stream_progress,
 )
+from .progress import edit_text
 
 logger = logging.getLogger("argus.bot")
 
@@ -144,9 +147,6 @@ async def video_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 
-_MEDIA_PROGRESS_INTERVAL_S = 3.0
-
-
 def _media_keyboard(n: int) -> InlineKeyboardMarkup:
     """One row per result: download / transcript / both, index-scoped.
 
@@ -210,7 +210,7 @@ async def _post_suggestion(app, chat_id: int, asset_id: int, job: ms.Job) -> Non
     repos = [link["url"] for link in sug.get("links") or [] if link.get("kind") == "repo"][:5]
     if repos:
         lines += ["", "Repos:", *repos]
-    rows = [[InlineKeyboardButton("✅ Accept", callback_data=f"mx:ok:{asset_id}")]]
+    rows = [[InlineKeyboardButton("✅ Accept", callback_data=f"mx:ok:{asset_id}", style="success")]]
     url = _public(app)
     if url:
         rows[0].append(InlineKeyboardButton("✏️ Edit", web_app=WebAppInfo(ms.item_url(url, asset_id))))
@@ -418,61 +418,236 @@ async def _get_media_quality(app) -> str:
         return "auto"
 
 
-async def _fetch_one_media(app, chat_id: int, url: str) -> None:
-    """Background task: download one URL into the vault, register it,
-    stream throttled progress edits, deliver the file when small enough."""
+def _lib(app):
+    return app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
+
+
+async def _send_card(app, card: cards.Card) -> bool:
+    """Post a video card; a card Telegram refuses outright is said in the
+    chat (the download, if any, still reports its outcome)."""
+    try:
+        await cards.send(app.bot, card, lib=_lib(app))
+        return True
+    except TelegramError as e:
+        logger.exception("the video card for %s could not be sent", card.url)
+        await app.bot.send_message(chat_id=card.chat_id, text=(
+            f"⚠️ Could not show the video card ({type(e).__name__}: {e.message}).\n{card.url}"))
+        return False
+
+
+async def open_card(app, chat_id: int, url: str, *, fmt: str = "v", title: str = "") -> cards.Card | None:
+    """The video card for one link: posted at once ("Reading the link…"),
+    then filled by a probe with the formats on offer."""
+    lib = _lib(app)
+    card = cards.Card(chat_id=chat_id, url=url, platform=detect_platform(url) or "", fmt=fmt,
+                      title=title if title != url else "",
+                      mp3=(await ms.load_settings(lib))["mp3_quality"] if lib is not None else "320")
+    if not await _send_card(app, card):
+        return None
+    app.create_task(_probe_card(app, card))
+    return card
+
+
+async def _probe_card(app, card: cards.Card) -> None:
+    """Background task: what the link offers (title, heights, sizes) onto
+    the card, which then asks for a format and quality."""
+    try:
+        info = await probe_url(card.url)
+    except Exception as e:                       # RuntimeError carries the downloader's explanation
+        if not isinstance(e, RuntimeError):
+            logger.exception("probing %s crashed", card.url)
+        if card.phase == "read":                 # not cancelled meanwhile
+            card.phase, card.failed_at, card.error = "fail", "probe", f"Could not read the link: {e}"
+            await cards.settle(app.bot, card)
+        return
+    if card.phase != "read":
+        return
+    cards.fill(card, info, await _get_media_quality(app))
+    card.phase = "pick"
+    await cards.settle(app.bot, card)
+
+
+def _on_download_done(app, card: cards.Card):
+    """A download cancelled before it ever ran still ends its card."""
+    def done(task) -> None:
+        if task.cancelled() and card.phase not in ("done", "fail", "x"):
+            card.phase = "x"
+            asyncio.ensure_future(cards.settle(app.bot, card))
+    return done
+
+
+async def card_action(app, chat_id: int | None, message_id: int | None, action: str, arg: str, *,
+                      answer=None) -> cards.Card | None:
+    """One tap on a video card, from its buttons or its widget: the state
+    changes at once, ``answer(card)`` (a widget's answer, due within 15 s)
+    goes next, then the card is redrawn. None: no such card (expired)."""
+    c = cards.get(chat_id, message_id)
+    if c is None:
+        if answer is not None:
+            await answer(None)
+        return None
+    bot = app.bot
+    if action == "plain":
+        if answer is not None:
+            await answer(c)
+        if c.widget:
+            await cards.to_native(bot, c)
+        return c
+    changed = False
+    if action in ("f", "q", "a"):
+        changed = cards.apply(c, action, arg)
+    elif action == "ok" and c.phase == "pick":
+        c.phase, c.stage, c.eta = "queue", "starting", ""     # nothing left from an earlier attempt
+        c.pct = c.done_bytes = c.total_bytes = None
+        c.task = app.create_task(_fetch_one_media(app, chat_id, c.url, card=c))
+        c.task.add_done_callback(_on_download_done(app, c))
+        changed = True
+    elif action == "x":
+        if c.phase in ("read", "pick"):
+            c.phase, changed = "x", True
+        elif c.phase in ("queue", "dl") and c.task is not None:
+            c.task.cancel()                      # the download draws its cancelled state
+    elif action == "retry" and c.phase == "fail":
+        c.error = ""
+        if c.failed_at == "probe":
+            c.phase = "read"
+            app.create_task(_probe_card(app, c))
+        else:
+            c.phase = "pick"
+        changed = True
+    if answer is not None:
+        await answer(c)
+    if changed:
+        await cards.settle(bot, c)
+    return c
+
+
+async def handle_card_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, arg: str) -> None:
+    """``vc:<action>:<arg>``: a tap on a native video card."""
+    q = update.callback_query
+    chat_id = q.message.chat.id if q.message else update.effective_chat.id
+    message_id = q.message.message_id if q.message else None
+    if await card_action(ctx.application, chat_id, message_id, action, arg) is not None:
+        return
+    rows = [[b for b in row if not (b.callback_data or "").startswith("vc:")]   # the item buttons still work
+            for row in (q.message.reply_markup.inline_keyboard
+                        if q.message and q.message.reply_markup else ())]
+    rows = [r for r in rows if r]
+    try:
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    except TelegramError as e:
+        logger.info("could not clear an expired video card's buttons (%s)", e)
+    await ctx.application.bot.send_message(chat_id=chat_id, text=(
+        "(this video card expired — tap ⬇ on the list again or paste the link)"))
+
+
+async def handle_widget_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap inside a video-card widget (Update.widget_query): answered with
+    the card's new state, which the widget draws at once."""
+    wq = cards.widget_query(update)
+    bot = ctx.application.bot
+
+    async def answer(c: cards.Card | None) -> None:
+        data = (cards.widget_state(c) if c is not None else
+                cards.off_state("This card expired — paste the link again."))
+        try:
+            await tgx.answer_widget_query(bot, wq["id"], data)
+        except TelegramError:
+            logger.exception("could not answer widget query %s", wq["id"])
+
+    if not _allowed(get_settings(), (wq.get("from") or {}).get("id")):
+        try:
+            await tgx.answer_widget_query(bot, wq["id"], cards.off_state("Unauthorized."))
+        except TelegramError:
+            logger.exception("could not answer widget query %s", wq["id"])
+        return
+    action, _, arg = (wq.get("data") or "").partition(":")
+    await card_action(ctx.application, (wq.get("chat") or {}).get("id"), wq.get("message_id"),
+                      action, arg or "_", answer=answer)
+
+
+async def _fetch_one_media(app, chat_id: int, url: str, *, card: cards.Card | None = None) -> None:
+    """Background task: download one URL into the vault on its video card
+    (live progress, Cancel), register it, deliver the file when small
+    enough. Without a card (/fetch) it opens one at the /quality setting."""
     bot = app.bot
     s = get_settings()
-    quality = await _get_media_quality(app)
+    lib = _lib(app)
+    if card is None:
+        card = cards.Card(chat_id=chat_id, url=url, platform=detect_platform(url) or "",
+                          quality=await _get_media_quality(app), phase="queue", stage="starting")
+        await _send_card(app, card)
+        card.task = asyncio.current_task()
+    audio = card.mp3 if card.fmt == "a" else None
+    quality = card.quality
 
-    prog = {"message_id": None, "last": 0.0}
-    await _stream_progress(bot, chat_id, f"⬇️ Downloading…\n{url}", prog)
-
-    def on_progress(pct: float, eta: str) -> None:
-        now = time.monotonic()
-        if pct < 100.0 and (now - prog["last"]) < _MEDIA_PROGRESS_INTERVAL_S:
-            return
-        prog["last"] = now
-        asyncio.ensure_future(_stream_progress(
-            bot, chat_id, f"⬇️ {pct:.0f}%  ·  ETA {eta}\n{url}", prog))
+    def on_status(st: dict) -> None:
+        if st.get("stage") and st["stage"] != card.stage:         # a new stream: its own numbers
+            card.stage, card.pct, card.eta, card.done_bytes, card.total_bytes = st["stage"], None, "", None, None
+        card.phase = "queue" if card.stage == "queued" else "dl"
+        for k in ("pct", "eta", "done_bytes", "total_bytes"):
+            if st.get(k) is not None:
+                setattr(card, k, st[k])
+        cards.kick(bot, card)
 
     try:
-        r = await download_media(url, dest_root=s.media_root,
-                                 quality=quality, on_progress=on_progress)
+        r = await download_media(url, dest_root=s.media_root, quality=quality, audio=audio,
+                                 any_url=audio is not None, on_status=on_status)
+    except asyncio.CancelledError:
+        card.phase = "x"
+        await cards.settle(bot, card)
+        raise
     except Exception as e:
         logger.exception("download_media crashed for %s", url)
-        await _stream_progress(bot, chat_id, f"⚠️ Download crashed: {e}", prog)
+        card.phase, card.failed_at, card.error = "fail", "download", f"Download crashed: {e}"
+        await cards.settle(bot, card)
         return
+    card.task = None                             # the file is here: too late to cancel
 
     if not r.ok:
-        await _stream_progress(
-            bot, chat_id, f"⚠️ Download failed ({r.platform or '?'}):\n"
-                          f"{(r.error or 'unknown error')[:800]}", prog)
+        card.phase, card.failed_at = "fail", "download"
+        card.error = f"Download failed ({r.platform or '?'}): {(r.error or 'unknown error')[:800]}"
+        await cards.settle(bot, card)
         return
 
-    lib = app.bot_data.get("library") if isinstance(app.bot_data, dict) else None
     asset = None
     if lib is not None:
+        meta: dict[str, Any] = ({"via": "telegram", "format": "mp3", "mp3_quality": audio} if audio
+                                else {"quality": quality})
+        meta["info_json"] = r.info_json_path
+        if r.thumb_path:
+            meta["thumb"] = r.thumb_path
         try:
             asset = await lib.get_asset(await lib.add_asset(
                 kind="media", platform=r.platform, source_url=url,
                 media_id=r.media_id, title=r.title or url, path=r.path,
-                size_bytes=r.size_bytes, duration_s=r.duration_s,
-                meta={"quality": quality, "info_json": r.info_json_path,
-                      **({"thumb": r.thumb_path} if r.thumb_path else {})}))
+                size_bytes=r.size_bytes, duration_s=r.duration_s, meta=meta))
         except Exception:
             logger.exception("asset registration failed for %s", r.path)
 
-    size_mb = r.size_bytes / (1024 * 1024)
-    dur = _fmt_duration(r.duration_s)
-    summary = (f"✅ Saved ({r.platform}, {size_mb:.1f} MB"
-               + (f", {dur}" if dur else "") + f")\n{r.path}"
-               + (f"\nasset:{asset['asset_id']}" if asset else ""))
-    await _stream_progress(bot, chat_id, summary, prog)
+    kind = (f"MP3 {cards._alabel(audio)}" if audio
+            else f"{cards._qlabel(quality)} {Path(r.path).suffix.lstrip('.').upper()}")
+    card.title = card.title or r.title or url
+    card.summary = " · ".join(x for x in (kind, _fmt_bytes(r.size_bytes), _fmt_duration(r.duration_s),
+                                          f"asset:{asset['asset_id']}" if asset else "") if x)
+    card.done_markup = _item_keyboard(app, asset) if asset is not None else None
+    card.phase = "done"
+    await cards.settle(bot, card)
     if asset is not None:
-        await bot.send_message(chat_id=chat_id, text=f"🎬 {(r.title or url)[:200]}",
-                               reply_markup=_item_keyboard(app, asset))
         await _autotag(app, chat_id, asset["asset_id"], r.title or url)
+
+    if audio and asset is not None:
+        try:
+            await ms.send_to_chat(bot, chat_id, asset, bot_token=s.telegram_bot_token, public_url=_public(app),
+                                  hours=(await ms.load_settings(lib))["link_hours"])
+        except ms.MediaError as e:
+            await bot.send_message(chat_id=chat_id, text=f"📁 MP3 saved to the vault, but: {e}\n{r.path}")
+        except Exception as e:
+            logger.exception("MP3 delivery failed")
+            await bot.send_message(chat_id=chat_id, text=(
+                f"📁 MP3 saved to the vault, but Telegram delivery failed "
+                f"({type(e).__name__}: {str(e)[:200]}).\n{r.path}"))
+        return
 
     if r.size_bytes > _TG_UPLOAD_CAP_BYTES and asset is not None and _public(app):
         # Too big for a bot upload: a private link from this PC instead of a dead end.
@@ -486,10 +661,13 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
     if r.size_bytes <= _TG_UPLOAD_CAP_BYTES:
         try:
             with Path(r.path).open("rb") as f:
-                await bot.send_video(
-                    chat_id=chat_id, video=f,
-                    caption=(r.title or Path(r.path).name)[:1024],
-                    supports_streaming=True)
+                if audio:                        # an MP3 the library could not take
+                    await bot.send_audio(chat_id=chat_id, audio=f, caption=(r.title or Path(r.path).name)[:1024])
+                else:
+                    await bot.send_video(
+                        chat_id=chat_id, video=f,
+                        caption=(r.title or Path(r.path).name)[:1024],
+                        supports_streaming=True)
         except Exception as e_vid:
             logger.warning("send_video failed (%s); retrying as document",
                            e_vid)
@@ -507,22 +685,18 @@ async def _fetch_one_media(app, chat_id: int, url: str) -> None:
                     chat_id=chat_id,
                     text=("📁 Saved to the vault, but Telegram delivery "
                           f"failed ({type(e_doc).__name__}: "
-                          f"{str(e_doc)[:200]}).\nThe file is intact at the "
-                          "path above."))
+                          f"{str(e_doc)[:200]}).\nThe file is intact at "
+                          f"{r.path}"))
     else:
-        # Name the cause. At /quality max this fires on almost every long
-        # video, and "over the cap" alone doesn't tell the user that their
-        # own quality setting is what put it there.
-        why = (f"\n\nYour /quality is `{quality}`, which takes the largest "
-               "available stream. `/quality 720` keeps most clips under "
-               "the cap and deliverable here."
-               if quality == "max" else "")
+        # Name the cause: a high quality is what puts most long videos
+        # over the cap, and "over the cap" alone doesn't say so.
+        why = ("\n\nA lower quality keeps most clips under the cap: pick 720p on the card "
+               "(or /quality 720 for /fetch)."
+               if not audio and (quality == "max" or (quality.isdigit() and int(quality) > 720)) else "")
         await bot.send_message(
             chat_id=chat_id,
-            text=(f"📁 File is {size_mb:.0f} MB — over Telegram's 50 MB bot "
-                  f"upload cap, so it stays in the vault at the path "
-                  f"above.{why}"),
-            parse_mode=ParseMode.MARKDOWN)
+            text=(f"📁 File is {_fmt_bytes(r.size_bytes)} — over Telegram's 50 MB bot "
+                  f"upload cap, so it stays in the vault at {r.path}{why}"))
 
 
 async def _transcript_for_item(app, chat_id: int, item: dict) -> None:
@@ -675,13 +849,7 @@ async def quality_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur = "auto"
         if lib is not None:
             cur = (await lib.get_setting("media_quality", "auto")) or "auto"
-        ff_note = ("available" if ffmpeg
-                   else "MISSING (single-file formats only — no merged hi-res)")
-        await update.message.reply_text(
-            f"🎚 Download quality: {cur}\n"
-            f"ffmpeg: {ff_note}\n\n"
-            "Set with /quality auto | min | max | <pixel height>\n"
-            "e.g. /quality 720")
+        await update.message.reply_text(_quality_text(cur, ffmpeg), reply_markup=_quality_keyboard(cur))
         return
     v = ctx.args[0].lower().strip()
     try:
@@ -695,6 +863,70 @@ async def quality_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await lib.set_setting("media_quality", v)
     await update.message.reply_text(f"🎚 Download quality set to: {v}")
+
+
+_QUALITY_ROWS = (("auto", "max", "min"), ("2160", "1440", "1080"), ("720", "480", "360"))
+
+
+def _quality_text(cur: str, ffmpeg) -> str:
+    ff_note = "available" if ffmpeg else "MISSING (single-file formats only — no merged hi-res)"
+    return (f"🎚 Download quality: {cur}\n"
+            f"ffmpeg: {ff_note}\n\n"
+            "The default on new video cards and for /fetch. Tap one, or\n"
+            "/quality auto | min | max | <pixel height>, e.g. /quality 720")
+
+
+def _quality_keyboard(cur: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        cards._qlabel(v) + (" ✓" if v == cur else ""), callback_data=f"qs:set:{v}",
+        style="primary" if v == cur else None) for v in row] for row in _QUALITY_ROWS])
+
+
+async def handle_quality_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, arg: str) -> None:
+    """``qs:set:<quality>``: a /quality button."""
+    q = update.callback_query
+    lib = _get_library(ctx)
+    ffmpeg = resolve_ffmpeg()
+    try:
+        quality_format(arg, ffmpeg_available=bool(ffmpeg))
+    except ValueError as e:
+        await q.edit_message_text(f"⚠️ {e}")
+        return
+    if action != "set" or lib is None:
+        await q.edit_message_text("⚠️ Library unavailable — setting not persisted.")
+        return
+    await lib.set_setting("media_quality", arg)
+    await edit_text(ctx.application.bot, chat_id=q.message.chat.id, message_id=q.message.message_id,
+                    text=_quality_text(arg, ffmpeg) + f"\n\n✅ Set to {arg}.", reply_markup=_quality_keyboard(arg))
+
+
+async def widgets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/widgets [on|off] — send video cards as Telegram HTML widgets."""
+    s = get_settings()
+    if not _allowed(s, update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    lib = _get_library(ctx)
+    if lib is None:
+        await update.message.reply_text("⚠️ Library unavailable.")
+        return
+    arg = ctx.args[0].lower().strip() if ctx.args else ""
+    if arg not in ("", "on", "off"):
+        await update.message.reply_text("Usage: /widgets [on|off]")
+        return
+    if arg:
+        await lib.set_setting(cards.WIDGETS_KEY, arg)
+        if arg == "on":                          # a new refusal or failure is told again
+            for key in ("widget", "widget-error"):
+                tgx._noticed.discard((update.effective_chat.id, key))
+    cur = (await lib.get_setting(cards.WIDGETS_KEY, "off")) or "off"
+    await update.message.reply_text(
+        f"🧩 HTML widgets: {cur}\n\n" + (
+            "Video cards go out as Telegram widgets (Bot API 10.4). If Telegram refuses one, "
+            "Argus says so once, switches widgets off and sends the regular card. /widgets off goes back."
+            if cur == "on" else
+            "Video cards use regular buttons. /widgets on sends them as Telegram widgets where "
+            "Telegram allows it; a refusal switches them back off with one notice."))
 
 
 async def transcripts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -974,32 +1206,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                      "link again)")
             return
         item = pool[idx - 1]
-        queued: list[str] = []
-        if action == "mp3":
-            app, lib, s = ctx.application, _get_library(ctx), get_settings()
-            if lib is None:
-                await app.bot.send_message(chat_id=chat_id, text="⚠️ Library unavailable.")
-                return
-
-            async def then(job: ms.Job) -> None:
-                await _deliver(app, chat_id, job, "MP3")
-                if job.state == "done":
-                    await _autotag(app, chat_id, job.asset_id, item.get("title") or item["url"])
-            ms.start_job("fetch", f"MP3 · {item.get('title') or item['url']}",
-                         lambda job: ms.fetch(lib, s, item["url"], job, mode="mp3", via="telegram"), then=then)
-            queued.append("mp3")
-        if action in ("dl", "both"):
-            ctx.application.create_task(
-                _fetch_one_media(ctx.application, chat_id, item["url"]))
-            queued.append("download")
+        if action in ("dl", "mp3", "both"):
+            # The video card asks for the format and quality, then shows the download.
+            await open_card(ctx.application, chat_id, item["url"], fmt="a" if action == "mp3" else "v",
+                            title=item.get("title") or "")
         if action in ("tr", "both"):
             ctx.application.create_task(
                 _transcript_for_item(ctx.application, chat_id, item))
-            queued.append("transcript")
-        if queued:
             await ctx.application.bot.send_message(
                 chat_id=chat_id,
-                text=f"⏬ Queued {' + '.join(queued)} for #{idx}: "
+                text=f"⏬ Queued transcript for #{idx}: "
                      f"{(item.get('title') or item['url'])[:80]}")
         return
 
@@ -1038,5 +1254,7 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("transcripts", transcripts_cmd))
     app.add_handler(CommandHandler("media", media_cmd))
     app.add_handler(CommandHandler("rename", rename_cmd))
+    app.add_handler(CommandHandler("widgets", widgets_cmd))
+    app.add_handler(cards.WidgetQueryHandler(handle_widget_query))
     app.add_handler(MessageHandler(filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
                                    | filters.Document.ALL, handle_file))

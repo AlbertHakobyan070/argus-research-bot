@@ -127,9 +127,19 @@ Downloads and transcripts are written into your DS vault:
 
 ### `/find [yt|shorts|reddit] <query>`
 Search for videos, then act on each result with buttons:
-- **⬇** download to the vault
+- **⬇** download to the vault (opens its video card, below)
+- **🎵** the audio as mp3 (the same card, set to MP3)
 - **📝** transcript (captions for YouTube, speech-to-text otherwise)
 - **⬇+📝** both
+
+**The video card.** ⬇ or 🎵 posts one card under Telegram's preview of the
+link. Once Argus has read the link, the card offers **🎬 Video** or **🎵 MP3**,
+the qualities that link really has (each with a size estimate when the site
+says), **⬇️ Download** and **✖ Cancel**. After Download the same card shows the
+progress: a bar, the stage (video, audio, merging…), percent, size and ETA,
+with **✖ Cancel** (it stops the download and removes its partial files). It
+ends as saved (with the item buttons), failed (the reason and **🔁 Try again**)
+or cancelled.
 
 Default scope is YouTube; `shorts` biases to Shorts, `reddit` searches Reddit
 video posts. The result pool expires after a while; search again if a button
@@ -153,10 +163,20 @@ Each saved item gets buttons: **🎵 MP3**, **📝 Transcribe**, **🏷 Tags** a
 the link's audio straight to mp3.
 
 ### `/quality [auto|min|max|<height>]`
-Global download quality. `auto` picks a sensible cap, `max`/`min` are the
-extremes, or give a pixel height like `720`. With no argument it shows the
-current setting and whether ffmpeg is available (needed to merge high-res
-video+audio).
+Global download quality: the default on new video cards and for `/fetch`.
+`auto` picks a sensible cap, `max`/`min` are the extremes, or give a pixel
+height like `720`. With no argument it shows the current setting, whether
+ffmpeg is available (needed to merge high-res video+audio), and buttons to
+pick one.
+
+### `/widgets [on|off]`
+Sends video cards as Telegram **HTML widgets** (Bot API 10.4) instead of
+regular buttons: the same choices and progress, drawn inside the message in
+your chat's colours. Off by default. Telegram decides which bots may send
+widgets; if it refuses one, Argus says so once in the chat, switches widgets
+off and sends the regular card. Under a widget, **🔘 Regular buttons** brings
+the regular card back (apps without widget support show only the caption
+and that button).
 
 ### `/transcript <indices> [format=txt|srt]`
 Fetch YouTube captions for videos picked from your last `/find` (or `/video`)

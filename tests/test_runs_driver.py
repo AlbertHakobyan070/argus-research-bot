@@ -21,11 +21,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from telegram import InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, EndPointNotFound, RetryAfter
 
 from argus import llm
 from argus.bot import app as bot_app
-from argus.bot import common, history, progress, runs
+from argus.bot import common, history, progress, runs, tgx
 from argus.bot import media as bot_media
 from argus.bot import research as bot_research
 from argus.bot.progress import RunEventBus
@@ -122,6 +122,8 @@ async def env(monkeypatch, tmp_path):
     bot.edit_message_text = AsyncMock()
     bot.send_document = AsyncMock()
     bot.send_chat_action = AsyncMock()
+    bot.do_api_request = AsyncMock(side_effect=EndPointNotFound("Not Found"))   # a server without rich messages
+    monkeypatch.setattr(tgx, "_noticed", set())                                 # each test's chats start un-noticed
     app = SimpleNamespace(bot=bot, bot_data={"graph": graph, "library": lib})
 
     settings = Settings(freellmapi_base_url="http://127.0.0.1:9/v1", freellmapi_api_key="k",

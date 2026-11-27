@@ -28,13 +28,15 @@ _sleep = asyncio.sleep   # the RetryAfter wait (tests patch it)
 
 
 async def edit_text(bot, *, chat_id: int, message_id: int, text: str, reply_markup=None,
-                    parse_mode=None) -> bool:
+                    parse_mode=None, link_preview_options=None) -> bool:
     """editMessageText, Telegram's answers sorted: True when the message shows
     ``text`` ("message is not modified" included), False when the message no
     longer exists. A ``RetryAfter`` waits its ``retry_after``, then tries once
     more; any other Telegram error propagates."""
     edit = dict(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup,
                 parse_mode=parse_mode)
+    if link_preview_options is not None:
+        edit["link_preview_options"] = link_preview_options
     try:
         return await _edit_once(bot, edit)
     except RetryAfter as e:

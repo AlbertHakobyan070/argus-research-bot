@@ -9,7 +9,7 @@ dependencies = [
     "langgraph>=1.2.8,<2",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "aiosqlite>=0.20",
-    "python-telegram-bot[ext]>=21.6",
+    "python-telegram-bot[ext]>=22.8",   # InlineKeyboardButton(style=...); newer Bot API methods go through do_api_request
     "pydantic>=2.7",
     "httpx>=0.27,<0.29",            # fetchers reads httpx 0.28's proxy selection (Client._transport_for_url)
     "python-dotenv>=1.0",
