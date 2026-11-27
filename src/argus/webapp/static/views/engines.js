@@ -1,7 +1,8 @@
 // #/engines — the engines console (GET/PUT /api/engines), laid out as the kit's console.html: the
 // active profile with its validation and warnings, per-profile tier and role overrides (live model
-// lists, fallback lists), the transcriber, the month-to-date Exa spend, and the provider definitions
-// (read-only: they are file-only). The server takes one change per PUT; each control sends one.
+// lists, fallback lists), the transcriber, the page fetchers (read-only), the month-to-date Exa spend,
+// and the provider definitions (read-only: they are file-only). The server takes one change per PUT;
+// each control sends one.
 import { ApiError, get, putEngines } from "../api.js";
 import { $, $$, act, esc, showProblem, toast, usd, when } from "./common.js";
 
@@ -23,7 +24,7 @@ function paint(s) {
   s.el.innerHTML = `<div class="page-head"><div><span class="kicker">Engines</span>
       <h1>${esc(body.validation.ok ? `${body.active_profile} is active and valid` : `${body.active_profile} is active but does not validate`)}</h1>
       <p>Changes apply to the next run. Provider definitions and prices live in <code>argus_engines.json</code>.</p></div></div>
-    ${profilesSec(s)}${overridesSec(s)}${transcriberSec(s)}${spendSec(s)}${providersSec(s)}
+    ${profilesSec(s)}${overridesSec(s)}${transcriberSec(s)}${fetchersSec(s)}${spendSec(s)}${providersSec(s)}
     ${s.providers.map((p, i) => `<datalist id="models-${i}"></datalist>`).join("")}`;
   wire(s);
   window.UI.init(s.el);
@@ -186,6 +187,23 @@ function transcriberSec(s) {
           <span class="meta">${keys.length ? keys.map((k) => `${esc(k)}: ${esc(JSON.stringify(settings[k]))}`).join(" · ") : "none set (the engine's defaults)"}</span></div>
         <div class="set-panel-f"><button class="btn btn-a" type="button" id="tr-save">Save transcriber</button></div>
       </form></section>`;
+}
+
+function fetchersSec(s) {
+  const f = s.body.fetch;
+  if (!f) return "";
+  const chain = (c) => esc((c || []).join(" → ") || "—");
+  const rows = f.rungs.map((r) => `<tr><td><b>${esc(r.rung)}</b></td>
+      <td>${r.ok ? '<span class="status" data-s="good">ready</span>' : '<span class="status" data-s="idle">off</span>'}</td>
+      <td>${esc(r.detail)}</td></tr>`).join("");
+  return `<section class="sec set-sec" id="fetchers" data-kicker="Fetchers">
+      ${intro("Fetchers", "How pages are read, tried in order until one gives text. Read-only: install groups add fetchers (restart the bot after).")}
+      <div class="set-panel">
+        <div class="set-row"><span class="set-l"><b>Exa mode</b><small>The default for research.</small></span><span class="meta mono">${chain(f.chains.exa)}</span></div>
+        <div class="set-row"><span class="set-l"><b>Free web mode and /read</b><small>No Exa.</small></span><span class="meta mono">${chain(f.chains.free)}</span></div>
+      </div>
+      <div class="tw"><table><thead><tr><th>Fetcher</th><th>State</th><th>Uses / needs</th></tr></thead><tbody>${rows}</tbody></table></div>
+    </section>`;
 }
 
 function spendSec(s) {

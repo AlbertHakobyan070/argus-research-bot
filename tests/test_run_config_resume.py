@@ -439,6 +439,18 @@ async def test_research_cmd_records_the_run_config_in_checkpoint_and_library(gra
     assert await lib.get_run_config(run_id) == values["run_config"]
 
 
+async def test_research_free_records_the_free_web_mode(graph, lib):
+    from argus.graph.run_config import FREE_FETCH_CHAIN, FREE_PROVIDERS
+    ctx = await _ctx(graph, lib, ["/free", "some", "topic"])
+    await bot_research.research_cmd(_update(), ctx)
+    await settle_runs()
+    ((run_id, h),) = bot_common._inflight.items()
+    rc = require((await graph.aget_state(h.cfg)).values)
+    assert (rc.web, rc.search.providers_enabled, rc.fetch.chain) == ("free", FREE_PROVIDERS, FREE_FETCH_CHAIN)
+    assert h.choices.web == "free"
+    assert (await lib.get_run_config(run_id))["web"] == "free"
+
+
 async def test_research_cmd_tells_the_chat_when_the_brief_is_exhausted(monkeypatch, lib):
     """``brief.draft`` must raise (spec §2.1): the drive reports it — the user
     is told, the run is marked ``error`` and leaves the in-flight registry."""

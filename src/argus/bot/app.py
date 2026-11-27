@@ -26,7 +26,7 @@ from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from ..library import Library
 from ..media import resolve_ffmpeg
 from ..webapp import server as webapp_server
-from . import delete, engines_cmd, history, media, repos, research, runs
+from . import delete, engines_cmd, history, media, read, repos, research, runs
 from .common import (
     _TG_CONNECT_TIMEOUT_S, _TG_MEDIA_WRITE_TIMEOUT_S, _TG_POOL_TIMEOUT_S,
     _TG_READ_TIMEOUT_S, _TG_WRITE_TIMEOUT_S, _allowed, _safe_send, _set_run_status,
@@ -48,6 +48,7 @@ logger = logging.getLogger("argus.bot")
 # the closes (or its own first failure).
 HANDLER_MODULES = [research, media, history, delete]
 HANDLER_MODULES.append(engines_cmd)
+HANDLER_MODULES.append(read)
 HANDLER_MODULES.append(repos)
 POST_INIT_HOOKS: list = []
 POST_STOP_HOOKS: list = []
@@ -61,8 +62,8 @@ POST_SHUTDOWN_HOOKS.append(webapp_server.stop)
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Free-text router. Order: (1) a pending HITL reply (plan-edit /
-    revise feedback), (2) pasted media links → action keyboard, else
-    ignore."""
+    revise feedback), (2) pasted media links → action keyboard, (3) other
+    pasted links → Read / Research buttons, else ignore."""
     s = get_settings()
     if not _allowed(s, update.effective_user.id):
         return  # silently ignore strangers
@@ -71,6 +72,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await research.handle_pending_reply(update, ctx, chat_id, text):
         return
     await media.handle_text(update, ctx, chat_id, text)
+    await read.handle_text(update, ctx, chat_id, text)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +134,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Transcript library buttons (t:send:<asset_id>).
     if ns == "t" and action == "send":
         await media.handle_callback(update, ctx, ns, action, run_id)
+        return
+
+    # Read buttons (rd:read/brw/res:<key>) act on a pooled link request, not on a run.
+    if ns == read.NS:
+        await read.handle_callback(update, ctx, action, run_id)
         return
 
     # Everything else is run-scoped (len / dep / prof / rec / plan / report):

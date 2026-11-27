@@ -245,18 +245,19 @@ def _site_candidates(url: str, words: frozenset[str], cfg) -> list:
     return out
 
 
-def _read_page(url: str, reader, *, cfg, ledger: SpendLedger) -> tuple[str, str, str]:
-    """One page → ``(text, title, error)``: ``reader()`` when given, else the fetch chain."""
+def _read_page(url: str, reader, *, cfg, ledger: SpendLedger | None) -> tuple[str, str, str, str]:
+    """One page → ``(text, title, error, fetcher)``: ``reader()`` when given
+    (fetcher ``"github"``), else the fetch chain (its winning rung)."""
     if reader is not None:
         try:
-            return reader(), "", ""
+            return reader(), "", "", "github"
         except (fetchers._RungError, fetchers._Refused, httpx.HTTPError, ValueError) as e:
-            return "", "", str(e)
+            return "", "", str(e), ""
     res = fetchers.fetch({"url": url, "title": ""}, cfg=cfg, ledger=ledger, exa_enabled=exa_enabled(), pinned=True)
     if not res.ok:
-        return "", "", res.error
+        return "", "", res.error, ""
     with open(res.markdown_path, encoding="utf-8", errors="replace") as f:
-        return f.read(), res.title or "", ""
+        return f.read(), res.title or "", "", res.fetcher
 
 
 def _source(url: str, title: str, kind: str, text: str, about: str, of: str) -> dict:
@@ -264,9 +265,11 @@ def _source(url: str, title: str, kind: str, text: str, about: str, of: str) -> 
             "summary": about, "provider": "user", "source": SOURCE, "pinned": True, "sub_qs": [], "anchor_of": of}
 
 
-def read_anchor(url: str, *, rc, ledger: SpendLedger, words: frozenset[str] = frozenset(),
+def read_anchor(url: str, *, rc, ledger: SpendLedger | None, words: frozenset[str] = frozenset(),
                 explore: bool = True) -> tuple[dict, list[dict], list[str]]:
-    """Read one link (and, at a root, its representative parts) → ``(anchor, pinned sources, errors)``."""
+    """Read one link (and, at a root, its representative parts) → ``(anchor, pinned sources, errors)``.
+    Only ``rc.fetch`` is read; ``ledger`` None never reaches Exa ``/contents``. The
+    anchor and each part carry ``fetcher``, the rung that read them ("" when none did)."""
     errors: list[str] = []
     repo = fetchers._github_repo(url)
     header, about, meta, names = "", "", {}, []
@@ -274,7 +277,7 @@ def read_anchor(url: str, *, rc, ledger: SpendLedger, words: frozenset[str] = fr
         header, about, meta, names, err = _github_meta(*repo)
         if err:
             errors.append(f"anchors: {url}: {err}")
-    body, page_title, err = _read_page(url, None, cfg=rc.fetch, ledger=ledger)
+    body, page_title, err, fetcher = _read_page(url, None, cfg=rc.fetch, ledger=ledger)
     if err:
         errors.append(f"anchors: {url}: not read ({err})")
     text = "\n\n".join(p for p in (header, body.strip()) if p)[:TEXT_CHARS]
@@ -286,7 +289,7 @@ def read_anchor(url: str, *, rc, ledger: SpendLedger, words: frozenset[str] = fr
     kind = "repo" if repo else "web"
     anchor = {"url": url, "title": title, "kind": kind, "ok": ok,
               "error": "" if ok else (err or f"only {len(text.strip())} chars of text (a script-built page?)"),
-              "chars": len(text),
+              "chars": len(text), "fetcher": fetcher,
               "about": about, "context": text[:CONTEXT_CHARS] if ok else "", "pages": []}
     sources = [_source(url, title, kind, text, about, url)] if ok else []
 
@@ -298,10 +301,10 @@ def read_anchor(url: str, *, rc, ledger: SpendLedger, words: frozenset[str] = fr
             candidates = []
             errors.append(f"anchors: {url}: no representative parts ({e})")
         for _score, purl, ptitle, why, reader in sorted(candidates, key=lambda c: -c[0])[:EXTRA_MAX]:
-            ptext, fetched_title, perr = _read_page(purl, reader, cfg=rc.fetch, ledger=ledger)
+            ptext, fetched_title, perr, pfetcher = _read_page(purl, reader, cfg=rc.fetch, ledger=ledger)
             pok = len(ptext.strip()) >= MIN_CHARS
             page = {"url": purl, "title": ptitle or fetched_title or purl, "why": why, "ok": pok,
-                    "chars": len(ptext), "error": "" if pok else (perr or "too little text"),
+                    "chars": len(ptext), "error": "" if pok else (perr or "too little text"), "fetcher": pfetcher,
                     "context": ptext.strip()[:PAGE_CONTEXT_CHARS] if pok else ""}
             anchor["pages"].append(page)
             if pok:

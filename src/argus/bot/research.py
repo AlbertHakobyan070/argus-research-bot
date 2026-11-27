@@ -26,7 +26,17 @@ logger = logging.getLogger("argus.bot")
 
 _RECENCY_LABELS = {None: "auto", "d": "past day", "w": "past week", "m": "past month", "y": "past year",
                    "any": "any date"}
-_KNOBS = {"len": "length", "dep": "depth", "prof": "profile", "rec": "recency"}
+_KNOBS = {"len": "length", "dep": "depth", "prof": "profile", "rec": "recency", "web": "web"}
+_WEB_LABELS = {"exa": "Exa", "free": "Free web"}
+_WEB_FLAGS = {"/free": "free", "--free": "free", "/exa": "exa", "--exa": "exa"}
+
+
+def _parse_web(args: list[str]) -> tuple[str | None, list[str]]:
+    """``/free`` (or ``/exa``) at the head of an args list → ``(mode, rest)``;
+    none there → ``(None, args)``."""
+    if args and args[0].lower() in _WEB_FLAGS:
+        return _WEB_FLAGS[args[0].lower()], list(args[1:])
+    return None, list(args)
 _EXCERPT_CAP = 3000      # raw report chars in the preview; the full file follows on Send
 _MAX_NOTES = 8           # degradation notes in the preview; the report has them all
 _NOTE_ROOM = 200         # a gate edit appends a note (runs._REPLY_PROMPTS, "✅ approved from console", …)
@@ -56,26 +66,31 @@ async def research_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not ctx.args:
         await update.message.reply_text(
-            "Usage: /research [/length <m>] <topic>\n"
-            "Lengths: " + " / ".join(VALID_LENGTHS)
+            "Usage: /research [/free] [/length <m>] <topic>\n"
+            "Lengths: " + " / ".join(VALID_LENGTHS) + "\n"
+            "/free: no Exa — DuckDuckGo, GitHub and arXiv, pages read by the free fetchers"
         )
         return
-    # T7.1: allow ``/research /length <m> <topic>`` so the user can
-    # pre-pin a length without waiting for the keyboard. Empty /length
-    # is silently ignored (caller falls back to DEFAULT_LENGTH).
-    length, topic_args = _parse_length(list(ctx.args))
-    if not length:
-        length = DEFAULT_LENGTH
-        topic_args = list(ctx.args)
-    topic = " ".join(topic_args).strip()
+    # ``/research /free /length <m> <topic>``: the web mode and the length, each
+    # optional, in either order, before the topic. An empty /length is ignored
+    # (DEFAULT_LENGTH); no web flag is Exa, the default.
+    args = list(ctx.args)
+    web, args = _parse_web(args)
+    length, rest = _parse_length(args)
+    if length:
+        args = rest
+    if web is None:
+        web, args = _parse_web(args)
+    topic = " ".join(args).strip()
     if not topic:
         await update.message.reply_text(
-            "Usage: /research [/length <m>] <topic>"
+            "Usage: /research [/free] [/length <m>] <topic>"
         )
         return
     chat_id = update.effective_chat.id
     await _relay(ctx, chat_id, await runs.start_run(chat_id=chat_id, user_id=update.effective_user.id,
-                                                    topic=topic, length=length))
+                                                    topic=topic, length=length or DEFAULT_LENGTH,
+                                                    web=web or "exa"))
 
 
 async def ask_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -217,6 +232,11 @@ def _format_plan(p: dict) -> str:
         facts.append("Exa: " + ((f"≈ ${est:.3f}" if est is not None else "n/a") if p["exa_enabled"] else "off"))
     if facts:
         lines.append(" · ".join(facts))
+    if p.get("web") == "free":                    # the free fetchers this install runs, and the ones it lacks
+        chain = [r for r in p.get("fetch_chain") or [] if r != "exa_text"]
+        missing = [m.split(":", 1)[0] for m in p.get("fetch_missing") or []]
+        lines.append("Web: free (no Exa) · fetch: " + _md_escape(" → ".join(chain) or "none")
+                     + (f" · not installed: {_md_escape(', '.join(missing))}" if missing else ""))
     if p.get("error"):
         lines.append(f"⚠️ {_md_escape(_clip(p['error'], _HEAD_CHARS))}")
     lines.append("")
@@ -315,7 +335,8 @@ def _plan_keyboard(p: dict) -> InlineKeyboardMarkup:
         [*(button(d.capitalize(), f"dep:{d}", not auto and d == p.get("depth")) for d in runs.DEPTHS),
          button("Auto", "dep:auto", auto)],
         [button(f"⚙ {profile}", "prof:next"),
-         button(f"🕒 {_RECENCY_LABELS.get(p.get('recency'), p.get('recency'))}", "rec:next")],
+         button(f"🕒 {_RECENCY_LABELS.get(p.get('recency'), p.get('recency'))}", "rec:next"),
+         button(f"🌐 {_WEB_LABELS.get(p.get('web') or 'exa', p.get('web'))}", "web:next")],
         [button("✅ Approve", "plan:approve", style="success"), button("✏️ Edit", "plan:edit"),
          button("❌ Cancel", "plan:cancel", style="danger")],
     ])

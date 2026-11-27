@@ -158,8 +158,10 @@ def test_crawl_happy_path(tmp_path: Path, fake_subprocess) -> None:
 
     folder = tmp_path / "crawled"
     folder.mkdir()
-    (folder / "a.md").write_text("# A\n", encoding="utf-8")
-    (folder / "b.md").write_text("# B\n", encoding="utf-8")
+    # crawl.py's own layout: each page opens with its source line; index.md is the summary
+    (folder / "a.md").write_text("<!-- source: https://docs.example.com/a -->\n\n# A\n", encoding="utf-8")
+    (folder / "b.md").write_text("<!-- source: https://docs.example.com/b -->\n\n# B\n", encoding="utf-8")
+    (folder / "index.md").write_text("# Crawl of https://docs.example.com/\n", encoding="utf-8")
     fake_subprocess.state["rc"] = 0
     fake_subprocess.state["out"] = json.dumps(
         {"ok": True, "folder": str(folder), "pages": 2, "failed": 0}
@@ -168,8 +170,9 @@ def test_crawl_happy_path(tmp_path: Path, fake_subprocess) -> None:
     r = crawl_url("https://docs.example.com/", max_pages=3)
     assert r.ok is True
     assert r.markdown_path and Path(r.markdown_path).exists()
-    # up to max_pages returned in `pages`
+    # up to max_pages returned in `pages`, the index.md summary never among them
     assert 1 <= len(r.pages) <= 3
+    assert all(Path(p).name != "index.md" for p in r.pages)
 
 
 def test_crawl_rc0_but_folder_ghost(fake_subprocess) -> None:
@@ -199,7 +202,7 @@ def test_crawl_multiline_stdout_with_banner(tmp_path: Path,
 
     folder = tmp_path / "crawled2"
     folder.mkdir()
-    (folder / "x.md").write_text("# X\n", encoding="utf-8")
+    (folder / "x.md").write_text("<!-- source: https://docs.example.com/x -->\n\n# X\n", encoding="utf-8")
 
     banner_lines = [
         "[INFO] crawl.py starting",

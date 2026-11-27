@@ -42,6 +42,9 @@ live progress card (stage, counts, last event) follows the run while it works.
      that cannot run is marked ⚠ and Approve refuses it with the reason.
    - **🕒 recency** — cycles auto (the brief decides) / past day / week /
      month / year / any (no recency filter).
+   - **🌐 web** — Exa or Free web (below). It switches the rest of the run —
+     the research waves and every page read — not the search that drafted
+     this plan, which ran in the mode the run started with.
    - **✅ Approve** — research the plan with these choices.
    - **✏️ Edit** — reply with changes; Argus redrafts the plan and re-searches.
    - **❌ Cancel** — drop the run.
@@ -62,6 +65,17 @@ live progress card (stage, counts, last event) follows the run while it works.
    - **❌ Cancel** — drop the report.
 
 Pre-pin the length without the keyboard: `/research /length long <topic>`.
+
+**Free web mode (no Exa).** `/research /free <topic>` (with a length too:
+`/research /free /length long <topic>`; in the console, **Web → Free web**)
+searches DuckDuckGo, GitHub and arXiv, and reads every page with the free
+fetchers, in order until one gives text: the built-in reader, then Scrapling
+(a browser's fingerprint without a browser), Jina Reader (Jina's servers
+render the page; it is sent the page address), the headless browser, and
+intel-stack's Crawl4AI. Each one runs only when it is installed — `/engines`
+lists them, and the plan card's Web line names the ones this run will use.
+Nothing is spent on Exa; expect fewer pages read on sites that block bots or
+build everything with scripts. Exa stays the default.
 
 **Length modes**
 
@@ -97,6 +111,24 @@ Pre-pin the length without the keyboard: `/research /length long <topic>`.
 ### `/ask <question>`
 A quick, single-shot answer from the model's own knowledge. No search, no
 plan, no gates — use it for fast look-ups, not for claims you need cited.
+
+### `/read <link> [question]`
+Reads a page now and answers from it — or summarises it when you ask
+nothing. Several links in one message are read together. A GitHub
+repository or a site's front page also reads a few of its parts (README,
+docs, releases; a site's docs or pricing pages), picked by your question's
+words; "only the README" or "just this page" keeps it on the link.
+- It uses the free fetchers (Free web mode, above): no Exa, no budget, and
+  it never waits for — or holds up — a research run.
+- The answer cites the pages as [1], [2]… and names the fetcher that read
+  them; the text read follows as a `.md` file.
+- **🌐 Try with the browser** appears when a page could not be read, or came
+  back thin, and the browser fetcher is installed: it reads the page again
+  in headless Chromium.
+- **🔎 Research this** starts `/research` on the same link and question.
+- Paste an article or repository link (not a video) and you get **📖 Read**
+  and **🔎 Research** buttons for it; the rest of your message is the
+  question.
 
 ---
 
@@ -349,8 +381,9 @@ grounding judge, …) has a primary engine, optional fallbacks and a declared
 failure policy.
 
 - `/engines` — the active profile, every role's binding, validation problems,
-  the last run's served models, the judge-diversity check and this month's
-  Exa spend.
+  the last run's served models, the judge-diversity check, this month's
+  Exa spend, and the page fetchers: each one's state (✅ ready, — off and
+  what it needs) and the order each mode tries them in.
 - `/engines use <profile>` — switch profiles (refused, with the reason, if the
   profile cannot run: a missing API key, an unchosen model).
 - `/engines tier <cheap|strong|judge> <provider>/<model>` — change a tier;
@@ -363,7 +396,15 @@ failure policy.
   show or switch the speech-to-text engine.
 
 Provider definitions (URLs, key names) are file-only. The console's Engines
-page does the same, one change at a time.
+page does the same, one change at a time, and lists the fetchers.
+
+**Fetchers come in install groups** (in the bot's venv, then restart the bot):
+- `uv pip install -e ".[web]"` — Scrapling and the headless browser, then
+  `python -m playwright install chromium` for the browser's Chromium.
+- `uv pip install -e ".[convert]"` — Word, PowerPoint and Excel pages, through
+  MarkItDown.
+- Jina Reader needs nothing; keyless it is rate-limited, so Argus spaces its
+  requests — a `JINA_API_KEY` in `.env` lifts that.
 
 ---
 

@@ -27,7 +27,7 @@ HELP_TEXT = """\
 
 *Research*
   /research <topic> — deep report (plan → approve → preview)
-  /ask <question> — quick answer, no search
+  /ask <q> — quick answer · /read <url> — a page
   Console: the *Argus* menu button
 
 *Media → vault*

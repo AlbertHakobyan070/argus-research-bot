@@ -19,8 +19,9 @@ from telegram import Update
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, ContextTypes
 
 from ..config import get_settings
-from ..engines import registry, transcribers
+from ..engines import fetchers, registry, transcribers
 from ..engines.registry import EngineConfigError
+from ..graph.run_config import FREE_FETCH_CHAIN, FetchConfig
 from ..engines.roles import ROLES
 from ..engines.schema import EngineSpec, EnginesConfig, ProfileOverrides
 from .common import _allowed, _get_library, _safe_send
@@ -188,7 +189,17 @@ async def _render(lib, chat_id: int) -> str:
     mtd = getattr(lib, "exa_usd_month_to_date", None) if lib is not None else None
     lines.append(f"Exa this month: ${await mtd():.2f}" if mtd else "Exa this month: n/a (not recorded yet)")
     lines.append("Profiles: " + ", ".join(cfg.profiles))
+    lines += await _fetch_lines()
     return "\n".join(lines)
+
+
+async def _fetch_lines() -> list[str]:
+    """The fetch rungs this install has, and the two chains as they run here."""
+    rows = await asyncio.to_thread(fetchers.status)         # blocking: the Playwright driver, once
+    chain = lambda c: " → ".join(fetchers.available_chain(c))   # noqa: E731
+    return (["Fetchers:"] + [f"  {'✅' if r['ok'] else '—'} {r['rung']}: {r['detail']}" for r in rows]
+            + [f"  Exa mode: {chain(FetchConfig().chain)}",
+               f"  Free web mode and /read: {chain(FREE_FETCH_CHAIN)}"])
 
 
 def _diversity(cfg: EnginesConfig, snap, last_summary: dict) -> list[str]:
