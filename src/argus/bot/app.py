@@ -26,7 +26,7 @@ from ..graph import async_sqlite_saver_cm, build_graph, quick_answer_graph
 from ..library import Library
 from ..media import resolve_ffmpeg
 from ..webapp import server as webapp_server
-from . import delete, engines_cmd, history, media, research, runs
+from . import delete, engines_cmd, history, media, repos, research, runs
 from .common import (
     _TG_CONNECT_TIMEOUT_S, _TG_MEDIA_WRITE_TIMEOUT_S, _TG_POOL_TIMEOUT_S,
     _TG_READ_TIMEOUT_S, _TG_WRITE_TIMEOUT_S, _allowed, _safe_send, _set_run_status,
@@ -48,6 +48,7 @@ logger = logging.getLogger("argus.bot")
 # the closes (or its own first failure).
 HANDLER_MODULES = [research, media, history, delete]
 HANDLER_MODULES.append(engines_cmd)
+HANDLER_MODULES.append(repos)
 POST_INIT_HOOKS: list = []
 POST_STOP_HOOKS: list = []
 POST_SHUTDOWN_HOOKS: list = []
@@ -113,9 +114,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await media.handle_quality_callback(update, ctx, action, run_id)
         return
 
-    # Library item buttons (mx:mp3/tr/tag/ok:<asset_id>).
+    # Library item buttons (mx:mp3/tr/tag/ok/inv:<asset_id>).
     if ns == "mx":
         await media.handle_item_callback(update, ctx, action, run_id)
+        return
+
+    # Investigate's result (rp:t/ok/bm:<asset>.<rev>[.<i>]) and /repos bookmarks (bk:pg/o/gh/rm/rmy:…).
+    if ns in ("rp", "bk"):
+        await repos.handle_callback(update, ctx, ns, action, run_id)
         return
 
     # Delete-browser buttons (del:cat/tgl/pg/ok/yes/no/cancel).

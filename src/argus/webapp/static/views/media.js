@@ -1,11 +1,13 @@
 // #/media[/<tab>] — the media library: Library (browse, search, filter by type, tag and group), Get (read a
-// link, choose video quality or mp3; upload from the device), Review (tag suggestions to confirm), Jobs
-// (downloads, conversions, transcripts, tagging — polled while any runs) and Settings.
-import { ApiError, media } from "../api.js";
-import { $, $$, act, esc, showProblem, toast, when } from "./common.js";
-import { bytes, card, duration, jobToast, reviewPanel, TYPES } from "./media_common.js";
+// link, choose video quality or mp3; upload from the device), Review (tag suggestions to confirm), Repos (the
+// bookmarked repos, tools and sites Investigate found), Jobs (downloads, conversions, transcripts, tagging,
+// investigations — polled while any runs) and Settings.
+import { ApiError, bookmarks, media } from "../api.js";
+import { $, $$, act, confirmDialog, esc, openLink, showProblem, toast, when } from "./common.js";
+import { bytes, card, duration, jobToast, reviewPanel, stars, TYPES } from "./media_common.js";
 
-const TABS = [["library", "Library"], ["get", "Get"], ["review", "Review"], ["jobs", "Jobs"], ["settings", "Settings"]];
+const TABS = [["library", "Library"], ["get", "Get"], ["review", "Review"], ["repos", "Repos"], ["jobs", "Jobs"],
+  ["settings", "Settings"]];
 const PAGE = 30;
 const TAG_PEEK = 8;                                // tags shown before "Show all"
 const JOB_POLL_MS = 2000;
@@ -19,7 +21,7 @@ export async function render(el, [tab = "library"], ctx) {
     <nav class="tablist media-tabs" role="tablist" aria-label="Media">${TABS.map(([k, label]) => `<a role="tab" href="#/media/${k}" aria-selected="${k === tab}">${esc(label)}${k === "review" && facets.pending ? ` <span class="count">${facets.pending}</span>` : ""}</a>`).join("")}</nav>
     <div id="notice" hidden></div><div id="tab"></div>`;
   const ctxT = { el, notice: $("#notice", el), root: $("#tab", el), facets, cleanups: [] };
-  await ({ library, get: getTab, review, jobs, settings }[tab])(ctxT);
+  await ({ library, get: getTab, review, repos: reposTab, jobs, settings }[tab])(ctxT);
   return () => ctxT.cleanups.forEach((f) => f());
 }
 
@@ -258,14 +260,111 @@ async function review(t) {
   });
 }
 
+// ---- Repos (bookmarks) ---------------------------------------------------------------------------
+const BM_PAGE = 30;
+
+function bookmarkRow(b) {
+  const facts = [b.kind === "tool" ? "tool or site" : "repo", b.stars != null ? `★${stars(b.stars)}` : ""].filter(Boolean);
+  const src = b.kind === "repo" ? "GitHub" : "the site";
+  return `<li class="repo-row bm-row" data-id="${b.bookmark_id}">
+      <div class="repo-main">
+        <p class="repo-head"><a class="repo-name" href="${esc(b.url)}" data-ext>${esc(b.name)}</a> <span class="meta">${esc(facts.join(" · "))}</span></p>
+        <form class="bm-note" novalidate><input class="input" type="text" name="note" maxlength="300" value="${esc(b.note)}" placeholder="Your note: what it is, why it is worth keeping" aria-label="Your note on ${esc(b.name)}">
+          <button class="btn btn-s" type="submit"><i data-icon="check"></i>Save</button></form>
+        <p class="repo-about">${b.about ? `<span class="tag">From ${esc(src)}</span> ${esc(b.about)}` : `<span class="faint">Nothing from ${esc(src)} yet.</span>`}</p>
+        ${b.videos.length ? `<p class="meta bm-videos">In: ${b.videos.map((v) => `<a href="#/media/item/${v.id}">${esc(v.title)}</a>`).join(" · ")}</p>` : ""}
+      </div>
+      <div class="bm-acts">
+        <button class="btn btn-s" type="button" data-about><i data-icon="download"></i>From ${esc(src)}</button>
+        <button class="btn btn-s btn-danger" type="button" data-del><i data-icon="trash-2"></i>Remove</button>
+      </div>
+    </li>`;
+}
+
+async function reposTab(t) {
+  const f = { q: "", offset: 0 };
+  t.root.innerHTML = `<section class="sec">
+      <div class="sec-head"><span class="kicker">Repos</span><h2>Bookmarked repos, tools and sites</h2>
+        <p>Bookmark them in an item's Repos section, or with ⭐ Attach + bookmark in the chat (where /repos lists them). The note is yours; the From button adds the project's own description.</p></div>
+      <form class="media-filters" role="search"><input class="input" type="search" name="q" placeholder="Search names, notes, descriptions" aria-label="Search bookmarks"></form>
+      <p class="meta" id="bm-count"></p>
+      <ul class="repo-list bm-list" id="bm-list"></ul>
+      <div class="btn-row"><button class="btn" type="button" id="bm-more" hidden>Show more</button></div>
+    </section>`;
+  const form = $(".media-filters", t.root);
+  const list = $("#bm-list", t.root);
+  const more = $("#bm-more", t.root);
+  const count = $("#bm-count", t.root);
+  let seq = 0;
+  let total = 0;
+  let typing = null;
+  t.cleanups.push(() => clearTimeout(typing));
+  const wire = (scope) => {
+    $$("a[data-ext]", scope).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openLink(a.href); }));
+    window.UI.init(scope);
+  };
+  const say = () => {
+    count.textContent = total === 0 ? (f.q ? "Nothing matches." : "No bookmarks yet. Investigate a saved video, then bookmark what you want to keep.")
+      : `${total} bookmark${total === 1 ? "" : "s"}, newest first`;
+  };
+  const load = async (append) => {
+    const mine = ++seq;
+    if (!append) f.offset = 0;
+    let r;
+    try { r = await bookmarks.list({ q: f.q, limit: BM_PAGE, offset: f.offset }); } catch (e) { showProblem(t.notice, e); return; }
+    if (mine !== seq) return;                      // a newer search answered first
+    const html = r.bookmarks.map(bookmarkRow).join("");
+    if (append) list.insertAdjacentHTML("beforeend", html); else list.innerHTML = html;
+    wire(list);
+    f.offset += r.bookmarks.length;
+    total = r.total;
+    more.hidden = f.offset >= r.total;
+    say();
+  };
+  form.addEventListener("submit", (e) => e.preventDefault());
+  form.addEventListener("input", () => {
+    clearTimeout(typing);
+    typing = setTimeout(() => { f.q = form.q.value.trim(); load(false); }, 300);
+  });
+  more.addEventListener("click", () => load(true));
+  list.addEventListener("submit", async (e) => {
+    const note = e.target.closest(".bm-note");
+    if (!note) return;
+    e.preventDefault();
+    const r = await act($("button", note), t.notice, () => bookmarks.note(note.closest(".bm-row").dataset.id, note.note.value));
+    if (r) toast("Note saved.", "cost", r.bookmark.name);
+  });
+  list.addEventListener("click", async (e) => {
+    const li = e.target.closest(".bm-row");
+    const about = e.target.closest("[data-about]");
+    const del = e.target.closest("[data-del]");
+    if (!li || !(about || del)) return;
+    const id = li.dataset.id;
+    if (about) {
+      const r = await act(about, t.notice, () => bookmarks.about(id));
+      if (!r) return;
+      li.outerHTML = bookmarkRow(r.bookmark);
+      wire($(`.bm-row[data-id="${id}"]`, list));
+      toast(r.bookmark.about, "cost", r.bookmark.name);
+      return;
+    }
+    const name = $(".repo-name", li).textContent;
+    const ok = await confirmDialog({ title: `Remove ${name}?`, body: "The bookmark and your note go; the videos keep it attached.", ok: "Remove" });
+    if (!ok) return;
+    const r = await act(del, t.notice, () => bookmarks.remove(id));
+    if (r) { li.remove(); total -= 1; f.offset -= 1; say(); toast(r.message, "why", "Removed"); }
+  });
+  await load(false);
+}
+
 // ---- Jobs ----------------------------------------------------------------------------------------
-const JOB_STATE = { running: ["warning", "Running"], done: ["good", "Done"], failed: ["critical", "Failed"] };
+const JOB_STATE ={ running: ["warning", "Running"], done: ["good", "Done"], failed: ["critical", "Failed"] };
 
 async function jobs(t) {
   let timer = null;
   let stopped = false;
   t.cleanups.push(() => { stopped = true; clearTimeout(timer); });
-  t.root.innerHTML = `<section class="sec"><div class="sec-head"><span class="kicker">Jobs</span><h2>Downloads, conversions, transcripts, tags</h2>
+  t.root.innerHTML = `<section class="sec"><div class="sec-head"><span class="kicker">Jobs</span><h2>Downloads, conversions, transcripts, tags, investigations</h2>
       <p>Jobs run on the PC whether this console is open or not; this list is lost when the bot restarts (the files are not).</p></div>
       <div id="job-list"></div></section>`;
   const list = $("#job-list", t.root);
