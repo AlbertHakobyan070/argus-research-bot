@@ -107,7 +107,11 @@ the runs list, a run's live progress, its plan gate (with the same knobs as
 the chat card), the report with **tap-to-verify** citations (tap `[n]` to see
 the source and its quotes) and **Send to chat**, a new-research form, and
 the engines settings. **Appearance** picks a light and a dark theme and
-whether to follow Telegram's light/dark or always use one. A session that
+whether to follow Telegram's light/dark or always use one, and a **Style**:
+Classic (crisp and still) or Cozy (rounder and softer, with small
+animations); any style goes with any theme. On a phone, swipe sideways on
+the page to move to the next or previous tab — the Media tabs, or the
+console's sections on a page without tabs. A session that
 is too old shows "Session expired — reopen from the menu button".
 
 The console is optional: if it is down, research and media in chat keep

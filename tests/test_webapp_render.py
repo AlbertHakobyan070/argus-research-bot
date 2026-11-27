@@ -175,6 +175,16 @@ def test_a_refresh_after_an_action_shows_a_network_failure_instead_of_rejecting(
     assert got["outcome"] == "resolved" and got["hidden"] is False and "the tunnel dropped" in got["html"], got
 
 
+def test_a_swipe_commits_only_when_long_and_flat_enough_and_never_past_the_ends():
+    # (tabs, current, dx, dy) -> the tab it lands on; a finger moving left (dx < 0) goes to the next tab
+    cases = [[5, 0, -80, 10], [5, 2, 80, -10], [5, 0, 80, 0], [5, 4, -80, 0], [5, 2, -40, 0],
+             [5, 2, -80, 60], [5, -1, -80, 0], [1, 0, -200, 0]]
+    got = _node("const m = await import(process.argv[1]);"
+                "process.stdout.write(JSON.stringify(JSON.parse(process.argv[2]).map((c) => m.swipeTarget(...c))));",
+                (server.STATIC_DIR / "swipe.js").as_uri(), json.dumps(cases))
+    assert got == [1, 1, -1, -1, -1, -1, -1, -1]
+
+
 # --- the CSP backstop ------------------------------------------------------
 
 def _directives(csp: str) -> dict[str, list[str]]:

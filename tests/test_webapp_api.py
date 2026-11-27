@@ -75,19 +75,29 @@ async def test_me(client, app, monkeypatch):
     assert (bot["allowed_user_id"], bot["public_url"], bot["console_ok"]) == (
         USER_ID, "https://a-b.trycloudflare.com", True)
     assert bot["active_profile"] is None and bot["version"]          # no engines config loaded here
-    assert body["appearance"] == {"mode": "telegram", "light": "ledger", "dark": "dark"}
+    assert body["appearance"] == {"mode": "telegram", "light": "ledger", "dark": "dark", "style": "classic"}
 
 
 async def test_appearance_saves_and_refuses_unknown_themes(client):
     r = await client.put("/api/appearance", headers=auth(), json={"mode": "dark", "dark": "slate"})
-    assert (await _json(r))["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate"}
+    assert (await _json(r))["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate", "style": "classic"}
     body = await _json(await client.get("/api/me", headers=auth()))
-    assert body["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate"}
+    assert body["appearance"] == {"mode": "dark", "light": "ledger", "dark": "slate", "style": "classic"}
     for bad in ({"mode": "neon"}, {"light": "dark"}, {"dark": "paper"}):
         r = await client.put("/api/appearance", headers=auth(), json=bad)
         assert r.status == 400, bad
     body = await _json(await client.get("/api/me", headers=auth()))
     assert body["appearance"]["dark"] == "slate"                   # a refused change saves nothing
+
+
+async def test_appearance_style_is_independent_of_the_theme(client):
+    r = await client.put("/api/appearance", headers=auth(), json={"style": "cozy"})
+    assert (await _json(r))["appearance"] == {"mode": "telegram", "light": "ledger", "dark": "dark", "style": "cozy"}
+    for bad in ({"style": "neon"}, {"style": ""}, {"style": None}, {"style": "cozy", "light": "nope"}):
+        r = await client.put("/api/appearance", headers=auth(), json=bad)
+        assert r.status == 400, bad
+    body = await _json(await client.get("/api/me", headers=auth()))
+    assert body["appearance"]["style"] == "cozy" and body["appearance"]["light"] == "ledger"
 
 
 # --- runs list and run view -------------------------------------------------

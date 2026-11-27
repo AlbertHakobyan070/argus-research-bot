@@ -10,6 +10,7 @@ import * as newRun from "./views/new.js";
 import * as run from "./views/run.js";
 import * as runs from "./views/runs.js";
 import * as settings from "./views/settings.js";
+import { initSwipe } from "./swipe.js";
 
 const ROUTES = [
   [/^\/runs$/, runs, "runs"],
@@ -30,12 +31,14 @@ const SKELETON = `<div class="page-head"><div class="skel-head"><span class="ske
   <section class="sec skel-sec">${'<div class="skel-row"><span class="skel w80"></span><span class="skel w40"></span></div>'.repeat(5)}</section>`;
 
 // ---- theme: the saved appearance (#/settings) — Telegram's light/dark or a pinned one, then which kit
-// theme; Telegram's own header and background take the theme's ground colour
-let appearance = { mode: "telegram", light: "ledger", dark: "dark" };
+// theme, and the style (classic or cozy: shape and motion, app.css); Telegram's own header and background
+// take the theme's ground colour
+let appearance = { mode: "telegram", light: "ledger", dark: "dark", style: "classic" };
 function applyTheme() {
   const webApp = tg();
   const dark = appearance.mode === "dark" || (appearance.mode === "telegram" && webApp?.colorScheme === "dark");
   document.documentElement.setAttribute("data-theme", dark ? appearance.dark : appearance.light);
+  document.documentElement.setAttribute("data-style", appearance.style);
   const ground = getComputedStyle(document.documentElement).getPropertyValue("--ground").trim();
   if (/^#[0-9a-f]{6}$/i.test(ground) && webApp?.isVersionAtLeast?.("6.9")) {
     webApp.setHeaderColor(ground);
@@ -126,6 +129,7 @@ async function start() {
   toTop.addEventListener("click", () => window.scrollTo({ top: 0,
     behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }));
   window.addEventListener("hashchange", () => route());
+  initSwipe(view);
   try {
     const me = await get.me();
     appearance = me.appearance;

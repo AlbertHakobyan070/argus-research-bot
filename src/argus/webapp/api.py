@@ -292,14 +292,16 @@ async def _report_file(d: Deps, run_id: str, key: str) -> Path:
 # routes
 # ---------------------------------------------------------------------------
 
-# The console's look: follow Telegram's light/dark, or pin one; a light and a dark theme from the kit.
+# The console's look: follow Telegram's light/dark, or pin one; a light and a dark theme from the kit;
+# and the style (shape and motion), independent of the colours.
 APPEARANCE_KEY = "console.appearance"
 APPEARANCE_MODES = ("telegram", "light", "dark")
+APPEARANCE_STYLES = ("classic", "cozy")
 # plus the imported Noetrix themes (scripts/import_noetrix_themes.py writes the listing)
 _NOETRIX = json.loads((Path(__file__).resolve().parent / "static" / "themes-noetrix.json").read_text(encoding="utf-8"))
 LIGHT_THEMES = ("ledger", "steel", "solar", "paper", *(t["id"] for t in _NOETRIX if t["mode"] == "light"))
 DARK_THEMES = ("dark", "graphite", "slate", "contrast", *(t["id"] for t in _NOETRIX if t["mode"] == "dark"))
-APPEARANCE_DEFAULT = {"mode": "telegram", "light": "ledger", "dark": "dark"}
+APPEARANCE_DEFAULT = {"mode": "telegram", "light": "ledger", "dark": "dark", "style": "classic"}
 
 
 async def _appearance(library) -> dict:
@@ -323,7 +325,8 @@ async def me(request: web.Request) -> web.Response:
 async def put_appearance(request: web.Request) -> web.Response:
     d, body = _deps(request), await _body(request)
     cur = await _appearance(d.library)
-    for key, allowed in (("mode", APPEARANCE_MODES), ("light", LIGHT_THEMES), ("dark", DARK_THEMES)):
+    for key, allowed in (("mode", APPEARANCE_MODES), ("light", LIGHT_THEMES), ("dark", DARK_THEMES),
+                         ("style", APPEARANCE_STYLES)):
         if key in body:
             if body[key] not in allowed:
                 raise _bad(f"{key} must be one of {', '.join(allowed)}")
