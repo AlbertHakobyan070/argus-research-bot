@@ -226,14 +226,30 @@ def _make_cb_update(chat_id: int, data: str) -> MagicMock:
     return update
 
 
-async def test_media_download_button_spawns_task():
+async def test_media_download_button_opens_the_video_card():
+    """⬇ no longer downloads at once: it posts the video card (reading the
+    link, with Cancel) and starts the probe that fills in the formats."""
     _pool_put("tg:99", [{"title": "T", "url": "https://youtu.be/abc123DEF45",
                          "platform": "youtube"}])
     ctx = _make_ctx()
     await on_callback(_make_cb_update(99, "m:dl:1"), ctx)
-    assert len(ctx.application.created_tasks) == 1
-    note = str(ctx.application.bot.send_message.await_args_list[-1])
-    assert "Queued download" in note
+    assert len(ctx.application.created_tasks) == 1, "the probe"
+    card = ctx.application.bot.send_message.await_args_list[-1].kwargs
+    assert "Reading the link" in card["text"]
+    assert card["link_preview_options"].url == "https://youtu.be/abc123DEF45"
+    datas = [b.callback_data for row in card["reply_markup"].inline_keyboard for b in row]
+    assert datas == ["vc:x:_"]
+
+
+async def test_a_tap_answered_too_late_is_still_acted_on():
+    from telegram.error import BadRequest
+    _pool_put("tg:99", [{"title": "T", "url": "https://youtu.be/abc123DEF45",
+                         "platform": "youtube"}])
+    ctx = _make_ctx()
+    update = _make_cb_update(99, "m:dl:1")
+    update.callback_query.answer = AsyncMock(side_effect=BadRequest("Query is too old and response timeout expired"))
+    await on_callback(update, ctx)
+    assert len(ctx.application.created_tasks) == 1, "the card still opens"
 
 
 async def test_media_both_button_spawns_two_tasks():

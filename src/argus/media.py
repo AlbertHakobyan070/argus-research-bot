@@ -58,8 +58,24 @@ _FRAGMENT_CONCURRENCY = int(os.environ.get("ARGUS_MEDIA_FRAGMENTS", "8"))
 _CONCURRENCY = int(os.environ.get("ARGUS_MEDIA_CONCURRENCY", "2"))
 _download_sem = asyncio.Semaphore(_CONCURRENCY)
 
-_PROGRESS_TEMPLATE = "ARGUSP|%(progress._percent_str)s|%(progress._eta_str)s"
-_PROGRESS_RE = re.compile(r"^ARGUSP\|\s*([\d.]+)%\|\s*(\S+)")
+# pct | eta | downloaded bytes | total bytes (the estimate when the total is
+# unknown, e.g. HLS); yt-dlp prints NA for a missing value.
+_PROGRESS_TEMPLATE = ("ARGUSP|%(progress._percent_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s"
+                      "|%(progress.total_bytes,progress.total_bytes_estimate)s")
+_PROGRESS_RE = re.compile(r"^ARGUSP\|\s*([\d.]+)%\|\s*([^\s|]+)")
+
+# The yt-dlp lines that mark a download's stage (see download_media's on_status).
+_FORMATS_RE = re.compile(r"^\[info\] .+: Downloading \d+ format\(s\): (.+)$")
+_DEST_RE = re.compile(r"^\[download\] Destination: (.+)$")
+_DONE_RE = re.compile(r"^\[download\] (.+) has already been downloaded$")
+# The files this run's post-processors are about to write (yt-dlp prints these
+# only right before its own ffmpeg starts): the mp3 itself, a merge / fixup target.
+_EXTRACT_RE = re.compile(r"^\[ExtractAudio\] Destination: (.+)$")
+_MERGER_RE = re.compile(r'^\[Merger\] Merging formats into "(.+)"$')
+_FIXUP_RE = re.compile(r'^\[Fixup\w*\] .+ of "(.+)"$')
+# ponytail: post-processor tags are CamelCase ([Merger], [MoveFiles]) while the
+# downloaders' are lower case ([download], [hlsnative]); a new lower-case PP would read as no stage.
+_PP_RE = re.compile(r"^\[([A-Z]\w*)\]")
 
 # How often the liveness watchdog checks for a stalled download.
 _WATCHDOG_TICK_S = 5.0
@@ -200,6 +216,28 @@ def parse_progress_line(line: str) -> tuple[float, str] | None:
         return float(m.group(1)), m.group(2)
     except ValueError:
         return None
+
+
+def _num(s: str) -> float | None:
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_progress_fields(line: str) -> dict[str, Any] | None:
+    """Every field of an ``ARGUSP`` progress line as ``{"pct", "eta",
+    "done_bytes", "total_bytes"}``, each None where yt-dlp had no value
+    (NA, N/A, Unknown, or a two-field line without byte counts); None for
+    any other line."""
+    s = (line or "").strip()
+    if not s.startswith("ARGUSP|"):
+        return None
+    pct, eta, done, total = ([p.strip() for p in s.split("|")[1:]] + [""] * 4)[:4]
+    done_n, total_n = _num(done), _num(total)
+    return {"pct": _num(pct.rstrip("%")), "eta": None if eta in ("", "NA", "Unknown") else eta,
+            "done_bytes": None if done_n is None else int(done_n),
+            "total_bytes": None if total_n is None else int(total_n)}
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +475,11 @@ async def _run_streaming(cmd: list[str], *, timeout_s: int,
     watchdog = asyncio.create_task(_watchdog())
     try:
         await asyncio.gather(_pump_stdout(), _pump_stderr(), proc.wait())
+    except BaseException:                       # cancel, or on_line raising: never leave the tree running
+        if proc.returncode is None:
+            _kill_tree(proc.pid)
+        await proc.wait()
+        raise
     finally:
         watchdog.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -448,18 +491,52 @@ async def _run_streaming(cmd: list[str], *, timeout_s: int,
     return proc.returncode or 0, stderr[-2000:]
 
 
+def _remove_partials(announced: list[Path], folder: Path, written: list[Path]) -> None:
+    """Delete what a cancelled download left: each file its own Destination
+    lines announced, plus that file's .part / .ytdl / .part-Frag* siblings,
+    and each file its post-processors began writing (``written``), exactly.
+    Nothing else, and nothing outside ``folder``, is touched."""
+    root = folder.resolve()
+    for p in [*announced, *written]:
+        if root not in p.resolve().parents:
+            logger.warning("not removing %s: outside %s", p, root)
+            continue
+        siblings = []
+        if p in announced:                      # a downloader's file: its resume state goes too
+            siblings = [p.with_name(p.name + ".part"), p.with_name(p.name + ".ytdl")]
+            if p.parent.is_dir():
+                siblings += [f for f in p.parent.iterdir() if f.name.startswith(p.name + ".part-Frag")]
+        for f in (p, *siblings):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:                     # logged; the cancel itself must still propagate
+                logger.exception("could not remove the cancelled download's %s", f)
+
+
 async def download_media(
     url: str, *, dest_root: Path | str, quality: str = "auto",
     on_progress: Callable[[float, str], None] | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     stall_s: int = STALL_TIMEOUT_S,
     audio: str | None = None, any_url: bool = False,
+    on_status: Callable[[dict], None] | None = None,
 ) -> MediaResult:
     """Download one media URL into ``dest_root/<platform>/``.
 
     ``audio`` (an MP3_QUALITIES value) fetches the best audio stream as
     mp3 instead of the video. ``any_url`` lets yt-dlp try a link outside
     the four platforms (into ``other/``).
+
+    ``on_status`` gets ``{"stage", "pct", "eta", "done_bytes",
+    "total_bytes"}`` on each stage change and each progress line. Stages:
+    queued (waiting for a free slot), starting, video / audio (the two
+    streams of a merged format; audio also for an mp3), download (a
+    single-file format), merging, converting (to mp3), finishing (the
+    other post-processors).
+
+    A cancel kills the downloader tree, deletes this download's partial
+    files and re-raises. A run that fails deletes what its post-processors
+    were writing (a truncated mp3 would be served as "already downloaded").
 
     Returns a fail-soft :class:`MediaResult` — ``ok=False`` carries the
     downloader's stderr tail so the bot can surface WHY it failed
@@ -486,6 +563,24 @@ async def download_media(
     argv = _build_argv(url, platform, dest_root, fmt, marker, ffmpeg,
                        None if audio else quality_sort(quality), audio=audio)
     cmd = [*_YTDLP_PREFIX, *argv]
+    announced: list[Path] = []                  # this download's own files, from its Destination lines
+    written: list[Path] = []                    # what its post-processors began writing
+    st = {"stage": "", "merged": False, "n": 0}  # n: streams so far, fetched or already on disk
+
+    def _status(stage: str, fields: dict | None = None) -> None:
+        st["stage"] = stage
+        if on_status is None:
+            return
+        try:
+            on_status({"stage": stage, "pct": None, "eta": None, "done_bytes": None, "total_bytes": None,
+                       **(fields or {})})
+        except Exception:
+            logger.exception("on_status callback failed")
+
+    def _next_stream() -> None:
+        st["n"] += 1
+        _status("audio" if audio or (st["merged"] and st["n"] >= 2)
+                else "video" if st["merged"] else "download")
 
     def _on_line(line: str) -> None:
         parsed = parse_progress_line(line)
@@ -494,14 +589,43 @@ async def download_media(
                 on_progress(*parsed)
             except Exception:
                 logger.exception("on_progress callback failed")
+        fields = parse_progress_fields(line)
+        if fields is not None:
+            _status(st["stage"], fields)
+        elif m := _FORMATS_RE.match(line):
+            st["merged"] = "+" in m.group(1)
+        elif m := _DEST_RE.match(line):
+            p = Path(m.group(1).strip())
+            if p not in announced:              # a mid-stream retry re-announces the same file
+                announced.append(p)
+                _next_stream()
+        elif _DONE_RE.match(line):              # resuming: maybe an earlier finished file, so never announced
+            _next_stream()
+        elif st["n"] and (m := _PP_RE.match(line)):
+            if w := _EXTRACT_RE.match(line):
+                written.append(Path(w.group(1).strip()))
+            elif w := _MERGER_RE.match(line) or _FIXUP_RE.match(line):
+                x = Path(w.group(1))
+                written.extend([x, x.with_name(f"{x.stem}.temp{x.suffix}")])
+            stage = {"Merger": "merging", "ExtractAudio": "converting"}.get(m.group(1), "finishing")
+            if stage != st["stage"]:
+                _status(stage)
 
     try:
+        if _download_sem.locked():
+            _status("queued")
         async with _download_sem:
+            _status("starting")
             rc, stderr = await _run_streaming(
                 cmd, timeout_s=timeout_s, on_line=_on_line,
                 stall_s=stall_s)
+    except asyncio.CancelledError:
+        _remove_partials(announced, plat_dir, written)
+        marker.unlink(missing_ok=True)
+        raise
     except Exception as e:
         logger.exception("downloader subprocess failed to run")
+        _remove_partials([], plat_dir, written)
         marker.unlink(missing_ok=True)
         return MediaResult(ok=False, url=url, platform=platform,
                            error=f"downloader failed to run: {e}",
@@ -518,6 +642,8 @@ async def download_media(
                 final_path = candidate
 
     if final_path is None:
+        # a killed ffmpeg's output is corrupt; the stream partials stay, so a resend resumes
+        _remove_partials([], plat_dir, written)
         err = stderr.strip() or f"yt-dlp exited {rc} without an output file"
         return MediaResult(ok=False, url=url, platform=platform,
                            error=explain_error(err)[-800:],
@@ -643,9 +769,10 @@ _OUT_TIME_RE = re.compile(r"^out_time_(?:us|ms)=(\d+)$")
 
 async def probe_url(url: str, *, timeout_s: int = 90) -> dict[str, Any]:
     """What a link offers, without downloading: title, duration, uploader,
-    the video heights on offer (short side, i.e. orientation-free) and the
-    best audio bitrate. Raises ``RuntimeError`` with the downloader's
-    explained error."""
+    the video heights on offer (short side, i.e. orientation-free) with their
+    approximate download sizes (``sizes``, heights of unknown size left out),
+    the best audio bitrate and size, the id and the thumbnail URL. Raises
+    ``RuntimeError`` with the downloader's explained error."""
     # One JSON line of often several hundred KB: communicate(), not the
     # line-streaming runner (its readline limit is 64 KB).
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
@@ -666,13 +793,29 @@ async def probe_url(url: str, *, timeout_s: int = 90) -> dict[str, Any]:
         stderr = err.decode("utf-8", "replace").strip()
         raise RuntimeError(explain_error(stderr or f"yt-dlp exited {proc.returncode} without metadata")[-800:]) from None
     fmts = info.get("formats") or []
-    heights = sorted({min(f["width"], f["height"]) for f in fmts
-                      if f.get("vcodec") not in (None, "none") and f.get("width") and f.get("height")})
+    vids = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("width") and f.get("height")]
+    heights = sorted({min(f["width"], f["height"]) for f in vids})
     abr = max((f.get("abr") or 0 for f in fmts if f.get("acodec") not in (None, "none")), default=0)
+    # yt-dlp lists formats worst to best, so the last one of a kind is its best
+    audio_only = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+    best_audio = audio_only[-1] if audio_only else {}
+    audio_size = best_audio.get("filesize") or best_audio.get("filesize_approx")
+    rate, duration = best_audio.get("abr") or abr, info.get("duration")
+    audio_bytes = int(audio_size) if audio_size else (round(duration * rate * 1000 / 8) if duration and rate else None)
+    sizes: dict[int, int] = {}
+    for h in heights:
+        sized = [f for f in vids if min(f["width"], f["height"]) == h and (f.get("filesize") or f.get("filesize_approx"))]
+        if sized:
+            best = ([f for f in sized if f.get("ext") == "mp4"] or sized)[-1]
+            n = best.get("filesize") or best.get("filesize_approx")
+            if best.get("acodec") in (None, "none"):     # video-only: the merge adds the best audio
+                n += audio_size or 0
+            sizes[h] = int(n)
     return {"url": url, "platform": detect_platform(url) or "other", "title": info.get("title") or "",
             "uploader": info.get("uploader") or info.get("channel") or "", "duration_s": info.get("duration"),
             "heights": heights, "audio_kbps": round(abr) or None,
-            "description": (info.get("description") or "")[:600]}
+            "description": (info.get("description") or "")[:600],
+            "id": info.get("id"), "thumbnail": info.get("thumbnail"), "sizes": sizes, "audio_bytes": audio_bytes}
 
 
 async def media_duration(path: Path | str, *, ffmpeg: str | None = None) -> float | None:

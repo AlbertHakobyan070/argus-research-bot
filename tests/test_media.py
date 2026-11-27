@@ -23,7 +23,9 @@ from argus.media import (
     download_media,
     explain_error,
     extract_urls,
+    parse_progress_fields,
     parse_progress_line,
+    probe_url,
     quality_format,
     quality_sort,
     reddit_search,
@@ -142,6 +144,25 @@ def test_parse_progress_line():
     assert parse_progress_line("ARGUSP|100.0%|00:00") == (100.0, "00:00")
     assert parse_progress_line("[download] something else") is None
     assert parse_progress_line("") is None
+    # the wider line (with byte counts) reads the same
+    assert parse_progress_line("ARGUSP| 42.3%|00:12|500|1000") == (42.3, "00:12")
+
+
+def test_parse_progress_fields_reads_bytes_and_na():
+    assert parse_progress_fields("ARGUSP| 42.3%|00:12|500|1000") == {
+        "pct": 42.3, "eta": "00:12", "done_bytes": 500, "total_bytes": 1000}
+    # what yt-dlp's template prints before it knows a size or an ETA
+    assert parse_progress_fields("ARGUSP|  N/A%| Unknown|500|NA") == {
+        "pct": None, "eta": None, "done_bytes": 500, "total_bytes": None}
+    assert parse_progress_fields("ARGUSP|  N/A%|NA|NA|NA") == dict.fromkeys(
+        ("pct", "eta", "done_bytes", "total_bytes"))
+    # total_bytes_estimate (HLS) is a float
+    assert parse_progress_fields("ARGUSP| 42.3%|00:12|500|1234.5")["total_bytes"] == 1234
+    # an old two-field line has no byte counts
+    assert parse_progress_fields("ARGUSP| 10.0%|00:20") == {
+        "pct": 10.0, "eta": "00:20", "done_bytes": None, "total_bytes": None}
+    assert parse_progress_fields("[download] Destination: x.mp4") is None
+    assert parse_progress_fields("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +350,289 @@ async def test_completed_file_is_kept_even_when_ytdlp_exits_nonzero(
     assert Path(r.path).exists()
     assert r.title == "Salvaged"
     assert r.size_bytes == 2048
+
+
+# ---------------------------------------------------------------------------
+# on_status stages, the queue, cancel
+# ---------------------------------------------------------------------------
+
+
+def _stub_printing(lines: list[str]) -> str:
+    """A downloader that prints ``lines`` ({dest} = its -P folder), then
+    finishes like _STUB_OK: the file and the marker."""
+    return textwrap.dedent(f"""\
+        import sys
+        from pathlib import Path
+        argv = sys.argv[1:]
+        dest = Path(argv[argv.index("-P") + 1])
+        dest.mkdir(parents=True, exist_ok=True)
+        for line in {lines!r}:
+            print(line.replace("{{dest}}", str(dest)), flush=True)
+        out = dest / "20260101_fake1_stub-video.mp4"
+        out.write_bytes(b"x" * 4096)
+        Path(argv[argv.index("--print-to-file") + 2]).write_text(str(out), encoding="utf-8")
+    """)
+
+
+def _st(stage, pct=None, eta=None, done=None, total=None):
+    return {"stage": stage, "pct": pct, "eta": eta, "done_bytes": done, "total_bytes": total}
+
+
+_MERGED = [
+    "[youtube] fake1: Downloading webpage",
+    "[info] fake1: Downloading 1 format(s): 137+140",
+    '[ThumbnailsConvertor] Converting thumbnail "{dest}/v.webp" to jpg',   # before the download: no stage
+    "[download] Destination: {dest}/v.f137.mp4",
+    "ARGUSP| 50.0%|00:10|500|1000",
+    "[download] Destination: {dest}/v.f140.m4a",
+    "ARGUSP|100.0%|00:00|200|NA",
+    '[Merger] Merging formats into "{dest}/v.mp4"',
+    "Deleting original file {dest}/v.f137.mp4 (pass -k to keep)",
+    '[Metadata] Adding metadata to "{dest}/v.mp4"',
+    '[MoveFiles] Moving file "{dest}/v.jpg" to "{dest}/v.jpg"',
+]
+_SINGLE = [
+    "[info] fake1: Downloading 1 format(s): 18",
+    "[download] Destination: {dest}/v.mp4",
+    "ARGUSP|100.0%|00:00|4096|4096",
+    '[FixupM3u8] Fixing MPEG-TS in MP4 container of "{dest}/v.mp4"',
+    '[EmbedThumbnail] ffmpeg: Adding thumbnail to "{dest}/v.mp4"',
+]
+_MP3 = [
+    "[info] fake1: Downloading 1 format(s): 251",
+    "[download] Destination: {dest}/v_audio.webm",
+    "ARGUSP|100.0%|00:00|300|300",
+    "[ExtractAudio] Destination: {dest}/v_audio.mp3",
+    '[Metadata] Adding metadata to "{dest}/v_audio.mp3"',
+]
+# yt-dlp re-prints a stream's Destination on each mid-stream retry
+_RETRY = [
+    "[info] fake1: Downloading 1 format(s): 137+140",
+    "[download] Destination: {dest}/v.f137.mp4",
+    "ARGUSP| 20.0%|00:40|200|1000",
+    "[download] Got error: Connection reset. Retrying (1/10)...",
+    "[download] Destination: {dest}/v.f137.mp4",
+    "ARGUSP| 40.0%|00:30|400|1000",
+    "[download] Destination: {dest}/v.f140.m4a",
+    "ARGUSP|100.0%|00:00|200|200",
+    '[Merger] Merging formats into "{dest}/v.mp4"',
+]
+# a resend after a stall: the video stream is on disk, the audio one resumes
+_RESUME = [
+    "[info] fake1: Downloading 1 format(s): 137+140",
+    "[download] {dest}/v.f137.mp4 has already been downloaded",
+    "[download] Destination: {dest}/v.f140.m4a",
+    "ARGUSP| 50.0%|00:05|100|200",
+    '[Merger] Merging formats into "{dest}/v.mp4"',
+]
+_BOTH_ON_DISK = [
+    "[info] fake1: Downloading 1 format(s): 137+140",
+    "[download] {dest}/v.f137.mp4 has already been downloaded",
+    "[download] {dest}/v.f140.m4a has already been downloaded",
+    '[Merger] Merging formats into "{dest}/v.mp4"',
+]
+
+
+@pytest.mark.parametrize("lines,audio,expected", [
+    (_MERGED, None, [_st("starting"), _st("video"), _st("video", 50.0, "00:10", 500, 1000),
+                     _st("audio"), _st("audio", 100.0, "00:00", 200, None), _st("merging"), _st("finishing")]),
+    (_SINGLE, None, [_st("starting"), _st("download"), _st("download", 100.0, "00:00", 4096, 4096),
+                     _st("finishing")]),
+    (_MP3, "320", [_st("starting"), _st("audio"), _st("audio", 100.0, "00:00", 300, 300),
+                   _st("converting"), _st("finishing")]),
+    (_RETRY, None, [_st("starting"), _st("video"), _st("video", 20.0, "00:40", 200, 1000),
+                    _st("video", 40.0, "00:30", 400, 1000), _st("audio"), _st("audio", 100.0, "00:00", 200, 200),
+                    _st("merging")]),
+    (_RESUME, None, [_st("starting"), _st("video"), _st("audio"), _st("audio", 50.0, "00:05", 100, 200),
+                     _st("merging")]),
+    (_BOTH_ON_DISK, None, [_st("starting"), _st("video"), _st("audio"), _st("merging")]),
+], ids=["merged", "single-file", "mp3", "retry", "resume", "both-on-disk"])
+async def test_on_status_reports_stages_and_bytes(tmp_path, monkeypatch, lines, audio, expected):
+    _install_stub(tmp_path, monkeypatch, _stub_printing(lines))
+    monkeypatch.setattr(media, "resolve_ffmpeg", lambda: "ffmpeg")
+    statuses: list[dict] = []
+    progress: list[tuple] = []
+
+    r = await download_media("https://youtu.be/abc123DEF45", dest_root=tmp_path / "vault", audio=audio,
+                             on_progress=lambda pct, eta: progress.append((pct, eta)),
+                             on_status=statuses.append)
+
+    assert r.ok, r.error
+    assert statuses == expected
+    # on_progress is unchanged: (pct, eta) per progress line
+    assert progress == [(s["pct"], s["eta"]) for s in expected if s["pct"] is not None]
+
+
+async def test_a_download_waiting_for_a_slot_reports_queued_first(tmp_path, monkeypatch):
+    _install_stub(tmp_path, monkeypatch, _STUB_OK)
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(media, "_download_sem", sem)
+    await sem.acquire()                         # every slot taken
+    stages: list[str] = []
+    task = asyncio.create_task(download_media("https://youtu.be/abc123DEF45", dest_root=tmp_path / "vault",
+                                              on_status=lambda s: stages.append(s["stage"])))
+    for _ in range(200):
+        if stages:
+            break
+        await asyncio.sleep(0.01)
+    assert stages == ["queued"], "nothing starts while the slot is taken"
+    sem.release()
+    r = await task
+    assert r.ok, r.error
+    assert stages[:2] == ["queued", "starting"]
+
+
+async def test_cancel_kills_the_tree_and_removes_only_this_downloads_partials(tmp_path, monkeypatch):
+    """Cancelling the task used to leave yt-dlp running and writing into the
+    vault. A cancel kills it and removes exactly the files it announced."""
+    plat = tmp_path / "vault" / "youtube"
+    plat.mkdir(parents=True)
+    (plat / "keep.mp4").write_bytes(b"k")               # a finished download
+    (plat / "other.mp4.part").write_bytes(b"o")         # another download's partial
+    stub = textwrap.dedent("""\
+        import sys, time
+        from pathlib import Path
+        argv = sys.argv[1:]
+        dest = Path(argv[argv.index("-P") + 1])
+        Path(argv[argv.index("--print-to-file") + 2]).write_text("", encoding="utf-8")
+        out = dest / "20260101_fake1_stub-video.f137.mp4"
+        print(f"[download] Destination: {out}", flush=True)
+        part = open(str(out) + ".part", "wb")     # held open, as a real downloader does
+        part.write(b"x" * 1024)
+        part.flush()
+        (dest / (out.name + ".part-Frag3")).write_bytes(b"f")
+        (dest / (out.name + ".ytdl")).write_bytes(b"{}")
+        print("ARGUSP|  5.0%|10:00|1024|20480", flush=True)
+        time.sleep(600)
+    """)
+    _install_stub(tmp_path, monkeypatch, stub)
+    real = asyncio.create_subprocess_exec
+    procs: list = []
+
+    async def spawn(*cmd, **kw):
+        procs.append(await real(*cmd, **kw))
+        return procs[-1]
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", spawn)
+    progressed = asyncio.Event()
+    task = asyncio.create_task(download_media("https://youtu.be/abc123DEF45", dest_root=tmp_path / "vault",
+                                              on_progress=lambda pct, eta: progressed.set()))
+    await asyncio.wait_for(progressed.wait(), 30)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert procs and procs[0].returncode is not None, "the downloader was killed and awaited"
+    # the .part, .ytdl, fragment and marker are gone; nothing else was touched
+    assert sorted(f.name for f in plat.iterdir()) == ["keep.mp4", "other.mp4.part"]
+
+
+def _stub_post_processing(lines: list[str], out: str, end: str) -> str:
+    """A downloader whose ffmpeg has written ``out`` (part-way, unless ``end``
+    writes the marker), prints ``lines`` ({dest} = its -P folder), then runs ``end``."""
+    return textwrap.dedent(f"""\
+        import sys, time
+        from pathlib import Path
+        argv = sys.argv[1:]
+        dest = Path(argv[argv.index("-P") + 1])
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / {out!r}).write_bytes(b"x" * 1024)
+        for line in {lines!r}:
+            print(line.replace("{{dest}}", str(dest)), flush=True)
+        {end}
+    """)
+
+
+_MARK = 'Path(argv[argv.index("--print-to-file") + 2]).write_text(str(dest / {!r}), encoding="utf-8")'
+
+
+@pytest.mark.parametrize("lines,audio,out", [
+    (_MP3[:4], "320", "v_audio.mp3"),           # ffmpeg writes the mp3 under its final name
+    (_MERGED[:8], None, "v.temp.mp4"),          # and a merge into <stem>.temp.mp4
+], ids=["mp3", "merge"])
+async def test_cancel_removes_what_the_post_processor_was_writing(tmp_path, monkeypatch, lines, audio, out):
+    """A Cancel mid-conversion left a truncated mp3 that the next request for the
+    link served as 'already downloaded'."""
+    plat = tmp_path / "vault" / "youtube"
+    plat.mkdir(parents=True)
+    (plat / "v.info.json").write_text("{}", encoding="utf-8")      # an earlier download of the same video owns it
+    _install_stub(tmp_path, monkeypatch, _stub_post_processing(lines, out, "time.sleep(600)"))
+    monkeypatch.setattr(media, "resolve_ffmpeg", lambda: "ffmpeg")
+    post = asyncio.Event()
+    task = asyncio.create_task(download_media(
+        "https://youtu.be/abc123DEF45", dest_root=tmp_path / "vault", audio=audio,
+        on_status=lambda s: s["stage"] in ("converting", "merging") and post.set()))
+    await asyncio.wait_for(post.wait(), 30)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sorted(f.name for f in plat.iterdir()) == ["v.info.json"]
+
+
+@pytest.mark.parametrize("end,ok", [
+    ("sys.exit(1)", False),                     # e.g. the stall watchdog killed ffmpeg
+    (_MARK.format("v_audio.mp3"), True),
+], ids=["failed", "succeeded"])
+async def test_a_failed_run_removes_its_mp3_and_a_successful_one_keeps_it(tmp_path, monkeypatch, end, ok):
+    _install_stub(tmp_path, monkeypatch, _stub_post_processing(_MP3, "v_audio.mp3", end))
+    monkeypatch.setattr(media, "resolve_ffmpeg", lambda: "ffmpeg")
+
+    r = await download_media("https://youtu.be/abc123DEF45", dest_root=tmp_path / "vault", audio="320")
+
+    assert r.ok is ok, r.error
+    assert (tmp_path / "vault" / "youtube" / "v_audio.mp3").exists() is ok
+
+
+# ---------------------------------------------------------------------------
+# probe_url against a stub -J
+# ---------------------------------------------------------------------------
+
+
+_PROBE_INFO = {
+    "id": "abc123DEF45", "title": "Probe", "uploader": "U", "duration": 100,
+    "thumbnail": "https://i.ytimg.com/vi/abc123DEF45/hq720.jpg",
+    "formats": [                                # worst to best, as yt-dlp lists them
+        {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a", "abr": 129.5,
+         "filesize": 1_600_000},
+        {"format_id": "251", "vcodec": "none", "acodec": "opus", "ext": "webm", "abr": 160.1,
+         "filesize_approx": 2_000_000},
+        {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a.40.2", "ext": "mp4", "width": 640, "height": 360,
+         "filesize": 5_000_000},
+        {"format_id": "136", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "width": 1280, "height": 720,
+         "filesize": 10_000_000},
+        {"format_id": "247", "vcodec": "vp9", "acodec": "none", "ext": "webm", "width": 1280, "height": 720,
+         "filesize": 9_000_000},
+        {"format_id": "137", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "width": 1080, "height": 1920},
+    ]}
+
+
+def _probe_stub(info: dict) -> str:
+    return f"import sys\nassert '-J' in sys.argv\nprint({json.dumps(info)!r})\n"
+
+
+async def test_probe_url_reports_sizes_thumbnail_and_id(tmp_path, monkeypatch):
+    _install_stub(tmp_path, monkeypatch, _probe_stub(_PROBE_INFO))
+    p = await probe_url("https://youtu.be/abc123DEF45")
+    assert p["id"] == "abc123DEF45"
+    assert p["thumbnail"] == "https://i.ytimg.com/vi/abc123DEF45/hq720.jpg"
+    assert p["heights"] == [360, 720, 1080]
+    # 360: a file with its own audio; 720: the mp4 (not the later webm) plus
+    # the best audio; 1080 has no size, so it is left out
+    assert p["sizes"] == {360: 5_000_000, 720: 12_000_000}
+    assert p["audio_bytes"] == 2_000_000
+    assert (p["title"], p["uploader"], p["duration_s"], p["audio_kbps"]) == ("Probe", "U", 100, 160)
+
+
+async def test_probe_url_estimates_audio_bytes_from_the_bitrate(tmp_path, monkeypatch):
+    info = {"id": "x1", "title": "T", "duration": 100,
+            "formats": [{"format_id": "a", "vcodec": "none", "acodec": "opus", "abr": 128}]}
+    _install_stub(tmp_path, monkeypatch, _probe_stub(info))
+    p = await probe_url("https://youtu.be/abc123DEF45")
+    assert p["audio_bytes"] == 1_600_000            # 100 s x 128 kbit/s / 8
+    assert p["sizes"] == {} and p["heights"] == []
+    assert p["thumbnail"] is None
 
 
 # ---------------------------------------------------------------------------

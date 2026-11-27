@@ -146,6 +146,7 @@ async def _ctx(graph, lib, args=()) -> MagicMock:
     app.bot.edit_message_text = AsyncMock()
     app.bot.send_chat_action = AsyncMock()
     app.bot.send_document = AsyncMock()
+    app.bot.do_api_request = AsyncMock(return_value={"message_id": 2})   # the /ask answer as a rich message
     app.bot_data = {"graph": graph, "library": lib}
     ctx = MagicMock()
     ctx.application = app

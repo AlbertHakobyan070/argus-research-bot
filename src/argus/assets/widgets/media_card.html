@@ -1,0 +1,83 @@
+<style>
+body{margin:0;padding:12px 20px max(14px,env(safe-area-inset-bottom))}
+#h{display:flex;gap:12px;align-items:center}
+.ic{flex:none;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--tg-theme-button-color);fill:var(--tg-theme-button-text-color)}
+.ic svg{width:24px;height:24px}
+.ic.s{background:var(--tg-theme-secondary-bg-color);fill:var(--tg-theme-hint-color)}
+.ic.f{background:var(--tg-theme-destructive-text-color)}
+.tx{flex:1;min-width:0}
+.t{font-weight:600;line-height:1.3;max-height:2.6em;overflow:hidden;overflow-wrap:anywhere}
+.m{margin-top:2px;font-size:.87em;color:var(--tg-theme-hint-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.k{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:14px 0 6px;font-size:.75em;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--tg-theme-hint-color)}
+.k b{font-size:1.15em;letter-spacing:0;text-transform:none;color:var(--tg-theme-text-color)}
+.k.e{color:var(--tg-theme-destructive-text-color)}
+.n,.k b,#g{font-variant-numeric:tabular-nums}
+#g{display:flex;justify-content:space-between;font-size:.87em;color:var(--tg-theme-hint-color)}
+#g span{margin-top:6px}
+#b{height:6px;border-radius:3px;overflow:hidden;background:var(--tg-theme-secondary-bg-color)}
+#i{height:100%;width:0;border-radius:3px;background:var(--tg-theme-button-color);transition:width .6s}
+button{min-height:36px;margin:0;padding:0 6px;border:0;border-radius:10px;font:inherit;color:var(--tg-theme-text-color);background:var(--tg-theme-secondary-bg-color)}
+button *{pointer-events:none}
+button:active{opacity:.7}
+.sg{display:flex;gap:2px;margin-top:14px;padding:2px;border-radius:12px;background:var(--tg-theme-secondary-bg-color)}
+.sg button{flex:1;background:transparent;color:var(--tg-theme-hint-color)}
+.on{font-weight:600}
+.sg .on{background:var(--tg-theme-bg-color);color:var(--tg-theme-text-color);box-shadow:0 0 0 1px var(--tg-theme-section-separator-color)}
+.gr{display:grid;grid-template-columns:repeat(var(--c),1fr);gap:6px}
+.gr button{font-size:.93em;border:1.5px solid transparent}
+.gr .on{border-color:var(--tg-theme-button-color);color:var(--tg-theme-accent-text-color);background:transparent}
+.u{font-size:.85em;color:var(--tg-theme-hint-color)}
+.ac{display:flex;gap:8px;margin-top:14px}
+.ac button{flex:1;min-height:42px;font-weight:600}
+.ac .p{flex:2;background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color)}
+button[disabled],.ac button[disabled]{color:var(--tg-theme-hint-color);background:var(--tg-theme-secondary-bg-color)}
+.sk{height:10px;width:55%;margin-top:7px;border-radius:5px;background:var(--tg-theme-secondary-bg-color)}
+.sk.g{width:auto;height:40px;margin:14px 0 32px;border-radius:12px}
+.sk.c{width:auto;height:36px;margin:0;border-radius:10px}
+.er{max-height:5.4em;overflow:hidden;overflow-wrap:anywhere;-webkit-user-select:text;user-select:text}
+.xn{margin:12px 0 0;color:var(--tg-theme-hint-color)}
+#n{margin:10px 0 0;font-size:.87em;color:var(--tg-theme-hint-color)}
+#n.e{color:var(--tg-theme-destructive-text-color)}
+@media(prefers-reduced-motion:reduce){#i{transition:none}}
+</style>
+<div id=w><div id=h></div><div id=a></div><div id=b hidden><div id=i></div></div><div id=g></div><div id=c></div><p id=n hidden></p></div>
+<script>
+const W=window.TelegramWidget,$=i=>document.getElementById(i),C={},
+P={v:'M8 5v14l11-7z',a:'M12 3v10.55A4 4 0 1 0 14 17V7h4V3z',d:'M5 20h14v-2H5zM19 9h-4V3H9v6H5l7 7z',done:'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z',fail:'M11 7h2v7h-2zm0 9h2v2h-2z',x:'M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z'},
+ST={video:'Downloading video',audio:'Downloading audio',download:'Downloading',merging:'Merging',converting:'Converting to MP3',finishing:'Finishing',queued:'Queued',starting:'Starting'},
+ER={NOT_ALLOWED:'Use the buttons under this message',TIMEOUT:'Argus did not answer — try again',RATE_LIMITED:'Too fast — wait a moment',BUSY:'Still sending the last tap — try again in a moment'},
+X=v=>String(v==null?'':v).replace(/[&<>"]/g,c=>'&#'+c.charCodeAt(0)+';'),
+J=v=>{try{const o=JSON.parse(v);return o&&typeof o=='object'?o:null}catch(e){return null}},
+put=(i,v)=>{if(C[i]!==v)$(i).innerHTML=C[i]=v};
+let S=null,N=-1,bz=0,nt='',ne=0;
+function take(o){if(o&&!(o.n<N)){S=o;if(o.n!=null)N=o.n}}
+function B(r,l,k){return'<button'+(k?' class='+k:'')+(r?' data-r="'+X(r)+'"':'')+(bz?' disabled':'')+'>'+l+'</button>'}
+function draw(){
+const s=S||{},ph=s.ph||'read',f=s.f=='a'?'a':'v',dl=ph=='queue'||ph=='dl',pc=Math.min(100,Math.max(0,+s.p||0)),
+ic={pick:f,queue:'d',dl:'d',done:'done',fail:'fail',x:'x',off:'x'}[ph],t=String(s.t||(ph=='off'?'Video card':'Reading the link…'));
+let a='',g='',c='';
+put('h','<div class="ic '+(ph=='fail'?'f':ic&&ph!='x'&&ph!='off'?'':'s')+'">'+(ic?'<svg viewBox="0 0 24 24"><path d="'+P[ic]+'"/></svg>':'')+'</div><div class=tx><div class=t>'+X(t.length>64?t.slice(0,64).replace(/\s+\S*$/,'')+'…':t)+'</div>'+(s.m?'<div class=m>'+X(s.m)+'</div>':ph=='read'?'<div class=sk></div>':'')+'</div>');
+if(ph=='read')a='<div class="sk g"></div><div class=gr style=--c:3>'+'<div class="sk c"></div>'.repeat(3)+'</div>';
+else if(ph=='pick'){const o=(f=='v'?s.vq:s.aq)||[],cur=f=='v'?s.q:s.a;
+a='<div class=sg>'+B(f=='a'&&'f:v','Video',f=='v'&&'on')+B(f=='v'&&'f:a','MP3',f=='a'&&'on')+'</div><div class=k><span>'+(o.length?'Quality':'')+'</span><b>'+X(s.sz)+'</b></div><div class=gr style=--c:'+(o.length>4?3:o.length)+'>'+o.map(v=>B(v!=cur&&(f=='v'?'q:':'a:')+v,/^\d+$/.test(v)?X(v)+(f=='v'?'p':'<span class=u> kbps</span>'):X(String(v).toUpperCase()),v==cur&&'on')).join('')+'</div>';
+c='<div class=ac>'+B('ok','Download','p')+B('x','Cancel')+'</div>'}
+else if(dl){const st=s.st||(ph=='queue'?'queued':'download');
+a='<div class=k><span>'+X(ST[st]||st)+'</span>'+(ph=='dl'&&s.p!=null?'<b>'+Math.round(pc)+'%</b>':'')+'</div>';
+g='<span>'+X(s.g)+'</span><span>'+(s.e?'ETA '+X(s.e):'')+'</span>';
+c='<div class=ac>'+B('x','Cancel')+'</div>'}
+else if(ph=='done')a='<div class=k><span>Downloaded</span></div><div class=n>'+X(s.r)+'</div>';
+else if(ph=='fail'){a='<div class="k e"><span>Download failed</span></div><div class=er>'+X(s.err)+'</div>';c='<div class=ac>'+B('retry','Try again','p')+'</div>'}
+else if(ph=='x')a='<p class=xn>Download cancelled</p>';
+else if(ph=='off')a='<p class=xn>'+X(s.err)+'</p>';
+put('a',a);put('g',g);put('c',c);
+$('b').hidden=!dl;$('i').style.width=(ph=='dl'?pc:0)+'%';
+const n=$('n');n.textContent=nt;n.hidden=!nt;n.className=ne?'e':''}
+function sync(){const o=J(W.chatData);if(W.chatData!=null&&!o){nt='Unreadable card state';ne=1}else{take(o);if(!bz){nt='';ne=0}}draw()}
+function ask(r){if(bz)return;let p;try{p=W.request(r)}catch(e){p=Promise.reject(e)}
+bz=1;nt='Sending…';ne=0;draw();
+p.then(a=>{const o=J(a&&a.result);bz=0;take(o);nt=o?'':String(a&&a.result||'');draw()},
+e=>{const k=e&&e.code;bz=0;nt=ER[k]||String(k||e&&e.message||e);ne=!!nt;draw()})}
+$('w').addEventListener('click',e=>{const t=e.target,r=t&&t.dataset&&t.dataset.r;if(r&&!t.disabled)ask(r)});
+if(W){W.onEvent('chatDataChanged',sync);W.onEvent('themeChanged',draw);sync();W.ready()}
+else $('w').textContent='Open this message in Telegram to use the download card.';
+</script>

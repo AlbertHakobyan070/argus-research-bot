@@ -13,6 +13,7 @@ from types import SimpleNamespace, TracebackType
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters,
 )
@@ -82,7 +83,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("Unauthorized.", show_alert=True)
         return
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except BadRequest as e:                      # answered too late ("query is too old"): still act on the tap
+        logger.warning("could not answer callback query %s (%s)", q.id, e)
     data = q.data or ""
     # v2: every callback is run-scoped — ``<ns>:<action>:<run8>``.
     parts = data.split(":")
@@ -97,6 +101,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # per-chat result pool, not on a run — handle before run lookup.
     if ns == "m":
         await media.handle_callback(update, ctx, ns, action, run_id)
+        return
+
+    # Video-card buttons (vc:f/q/a/ok/x/retry/plain:<arg>), keyed by the tapped message.
+    if ns == "vc":
+        await media.handle_card_callback(update, ctx, action, run_id)
+        return
+
+    # /quality buttons (qs:set:<quality>).
+    if ns == "qs":
+        await media.handle_quality_callback(update, ctx, action, run_id)
         return
 
     # Library item buttons (mx:mp3/tr/tag/ok:<asset_id>).
@@ -443,4 +457,5 @@ def main():
         logger.info(
             "argus_ytt cache cleanup: removed %d stale deliverable(s)", _removed,
         )
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    # widget_query: taps inside the video-card widget (Bot API 10.4, /widgets on).
+    app.run_polling(allowed_updates=["message", "callback_query", "widget_query"])

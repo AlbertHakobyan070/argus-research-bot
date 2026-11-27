@@ -66,7 +66,7 @@ from ..graph.run_config import PRESETS, RunConfig, ensure_in_checkpoint, require
 from ..graph.search_providers import exa_enabled
 from ..graph.state import DEFAULT_LENGTH, VALID_LENGTHS, ResearchBrief
 from ..library import mirror_run_md, new_run_id
-from . import common
+from . import common, rich, tgx
 from .common import _safe_send, _send_md_doc, _set_run_status
 from .progress import RunEventBus, TelegramCard, edit_text
 
@@ -675,7 +675,7 @@ async def _at_rest(h: RunHandle) -> None:
     elif not nxt:
         if h.quick:
             await h.card.stop("✅ Answered below.")
-            await _say(h, values.get("quick_answer") or "(no answer)", mode=ParseMode.MARKDOWN)
+            await _answer(h, values.get("quick_answer") or "(no answer)")
             await _status(h.run_id, "done")
         else:
             await h.card.stop("✅ Finished.")
@@ -683,6 +683,31 @@ async def _at_rest(h: RunHandle) -> None:
             await _say(h, f"✅ Run {h.run_id} finished — /continue {h.run_id} extends it.")
     else:
         raise RuntimeError(f"the drive stopped before {', '.join(nxt)}, which is not a gate")
+
+
+async def _answer(h: RunHandle, text: str) -> None:
+    """The /ask answer as a rich message; too big, refused or not sent (a
+    timeout, the network: said once in the chat apart from a refusal), the
+    Markdown line it always was — a timed-out send may have landed, and a
+    duplicate answer beats a missing one. Nothing for a quiet run."""
+    if not h.notify:
+        return
+    body = rich.answer_html(text)
+    if body is not None:
+        try:
+            await tgx.send_rich(_app.bot, h.chat_id, body)
+            tgx._noticed.discard((h.chat_id, "rich-error"))     # the next failure is said again
+            return
+        except TelegramError as e:
+            if tgx.refused(e):
+                logger.warning("run %s: Telegram refused the rich answer: %s", h.run_id, e)
+                await tgx.notice_once(_app.bot, h.chat_id, "rich-answer", f"ℹ️ Telegram refused the rich answer "
+                                      f"message ({_cut(str(e), 80)}), so the answer comes as text.")
+            else:
+                logger.warning("run %s: the rich answer could not be sent: %s: %s", h.run_id, type(e).__name__, e)
+                await tgx.notice_once(_app.bot, h.chat_id, "rich-error", f"⚠️ The rich answer message could not be "
+                                      f"sent ({type(e).__name__}: {_cut(str(e), 80)}), so the answer comes as text.")
+    await _say(h, text, mode=ParseMode.MARKDOWN)
 
 
 async def _drained(h: RunHandle, reason: str) -> None:
@@ -1366,6 +1391,31 @@ async def report_action(run_id: str, action: str, *, feedback: str | None = None
             h.starting = False
 
 
+async def _rich_report(h: RunHandle, md_path: Path) -> None:
+    """report.md as a rich message ahead of the files; nothing when even its
+    condensed form is too big. A refusal, a send that failed (a timeout, the
+    network) or a failure building it is said once in the chat, each in its
+    own words, and never holds the files back."""
+    try:
+        body = rich.report_html(md_path.read_text(encoding="utf-8"))
+        if body is not None:
+            await tgx.send_rich(_app.bot, h.chat_id, body)
+            tgx._noticed.discard((h.chat_id, "rich-error"))     # the next failure is said again
+    except TelegramError as e:
+        if tgx.refused(e):
+            logger.warning("run %s: Telegram refused the rich report: %s", h.run_id, e)
+            await tgx.notice_once(_app.bot, h.chat_id, "rich-report", f"ℹ️ Telegram refused the rich report message "
+                                  f"({_cut(str(e), 80)}), so the report comes as files only.")
+        else:
+            logger.warning("run %s: the rich report could not be sent: %s: %s", h.run_id, type(e).__name__, e)
+            await tgx.notice_once(_app.bot, h.chat_id, "rich-error", f"⚠️ The rich report message could not be sent "
+                                  f"({type(e).__name__}: {_cut(str(e), 80)}), so the report comes as files only.")
+    except Exception as e:
+        logger.exception("run %s: the rich report message failed", h.run_id)
+        await tgx.notice_once(_app.bot, h.chat_id, "rich-build", f"⚠️ The rich report message failed "
+                                                                 f"({_cut(str(e), 80)}), so the report comes as files only.")
+
+
 async def _deliver(h: RunHandle, actor: str) -> Outcome:
     """Send: the report files to the chat, then the run is finished — the
     checkpoint moves past the report gate (``as_node="deliver"`` → END), so a
@@ -1382,6 +1432,8 @@ async def _deliver(h: RunHandle, actor: str) -> Outcome:
     paths = values.get("report_paths") or {}
     bus.publish(h.run_id, "gate", "", {"kind": REPORT, "actor": actor})
     await _edit_gate(h, "📤 Sent" + (" from console." if actor == "webapp" else "."))
+    if h.notify and paths.get("md") and Path(paths["md"]).exists():
+        await _rich_report(h, Path(paths["md"]))
     try:
         cap = f"Argus report — folder: `{paths.get('folder', '')}`"
         for key in ("md", "pdf"):
