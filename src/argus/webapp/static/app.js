@@ -16,7 +16,7 @@ const ROUTES = [
   [/^\/run\/([A-Za-z0-9_-]+)$/, run, "runs"],
   [/^\/new$/, newRun, "new"],
   [/^\/engines$/, engines, "engines"],
-  [/^\/media(?:\/(library|get|review|jobs|settings))?$/, media, "media"],
+  [/^\/media(?:\/(library|get|review|repos|jobs|settings))?$/, media, "media"],
   [/^\/media\/item\/(\d+)$/, mediaItem, "media"],
   [/^\/settings$/, settings, "settings"],
 ];

@@ -240,6 +240,8 @@ Then fill in, from the old `.env`:
 - `TELEGRAM_ALLOWED_USER_ID` — your numeric Telegram id
 - `FREELLMAPI_API_KEY` and `FREELLMAPI_BASE_URL` — for the default profile
 - `EXA_API_KEY` — Exa search (optional; DDGS takes its queries without it)
+- `GITHUB_TOKEN` — optional; raises Investigate's GitHub checks from 60 an hour
+  to 5,000 (a fine-grained token with read-only access to public repositories)
 - any paid-provider key a profile you use binds (`GROQ_API_KEY`, …)
 
 The bot refuses to start only without a well-formed bot token. It answers

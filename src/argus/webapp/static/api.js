@@ -90,4 +90,15 @@ export const media = {
   uploadChunk: (uid, offset, blob) => api(`/api/media/uploads/${enc(uid)}?offset=${offset}`, { method: "PUT", raw: blob }),
   uploadFinish: (uid, body) => api(`/api/media/uploads/${enc(uid)}/finish`, { method: "POST", body }),
   uploadCancel: (uid) => api(`/api/media/uploads/${enc(uid)}`, { method: "DELETE" }),
+  investigate: (id) => api(`/api/media/${enc(id)}/investigate`, { method: "POST" }),
+  saveRepos: (id, repos, bookmark = []) => api(`/api/media/${enc(id)}/repos`, { method: "PUT", body: { repos, bookmark } }),
+  bookmark: (id, key) => api(`/api/media/${enc(id)}/bookmark`, { method: "POST", body: { key } }),
+};
+
+/** Repo / tool bookmarks (Investigate). */
+export const bookmarks = {
+  list: (params = {}) => api(`/api/bookmarks?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null))}`),
+  note: (id, note) => api(`/api/bookmarks/${enc(id)}`, { method: "PUT", body: { note } }),
+  about: (id) => api(`/api/bookmarks/${enc(id)}/about`, { method: "POST" }),
+  remove: (id) => api(`/api/bookmarks/${enc(id)}`, { method: "DELETE" }),
 };

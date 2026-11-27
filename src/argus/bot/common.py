@@ -35,11 +35,11 @@ HELP_TEXT = """\
   /fetch <url…> — download links (or just paste them)
   /quality [auto|min|max|<h>] — download quality
   /transcript <indices> — captions for /find picks
-  /transcripts · /media — transcripts · library
+  /transcripts · /media · /repos — transcripts, library, bookmarks
 
 *Runs*
   /runs — list · /status — in flight + console link
-  /cancel [id|all] — stop after the current step
+  /cancel [id|all] — stop after this step
   /continue <id> — resume, re-attach or extend
   /append <id> <url|asset:N> — queue sources
   /delete — free up space
@@ -48,7 +48,7 @@ HELP_TEXT = """\
   /engines — models per role · /engines use <profile>
   /engines transcriber — speech-to-text
 
-_Tip: paste a media link or send me a file to save it._
+_Tip: paste a link or send a file to save it._
 """
 
 # Loaded lazily from docs/help.md (repo) for `/help full`.

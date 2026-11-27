@@ -1,9 +1,9 @@
 // #/media/item/<id> — one library item: the player (signed, expiring link; seeking works), Download to the
-// device, Send to chat (a link when Telegram's cap is passed), MP3, Transcribe, the tag review, the item's
-// parts (its mp3s and transcripts), Add a transcript to a research run (then Continue it), Delete.
+// device, Send to chat (a link when Telegram's cap is passed), MP3, Transcribe, the tag review, the repos
+// and tools Investigate found (attach, bookmark), the item's parts (its mp3s and transcripts), Add a transcript to a research run (then Continue it), Delete.
 import { continueRun, get, media } from "../api.js";
 import { $, $$, act, confirmDialog, esc, openLink, toast, when } from "./common.js";
-import { bytes, downloadToDevice, duration, facts, jobToast, reviewPanel, tagChips, typeLabel, waitJob } from "./media_common.js";
+import { bytes, downloadToDevice, duration, facts, jobToast, reposPanel, reviewPanel, tagChips, typeLabel, waitJob } from "./media_common.js";
 
 const MP3_LABEL = { 320: "320 kbps", v0: "V0 VBR", 192: "192 kbps", 128: "128 kbps" };
 
@@ -21,7 +21,7 @@ export async function render(el, [id], ctx) {
   return () => { st.stopped = true; st.cleanups.forEach((f) => f()); $$("video,audio", el).forEach((m) => m.pause()); };
 }
 
-function draw(st, { item: it, parts, text, present, facets }, settings, repaint) {
+function draw(st, { item: it, parts, text, present, facets, bookmarked }, settings, repaint) {
   const isMedia = it.kind === "media";
   const transcripts = it.kind === "transcript" ? [it] : parts.filter((p) => p.kind === "transcript");
   const player = !present
@@ -63,6 +63,8 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
     </section>
     <section class="sec"><div class="sec-head"><span class="kicker">Tags</span><h2>${it.review === "pending" ? "Suggested tags — confirm or edit" : "Tags and group"}</h2>
       <p>What you will search for later. Suggestions come from the title, description and transcript.</p></div><div id="review"></div></section>
+    <section class="sec"><div class="sec-head"><span class="kicker">Repos</span><h2>${it.investigate?.state === "pending" ? "Found in it — tick what fits" : "Repos, tools and sites it mentions"}</h2>
+      <p>Investigate finds them in what the video says and shows; every one is checked before it is listed.</p></div><div id="repos"></div></section>
     ${parts.length ? `<section class="sec"><div class="sec-head"><span class="kicker">Parts</span><h2>Made from this item</h2></div>
       <div class="tw"><table><thead><tr><th>Part</th><th>Size</th><th></th></tr></thead><tbody>${parts.map((p) => `<tr>
         <td><a href="#/media/item/${p.id}">${esc(typeLabel(p))}${p.quality ? ` · ${esc(p.quality)}` : ""}${p.backend ? ` · ${esc(p.backend)}` : ""}</a><span class="meta row-id">${esc(p.vault_name)}</span></td>
@@ -139,6 +141,7 @@ function draw(st, { item: it, parts, text, present, facets }, settings, repaint)
     if (r) follow(r.job, "Transcript");
   });
   st.cleanups.push(reviewPanel($("#review", st.el), it, facets, { onSaved: () => repaint() }));
+  st.cleanups.push(reposPanel($("#repos", st.el), it, bookmarked, { onSaved: () => repaint() }));
   const att = $("#attach-form", st.el);
   if (att) attachForm(st, att, notice);
 }

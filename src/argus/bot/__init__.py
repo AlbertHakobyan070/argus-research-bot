@@ -12,6 +12,7 @@ full guide.
                  attach on action, /continue, the plan card's data
   progress.py    the run event bus and the live Telegram progress card
   media.py       /find, /video, /fetch, /quality, /transcript(s), /media, pasted links, sent files
+  repos.py       Investigate's result in the chat (rp:*), /repos bookmarks (bk:*)
   history.py     /runs, /status, /append, /continue, /cancel, /help
   delete.py      /delete
   engines_cmd.py /engines (profiles, roles, tiers, the transcriber)
