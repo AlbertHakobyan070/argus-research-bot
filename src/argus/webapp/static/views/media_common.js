@@ -1,5 +1,6 @@
 // Shared by the media views (#/media, #/media/item/<id>): formatting, library cards, the tag review panel
-// (suggested tags as toggles, confirmed only on Save), the device download, and waiting on a job.
+// (suggested tags as toggles, confirmed only on Save), the Investigate panel (repos, tools and sites the item
+// mentions, checked; attached only on Attach), the device download, and waiting on a job.
 import { media } from "../api.js";
 import { $, $$, act, esc, openLink, tg, toast } from "./common.js";
 
@@ -156,6 +157,109 @@ export function reviewPanel(root, it, facets, { onSaved, compact = false } = {})
       }
       const fresh = await media.item(it.id);
       reviewPanel(root, fresh.item, fresh.facets, { onSaved, compact });
+      window.UI.init(root);
+    });
+  });
+  return () => cancelWait?.();
+}
+
+// ---- Investigate ----------------------------------------------------------------------------------
+const WHERE = { title: "in the title", description: "in the description", comments: "in the uploader's comment",
+  tags: "in the tags", chapters: "in the chapters", transcript: "said" };
+
+/** 45485 → "45.5k"; null → "". */
+export const stars = (n) => (n == null ? "" : n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n));
+
+/** One repo / tool / site row: a tick (when `tick` is not null), the name (opens outside), its facts, the
+ *  project's own words, where the item says it, and a bookmark button. */
+export function repoRow(r, { tick = null, marked = false, attached = false } = {}) {
+  const facts = [r.kind === "tool" ? "tool or site" : "", r.stars != null ? `★${stars(r.stars)}` : "", r.archived ? "archived" : "",
+    r.fork ? "fork" : "", r.renamed_from ? `was ${r.renamed_from}` : "", r.sure === false ? "looked up" : ""].filter(Boolean);
+  const where = r.quote ? `<p class="meta repo-quote">${esc(WHERE[r.from] || "in the material")}: “${esc(r.quote)}”${r.at_s != null ? ` <span class="mono">${esc(duration(r.at_s))}</span>` : ""}</p>` : "";
+  return `<li class="repo-row">
+      ${tick === null ? "" : `<label class="check repo-tick"><input type="checkbox" data-key="${esc(r.key)}"${tick ? " checked" : ""} aria-label="Attach ${esc(r.name)}"></label>`}
+      <div class="repo-main">
+        <p class="repo-head"><a class="repo-name" href="${esc(r.url)}" data-ext>${esc(r.name)}</a>${facts.length ? ` <span class="meta">${esc(facts.join(" · "))}</span>` : ""}${attached ? ' <span class="status" data-s="good">attached</span>' : ""}</p>
+        ${r.about ? `<p class="repo-about">${esc(r.about)}</p>` : ""}${where}
+      </div>
+      <button class="btn btn-s btn-ghost repo-bm" type="button" data-bm="${esc(r.key)}" aria-pressed="${marked}" data-tip="${marked ? "Bookmarked" : "Bookmark it"}" aria-label="${marked ? "Bookmarked" : "Bookmark"} ${esc(r.name)}"><i data-icon="bookmark"></i></button>
+    </li>`;
+}
+
+function skippedHtml(inv) {
+  const s = inv.skipped || {};
+  const read = inv.read || {};
+  const lines = [
+    s.not_found?.length ? `Not public on GitHub (gone or private): ${s.not_found.slice(0, 8).join(", ")}` : "",
+    s.unresolved?.length ? `No match found for: ${s.unresolved.slice(0, 8).join(", ")}` : "",
+    s.unchecked?.length ? `Not checked (${s.unchecked.length}): ${s.stopped || "the per-run limit"}` : "",
+    s.errors?.length ? `Lookups that failed: ${s.errors.slice(0, 3).join("; ")}` : "",
+    s.more ? `${s.more} more were left out.` : "",
+    inv.note || "",
+    read.cut ? "The transcript is long: its first part was read." : "",
+    inv.at && !read.transcript && !inv.note ? "No transcript was read." : "",
+  ].filter(Boolean);
+  return lines.length ? `<ul class="meta repo-skipped">${lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : "";
+}
+
+/** The Investigate panel for one item: what it carries, and the latest investigation as a checklist (found
+ *  entries ticked when Argus is sure, plus what is already attached). Nothing changes until Attach;
+ *  Investigate (again) starts a job the panel waits on. onSaved(item) after an attach. Returns a cleanup. */
+export function reposPanel(root, it, bookmarked, { onSaved } = {}) {
+  const inv = it.investigate || {};
+  const found = inv.found || [];
+  const pending = inv.state === "pending" && found.length > 0;
+  const attached = it.repos || [];
+  const attachedKeys = new Set(attached.map((r) => r.key));
+  const marked = new Set(bookmarked || []);
+  const rows = pending ? [...found, ...attached.filter((r) => !found.some((f) => f.key === r.key))] : attached;
+  const chosen = new Set(pending ? [...found.filter((f) => f.on).map((f) => f.key), ...attachedKeys] : attachedKeys);
+  let cancelWait = null;
+  root.innerHTML = `<div class="repos-panel">
+      ${rows.length ? `<ul class="repo-list">${rows.map((r) => repoRow(r, { tick: chosen.has(r.key), marked: marked.has(r.key), attached: pending && attachedKeys.has(r.key) })).join("")}</ul>`
+        : `<p class="meta">${inv.at ? "Nothing that checks out was found." : "Investigate reads the title, description, the uploader's comments and the transcript (it transcribes first when there is none), then checks every repo on GitHub and every site before it shows it."}</p>`}
+      ${skippedHtml(inv)}
+      <div class="btn-row">
+        ${rows.length ? `<button class="btn btn-a" type="button" data-act="save"><i data-icon="check"></i>${pending ? "Attach ticked" : "Save"}</button>` : ""}
+        ${pending ? '<button class="btn" type="button" data-act="save-bm"><i data-icon="bookmark"></i>Attach + bookmark</button>' : ""}
+        <button class="btn" type="button" data-act="investigate"><i data-icon="scan-search"></i>${inv.at ? "Investigate again" : "Investigate"}</button>
+      </div>
+      <div class="sec-notice" hidden></div>
+    </div>`;
+  const notice = $(".sec-notice", root);
+  $$("a[data-ext]", root).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openLink(a.href); }));
+  $$('input[type="checkbox"][data-key]', root).forEach((c) => c.addEventListener("change", () => {
+    if (c.checked) chosen.add(c.dataset.key); else chosen.delete(c.dataset.key);
+  }));
+  const save = async (button, withBookmarks) => {
+    const keys = rows.map((r) => r.key).filter((k) => chosen.has(k));
+    const r = await act(button, notice, () => media.saveRepos(it.id, keys, withBookmarks ? keys : []));
+    if (r) { toast(`${r.item.repos.length} attached${withBookmarks ? " and bookmarked" : ""}.`, "cost", "Repos"); onSaved?.(r.item); }
+  };
+  const saveBtn = $('[data-act="save"]', root);
+  if (saveBtn) saveBtn.addEventListener("click", () => save(saveBtn, false));
+  const saveBm = $('[data-act="save-bm"]', root);
+  if (saveBm) saveBm.addEventListener("click", () => save(saveBm, true));
+  $$("[data-bm]", root).forEach((b) => b.addEventListener("click", async () => {
+    const r = await act(b, notice, () => media.bookmark(it.id, b.dataset.bm));
+    if (r) { b.setAttribute("aria-pressed", "true"); toast(`${r.bookmark.name} is in your bookmarks (Media → Repos).`, "cost", "Bookmarked"); }
+  }));
+  const again = $('[data-act="investigate"]', root);
+  again.addEventListener("click", async () => {
+    const r = await act(again, notice, () => media.investigate(it.id));
+    if (!r) return;
+    again.disabled = true;
+    again.textContent = "Investigating… (the Jobs tab shows each step)";
+    cancelWait = waitJob(r.job.id, async (job, err) => {
+      again.disabled = false;
+      if (err || !job || job.state === "failed") {
+        notice.hidden = false;
+        notice.innerHTML = `<aside class="callout problem" data-kind="trap" role="alert"><h4>Investigate<i>Did not finish</i></h4><p>${esc(job?.error || err?.message || "the job was lost (did the bot restart?)")}</p></aside>`;
+        again.textContent = "Investigate again";
+        return;
+      }
+      const fresh = await media.item(it.id);
+      reposPanel(root, fresh.item, fresh.bookmarked, { onSaved });
       window.UI.init(root);
     });
   });

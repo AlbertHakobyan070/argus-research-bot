@@ -158,7 +158,8 @@ status links, Reddit posts / `v.redd.it`, Instagram reels/posts.
 > instead (it expires; see the media settings), with an **Open** button for
 > the console.
 
-Each saved item gets buttons: **🎵 MP3**, **📝 Transcribe**, **🏷 Tags** and
+Each saved item gets buttons: **🎵 MP3**, **📝 Transcribe**, **🏷 Tags**,
+**🔎 Investigate** (the repos, tools and sites it mentions — below) and
 **📱 Open** (its page in the console). The pasted-link menu has **🎵** too:
 the link's audio straight to mp3.
 
@@ -197,7 +198,7 @@ upload takes files up to `ARGUS_MEDIA_UPLOAD_MAX_MB`, 4096 by default).
 
 ### `/media` and the console's Media section
 `/media` shows what the library holds and opens the console's **Media**
-section, which has five tabs:
+section, which has these tabs:
 - **Library** — every saved video, audio file and transcript, newest first:
   search titles, tags and gists; filter by type, group or tag.
 - **Get** — paste a link, **Read link** to see what it offers (the real
@@ -206,6 +207,7 @@ section, which has five tabs:
   Or upload a file from the device (sent in pieces; keep the console open),
   optionally transcribing it or making an mp3.
 - **Review** — tag suggestions waiting for you (below).
+- **Repos** — your bookmarked repos, tools and sites (see Investigate below).
 - **Jobs** — downloads, conversions, transcripts and tagging in progress.
   The list is lost on a bot restart; the files are not.
 - **Settings** — default video quality (shared with `/quality`), mp3
@@ -233,6 +235,44 @@ automatic suggestion off in the media settings; **Suggest tags** on any item
 Links to files are signed, expire, and only work through the console's
 current address — the quick tunnel changes it on every restart, so make a
 new link after one.
+
+### Investigate: the repos, tools and sites a video mentions
+**🔎 Investigate** on a saved item (in the chat, or **Investigate** in the
+Repos section of its console page) finds the GitHub repos the video mentions
+or clearly refers to — and the tools and websites it presents — and checks
+every one before showing it:
+- It reads the title (yours and the original), the description, the uploader's
+  own comments, tags and chapters, and the transcript. With no transcript yet
+  it transcribes first (YouTube: captions first, so usually seconds).
+- Links are taken as they are: github.com/owner/repo, owner.github.io/repo, a
+  bare `owner/repo` on its own line, and short links (t.co, bit.ly …), which
+  are followed to where they land.
+- The cheap model tier (role `media.investigate`) names what the video says
+  out loud — "lang graph", "owner slash repo" — with its words; a name the
+  video never says is dropped. A name without a link is looked up on GitHub,
+  then on the web, and the model picks the repo whose description matches
+  what the video says — a repo that only shares the name is not taken.
+- Every repo is checked on GitHub: it must exist and be public; a renamed repo
+  shows under its new name. Every tool or site must load. What could not be
+  found or checked is listed under the results, never shown as a find.
+
+The result lists each find with its stars, its GitHub description and where
+the video says it (with the time in the transcript). Links found outright
+start ticked, looked-up ones unticked: tick what fits, then **📎 Attach** (it
+joins the item, like tags) or **⭐ Attach + bookmark**. A list from an older
+investigation says so instead of acting.
+
+GitHub allows 60 checks an hour and 10 searches a minute without a token
+(shared by everything on the PC). To lift that, create a fine-grained token
+with read-only access to public repositories and put it in `.env` as
+`GITHUB_TOKEN=…` (5000 checks an hour); restart the bot.
+
+### `/repos`
+Your bookmarks, newest first, ten to a page: tap a number to open one — its
+note, the project's own description, the videos that carry it — then
+**📥 From GitHub** (a repo's description, or its README's first paragraph;
+for a tool, the site's title) or **🗑 Remove**. In the console,
+**Media → Repos** lists them with a search box and an editable note.
 
 ### Transcription engines
 - **YouTube** → caption extraction first (fast, no media download), then

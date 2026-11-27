@@ -432,7 +432,7 @@ async def test_a_sent_transcript_is_saved_with_its_buttons(lib, roots, monkeypat
     text, kb = note.edit_text.await_args.args[0], note.edit_text.await_args.kwargs["reply_markup"]
     assert f"asset:{rows[0]['asset_id']}" in text and "/append" in text
     labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert labels == ["🏷 Tags", "📱 Open"]                                    # a transcript: no mp3, no ASR
+    assert labels == ["🏷 Tags", "🔎 Investigate", "📱 Open"]                  # a transcript: no mp3, no ASR
 
 
 async def test_accept_in_chat_confirms_the_suggestion(lib, roots, monkeypatch):

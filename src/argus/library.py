@@ -16,6 +16,11 @@ startup (PTB ``post_init``) and closed at shutdown. Tables:
 - ``settings``     — global key/value toggles, e.g. ``media_quality``
                      (the /quality setting), and the ``engines.*`` JSON
                      values of the engines registry.
+- ``bookmarks``    — saved GitHub repos (``kind='repo'``, ``key`` =
+                     lowercase ``owner/name``) and tools or sites
+                     (``kind='tool'``, ``key`` = canonical URL): your
+                     ``note`` and the project's own ``about``. The items
+                     that mention one carry it in ``meta.repos`` (Investigate).
 
 v4 (spec §2.4) adds to ``runs``: ``config_json`` (the run's RunConfig;
 its ``length``/``depth`` columns mirror it), ``depth``, ``archetype``,
@@ -57,6 +62,11 @@ VALID_RUN_STATUSES: tuple[str, ...] = (
 )
 
 ASSET_KINDS: tuple[str, ...] = ("media", "transcript", "report")
+BOOKMARK_KINDS: tuple[str, ...] = ("repo", "tool")
+# every bookmark column, plus how many library items carry it
+_BOOKMARK_COLS = ("bookmarks.*, (SELECT count(DISTINCT a.asset_id) FROM assets a, json_each(a.meta_json, '$.repos') j"
+                  " WHERE json_extract(j.value, '$.kind') = bookmarks.kind"
+                  " AND json_extract(j.value, '$.key') = bookmarks.key) AS items")
 AUDIO_EXTS: tuple[str, ...] = (".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac")
 
 _SOURCE_STATUSES: tuple[str, ...] = ("pending", "ingested", "failed")
@@ -106,6 +116,22 @@ CREATE TABLE IF NOT EXISTS run_sources (
   ingested_at TEXT,
   PRIMARY KEY (run_id, ref)
 );
+
+CREATE TABLE IF NOT EXISTS bookmarks (
+  bookmark_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind        TEXT NOT NULL CHECK (kind IN ('repo','tool')),
+  key         TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  url         TEXT NOT NULL,
+  note        TEXT NOT NULL DEFAULT '',
+  about       TEXT,
+  stars       INTEGER,
+  asset_id    INTEGER REFERENCES assets(asset_id) ON DELETE SET NULL,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  UNIQUE (kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_created ON bookmarks(created_at DESC);
 """
 
 # Columns v4 adds to ``runs`` (spec §2.4), in the order _migrate adds them.
@@ -585,6 +611,111 @@ class Library:
             [int(i) for i in asset_ids])
         await db.commit()
         return cur.rowcount
+
+    # -- bookmarks (Investigate) ------------------------------------------------
+
+    async def add_bookmark(self, *, kind: str, key: str, name: str, url: str, note: str = "",
+                           stars: int | None = None, asset_id: int | None = None) -> dict[str, Any]:
+        """Save a repo or tool, or refresh a saved one (name, url, stars; the
+        note only when it was empty; the item it came from only when unset).
+        The bookmark."""
+        if kind not in BOOKMARK_KINDS:
+            raise ValueError(f"unknown bookmark kind {kind!r}")
+        if not key or not name or not url:
+            raise ValueError("a bookmark needs a key, a name and a url")
+        db, now = self._conn(), _now()
+        async with db.execute(
+                "INSERT INTO bookmarks (kind, key, name, url, note, stars, asset_id, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(kind, key) DO UPDATE SET name=excluded.name, url=excluded.url,"
+                "  stars=coalesce(excluded.stars, bookmarks.stars),"
+                "  note=CASE WHEN bookmarks.note = '' THEN excluded.note ELSE bookmarks.note END,"
+                "  asset_id=coalesce(bookmarks.asset_id, excluded.asset_id), updated_at=excluded.updated_at"
+                " RETURNING bookmark_id",
+                (kind, key, name, url, note or "", stars, asset_id, now, now)) as cur:
+            row = await cur.fetchone()
+        await db.commit()
+        return await self.get_bookmark(int(row[0]))
+
+    async def get_bookmark(self, bookmark_id: int) -> dict[str, Any] | None:
+        db = self._conn()
+        async with db.execute(f"SELECT {_BOOKMARK_COLS} FROM bookmarks WHERE bookmark_id = ?",
+                              (int(bookmark_id),)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_bookmark_by_key(self, kind: str, key: str) -> dict[str, Any] | None:
+        db = self._conn()
+        async with db.execute(f"SELECT {_BOOKMARK_COLS} FROM bookmarks WHERE kind = ? AND key = ?",
+                              (kind, key)) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_bookmarks(self, *, q: str | None = None, kind: str | None = None, limit: int = 50,
+                             offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+        """Bookmarks newest first, each with ``items`` (how many library items
+        carry it); ``q`` matches name, URL, note and about. (rows, total)."""
+        where, args = ["1=1"], []
+        if kind is not None:
+            if kind not in BOOKMARK_KINDS:
+                raise ValueError(f"unknown bookmark kind {kind!r}")
+            where.append("kind = ?")
+            args.append(kind)
+        if q:
+            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(name LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\'"
+                         " OR coalesce(about, '') LIKE ? ESCAPE '\\')")
+            args += [like] * 4
+        sql_where = " AND ".join(where)
+        db = self._conn()
+        async with db.execute(f"SELECT count(*) FROM bookmarks WHERE {sql_where}", args) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+                f"SELECT {_BOOKMARK_COLS} FROM bookmarks WHERE {sql_where}"
+                " ORDER BY created_at DESC, bookmark_id DESC LIMIT ? OFFSET ?",
+                [*args, int(limit), int(offset)]) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        return rows, int(total)
+
+    async def update_bookmark(self, bookmark_id: int, **cols: Any) -> dict[str, Any] | None:
+        """Set ``note``, ``about``, ``stars``, ``name`` or ``url``; the updated
+        bookmark, or None for an unknown id."""
+        bad = set(cols) - {"note", "about", "stars", "name", "url"}
+        if bad:
+            raise ValueError(f"cannot update bookmark column(s): {', '.join(sorted(bad))}")
+        if not cols:
+            return await self.get_bookmark(bookmark_id)
+        db = self._conn()
+        sets = ", ".join(f"{k} = ?" for k in cols)
+        cur = await db.execute(f"UPDATE bookmarks SET {sets}, updated_at = ? WHERE bookmark_id = ?",
+                               (*cols.values(), _now(), int(bookmark_id)))
+        await db.commit()
+        return await self.get_bookmark(bookmark_id) if cur.rowcount else None
+
+    async def delete_bookmark(self, bookmark_id: int) -> bool:
+        db = self._conn()
+        cur = await db.execute("DELETE FROM bookmarks WHERE bookmark_id = ?", (int(bookmark_id),))
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def bookmarked_keys(self, keys: list[str]) -> set[str]:
+        """Which of ``keys`` are saved as bookmarks (either kind)."""
+        if not keys:
+            return set()
+        db = self._conn()
+        async with db.execute(f"SELECT key FROM bookmarks WHERE key IN ({','.join('?' * len(keys))})",
+                              list(keys)) as cur:
+            return {r[0] for r in await cur.fetchall()}
+
+    async def bookmark_items(self, kind: str, key: str) -> list[dict[str, Any]]:
+        """The library items that carry this repo or tool (``meta.repos``), newest first."""
+        db = self._conn()
+        async with db.execute(
+                "SELECT DISTINCT assets.* FROM assets, json_each(assets.meta_json, '$.repos') AS j"
+                " WHERE json_extract(j.value, '$.kind') = ? AND json_extract(j.value, '$.key') = ?"
+                " ORDER BY assets.created_at DESC, assets.asset_id DESC", (kind, key)) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_asset(r) for r in rows]
 
     # -- settings kv (global toggles like /quality) ----------------------------
 
