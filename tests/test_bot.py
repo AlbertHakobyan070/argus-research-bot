@@ -240,8 +240,8 @@ def test_help_lists_engines():
 
 def test_plan_keyboard_rows_and_run_scoping():
     """Lengths (✅ on the chosen), depths (✅ on the chosen), the cycling
-    ⚙ profile and 🕒 recency buttons, then Approve / Edit / Cancel — every
-    button scoped to the run (WP-E1, spec §3)."""
+    ⚙ profile, 🕒 recency and 🌐 web buttons, then Approve / Edit / Cancel —
+    every button scoped to the run (WP-E1, spec §3)."""
     kb = _plan_keyboard({"run_id": "ab12cd34", "length": "long", "depth": "exhaustive",
                          "profile": "max-quality", "profile_problem": "ANTHROPIC_API_KEY is not set",
                          "recency": "w"})
@@ -252,9 +252,25 @@ def test_plan_keyboard_rows_and_run_scoping():
     assert [d for _, d in rows[2]] == [f"dep:{d}:ab12cd34" for d in ("quick", "standard", "deep", "exhaustive",
                                                                      "auto")]      # Task 10 review: an Auto button
     assert [t for t, _ in rows[2] if "✅" in t] == ["Exhaustive ✅"]
-    assert rows[3] == [("⚙ max-quality ⚠", "prof:next:ab12cd34"), ("🕒 past week", "rec:next:ab12cd34")]
+    assert rows[3] == [("⚙ max-quality ⚠", "prof:next:ab12cd34"), ("🕒 past week", "rec:next:ab12cd34"),
+                       ("🌐 Exa", "web:next:ab12cd34")]                       # no web key: Exa, the default
     assert [d for _, d in rows[4]] == ["plan:approve:ab12cd34", "plan:edit:ab12cd34", "plan:cancel:ab12cd34"]
     assert not any("console" in t.lower() for row in rows for t, _ in row)     # no console button (spec §3)
+
+
+def test_plan_keyboard_web_button_names_the_mode():
+    kb = _plan_keyboard({"run_id": "ab12cd34", "web": "free"})
+    assert ("🌐 Free web", "web:next:ab12cd34") in [(b.text, b.callback_data) for b in kb.inline_keyboard[3]]
+
+
+def test_format_plan_free_web_line_names_the_fetchers_and_what_is_missing():
+    text = _format_plan({"plan": {"summary": "s"}, "web": "free", "exa_enabled": False,
+                         "fetch_chain": ["exa_text", "native", "scrapling", "jina"],
+                         "fetch_missing": ["browser: not installed — uv pip install -e \".[web]\""]})
+    assert "Exa: off" in text
+    assert "Web: free (no Exa) · fetch: native → scrapling → jina · not installed: browser" in text
+    assert "exa_text" not in text                      # the inline-text rung is not a fetcher to show
+    assert "Web: free" not in _format_plan({"plan": {"summary": "s"}, "web": "exa"})
 
 
 @pytest.mark.parametrize("payload,shown", [

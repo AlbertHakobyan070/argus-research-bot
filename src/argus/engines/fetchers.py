@@ -11,7 +11,25 @@ Rungs, in ``FetchConfig.chain`` order, first success wins:
                    ledger's cap — or only counted, for a pinned source — and
                    ``costDollars`` added to it);
 - ``intel_*``      the intel-stack scripts (snatch / crawl / stealth) — in the
-                   chain only when both ``INTEL_*`` paths exist (checked at import).
+                   chain only when both ``INTEL_*`` paths exist (checked at import);
+- ``scrapling``    Scrapling's ``Fetcher`` (curl_cffi with a browser's TLS and
+                   headers, no browser), then the same text extraction as ``native``
+                   — the ``web`` install group;
+- ``jina``         Jina Reader (``https://r.jina.ai/<url>``): Jina's servers render
+                   the page and return its text. It sends the page address to Jina
+                   AI; keyless it is spaced ``JINA_KEYLESS_INTERVAL_S`` apart
+                   (``JINA_API_KEY``, when set, lifts that);
+- ``browser``      headless Chromium through Playwright, one page at a time
+                   (``_BROWSER_LOCK``), images, media and fonts not loaded, then the
+                   ``native`` text extraction — the ``web`` install group plus the
+                   Chromium build (``python -m playwright install chromium``).
+
+A rung whose package is not installed is not in the chain (``available_chain``);
+``missing_rungs`` names what a chain asks for that this install cannot run, and
+``status`` describes every rung for ``/engines`` and the console. Word,
+PowerPoint and Excel files are converted by MarkItDown (the ``convert`` install
+group) in ``native`` and ``scrapling``; without it such a file fails its rung
+with the install command.
 
 Guards (spec §2.8, WP-B review):
 
@@ -31,7 +49,25 @@ Guards (spec §2.8, WP-B review):
 - every download stops at ``FetchConfig.max_bytes`` decoded bytes: requests send
   ``Accept-Encoding: gzip, deflate``, bodies go through a bounded decompressor,
   any other ``Content-Encoding`` is refused. Text on disk is capped at
-  ``max_chars_on_disk``.
+  ``max_chars_on_disk``;
+- ``scrapling`` follows redirects itself, each hop through the guard and pinned
+  to the checked addresses (curl's ``RESOLVE``, for the host as the guard read
+  it: the URL curl gets carries that spelling), the transfer capped by curl's
+  ``MAXFILESIZE_LARGE`` (on the decoded bytes). As in ``native``, an HTTP(S)
+  proxy from the environment resolves the name itself, so the pin cannot apply
+  through one (libcurl reads those variables);
+- ``browser`` sends every connection Chromium makes through ``_Gate``, a SOCKS5
+  proxy in this process: Chromium resolves no name itself, and the gate checks
+  each host and connects to the checked addresses. That covers what a route
+  cannot see: redirect hops, popups, WebSockets, workers. No QUIC, and WebRTC
+  only through the proxy. Chromium runs with its sandbox on (Playwright turns
+  it off by default). Each routed request is also checked before it is
+  sent (a route on the context: images, media and fonts are not loaded). A
+  refused redirect hop of the page discards it (``refused: …``). The gate
+  stops at ``_BROWSER_NET_FACTOR × max_bytes`` received, and the HTML is
+  checked against ``max_bytes``;
+- a Word, PowerPoint or Excel file is a zip: the sizes its parts declare must
+  sum to at most ``_OFFICE_INFLATED_MAX`` before MarkItDown reads it.
 
 A rung's expected failures — HTTP status, network and timeout errors, a body
 that does not decode, size, a third-party parser's exception — are its own
@@ -42,18 +78,25 @@ succeeded), on success too.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
+import importlib.metadata
+import importlib.util
 import ipaddress
+import json
 import math
 import os
 import re
+import selectors
 import socket
 import tempfile
+import threading
 import time
+import zipfile
 import zlib
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -71,6 +114,7 @@ if TYPE_CHECKING:
     from .ledger import SpendLedger
 
 INTEL_RUNGS = frozenset({"intel_snatch", "intel_crawl", "intel_stealth"})
+_RUNGS = frozenset({"exa_text", "native", "exa_contents", "scrapling", "jina", "browser"}) | INTEL_RUNGS
 _MIN_CHARS = 200            # less text than this is a failed rung (the digest skips it anyway)
 _EXA_TEXT_MIN = 300
 _MAX_REDIRECTS = 5
@@ -88,11 +132,39 @@ def intel_available(stack_dir: Path, python_bin: Path) -> bool:
     return Path(stack_dir).is_dir() and Path(python_bin).is_file()
 
 
+def _installed(*modules: str) -> bool:
+    """Every module importable (``find_spec``: nothing is imported)."""
+    return all(importlib.util.find_spec(m) is not None for m in modules)
+
+
 INTEL_AVAILABLE = intel_available(tools.INTEL_STACK_DIR, tools.INTEL_PYTHON_BIN)
+# The optional install groups (pyproject.toml), checked once at import like intel-stack.
+SCRAPLING_AVAILABLE = _installed("scrapling", "curl_cffi", "browserforge")
+BROWSER_AVAILABLE = _installed("playwright")
+MARKITDOWN_AVAILABLE = _installed("markitdown")
+INSTALL = {"web": 'uv pip install -e ".[web]"', "convert": 'uv pip install -e ".[convert]"',
+           "chromium": "python -m playwright install chromium"}
+
+
+def _missing(rung: str) -> str:
+    """Why this install cannot run ``rung`` ("" when it can)."""
+    if rung in INTEL_RUNGS and not INTEL_AVAILABLE:
+        return f"intel-stack not found ({tools.INTEL_STACK_DIR})"
+    if rung == "scrapling" and not SCRAPLING_AVAILABLE:
+        return f"not installed — {INSTALL['web']}"
+    if rung == "browser" and not BROWSER_AVAILABLE:
+        return f"not installed — {INSTALL['web']}, then {INSTALL['chromium']}"
+    return ""
 
 
 def available_chain(chain: list[str]) -> list[str]:
-    return [r for r in chain if r not in INTEL_RUNGS or INTEL_AVAILABLE]
+    """``chain`` without the rungs this install cannot run."""
+    return [r for r in chain if not _missing(r)]
+
+
+def missing_rungs(chain: list[str]) -> list[str]:
+    """``"<rung>: <why>"`` for each rung of ``chain`` this install cannot run."""
+    return [f"{r}: {why}" for r in dict.fromkeys(chain) if (why := _missing(r))]
 
 
 @dataclass
@@ -238,16 +310,19 @@ def _http_client(cfg: FetchConfig, *, pinned: bool = False) -> httpx.Client:
                         transport=httpx.HTTPTransport(limits=limits) if pinned else None)
 
 
-def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -> httpx.Response:
+def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str],
+          headers: dict[str, str] | None = None) -> httpx.Response:
     """A streamed GET of ``url``. When an HTTP(S) proxy from the environment applies
     to it, by name through ``env``: the proxy resolves the name, so the pin cannot
     apply. Otherwise on ``pinned``, to the checked addresses in order (the next one
     when a connection fails or times out, as a connect by name would):
     ``scheme://<address>[:port]/path?query`` with the original ``Host`` header and
-    ``sni_hostname``, so TLS still verifies the real name."""
+    ``sni_hostname``, so TLS still verifies the real name. ``headers`` are added
+    to the request."""
+    extra = dict(headers or {})
     # httpx's own trust_env selection (it has no public call for it): the one send() makes
     if env._transport_for_url(httpx.URL(url)) is not env._transport:
-        return env.send(env.build_request("GET", url, headers={"Accept-Encoding": _ACCEPT_ENCODING}),
+        return env.send(env.build_request("GET", url, headers={**extra, "Accept-Encoding": _ACCEPT_ENCODING}),
                         stream=True)
     parts = urlsplit(url)
     name = _norm_host(parts.hostname or "")        # the name the guard checked, IDNA-encoded
@@ -259,7 +334,7 @@ def _open(env: httpx.Client, pinned: httpx.Client, url: str, addrs: list[str]) -
         netloc = (f"[{addr}]" if ":" in addr else addr) + (f":{parts.port}" if parts.port else "")
         request = pinned.build_request(
             "GET", urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, "")),
-            headers={"Host": host, "Accept-Encoding": _ACCEPT_ENCODING}, extensions={"sni_hostname": name})
+            headers={**extra, "Host": host, "Accept-Encoding": _ACCEPT_ENCODING}, extensions={"sni_hostname": name})
         return pinned.send(request, stream=True)
 
     *rest, last = addrs
@@ -309,17 +384,21 @@ def _read_body(r: httpx.Response, cfg: FetchConfig) -> bytes:
     return bytes(body)
 
 
-def _get(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, bytes, str]:
+def _get(client: httpx.Client, url: str, cfg: FetchConfig,
+         headers: dict[str, str] | None = None) -> tuple[str, bytes, str]:
     """(final URL, decoded body, content-type) of a GET: at most ``_MAX_REDIRECTS``
     redirects, every hop read the WHATWG way, through the guard and sent to the
     address it checked — or by name through the environment's proxy, when one
     applies (``_open``); the body under the byte cap. ``client`` trusts the
-    environment; the pinned hops go on a client of their own."""
+    environment; the pinned hops go on a client of their own. ``headers`` go only
+    to the first URL's host: a redirect elsewhere never carries them (a key)."""
     pinned = _http_client(cfg, pinned=True)
+    origin = urlsplit(_whatwg(url)).netloc.lower()
     try:
         for _ in range(_MAX_REDIRECTS + 1):
             url = _whatwg(url)
-            r = _open(client, pinned, url, check_target(url))
+            same = urlsplit(url).netloc.lower() == origin
+            r = _open(client, pinned, url, check_target(url), headers if same else None)
             try:
                 if r.status_code in _REDIRECTS:
                     location = r.headers.get("location")
@@ -377,11 +456,64 @@ def _html_text(html: bytes, url: str) -> tuple[str, str]:
     return text, (meta.title if meta is not None and meta.title else "")
 
 
+_OFFICE_TYPES = {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                 "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx"}
+OFFICE_SUFFIXES = frozenset(_OFFICE_TYPES.values())
+
+
+def _office_suffix(url: str, ctype: str) -> str | None:
+    """``.docx`` / ``.pptx`` / ``.xlsx`` by content type, else by the URL's path —
+    but an HTML response is HTML whatever its path says."""
+    mtype = ctype.split(";", 1)[0].strip().lower()
+    if mtype in _OFFICE_TYPES:
+        return _OFFICE_TYPES[mtype]
+    if mtype in ("text/html", "application/xhtml+xml"):
+        return None
+    suffix = PurePosixPath(urlsplit(url).path).suffix.lower()
+    return suffix if suffix in OFFICE_SUFFIXES else None
+
+
+_OFFICE_INFLATED_MAX = 64 * 1024 * 1024      # an Office file is a zip: all its parts, inflated, at most this
+
+
+def _office_text(body: bytes, suffix: str) -> str:
+    """A Word / PowerPoint / Excel file's text through MarkItDown (the ``convert``
+    group), once its parts are known to inflate to at most ``_OFFICE_INFLATED_MAX``
+    (a zip bomb). The sizes the zip declares bound that: its parsers (mammoth,
+    python-pptx, openpyxl) read through ``zipfile``, which never inflates a part
+    past its declared size (a part that would fails its CRC check)."""
+    if not MARKITDOWN_AVAILABLE:
+        raise _RungError(f"a {suffix} file: reading it needs the convert install group ({INSTALL['convert']})")
+    try:
+        with zipfile.ZipFile(BytesIO(body)) as zf:
+            inflated = sum(info.file_size for info in zf.infolist())
+    except Exception as e:      # zipfile on untrusted bytes: what it raises is this rung's failure
+        raise _RungError(f"a {suffix} file that does not unzip ({type(e).__name__}: {e})") from e
+    if inflated > _OFFICE_INFLATED_MAX:
+        raise _RungError(f"a {suffix} file too large unzipped (> {_OFFICE_INFLATED_MAX} bytes)")
+    from markitdown import MarkItDown
+    try:
+        result = MarkItDown(enable_plugins=False).convert_stream(BytesIO(body), file_extension=suffix)
+    except Exception as e:      # a third-party parser on untrusted bytes: what it raises is this rung's failure
+        raise _RungError(f"markitdown: {type(e).__name__}: {e}") from e
+    return (result.text_content or "").strip()
+
+
+def _convert(url: str, body: bytes, ctype: str, cfg: FetchConfig) -> tuple[str, str]:
+    """A downloaded body → ``(text, title)``: a PDF through pypdf, an Office file
+    through MarkItDown, anything else as HTML through trafilatura."""
+    if _is_pdf(url, ctype, body):
+        return _pdf_text(body, cfg.max_chars_on_disk), ""
+    suffix = _office_suffix(url, ctype)
+    if suffix:
+        return _office_text(body, suffix), ""
+    return _html_text(body, url)
+
+
 def _page(client: httpx.Client, url: str, cfg: FetchConfig) -> tuple[str, str]:
     final, body, ctype = _get(client, url, cfg)
-    if _is_pdf(final, ctype, body):
-        return _pdf_text(body, cfg.max_chars_on_disk), ""
-    return _html_text(body, final)
+    return _convert(final, body, ctype, cfg)
 
 
 _ARXIV_ABS = "https://arxiv.org/abs/"
@@ -504,6 +636,425 @@ def _intel(rung: str, url: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# the free-web rungs: Scrapling, Jina Reader, a headless browser
+# ---------------------------------------------------------------------------
+
+def _resolve_pin(host: str, port: int, addrs: list[str]) -> str:
+    """curl's ``RESOLVE`` entry sending ``host:port`` to the checked addresses."""
+    return f"{host}:{port}:" + ",".join(f"[{a}]" if ":" in a else a for a in addrs)
+
+
+def _as_checked(url: str, host: str) -> str:
+    """``url`` with ``host`` (``_split``'s: IDNA, lowercase, no trailing dot) as its
+    host and no user info or fragment, so the name curl connects to is the name
+    its ``RESOLVE`` entry pins: ``example.com.`` would miss ``example.com:443:…``
+    and be looked up again."""
+    parts = urlsplit(url)
+    netloc = f"[{host}]" if ":" in host else host
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
+
+
+def _scrapling_get(url: str, pin: str, cfg: FetchConfig):
+    """One GET through a Scrapling ``FetcherSession`` (a browser's TLS and headers),
+    no redirect followed, its curl session pinned to ``pin`` and capped. curl_cffi
+    takes curl options only per session, and Scrapling creates that session itself:
+    its ``_curl_session`` (Scrapling 0.5) is where they go — gone, the rung fails."""
+    from curl_cffi import CurlOpt                 # the web install group (available_chain checked it)
+    from curl_cffi.curl import CurlError
+    from scrapling.fetchers import FetcherSession
+
+    with FetcherSession(follow_redirects=False, retries=1, timeout=cfg.timeout_s) as session:
+        curl = getattr(session, "_curl_session", None)
+        if curl is None or not hasattr(curl, "curl_options"):
+            raise _RungError(f"scrapling {_version('scrapling')}: no curl session to pin the checked address to")
+        curl.curl_options = {CurlOpt.RESOLVE: [pin], CurlOpt.MAXFILESIZE_LARGE: cfg.max_bytes}
+        try:
+            return session.get(url)
+        except CurlError as e:                    # network, timeout, TLS, the size cap
+            raise _RungError(f"scrapling: {type(e).__name__}: {e}") from e
+
+
+def _scrapling(url: str, cfg: FetchConfig) -> tuple[str, str]:
+    """Scrapling (curl_cffi impersonating a browser): redirects followed here,
+    each hop through the guard and pinned to its checked addresses, the transfer
+    capped; then ``_convert``."""
+    for _ in range(_MAX_REDIRECTS + 1):
+        url = _whatwg(url)
+        addrs = check_target(url)
+        host, port = _split(url)
+        url = _as_checked(url, host)
+        page = _scrapling_get(url, _resolve_pin(host, port, addrs), cfg)
+        headers = {str(k).lower(): str(v) for k, v in (page.headers or {}).items()}
+        if page.status in _REDIRECTS:
+            location = headers.get("location")
+            if not location:
+                raise _RungError(f"HTTP {page.status} without a Location")
+            try:
+                url = urljoin(url, location)
+            except ValueError as e:
+                raise _RungError(f"HTTP {page.status} to a malformed Location {location!r} ({e})") from e
+            continue
+        if page.status >= 400:
+            raise _RungError(f"HTTP {page.status}")
+        body = page.body
+        if isinstance(body, str):
+            body = body.encode(page.encoding or "utf-8", errors="replace")
+        if len(body) > cfg.max_bytes:
+            raise _too_large(cfg)
+        return _convert(url, body, headers.get("content-type", ""), cfg)
+    raise _RungError(f"more than {_MAX_REDIRECTS} redirects")
+
+
+_JINA = "https://r.jina.ai/"
+JINA_KEYLESS_INTERVAL_S = 3.1      # keyless Reader: 20 requests a minute (x-ratelimit-limit "20;w=60")
+_JINA_LOCK = threading.Lock()
+_jina_last = [0.0]                 # monotonic time of the last keyless request, process-wide
+_sleep = time.sleep
+
+
+def _jina(url: str, cfg: FetchConfig) -> tuple[str, str]:
+    """Jina Reader's JSON for ``url``: its servers fetch and render the page."""
+    key = os.environ.get("JINA_API_KEY", "").strip()
+    if not key:
+        with _JINA_LOCK:                          # one keyless request per interval, whatever the threads
+            wait = JINA_KEYLESS_INTERVAL_S - (time.monotonic() - _jina_last[0])
+            if wait > 0:
+                _sleep(wait)
+            _jina_last[0] = time.monotonic()
+    headers = {"Accept": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
+    with _http_client(cfg) as client:
+        _final, body, _ctype = _get(client, _JINA + url, cfg, headers=headers)
+    try:
+        reply = json.loads(body)
+    except ValueError as e:
+        raise _RungError(f"jina: malformed reply, not JSON ({type(e).__name__}: {e})") from e
+    data = reply.get("data") if isinstance(reply, dict) else None
+    if not isinstance(data, dict):
+        raise _RungError(f"jina: malformed reply, no data object (code {reply.get('code') if isinstance(reply, dict) else '?'})")
+    status = str(data.get("httpStatus") or "")
+    if status.isdigit() and int(status) >= 400:
+        raise _RungError(f"the site answered Jina with HTTP {status}")
+    text, title = data.get("content") or "", data.get("title") or ""
+    if not isinstance(text, str) or not isinstance(title, str):
+        raise _RungError("jina: malformed reply, content or title is not text")
+    return text, title
+
+
+_BROWSER_LOCK = threading.Lock()   # one Chromium at a time: the bot's host has little free memory
+_BROWSER_SKIP = frozenset({"image", "media", "font"})
+_SETTLE_MS = 5000                  # after the DOM is ready, wait this long at most for the network to go quiet
+
+
+def _first_line(e: Exception) -> str:
+    return (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
+
+
+_BROWSER_NET_FACTOR = 4            # the browser receives at most this many times max_bytes in all (page, scripts, styles)
+# no QUIC, and WebRTC only through the proxy (over TCP, so through the gate): no UDP leaves Chromium
+_BROWSER_ARGS = ("--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+
+
+def _recv_exact(conn: socket.socket, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("closed during the SOCKS handshake")
+        data += chunk
+    return data
+
+
+def _socks_reply(code: int) -> bytes:
+    """A SOCKS5 reply (RFC 1928): 0 granted, 2 not allowed, 4 host unreachable,
+    5 connection refused, 7 command or 8 address type not supported."""
+    return bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0])
+
+
+class _Gate:
+    """A SOCKS5 proxy on 127.0.0.1 that every connection Chromium makes goes
+    through: the page, its subresources, redirect hops, popups, workers and
+    WebSockets. Given a SOCKS5 proxy, Playwright has Chromium resolve no name
+    itself, and ``bypass="<-loopback>"`` proxies loopback too, whatever the
+    environment says. So the gate sees each host by name: ``check_target`` runs,
+    and the connection goes to the checked addresses, never a second lookup.
+    A refused host gets reply 2 (recorded in ``refused``). Past
+    ``_BROWSER_NET_FACTOR × max_bytes`` received, every connection is closed
+    (``too_large``)."""
+
+    def __init__(self, cfg: FetchConfig) -> None:
+        self._timeout = cfg.timeout_s
+        self._cap = cfg.max_bytes * _BROWSER_NET_FACTOR
+        self._lock = threading.Lock()
+        self._open: set[socket.socket] = set()
+        self.received = 0
+        self.refused: list[str] = []
+        self.failures: list[Exception] = []
+        self._server = socket.create_server(("127.0.0.1", 0))
+        self.port = self._server.getsockname()[1]
+        threading.Thread(target=self._accept, name="argus-browser-gate", daemon=True).start()
+
+    @property
+    def too_large(self) -> bool:
+        return self.received > self._cap
+
+    def close(self) -> None:
+        self._server.close()
+        with self._lock:
+            sockets, self._open = list(self._open), set()
+        for s in sockets:
+            s.close()
+
+    def _track(self, s: socket.socket) -> socket.socket:
+        with self._lock:
+            self._open.add(s)
+        return s
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _addr = self._server.accept()
+            except OSError:                       # close() closed the listening socket
+                return
+            threading.Thread(target=self._serve, args=(self._track(conn),), daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        upstream = None
+        try:
+            conn.settimeout(self._timeout)
+            target = self._handshake(conn)
+            if target is None:
+                return
+            host, port = target
+            try:
+                addrs = check_target(f"http://{f'[{host}]' if ':' in host else host}:{port}/")
+            except _Refused as e:
+                self.refused.append(str(e))
+                conn.sendall(_socks_reply(2))
+                return
+            except _RungError:                    # a name that does not resolve, a malformed one
+                conn.sendall(_socks_reply(4))
+                return
+            upstream = self._connect(addrs, port)
+            if upstream is None:
+                conn.sendall(_socks_reply(5))
+                return
+            conn.sendall(_socks_reply(0))
+            self._relay(conn, upstream)
+        except OSError:      # reset, closed or timed out: Chromium sees the connection fail, as it would without the gate
+            pass
+        except Exception as e:      # a bug, or an own-endpoint variable the guard cannot read: the rung raises it
+            self.failures.append(e)
+        finally:
+            for s in (conn, upstream):
+                if s is not None:
+                    with self._lock:
+                        self._open.discard(s)
+                    s.close()
+
+    def _handshake(self, conn: socket.socket) -> tuple[str, int] | None:
+        """No authentication, CONNECT only: ``(host, port)``, or None once refused."""
+        ver, n = _recv_exact(conn, 2)
+        if ver != 5 or 0 not in _recv_exact(conn, n):
+            conn.sendall(b"\x05\xff")
+            return None
+        conn.sendall(b"\x05\x00")
+        ver, cmd, _rsv, atyp = _recv_exact(conn, 4)
+        if atyp == 1:
+            host = socket.inet_ntop(socket.AF_INET, _recv_exact(conn, 4))
+        elif atyp == 3:                           # a name; latin-1 never fails, check_target judges it
+            host = _recv_exact(conn, _recv_exact(conn, 1)[0]).decode("latin-1")
+        elif atyp == 4:
+            host = socket.inet_ntop(socket.AF_INET6, _recv_exact(conn, 16))
+        else:
+            conn.sendall(_socks_reply(8))
+            return None
+        port = int.from_bytes(_recv_exact(conn, 2), "big")
+        if ver != 5 or cmd != 1:
+            conn.sendall(_socks_reply(7))
+            return None
+        return host, port
+
+    def _connect(self, addrs: list[str], port: int) -> socket.socket | None:
+        for addr in addrs:                        # in the resolver's order, the next when one fails
+            try:
+                return self._track(socket.create_connection((addr, port), timeout=self._timeout))
+            except OSError:
+                continue
+        return None
+
+    def _relay(self, conn: socket.socket, upstream: socket.socket) -> None:
+        upstream.settimeout(self._timeout)
+        peer = {conn: upstream, upstream: conn}
+        with selectors.DefaultSelector() as sel:
+            sel.register(conn, selectors.EVENT_READ)
+            sel.register(upstream, selectors.EVENT_READ)
+            while True:
+                ready = sel.select(timeout=self._timeout)
+                if not ready:                     # idle this long: closed
+                    return
+                for key, _events in ready:
+                    data = key.fileobj.recv(65536)
+                    if not data:
+                        return
+                    if key.fileobj is upstream:
+                        with self._lock:
+                            self.received += len(data)
+                        if self.too_large:
+                            self.close()
+                            return
+                    peer[key.fileobj].sendall(data)
+
+
+def _browser(url: str, cfg: FetchConfig) -> tuple[str, str]:
+    """Headless Chromium renders ``url``, every connection through ``_Gate`` and
+    every routed request through the guard as well (see the module doc); its
+    HTML through ``_html_text``."""
+    from playwright.sync_api import Error as PWError       # the web install group (available_chain checked it)
+    from playwright.sync_api import TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
+
+    refused: list[str] = []
+    gate: _Gate | None = None
+
+    def verdict() -> None:
+        """On every way out: what the gate or a redirect hop decided comes first."""
+        if gate is not None and gate.failures:
+            raise gate.failures[0]
+        if refused:
+            raise _Refused(f"{refused[0]} (a redirect in the browser)")
+        if gate is not None and gate.too_large:
+            raise _RungError(f"browser: too large (> {cfg.max_bytes * _BROWSER_NET_FACTOR} bytes received)")
+
+    def guard(route) -> None:
+        request = route.request
+        if request.resource_type in _BROWSER_SKIP:
+            route.abort("blockedbyclient")
+            return
+        if _HTTP_SCHEME.match(request.url):       # data: and blob: never leave the browser
+            try:
+                check_target(_whatwg(request.url))
+            except (_Refused, _RungError):        # a private address, or a name that does not resolve
+                route.abort("blockedbyclient")
+                return
+        route.continue_()
+
+    def on_request(request) -> None:              # redirect hops are never routed: checked as announced
+        if request.redirected_from is not None and _HTTP_SCHEME.match(request.url):
+            try:
+                check_target(_whatwg(request.url))
+            except _Refused as e:
+                refused.append(str(e))
+            except _RungError:
+                pass                              # a hop that does not resolve fails the navigation itself
+
+    with _BROWSER_LOCK:
+        gate = _Gate(cfg)
+        try:
+            with sync_playwright() as pw:
+                try:
+                    # chromium_sandbox: Playwright's default passes --no-sandbox; this page is untrusted
+                    browser = pw.chromium.launch(proxy={"server": f"socks5://127.0.0.1:{gate.port}",
+                                                        "bypass": "<-loopback>"}, args=list(_BROWSER_ARGS),
+                                                 chromium_sandbox=True)
+                except PWError as e:
+                    raise _RungError(f"browser: Chromium did not start ({_first_line(e)}) — {INSTALL['chromium']}") from e
+                try:
+                    context = browser.new_context(service_workers="block")
+                    context.route("**/*", guard)          # every page of the context: popups too
+                    page = context.new_page()
+                    page.on("request", on_request)
+                    try:
+                        response = page.goto(url, wait_until="domcontentloaded", timeout=cfg.timeout_s * 1000)
+                    except PWTimeout as e:
+                        verdict()
+                        raise _RungError(f"browser: no page after {cfg.timeout_s} s") from e
+                    except PWError as e:
+                        verdict()
+                        raise _RungError(f"browser: {_first_line(e)}") from e
+                    verdict()
+                    if response is not None and response.status >= 400:
+                        raise _RungError(f"HTTP {response.status}")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=_SETTLE_MS)
+                    except PWTimeout:
+                        pass        # a page with steady background traffic never goes quiet: read what has rendered
+                    verdict()
+                    html, final, title = page.content(), page.url, page.title()
+                finally:
+                    browser.close()
+        except PWError as e:        # the driver, a crashed renderer, a page read while it navigates
+            verdict()
+            raise _RungError(f"browser: {_first_line(e)}") from e
+        finally:
+            gate.close()
+    verdict()
+    body = html.encode("utf-8")
+    if len(body) > cfg.max_bytes:
+        raise _too_large(cfg)
+    text, meta_title = _html_text(body, final)
+    return text, title or meta_title
+
+
+# ---------------------------------------------------------------------------
+# what this install can fetch (/engines, the console)
+# ---------------------------------------------------------------------------
+
+def _version(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+@functools.cache
+def chromium_path() -> str:
+    """Playwright's Chromium executable when it is on disk, else "" (asks the
+    Playwright driver once per process; the browser rung itself always tries)."""
+    if not BROWSER_AVAILABLE:
+        return ""
+    from playwright.sync_api import Error as PWError
+    from playwright.sync_api import sync_playwright
+    try:
+        with sync_playwright() as pw:
+            path = pw.chromium.executable_path
+    except PWError as e:
+        raise EngineConfigError(f"the Playwright driver did not start: {_first_line(e)}") from e
+    return path if Path(path).is_file() else ""
+
+
+def status() -> list[dict]:
+    """Every fetch rung: ``{rung, ok, detail}`` — what it uses, or what it needs.
+    Blocking (the Playwright driver, once): call it from a thread."""
+    rows = [("exa_text", True, "the text a search hit or one of your links already carries (no request)")]
+    office = (f"Word, PowerPoint, Excel via MarkItDown {_version('markitdown')}" if MARKITDOWN_AVAILABLE
+              else f"Word, PowerPoint, Excel need the convert group — {INSTALL['convert']}")
+    rows.append(("native", True, f"httpx + trafilatura, PDFs via pypdf; {office}"))
+    rows.append(("exa_contents", bool(os.environ.get("EXA_API_KEY", "").strip()),
+                 "Exa /contents, from the run's page budget" if os.environ.get("EXA_API_KEY", "").strip()
+                 else "needs EXA_API_KEY"))
+    rows.append(("scrapling", SCRAPLING_AVAILABLE,
+                 f"Scrapling {_version('scrapling')}, a browser's TLS and headers without a browser"
+                 if SCRAPLING_AVAILABLE else _missing("scrapling")))
+    rows.append(("jina", True, "Jina Reader (sends the page address to r.jina.ai); "
+                 + ("JINA_API_KEY set" if os.environ.get("JINA_API_KEY", "").strip()
+                    else f"keyless: one page every {JINA_KEYLESS_INTERVAL_S:g} s")))
+    if BROWSER_AVAILABLE:
+        try:
+            chromium, problem = chromium_path(), ""
+        except EngineConfigError as e:            # shown in its row; the rest of the status still renders
+            chromium, problem = "", str(e)
+        rows.append(("browser", bool(chromium), f"headless Chromium, Playwright {_version('playwright')}"
+                     + ("" if chromium else f" — {problem or 'Chromium not found'}: {INSTALL['chromium']}")))
+    else:
+        rows.append(("browser", False, _missing("browser")))
+    for rung in sorted(INTEL_RUNGS):
+        rows.append((rung, INTEL_AVAILABLE, "intel-stack script" if INTEL_AVAILABLE else _missing(rung)))
+    return [{"rung": r, "ok": ok, "detail": detail} for r, ok, detail in rows]
+
+
+# ---------------------------------------------------------------------------
 # the chain
 # ---------------------------------------------------------------------------
 
@@ -541,10 +1092,15 @@ def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_ena
         elif rung == "exa_contents" and not exa_enabled:
             continue
         else:
+            if rung not in _RUNGS:
+                raise ValueError(f"unknown fetch rung {rung!r}")
             try:
                 check_target(url)
                 text, title = (_native(url, source, cfg) if rung == "native" else
                                _exa_contents(url, cfg, ledger, pinned) if rung == "exa_contents" else
+                               _scrapling(url, cfg) if rung == "scrapling" else
+                               _jina(url, cfg) if rung == "jina" else
+                               _browser(url, cfg) if rung == "browser" else
                                _intel(rung, url))
                 if len(text.strip()) < _MIN_CHARS:
                     raise _RungError(f"only {len(text.strip())} chars of text")
@@ -562,4 +1118,6 @@ def fetch(source: dict, *, cfg: FetchConfig, ledger: SpendLedger | None, exa_ena
                        or f"no fetch rung applies (chain: {cfg.chain})", rungs_tried=tried, ms=ms())
 
 
-__all__ = ["FetchResult", "fetch", "available_chain", "intel_available", "check_target", "INTEL_AVAILABLE"]
+__all__ = ["FetchResult", "fetch", "available_chain", "missing_rungs", "status", "intel_available",
+           "check_target", "INTEL_AVAILABLE", "SCRAPLING_AVAILABLE", "BROWSER_AVAILABLE", "MARKITDOWN_AVAILABLE",
+           "INSTALL", "OFFICE_SUFFIXES"]

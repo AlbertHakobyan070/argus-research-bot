@@ -35,10 +35,10 @@ from pydantic import ValidationError
 from telegram.error import TelegramError
 
 from .. import __version__, updates
-from ..engines import registry
+from ..engines import fetchers, registry
 from ..engines.registry import EngineConfigError
 from ..engines.schema import ProfileOverrides, TranscriberConfig
-from ..graph.run_config import PRESETS, RunConfig
+from ..graph.run_config import FREE_FETCH_CHAIN, PRESETS, FetchConfig, RunConfig
 from ..graph.state import VALID_LENGTHS
 from . import render
 from .auth import AuthError, AuthUser, validate_init_data, validate_service_token
@@ -431,7 +431,9 @@ async def start_run(request: web.Request) -> web.Response:
     if not isinstance(topic, str) or not topic.strip():
         raise _bad("topic must be a non-empty string")
     _service_refuses(request, body, ("overrides", "engines_profile"), "start")
-    knobs = {k: _opt(body, k) for k in ("length", "depth", "engines_profile")}
+    knobs = {k: _opt(body, k) for k in ("length", "depth", "engines_profile", "web")}
+    if knobs["web"] not in (None, "exa", "free"):
+        raise _bad("web must be 'exa' or 'free'")
     overrides = dict(_opt(body, "overrides", dict) or {})
     recency = _opt(body, "recency")
     if recency is not None:
@@ -512,8 +514,11 @@ async def _engines_body(d: Deps) -> dict:
     except EngineConfigError as e:
         snap, validation = None, {"ok": False, "errors": [str(e)]}
     mtd = await d.library.exa_usd_month_to_date() if d.library is not None else None
+    fetch = {"rungs": await asyncio.to_thread(fetchers.status),     # blocking: the Playwright driver, once
+             "chains": {"exa": fetchers.available_chain(FetchConfig().chain),
+                        "free": fetchers.available_chain(FREE_FETCH_CHAIN)}}
     return {"config": config, "active_profile": cfg.active_profile, "snapshot": snap, "validation": validation,
-            "exa_month_to_date_usd": mtd}
+            "exa_month_to_date_usd": mtd, "fetch": fetch}
 
 
 async def get_engines(request: web.Request) -> web.Response:

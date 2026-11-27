@@ -270,6 +270,8 @@ function planKnobs(s, p) {
         <select class="input" id="profile">${(p.profiles || []).map((n) => `<option${n === p.profile ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></div>
       <div class="set-row"><span class="set-l"><b>Recency</b><small>Set by the brief or the chat card's recency button.</small></span>
         <span class="meta">${esc(p.recency === null || p.recency === undefined ? `auto — ${recency}` : recency)}</span></div>
+      <div class="set-row"><span class="set-l"><b>Web</b><small>Set when the run started, or by the chat card's 🌐 button.</small></span>
+        <span class="meta">${p.web === "free" ? `Free web — ${esc((p.fetch_chain || []).filter((r) => r !== "exa_text").join(" → ") || "no fetcher")}` : "Exa"}</span></div>
       <div class="set-row"><span class="set-l"><b>Exa estimate</b><small>Upper bound for these settings${p.exa_enabled ? "" : " — Exa is off for this run"}.</small></span>
         <span class="mono" id="estimate"></span></div>
     </form>`;

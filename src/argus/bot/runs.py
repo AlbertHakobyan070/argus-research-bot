@@ -57,7 +57,7 @@ from telegram.error import TelegramError
 
 from .. import llm
 from ..config import get_settings
-from ..engines import registry
+from ..engines import fetchers, registry
 from ..engines.registry import EngineConfigError
 from ..engines.search import resolve_recency
 from ..graph.nodes import MAX_EXTEND_ROUNDS, MAX_REVISE_ROUNDS
@@ -89,6 +89,7 @@ _GATES = {("research",): PLAN, ("deliver",): REPORT}
 _ROUTES = {("brief",): "intake", ("extend_prep",): "deliver", ("revise_prep",): "deliver", (): "deliver"}
 DEPTHS = tuple(PRESETS)
 RECENCY_CYCLE = (None, "d", "w", "m", "y", "any")      # None: the brief's time-sensitivity hint decides
+WEB_MODES = ("exa", "free")                             # the plan card's web knob cycles them
 _REPLY_PROMPTS = {
     "plan_edit": (PLAN, "_✏️ Reply with your changes and I'll redraft the plan "
                         "(or tap ✅ Approve to keep this one)._"),
@@ -110,11 +111,13 @@ class Outcome:
 @dataclass
 class Choices:
     """The plan-gate knobs; None follows the default (depth: the length's;
-    profile: the active one; recency: the brief's hint)."""
+    profile: the active one; recency: the brief's hint). ``web``: "exa" or
+    "free" (no Exa: RunConfig.from_preset)."""
     length: str
     depth: str | None = None
     profile: str | None = None
     recency: str | None = None
+    web: str = "exa"
 
 
 @dataclass(eq=False)
@@ -928,12 +931,14 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
                     depth: str | None = None, overrides: dict | None = None, quick: bool = False,
                     engines_profile: str | None = None, origin: str = "telegram",
                     external_ref: str | None = None, notify_chat: bool = True, auto_approve_plan: bool = False,
-                    auto_send_report: bool = False) -> Outcome:
+                    auto_send_report: bool = False, web: str = "exa") -> Outcome:
     """/research (``quick``: /ask) and ``POST /api/runs``: a new run and its
     first drive — to the plan gate, or (quick) to the answer. An
     ``engines_profile`` other than the active one is validated like the plan
     card's profile; it is the run's from the plan drive on and the card's
-    profile choice. The start options: module docstring."""
+    profile choice. ``web``: "exa" or "free" (no Exa). A ``fetch.chain``
+    override naming a rung this install cannot run is refused with what it
+    needs. The start options: module docstring."""
     if _app is None or ("quick_graph" if quick else "graph") not in _app.bot_data:
         return Outcome("refused", "⚠️ Bot not fully initialized (no graph) — restart the bot.")
     key = (origin, external_ref) if external_ref is not None else None
@@ -965,7 +970,10 @@ async def start_run(*, chat_id: int, user_id: int, topic: str, length: str = DEF
                 if engines_profile != cfg.active_profile:
                     engines = await _resolve_profile(h, engines_profile)
             rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, overrides=overrides,
-                                       origin=origin)
+                                       origin=origin, web=web)
+            missing = fetchers.missing_rungs(rc.fetch.chain) if "fetch.chain" in (overrides or {}) else []
+            if missing:                                # asked for by name: never dropped quietly
+                raise ValueError("fetch.chain names what this install cannot run — " + "; ".join(missing))
             h.choices = _default_choices(rc, active.profile)
             lib = _library()
             if lib is not None:
@@ -1031,7 +1039,8 @@ def _default_choices(rc: RunConfig, active: str) -> Choices:
     """The plan-gate knobs ``rc`` was built with; its engines profile is None
     when it is ``active`` (the active profile's name)."""
     return Choices(length=rc.length, depth=None if rc.depth == RunConfig.default_depth(rc.length) else rc.depth,
-                   profile=None if rc.engines.profile == active else rc.engines.profile, recency=rc.recency)
+                   profile=None if rc.engines.profile == active else rc.engines.profile, recency=rc.recency,
+                   web=rc.web)
 
 
 def _attached_choices(h: RunHandle, rc: RunConfig, active: str) -> None:
@@ -1056,7 +1065,7 @@ def _rebuilt(c: Choices, rc: RunConfig, engines) -> RunConfig:
     if c.recency is not None:
         overrides["recency"] = c.recency
     return rc.model_copy(update={"overrides_applied": overrides}).rebuild(length=c.length, depth=c.depth,
-                                                                           engines=engines)
+                                                                           engines=engines, web=c.web)
 
 
 async def _resolve_profile(h: RunHandle, name: str):
@@ -1111,6 +1120,8 @@ async def _payload(h: RunHandle, values: dict) -> dict:
         "recency": c.recency,
         "recency_window": resolve_recency(rc.model_copy(update={"recency": c.recency}), brief)[0],
         "exa_enabled": exa_on, "exa_estimate_usd": estimate, "error": error,
+        "web": c.web, "fetch_chain": fetchers.available_chain(preview.fetch.chain),
+        "fetch_missing": fetchers.missing_rungs(preview.fetch.chain),
     }
 
 
@@ -1180,6 +1191,12 @@ async def _choose(h: RunHandle, c: Choices, knob: str, value: str) -> None:
         elif value not in RECENCY_CYCLE:
             raise ValueError(f"unknown recency {value!r}")
         c.recency = value
+    elif knob == "web":
+        if value == "next":
+            value = WEB_MODES[(WEB_MODES.index(c.web) + 1) % len(WEB_MODES)]
+        elif value not in WEB_MODES:
+            raise ValueError(f"unknown web mode {value!r}")
+        c.web = value
     elif knob == "profile":
         cfg = registry.current_config()
         names = list(cfg.profiles)

@@ -43,9 +43,18 @@ class SearchConfig(BaseModel):
     ddgs_max_results: int = 10
 
 
+Rung = Literal["exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth",
+               "scrapling", "jina", "browser"]
+Web = Literal["exa", "free"]
+# web="free": no Exa anywhere — DuckDuckGo, arXiv and GitHub search; the pages read by the
+# free rungs (engines/fetchers.py), each tried only when this install has it. intel_crawl
+# (crawl4ai through intel-stack) last; intel_snatch / intel_stealth stay Exa-mode only.
+FREE_PROVIDERS = ["ddgs", "arxiv", "github"]
+FREE_FETCH_CHAIN: list[str] = ["exa_text", "native", "scrapling", "jina", "browser", "intel_crawl"]
+
+
 class FetchConfig(BaseModel):
-    chain: list[Literal["exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth"]] = [
-        "exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth"]
+    chain: list[Rung] = ["exa_text", "native", "exa_contents", "intel_snatch", "intel_crawl", "intel_stealth"]
     max_chars_on_disk: int = 60000
     max_bytes: int = 25_000_000                 # download cap; PDFs are often > 5 MB
     timeout_s: int = 30
@@ -174,6 +183,7 @@ class RunConfig(BaseModel):
     depth: Depth
     preset_origin: str                                         # preset name the values came from
     recency: Literal["d", "w", "m", "y", "any"] | None = None  # None → brief's time-sensitivity hint decides; "any" → no recency filter, even for a time-sensitive brief
+    web: Web = "exa"                                           # "free": FREE_PROVIDERS + FREE_FETCH_CHAIN (from_preset)
     research: ResearchConfig
     search: SearchConfig
     fetch: FetchConfig
@@ -215,18 +225,25 @@ class RunConfig(BaseModel):
 
     @classmethod
     def from_preset(cls, *, length: str, depth: str | None = None, engines: EnginesSnapshot,
-                    overrides: Mapping[str, Any] | None = None, origin: str) -> RunConfig:
-        """Preset for ``depth`` (default: ``default_depth(length)``), then dotted-key
-        overrides such as ``{"research.waves": 2}``, recorded in ``overrides_applied``;
-        unknown keys raise ValueError."""
+                    overrides: Mapping[str, Any] | None = None, origin: str, web: str = "exa") -> RunConfig:
+        """Preset for ``depth`` (default: ``default_depth(length)``), the ``web``
+        mode's search providers and fetch chain ("free": ``FREE_PROVIDERS``,
+        ``FREE_FETCH_CHAIN``), then dotted-key overrides such as
+        ``{"research.waves": 2}``, recorded in ``overrides_applied`` (they win over
+        the mode); unknown keys raise ValueError."""
         depth = depth or cls.default_depth(length)
         if depth not in PRESETS:
             raise ValueError(f"unknown depth {depth!r}")
+        if web not in ("exa", "free"):
+            raise ValueError(f"unknown web mode {web!r} (expected 'exa' or 'free')")
         overrides = copy.deepcopy(dict(overrides or {}))
         preset = copy.deepcopy(PRESETS[depth])
         if depth == "quick" and length == "tldr":   # table: compose.analyst "on unless length=tldr"
             preset["compose"]["analyst"] = False
-        data = cls(length=length, depth=depth, preset_origin=depth, engines=engines, origin=origin,
+        if web == "free":
+            preset["search"]["providers_enabled"] = list(FREE_PROVIDERS)
+            preset["fetch"]["chain"] = list(FREE_FETCH_CHAIN)
+        data = cls(length=length, depth=depth, preset_origin=depth, engines=engines, origin=origin, web=web,
                    created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                    **preset).model_dump()
         knobs = dict(_leaves({k: data[k] for k in _OVERRIDABLE}))
@@ -248,12 +265,14 @@ class RunConfig(BaseModel):
         rc = cls.from_preset(length=length, engines=engines, origin="legacy")
         return rc.model_copy(update={"legacy": True})
 
-    def rebuild(self, *, length: str, depth: str | None = None, engines: EnginesSnapshot) -> RunConfig:
-        """Plan-gate changes: ``from_preset`` for the new length/depth/engines,
-        re-applying ``overrides_applied`` so console overrides are never silently
-        dropped; ``origin`` and ``legacy`` carry over."""
+    def rebuild(self, *, length: str, depth: str | None = None, engines: EnginesSnapshot,
+                web: str | None = None) -> RunConfig:
+        """Plan-gate changes: ``from_preset`` for the new length/depth/engines/web
+        mode (``web`` None keeps this one's), re-applying ``overrides_applied`` so
+        console overrides are never silently dropped; ``origin`` and ``legacy``
+        carry over."""
         rc = self.from_preset(length=length, depth=depth, engines=engines,
-                              overrides=self.overrides_applied, origin=self.origin)
+                              overrides=self.overrides_applied, origin=self.origin, web=web or self.web)
         return rc.model_copy(update={"legacy": self.legacy})
 
     def gap_reserve(self) -> int:

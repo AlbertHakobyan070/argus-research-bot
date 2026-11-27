@@ -274,13 +274,25 @@ def crawl_url(url: str, *, deep: bool = False, max_pages: int = 8,
     md = None
     pages: list[str] = []
     if folder and Path(folder).is_dir():
-        mds = sorted(Path(folder).rglob("*.md"))
+        # crawl.py writes each page as "<!-- source: <url> -->" + markdown, then an
+        # index.md summary ("# Crawl of …") — which sorted first whenever the page's
+        # slug sorts after "index" and was returned as the page (run 104a2cb1).
+        mds = [p for p in sorted(Path(folder).rglob("*.md")) if _is_crawled_page(p)]
         if mds:
             md = str(mds[0])
             pages = [str(p) for p in mds[:max_pages]]
     ok = bool(md) and Path(md).exists()
     return CrawlResult(ok=ok, folder=folder or None, markdown_path=md,
                         pages=pages, duration_s=duration)
+
+
+_CRAWLED_PAGE = "<!-- source:"
+
+
+def _is_crawled_page(path: Path) -> bool:
+    """A page crawl.py saved (it opens with its source line), not its index.md summary."""
+    with path.open(encoding="utf-8", errors="replace") as f:
+        return f.read(len(_CRAWLED_PAGE)) == _CRAWLED_PAGE
 
 
 def normalize_to_markdown(source: str, *, md_only: bool = True,

@@ -34,6 +34,19 @@ dev = [
 asr = [
     "faster-whisper>=1.1",
 ]
+# Free-web fetchers (engines/fetchers.py): the scrapling rung (a browser's TLS and headers, no
+# browser) and the browser rung (headless Chromium: then `python -m playwright install chromium`).
+# scrapling <0.6: the rung pins each hop through its FetcherSession's curl session. playwright 1.64
+# drives Chromium build 1248; patchright (scrapling's) is held on the same release.
+web = [
+    "scrapling[fetchers]>=0.5.1,<0.6",
+    "playwright>=1.64.1,<1.65",
+    "patchright>=1.64.3,<1.65",
+]
+# Word, PowerPoint and Excel pages, through MarkItDown (PDFs stay on pypdf).
+convert = [
+    "markitdown[docx,pptx,xlsx]>=0.1.9,<0.2",
+]
 
 [build-system]
 requires = ["hatchling"]

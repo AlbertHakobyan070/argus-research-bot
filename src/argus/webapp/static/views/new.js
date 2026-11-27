@@ -1,5 +1,5 @@
-// #/new — start a research run (POST /api/runs): topic, length, depth, recency, engines profile,
-// dotted RunConfig overrides, and the Exa upper-bound estimate for those settings.
+// #/new — start a research run (POST /api/runs): topic, length, web mode (Exa or free), depth,
+// recency, engines profile, dotted RunConfig overrides, and the Exa upper-bound estimate for those settings.
 import { ApiError, get, post } from "../api.js";
 import { $, act, esc, exaEstimate, LENGTHS, mainButton, RECENCY, toast, usd } from "./common.js";
 
@@ -29,6 +29,7 @@ export async function render(el, _params, ctx) {
   })]);
   const profiles = engines.config ? Object.keys(engines.config.profiles) : [];
   const depths = Object.keys(presets.presets);
+  const freeChain = (engines.fetch?.chains?.free || []).filter((r) => r !== "exa_text").join(" → ");
   el.innerHTML = `<div class="page-head"><div><span class="kicker">New research</span><h1>Start a research run</h1>
       <p>The bot drafts a plan from live search first; nothing is fetched until you approve it. Progress shows here and in the chat.</p></div></div>
     <div id="notice" hidden></div>
@@ -42,6 +43,8 @@ export async function render(el, _params, ctx) {
         </div>
         <div class="set-row"><span class="set-l"><b>Length</b><small>How long the report is.</small></span>
           <div class="seg seg-s" role="radiogroup" aria-label="Length">${Object.entries(LENGTHS).map(([v, label]) => `<label><input type="radio" name="length" value="${v}"${v === DEFAULT_LENGTH ? " checked" : ""}><span>${esc(label)}</span></label>`).join("")}</div></div>
+        <div class="set-row"><span class="set-l"><b>Web</b><small>Exa, or free: DuckDuckGo, GitHub and arXiv, with pages read by ${freeChain ? esc(freeChain) : "the free fetchers"}. No Exa spend.</small></span>
+          <div class="seg seg-s" role="radiogroup" aria-label="Web">${[["exa", "Exa"], ["free", "Free web"]].map(([v, label]) => `<label><input type="radio" name="web" value="${v}"${v === "exa" ? " checked" : ""}><span>${esc(label)}</span></label>`).join("")}</div></div>
         <div class="set-row"><label class="set-l" for="depth"><b>Depth</b><small>How much it searches and fetches.</small></label>
           <select class="input" id="depth" name="depth"><option value="">Auto</option>${depths.map((d) => `<option value="${esc(d)}">${esc(d)}</option>`).join("")}</select></div>
         <div class="set-row"><label class="set-l" for="recency"><b>Recency</b><small>Limit sources to a recent window.</small></label>
@@ -78,6 +81,10 @@ export async function render(el, _params, ctx) {
   };
   const estimate = () => {
     const { length, depth, overrides } = read();
+    if (form.elements.namedItem("web").value === "free") {
+      $("#estimate", form).textContent = "Exa: off — free web mode";
+      return;
+    }
     const est = exaEstimate(presets, depth, overrides || {}, presets.exa_prices);
     $("#estimate", form).textContent = est === null ? "Exa estimate: n/a (no Exa prices configured)"
       : `Exa estimate ≈ ${usd(est)} upper bound (${LENGTHS[length]}, ${depth}${presets.exa_prices.prices_as_of ? `, prices as of ${presets.exa_prices.prices_as_of}` : ""}) — when Exa is enabled`;
@@ -94,6 +101,7 @@ export async function render(el, _params, ctx) {
     if (!topic) { form.topic.focus(); return; }
     if (overrides === null) { form.overrides.focus(); return; }
     const body = { topic, length };
+    if (form.elements.namedItem("web").value === "free") body.web = "free";
     if (form.depth.value) body.depth = form.depth.value;
     if (form.recency.value) body.recency = form.recency.value;
     if (profiles.length && form.profile.value !== engines.active_profile) body.engines_profile = form.profile.value;

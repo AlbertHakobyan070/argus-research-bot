@@ -44,7 +44,10 @@ cp .env.example .env
 
 # 2) install (from the repo root)
 uv venv --python 3.12 venv
-VIRTUAL_ENV=venv uv pip install -e ".[dev]"     # add ",asr" for local faster-whisper
+VIRTUAL_ENV=venv uv pip install -e ".[dev]"     # add ",asr" for local faster-whisper,
+                                                #   ",web" for the Scrapling and browser fetchers
+                                                #   (then: venv/Scripts/python -m playwright install chromium),
+                                                #   ",convert" for Word/PowerPoint/Excel via MarkItDown
 
 # 3) start the bot (Windows: Git Bash; macOS/Linux: scripts/run_mac.sh)
 ./scripts/run.sh

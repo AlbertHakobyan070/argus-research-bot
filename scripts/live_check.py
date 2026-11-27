@@ -69,6 +69,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--profile", default=None, help="engines profile (default: the active one)")
     p.add_argument("--recency", default=None, choices=["d", "w", "m", "y"],
                    help="run_config.recency (default: the brief's time-sensitivity decides)")
+    p.add_argument("--web", default="exa", choices=["exa", "free"],
+                   help="free: no Exa (DuckDuckGo/GitHub/arXiv search, the free fetchers)")
     p.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "argus_live_check")
     p.add_argument("--expect-banner", action="store_true",
                    help="expect the grounding banner (a nonexistent entity; the classified no-evidence report passes)")
@@ -297,7 +299,7 @@ async def _main(args: argparse.Namespace) -> int:
     record = await runner._run_one(
         query, length=args.length, depth=args.depth, engines=engines, timeout_s=None,
         state_dir=args.out, origin="live_check",
-        overrides={"recency": args.recency} if args.recency else None)
+        overrides={"recency": args.recency} if args.recency else None, web=args.web)
     if not (qdir / "state.json").exists():
         print(f"run {record['status']}: {record.get('error')} - no checkpoint, nothing to check")
         return 1

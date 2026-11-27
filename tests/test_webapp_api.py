@@ -171,6 +171,14 @@ async def test_start_run(client, fake):
                                          "overrides": {"research.waves": 2, "recency": "m"}, "origin": "webapp"})]
 
 
+async def test_start_run_passes_the_web_mode(client, fake):
+    await _json(await client.post("/api/runs", headers=auth(), json={"topic": "x", "web": "free"}))
+    assert fake.calls == [("start_run", {"chat_id": USER_ID, "user_id": USER_ID, "topic": "x", "web": "free",
+                                         "overrides": {}, "origin": "webapp"})]
+    body = await _json(await client.post("/api/runs", headers=auth(), json={"topic": "x", "web": "paid"}), 400)
+    assert body["error"]["code"] == "bad_request" and "web must be" in body["error"]["message"]
+
+
 async def test_start_run_with_only_a_topic(client, fake):
     await _json(await client.post("/api/runs", headers=auth(), json={"topic": "x"}))
     assert fake.calls == [("start_run", {"chat_id": USER_ID, "user_id": USER_ID, "topic": "x",
@@ -353,7 +361,9 @@ async def engines(monkeypatch, tmp_path, lib):
 async def test_get_engines(client, engines, lib):
     lib.exa_usd = 1.25
     body = await _json(await client.get("/api/engines", headers=auth()))
-    assert set(body) == {"config", "active_profile", "snapshot", "validation", "exa_month_to_date_usd"}
+    assert set(body) == {"config", "active_profile", "snapshot", "validation", "exa_month_to_date_usd", "fetch"}
+    assert set(body["fetch"]) == {"rungs", "chains"} and set(body["fetch"]["chains"]) == {"exa", "free"}
+    assert all(set(r) == {"rung", "ok", "detail"} for r in body["fetch"]["rungs"])
     assert body["active_profile"] == "main" and body["exa_month_to_date_usd"] == 1.25
     providers = body["config"]["providers"]
     assert providers["fixed"]["api_key"] == {"env": "T_WEB_FIXED_KEY", "present": True}

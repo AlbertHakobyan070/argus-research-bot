@@ -118,10 +118,10 @@ def _copy_report_files(paths: dict, qdir: Path) -> None:
 
 async def _run_one(query_obj: dict, *, length: str, depth: str | None,
                    engines: EnginesSnapshot, timeout_s: int | None, state_dir: Path,
-                   origin: str = "bench", overrides: dict | None = None) -> dict:
+                   origin: str = "bench", overrides: dict | None = None, web: str = "exa") -> dict:
     """Run a single query end-to-end. Auto-resume through interrupts.
     ``timeout_s`` None: no limit (the live check); ``overrides``: dotted
-    RunConfig keys, e.g. ``{"recency": "m"}``."""
+    RunConfig keys, e.g. ``{"recency": "m"}``; ``web``: "exa" or "free"."""
     qid = query_obj["id"]
     query = query_obj["query"]
     qdir = state_dir / qid
@@ -130,7 +130,7 @@ async def _run_one(query_obj: dict, *, length: str, depth: str | None,
     thread_id = f"bench-{qid}-{uuid.uuid4().hex[:8]}"
     user_id = 0  # bench user
     rc = RunConfig.from_preset(length=length, depth=depth, engines=engines, overrides=overrides,
-                               origin=origin)
+                               origin=origin, web=web)
 
     # Fresh checkpointer per query — no state leakage.
     graph = build_graph(checkpointer=MemorySaver())
