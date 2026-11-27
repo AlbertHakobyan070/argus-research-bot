@@ -1,9 +1,11 @@
-// #/settings — the console's look: follow Telegram's light/dark or pin one, and which light and which dark
-// theme (the kit's themes). Saved on the bot (PUT /api/appearance); app.js applies it ("argus:appearance").
+// #/settings — the console's look: the style (classic or cozy), follow Telegram's light/dark or pin one, and
+// which light and which dark theme (the kit's themes). Saved on the bot (PUT /api/appearance); app.js
+// applies it ("argus:appearance").
 // Backend: the site-dependent packages (updates.py), their versions and an Update button each.
 import { get, saveAppearance, updates } from "../api.js";
 import { $, $$, act, esc, toast } from "./common.js";
 
+const STYLES = [["classic", "Classic"], ["cozy", "Cozy"]];
 const MODES = [["telegram", "Follow Telegram"], ["light", "Always light"], ["dark", "Always dark"]];
 const LIGHT = [["ledger", "Ledger", "warm parchment, amber"], ["steel", "Steel", "cool grey, blue"],
   ["solar", "Solar", "cream, ocean blue"], ["paper", "Paper", "white, ink blue"]];
@@ -26,11 +28,14 @@ export async function render(el, _params, ctx) {
       <small id="${key}-name"></small></span>
       <div class="themes" role="radiogroup" aria-label="${esc(label)}">${themes.map(([id, name]) => `<button class="tsw" type="button" role="radio" data-key="${key}" data-theme-id="${id}" aria-label="${esc(name)}" data-tip="${esc(name)}"><i></i><span>${esc(name)}</span></button>`).join("")}</div></div>`;
   el.innerHTML = `<div class="page-head"><div><span class="kicker">Settings</span><h1>Look and backend</h1>
-      <p>The theme is saved on the bot, so every device you open the console from looks the same.</p></div></div>
-    <section class="sec set-sec" data-kicker="Theme">
-      <div class="set-intro"><h2>Theme</h2><p>Follow Telegram switches between your light and dark theme with the app; or pin one.</p>
+      <p>The look is saved on the bot, so every device you open the console from looks the same.</p></div></div>
+    <section class="sec set-sec" data-kicker="Look">
+      <div class="set-intro"><h2>Look</h2><p>The style sets shapes and motion, the themes set the colours; any style goes with any theme.
+        Follow Telegram switches between your light and dark theme with the app; or pin one.</p>
         <div class="sec-notice" hidden></div></div>
       <div class="set-panel">
+        <div class="set-row"><span class="set-l"><b>Style</b><small>Classic is crisp and still; Cozy is rounder and softer, with small animations.</small></span>
+          <div class="seg seg-s" role="radiogroup" aria-label="Style">${STYLES.map(([v, label]) => `<label><input type="radio" name="style" value="${v}"><span>${esc(label)}</span></label>`).join("")}</div></div>
         <div class="set-row"><span class="set-l"><b>Light or dark</b><small>Telegram's own setting, or always one.</small></span>
           <div class="seg seg-s" role="radiogroup" aria-label="Light or dark">${MODES.map(([v, label]) => `<label><input type="radio" name="mode" value="${v}"><span>${esc(label)}</span></label>`).join("")}</div></div>
         ${swatches("light", "Light theme", LIGHT)}
@@ -45,6 +50,7 @@ export async function render(el, _params, ctx) {
   backend(el);
   const notice = $(".sec-notice", el);
   const paint = () => {
+    $$("input[name=style]", el).forEach((r) => { r.checked = r.value === a.style; });
     $$("input[name=mode]", el).forEach((r) => { r.checked = r.value === a.mode; });
     $$(".tsw", el).forEach((b) => b.setAttribute("aria-checked", String(a[b.dataset.key] === b.dataset.themeId)));
     for (const [key, themes] of [["light", LIGHT], ["dark", DARK]]) {
@@ -58,6 +64,7 @@ export async function render(el, _params, ctx) {
     if (r) a = r.appearance;
     paint();                                     // a refused change repaints the saved state
   };
+  $$("input[name=style]", el).forEach((r) => r.addEventListener("change", () => save(null, { style: r.value })));
   $$("input[name=mode]", el).forEach((r) => r.addEventListener("change", () => save(null, { mode: r.value })));
   $$(".tsw", el).forEach((b) => b.addEventListener("click", () => {
     // picking a light theme while pinned dark (or the reverse) shows it: the pin follows the pick

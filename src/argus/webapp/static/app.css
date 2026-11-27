@@ -280,3 +280,78 @@ section.sec[hidden] + section.sec{border-top:0}
 .to-top{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));z-index:15;
   background:var(--panel);border:1px solid var(--line);border-radius:var(--r);opacity:.88}
 .to-top:hover,.to-top:focus-visible{opacity:1;color:var(--ink)}
+
+/* ==== swipe between tabs (swipe.js) ==== */
+/* the page follows the finger a little, then the new tab slides in from that side; .main clips the
+   pull so the page never scrolls sideways */
+.main{overflow-x:clip}
+@media (prefers-reduced-motion:no-preference){
+  #view{transition:translate var(--t-fast) var(--ease)}
+  #view.swiping{transition:none}
+  #view.swipe-in{animation:swipe-in 220ms var(--ease)}
+  #view.swipe-in[data-swipe="prev"]{animation-name:swipe-in-prev}
+}
+@keyframes swipe-in{from{opacity:.35;transform:translateX(44px)}}
+@keyframes swipe-in-prev{from{opacity:.35;transform:translateX(-44px)}}
+
+/* ==== cozy style ==== */
+/* <html data-style="cozy"> (Settings → Look → Style): rounder corners, soft depth, a little more air and
+   small motions. Shape, spacing and motion only, from tokens every theme defines (--shadow, --ink,
+   --line-soft, --accent-soft), so each colour theme — the kit's and the Noetrix packs — keeps its colours.
+   Motions run once, stay under 250 ms and are off with prefers-reduced-motion (base.css zeroes them too). */
+:root[data-style="cozy"]{
+  --r:11px;--r-sm:7px;
+  --s3:13px;--s4:18px;--s5:28px;--s6:36px;
+  --kit-cozy-t:190ms;
+  /* the theme's ink pulled toward black: a warm shade on light themes, never a glow on dark ones.
+     Contrast's --shadow is none, which voids these lists: no shadows there, as that theme intends. */
+  --kit-shade:color-mix(in oklab,color-mix(in oklab,var(--ink) 25%,black) 22%,transparent);
+  --kit-rest:var(--shadow),0 6px 16px -12px var(--kit-shade);
+  --kit-lift:var(--shadow),0 14px 28px -16px var(--kit-shade);
+}
+[data-style="cozy"] .page-head h1{font-family:var(--serif);font-weight:600;letter-spacing:-.008em}
+[data-style="cozy"] :is(.set-panel,.tw,.kpis,.acc){border-color:var(--line-soft)}
+[data-style="cozy"] :is(.card,.set-panel,.tw,.kpis,.acc,.callout,.plan-anchors,.transcript){box-shadow:var(--kit-rest)}
+[data-style="cozy"] .set-row{padding:17px 20px}
+/* segmented controls: the pick is a pill inside a soft well */
+[data-style="cozy"] .seg{gap:2px;padding:2px;background:var(--panel-2);border-color:var(--line-soft)}
+[data-style="cozy"] .seg > * + *{border-left:0}
+[data-style="cozy"] :is(.seg > button,.seg > label > span){border-radius:calc(var(--r) - 3px)}
+/* tab strips (Media) and the phone nav: the current one is a soft pill, not an underline */
+[data-style="cozy"] .tablist{gap:4px;padding-bottom:var(--s2);border-bottom-color:var(--line-soft)}
+[data-style="cozy"] .tablist [role="tab"]{border:0;border-radius:var(--r-pill);padding:8px 14px}
+[data-style="cozy"] .tablist [role="tab"]:hover{background:var(--panel-2)}
+[data-style="cozy"] .tablist [role="tab"][aria-selected="true"]{background:var(--accent-soft);color:var(--ink)}
+@media (max-width:1140px){
+  [data-style="cozy"] .track a{border-bottom:0;border-radius:var(--r-pill);padding:7px 12px;margin:5px 0}
+  [data-style="cozy"] .track a.on{background:var(--accent-soft)}
+}
+@media (max-width:620px){[data-style="cozy"] .track a{padding:6px 9px}}
+
+@media (prefers-reduced-motion:no-preference){
+  /* press: controls sink a little under the finger and spring back */
+  [data-style="cozy"] :is(.btn,.ib,.chip,.tsw){transition:color var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease),box-shadow var(--t-fast) var(--ease),scale var(--kit-cozy-t) var(--kit-ease-spring)}
+  [data-style="cozy"] :is(.btn,.ib,.chip,.tsw):active:not(:disabled){scale:.95}
+  [data-style="cozy"] :is(.seg > label > span,.tablist [role="tab"],.track a){transition:color var(--t-fast) var(--ease),
+    background var(--kit-cozy-t) var(--ease),scale var(--kit-cozy-t) var(--kit-ease-spring)}
+  [data-style="cozy"] :is(.seg > label:active > span,.tablist [role="tab"]:active,.track a:active){scale:.95}
+  /* a tab change: the new tab's pill fills in */
+  @starting-style{[data-style="cozy"] .tablist [role="tab"][aria-selected="true"]{background-color:transparent}}
+  /* cards and rows lift under a pointer and give a little under a tap */
+  [data-style="cozy"] :is(a.card,.run-row){transition:border-color var(--t-fast) var(--ease),background var(--t-fast) var(--ease),
+    box-shadow var(--kit-cozy-t) var(--ease),translate var(--kit-cozy-t) var(--ease),scale var(--t-fast) var(--ease)}
+  [data-style="cozy"] :is(a.card,.run-row):active{scale:.985}
+  /* a view arrives: its blocks rise into place in a short cascade (skeleton, then content) */
+  [data-style="cozy"] #view > div > *{transition:opacity var(--kit-cozy-t) var(--ease),translate var(--kit-cozy-t) var(--ease)}
+  @starting-style{[data-style="cozy"] #view > div > *{opacity:0;translate:0 8px}}
+  [data-style="cozy"] #view > div > :nth-child(2){transition-delay:25ms}
+  [data-style="cozy"] #view > div > :nth-child(n+3){transition-delay:50ms}
+  /* toasts settle with a small spring; the switch knob too */
+  [data-style="cozy"] .toast{transition-duration:220ms;transition-timing-function:var(--kit-ease-spring)}
+  @starting-style{[data-style="cozy"] .toast{opacity:0;transform:translateY(12px) scale(.96)}}
+  [data-style="cozy"] .switch::before{transition:transform 220ms var(--kit-ease-spring),background var(--t-fast) var(--ease)}
+}
+@media (hover:hover) and (prefers-reduced-motion:no-preference){
+  [data-style="cozy"] a.card:hover{translate:0 -2px;box-shadow:var(--kit-lift)}
+}
